@@ -39,15 +39,10 @@ pub async fn run(config: Config) -> anyhow::Result<()> {
     let (router, seams) = server::build(memory.clone());
 
     // ACP subprocess: held for the lifetime of hi-agent (impl.md § "Four
-    // primitives → ACP"). `CLAUDE_CODE_BIN` / `CLAUDE_CODE_ARGS` override
-    // the defaults; the ACP transport may also be redirected to a sibling
-    // container in the deferred Docker story.
-    let acp_bin = std::env::var("CLAUDE_CODE_BIN").unwrap_or_else(|_| "claude-code".to_string());
-    let acp_args: Vec<String> = std::env::var("CLAUDE_CODE_ARGS")
-        .ok()
-        .map(|s| s.split_whitespace().map(String::from).collect())
-        .unwrap_or_default();
-    let acp = std::sync::Arc::new(acp::AcpProcess::spawn(acp_bin.into(), acp_args).await?);
+    // primitives → ACP").
+    let acp = std::sync::Arc::new(
+        acp::AcpProcess::spawn("claude-agent-acp".into(), Vec::new()).await?,
+    );
     tracing::info!("ACP subprocess up");
 
     // === MCP hub ===

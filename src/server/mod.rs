@@ -16,7 +16,7 @@ use std::sync::Arc;
 
 use axum::Router;
 use axum::http::StatusCode;
-use axum::routing::{get, post};
+use axum::routing::post;
 use tokio::sync::{broadcast, mpsc};
 use tower_http::trace::TraceLayer;
 

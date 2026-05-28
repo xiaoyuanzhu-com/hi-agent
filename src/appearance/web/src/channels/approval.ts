@@ -10,7 +10,7 @@ export interface ApprovalRequest {
   id: string;
   action: string;
   summary: string;
-  details?: string;
+  details?: unknown;
   requested_at?: string;
   /** Whatever else the server included. */
   [key: string]: unknown;

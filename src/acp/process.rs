@@ -42,11 +42,7 @@ impl McpServerCfg {
         let env: Vec<EnvVariable> = self
             .env
             .iter()
-            .map(|(k, v)| EnvVariable {
-                name: k.clone(),
-                value: v.clone(),
-                meta: None,
-            })
+            .map(|(k, v)| EnvVariable::new(k.clone(), v.clone()))
             .collect();
         let stdio = McpServerStdio::new(self.name.clone(), self.command.clone())
             .args(self.args.clone())

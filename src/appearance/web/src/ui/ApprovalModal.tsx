@@ -75,7 +75,7 @@ export function ApprovalModal({ request, onDecide }: ApprovalModalProps) {
           {request.summary}
         </p>
 
-        {request.details && (
+        {request.details != null && (
           <pre
             style={{
               margin: 0,
@@ -91,7 +91,9 @@ export function ApprovalModal({ request, onDecide }: ApprovalModalProps) {
               overflow: "auto",
             }}
           >
-            {request.details}
+            {typeof request.details === "string"
+              ? request.details
+              : JSON.stringify(request.details, null, 2)}
           </pre>
         )}
 
