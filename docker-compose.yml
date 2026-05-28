@@ -1,0 +1,56 @@
+# Two-container layout for hi-agent + claude-code, per impl.md
+# § "Open question — claude-code in the image", path (2).
+#
+# IMPORTANT — illustrative, not pinned.
+#   * The `claude-code` image name and command below are PLACEHOLDERS. There
+#     is no canonical published image for claude-code at the time this file
+#     was written. Replace `image:` and `command:` with whatever
+#     distribution you have access to (npm-installed launcher, official
+#     binary, vendor image, etc.).
+#   * The shared-socket trick uses `socat`. hi-agent's `CLAUDE_CODE_BIN=socat`
+#     plus `CLAUDE_CODE_ARGS` make the ACP subprocess actually be socat
+#     bridging stdio to the Unix socket exposed by the sibling container.
+#     That works with the current `src/acp/process.rs` — see
+#     `AcpProcess::spawn`, which just executes whatever `CLAUDE_CODE_BIN`
+#     names with `CLAUDE_CODE_ARGS` appended.
+#   * The hi-agent image is the one built from the local Dockerfile.
+
+services:
+  hi-agent:
+    build: .
+    environment:
+      CLAUDE_CODE_BIN: socat
+      CLAUDE_CODE_ARGS: "STDIO UNIX-CONNECT:/sockets/claude-code.sock"
+      RUST_LOG: info
+    volumes:
+      - ./data:/data
+      - sockets:/sockets
+    ports:
+      - "8080:8080"
+    command:
+      - hi-agent
+      - --port=8080
+      - --data-dir=/data
+    depends_on:
+      - claude-code
+
+  claude-code:
+    # PLACEHOLDER — replace with whatever image ships claude-code + socat.
+    # A debian-slim base with `npm i -g @anthropic-ai/claude-code` and
+    # `apt-get install -y socat` would also work as a custom build.
+    image: ghcr.io/anthropic/claude-code:latest
+    volumes:
+      - sockets:/sockets
+    # PLACEHOLDER command. Bridges any stdio connection on the socket to a
+    # fresh claude-code subprocess. `fork` lets each new ACP session get a
+    # fresh process (or change to non-fork if claude-code multiplexes
+    # sessions natively over a single stdio pair).
+    command:
+      [
+        "socat",
+        "UNIX-LISTEN:/sockets/claude-code.sock,fork,reuseaddr",
+        "EXEC:claude-code",
+      ]
+
+volumes:
+  sockets:

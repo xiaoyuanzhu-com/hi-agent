@@ -1,0 +1,2 @@
+rust: cargo watch -x 'run -- --port 8080'
+web:  cd src/appearance/web && pnpm dev

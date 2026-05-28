@@ -1,0 +1,2 @@
+placeholder so rust-embed's compile-time folder check succeeds before `pnpm build` has run.
+the real assets go here from `vite build`; this file is harmless when embedded.
