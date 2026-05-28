@@ -28,50 +28,71 @@ export function ApprovalModal({ request, onDecide }: ApprovalModalProps) {
       style={{
         position: "fixed",
         inset: 0,
-        background: "rgba(0, 0, 0, 0.45)",
-        display: "flex",
-        alignItems: "center",
-        justifyContent: "center",
+        background:
+          "radial-gradient(ellipse at center, rgba(255, 78, 203, 0.14), rgba(2, 4, 12, 0.78) 60%)",
+        backdropFilter: "blur(8px)",
+        WebkitBackdropFilter: "blur(8px)",
+        display: "grid",
+        placeItems: "center",
         padding: 16,
-        zIndex: 50,
+        zIndex: 60,
+        animation: "hi-flicker 320ms steps(1) 1",
       }}
     >
       <div
+        className="glass"
         style={{
+          position: "relative",
           width: "100%",
-          maxWidth: 440,
-          background: "var(--bg-elevated)",
-          color: "var(--fg)",
-          borderRadius: 14,
-          boxShadow: "var(--shadow-md)",
-          border: "1px solid var(--border)",
-          padding: 20,
+          maxWidth: 480,
+          padding: "22px 22px 18px",
+          borderRadius: 18,
+          border: "1px solid rgba(255, 78, 203, 0.55)",
+          boxShadow: "var(--glow-magenta)",
           display: "flex",
           flexDirection: "column",
-          gap: 14,
+          gap: 16,
         }}
       >
-        <header style={{ display: "flex", flexDirection: "column", gap: 4 }}>
+        <CornerBrackets color="var(--magenta)" />
+
+        <header style={{ display: "flex", flexDirection: "column", gap: 6 }}>
           <span
             style={{
-              fontSize: 12,
+              fontSize: 10,
+              letterSpacing: "0.32em",
               textTransform: "uppercase",
-              letterSpacing: 0.6,
-              color: "var(--fg-muted)",
+              color: "var(--magenta)",
               fontFamily: "var(--font-mono)",
+              textShadow: "var(--glow-magenta)",
             }}
           >
-            approval requested
+            // approval required
           </span>
           <h2
             id="approval-title"
-            style={{ margin: 0, fontSize: 17, lineHeight: 1.3 }}
+            style={{
+              margin: 0,
+              fontSize: 18,
+              lineHeight: 1.3,
+              color: "var(--fg)",
+              letterSpacing: "0.01em",
+              fontFamily: "var(--font-mono)",
+            }}
           >
             {request.action}
           </h2>
         </header>
 
-        <p style={{ margin: 0, color: "var(--fg)", whiteSpace: "pre-wrap" }}>
+        <p
+          style={{
+            margin: 0,
+            color: "var(--fg)",
+            whiteSpace: "pre-wrap",
+            fontSize: 14,
+            lineHeight: 1.55,
+          }}
+        >
           {request.summary}
         </p>
 
@@ -79,15 +100,16 @@ export function ApprovalModal({ request, onDecide }: ApprovalModalProps) {
           <pre
             style={{
               margin: 0,
-              padding: 10,
-              borderRadius: 8,
-              background: "var(--bg)",
-              border: "1px solid var(--border)",
+              padding: 12,
+              borderRadius: 10,
+              background: "rgba(2, 6, 18, 0.65)",
+              border: "1px solid var(--line)",
               fontSize: 12,
               fontFamily: "var(--font-mono)",
+              color: "var(--fg-dim)",
               whiteSpace: "pre-wrap",
               wordBreak: "break-word",
-              maxHeight: 180,
+              maxHeight: 200,
               overflow: "auto",
             }}
           >
@@ -102,11 +124,14 @@ export function ApprovalModal({ request, onDecide }: ApprovalModalProps) {
             display: "flex",
             flexDirection: "column",
             gap: 6,
-            fontSize: 13,
-            color: "var(--fg-muted)",
+            fontSize: 10,
+            color: "var(--fg-mute)",
+            fontFamily: "var(--font-mono)",
+            textTransform: "uppercase",
+            letterSpacing: "0.24em",
           }}
         >
-          Reason (optional)
+          rationale (optional)
           <input
             type="text"
             value={reason}
@@ -114,12 +139,15 @@ export function ApprovalModal({ request, onDecide }: ApprovalModalProps) {
             placeholder="why you decided this way"
             disabled={busy}
             style={{
-              padding: "8px 10px",
-              borderRadius: "var(--radius)",
-              border: "1px solid var(--border)",
-              background: "var(--bg)",
+              padding: "10px 12px",
+              borderRadius: 10,
+              border: "1px solid var(--line-strong)",
+              background: "rgba(2, 6, 18, 0.55)",
+              color: "var(--fg)",
               outline: "none",
-              fontSize: 14,
+              fontFamily: "var(--font-mono)",
+              fontSize: 13,
+              letterSpacing: "0.01em",
             }}
           />
         </label>
@@ -128,54 +156,120 @@ export function ApprovalModal({ request, onDecide }: ApprovalModalProps) {
           style={{
             display: "flex",
             justifyContent: "flex-end",
-            gap: 8,
-            marginTop: 4,
+            gap: 10,
+            marginTop: 2,
           }}
         >
-          <button
-            type="button"
-            disabled={busy}
+          <DecisionButton
+            tone="deny"
+            busy={busy}
             onClick={() => void decide(false)}
-            style={{
-              padding: "9px 14px",
-              borderRadius: "var(--radius)",
-              border: "1px solid var(--border)",
-              background: "transparent",
-              color: "var(--danger)",
-              cursor: busy ? "not-allowed" : "pointer",
-              fontWeight: 600,
-            }}
           >
             Deny
-          </button>
-          <button
-            type="button"
-            disabled={busy}
+          </DecisionButton>
+          <DecisionButton
+            tone="allow"
+            busy={busy}
             onClick={() => void decide(true)}
-            style={{
-              padding: "9px 14px",
-              borderRadius: "var(--radius)",
-              border: "none",
-              background: "var(--ok)",
-              color: "#ffffff",
-              cursor: busy ? "not-allowed" : "pointer",
-              fontWeight: 600,
-            }}
           >
             Allow
-          </button>
+          </DecisionButton>
         </footer>
 
         <div
           style={{
-            fontSize: 11,
-            color: "var(--fg-muted)",
+            fontSize: 10,
+            color: "var(--fg-mute)",
             fontFamily: "var(--font-mono)",
+            letterSpacing: "0.12em",
           }}
         >
-          id: {request.id}
+          id · {request.id}
         </div>
       </div>
     </div>
+  );
+}
+
+function DecisionButton({
+  tone,
+  busy,
+  onClick,
+  children,
+}: {
+  tone: "allow" | "deny";
+  busy: boolean;
+  onClick: () => void;
+  children: React.ReactNode;
+}) {
+  const isAllow = tone === "allow";
+  return (
+    <button
+      type="button"
+      onClick={onClick}
+      disabled={busy}
+      style={{
+        position: "relative",
+        padding: "11px 22px",
+        borderRadius: 10,
+        fontFamily: "var(--font-mono)",
+        fontSize: 12,
+        letterSpacing: "0.18em",
+        textTransform: "uppercase",
+        color: isAllow ? "#04060d" : "var(--danger)",
+        background: isAllow
+          ? "linear-gradient(135deg, #5af6ff, #75ffd0)"
+          : "transparent",
+        border: `1px solid ${isAllow ? "var(--cyan-soft)" : "var(--danger)"}`,
+        boxShadow: isAllow ? "var(--glow-cyan)" : "0 0 0 transparent",
+        cursor: busy ? "not-allowed" : "pointer",
+        transition: "all 220ms var(--ease-out)",
+        fontWeight: 600,
+      }}
+    >
+      {children}
+    </button>
+  );
+}
+
+function CornerBrackets({ color }: { color: string }) {
+  const size = 14;
+  const thickness = 1;
+  const offset = 8;
+  const style = (corner: "tl" | "tr" | "bl" | "br") => {
+    const base: React.CSSProperties = {
+      position: "absolute",
+      width: size,
+      height: size,
+      pointerEvents: "none",
+    };
+    if (corner === "tl") return {
+      ...base, top: offset, left: offset,
+      borderTop: `${thickness}px solid ${color}`,
+      borderLeft: `${thickness}px solid ${color}`,
+    };
+    if (corner === "tr") return {
+      ...base, top: offset, right: offset,
+      borderTop: `${thickness}px solid ${color}`,
+      borderRight: `${thickness}px solid ${color}`,
+    };
+    if (corner === "bl") return {
+      ...base, bottom: offset, left: offset,
+      borderBottom: `${thickness}px solid ${color}`,
+      borderLeft: `${thickness}px solid ${color}`,
+    };
+    return {
+      ...base, bottom: offset, right: offset,
+      borderBottom: `${thickness}px solid ${color}`,
+      borderRight: `${thickness}px solid ${color}`,
+    };
+  };
+  return (
+    <>
+      <span aria-hidden style={style("tl")} />
+      <span aria-hidden style={style("tr")} />
+      <span aria-hidden style={style("bl")} />
+      <span aria-hidden style={style("br")} />
+    </>
   );
 }

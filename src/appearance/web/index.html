@@ -2,9 +2,18 @@
 <html lang="en">
   <head>
     <meta charset="UTF-8" />
-    <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
-    <meta name="color-scheme" content="light dark" />
+    <meta
+      name="viewport"
+      content="width=device-width, initial-scale=1, viewport-fit=cover"
+    />
+    <meta name="color-scheme" content="dark" />
+    <meta name="theme-color" content="#04060d" />
     <title>hi-agent</title>
+    <style>
+      /* Paint immediately on first frame so the canvas + content fade onto
+         a deep-space backdrop, never a white flash. */
+      html, body { background: #04060d; color: #d6e4ff; }
+    </style>
   </head>
   <body>
     <div id="root"></div>
