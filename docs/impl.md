@@ -319,33 +319,28 @@ hi-agent/
 
 ## Build, dev, and deploy
 
-### justfile recipes
+### Makefile recipes
 
 ```
-default:
-    @just --list
-
-# install all deps, build everything, produce the release binary
 build:
-    cd src/appearance/web && pnpm install --frozen-lockfile && pnpm build
-    cargo build --release
+	cd src/appearance/web && npm ci && npm run build
+	cargo build --release
 
-# dev: two processes — cargo watch for Rust, vite dev for SPA
 dev:
-    overmind start -f Procfile.dev
+	trap 'kill 0' INT TERM EXIT; \
+	cargo watch -x 'run -- --port 8080' & \
+	(cd src/appearance/web && npm run dev) & \
+	wait
 
-# run the release binary
 run:
-    ./target/release/hi-agent
+	./target/release/hi-agent
 
-# tests
 test:
-    cargo test
-    cd src/appearance/web && pnpm test
+	cargo test
+	cd src/appearance/web && npm test
 
-# docker image
 docker:
-    docker build -t hi-agent:dev .
+	docker build -t hi-agent:dev .
 ```
 
 ### Dev mode
@@ -355,15 +350,11 @@ Two processes, no embedding:
 - Vite dev server on `:5173` with HMR; proxies channel routes to `:8080` via `vite.config.ts`.
 - Browser only talks to `:5173`.
 
-`Procfile.dev`:
-```
-rust: cargo watch -x 'run -- --port 8080'
-web:  cd src/appearance/web && pnpm dev
-```
+`make dev` backgrounds both with a `trap 'kill 0'` so Ctrl-C stops the group. Output is interleaved without prefixes; run them in separate terminals if you need clean streams.
 
 ### Release mode
 
-`pnpm build` produces `src/appearance/web/dist/`. `cargo build --release` embeds it via `rust-embed`. Single binary serves everything on one port.
+`npm run build` produces `src/appearance/web/dist/`. `cargo build --release` embeds it via `rust-embed`. Single binary serves everything on one port.
 
 ### Docker
 

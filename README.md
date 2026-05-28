@@ -11,14 +11,14 @@ design v0.1 · 2026-05-28 · v0 implementation complete · not load-tested.
 ### Prerequisites
 
 - Rust toolchain (2024 edition — `rustc` 1.85 or newer)
-- Node 22+ and `pnpm` (via `corepack enable`)
+- Node 22+ (npm ships with Node)
 - `claude-code` available on `PATH`, or set `CLAUDE_CODE_BIN`
 
 ### Build and run
 
 ```sh
 # 1. build the SPA so rust-embed has something to embed
-cd src/appearance/web && pnpm install && pnpm build && cd ../../..
+cd src/appearance/web && npm ci && npm run build && cd ../../..
 
 # 2. build the Rust binary
 cargo build --release
@@ -27,10 +27,10 @@ cargo build --release
 ./target/release/hi-agent
 ```
 
-Or, with `just`:
+Or, with `make`:
 
 ```sh
-just build && just run
+make build && make run
 ```
 
 ### Verify it's alive
@@ -171,8 +171,7 @@ hi-agent/
 ├── build.rs                                # rerun-if-changed for the SPA
 ├── Dockerfile                              # multi-stage build (SPA → rust → debian-slim)
 ├── docker-compose.yml                      # sibling-container layout for claude-code (illustrative)
-├── justfile                                # build / dev / run / test / docker
-├── Procfile.dev                            # `cargo watch` + Vite dev server
+├── Makefile                                # build / dev / run / test / docker
 ├── docs/
 │   ├── impl.md                             # architecture and step plan
 │   └── risks.md                            # unverified-things register (Step 0 spike output)
@@ -202,10 +201,10 @@ hi-agent/
 Two processes — the Rust binary on `:8080` and the Vite dev server on `:5173`, with Vite proxying channel routes to `:8080`:
 
 ```sh
-just dev
+make dev
 ```
 
-(That runs `overmind start -f Procfile.dev`. If you don't use overmind, run the two lines from `Procfile.dev` in separate terminals.)
+(That backgrounds `cargo watch` and `npm run dev` with a `trap` so Ctrl-C stops both. Output from the two processes is interleaved without prefixes — if that bothers you, run them in separate terminals.)
 
 The browser talks to `:5173`. HMR works for the SPA; Rust reloads on file change via `cargo watch`.
 

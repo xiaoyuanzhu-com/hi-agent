@@ -1,10 +1,10 @@
 # Stage 1: build the SPA
 FROM node:22-alpine AS web
 WORKDIR /web
-COPY src/appearance/web/package.json src/appearance/web/pnpm-lock.yaml ./
-RUN corepack enable && pnpm install --frozen-lockfile
+COPY src/appearance/web/package.json src/appearance/web/package-lock.json ./
+RUN npm ci
 COPY src/appearance/web ./
-RUN pnpm build
+RUN npm run build
 
 # Stage 2: build the Rust binary (embeds SPA)
 FROM rust:1-bookworm AS rust
