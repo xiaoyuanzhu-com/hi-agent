@@ -1,12 +1,7 @@
 import { useCallback, useEffect, useMemo, useState } from "react";
 import { postThought, subscribeThought } from "./channels/thought";
-import {
-  awaitApproval,
-  postApproval,
-  type ApprovalRequest,
-} from "./channels/approval";
+import { postAudio } from "./channels/audio";
 import { Composer } from "./ui/Composer";
-import { ApprovalModal } from "./ui/ApprovalModal";
 import { ParticleField } from "./ui/ParticleField";
 import { Orb, type AgentState } from "./ui/Orb";
 import { HUD, type StatusKind } from "./ui/HUD";
@@ -53,7 +48,6 @@ export function App() {
   const [peer, setPeer] = useState<string>(() => loadPeer());
   const [messages, setMessages] = useState<MessageData[]>([]);
   const [thoughtState, setThoughtState] = useState<StatusKind>("connecting");
-  const [approval, setApproval] = useState<ApprovalRequest | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [logOpen, setLogOpen] = useState<boolean>(() => loadLogOpen());
   const [streamingId, setStreamingId] = useState<string | null>(null);
@@ -164,32 +158,6 @@ export function App() {
     return () => cancelAnimationFrame(raf);
   }, []);
 
-  // ---- /approval subscription loop ----------------------------------------
-  useEffect(() => {
-    const ctrl = new AbortController();
-    let cancelled = false;
-
-    (async () => {
-      while (!cancelled) {
-        try {
-          const req = await awaitApproval({ peer, signal: ctrl.signal });
-          if (cancelled) break;
-          if (req) setApproval(req);
-        } catch (err) {
-          if (cancelled || ctrl.signal.aborted) break;
-          // eslint-disable-next-line no-console
-          console.warn("[approval] subscribe error:", err);
-          await new Promise((r) => setTimeout(r, 1500));
-        }
-      }
-    })();
-
-    return () => {
-      cancelled = true;
-      ctrl.abort();
-    };
-  }, [peer]);
-
   // ---- Actions ------------------------------------------------------------
   const sendThought = useCallback(
     async (text: string) => {
@@ -214,21 +182,27 @@ export function App() {
     [peer],
   );
 
-  const decideApproval = useCallback(
-    async (allow: boolean, reason?: string) => {
-      if (!approval) return;
+  const sendAudio = useCallback(
+    async (blob: Blob, mime: string) => {
       try {
-        await postApproval(
-          { id: approval.id, allow, reason },
-          { from: peer },
-        );
-        setApproval(null);
+        const { transcript } = await postAudio({ from: peer, blob, mime });
+        setMessages((m) => [
+          ...m,
+          {
+            id: nextMsgId(),
+            direction: "out",
+            from: peer,
+            text: transcript,
+            at: new Date().toISOString(),
+          },
+        ]);
+        setError(null);
       } catch (err) {
         const msg = err instanceof Error ? err.message : String(err);
         setError(msg);
       }
     },
-    [approval, peer],
+    [peer],
   );
 
   // ---- Derived state ------------------------------------------------------
@@ -242,14 +216,13 @@ export function App() {
   const channels = useMemo(
     () => [
       { name: "thought", supported: true, active: thoughtState === "live" || streamingId !== null },
-      { name: "approval", supported: true, active: approval !== null },
       { name: "vision", supported: false },
-      { name: "audio", supported: false, active: micOn },
+      { name: "audio", supported: true, active: micOn },
       { name: "touch", supported: false },
       { name: "smell", supported: false },
       { name: "taste", supported: false },
     ],
-    [thoughtState, streamingId, approval, micOn],
+    [thoughtState, streamingId, micOn],
   );
 
   // The last in-flight message preview (under the orb) — shows the live
@@ -293,11 +266,12 @@ export function App() {
 
       {error && <ErrorToast text={error} onClose={() => setError(null)} />}
 
-      <Composer onSend={sendThought} onMicChange={setMicOn} />
-
-      {approval && (
-        <ApprovalModal request={approval} onDecide={decideApproval} />
-      )}
+      <Composer
+        onSend={sendThought}
+        onAudio={sendAudio}
+        onError={setError}
+        onMicChange={setMicOn}
+      />
     </div>
   );
 }
@@ -427,7 +401,7 @@ function CenterStage({
 function stateLabel(s: AgentState): string {
   switch (s) {
     case "idle":      return "standby";
-    case "listening": return "input // /audio (placeholder)";
+    case "listening": return "input // /audio";
     case "thinking":  return "processing";
     case "speaking":  return "transmitting";
     case "offline":   return "link severed";

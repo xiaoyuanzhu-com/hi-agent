@@ -1,54 +1,33 @@
 //! Smoke test for the HTTP route surface.
 //!
-//! Does NOT spawn `claude-code` or the ACP subprocess; the test builds the
-//! axum router via [`hi_agent::server::build`] directly and discards the
-//! reactor seams. That keeps the test hermetic and runnable on CI without
-//! the cognition dependency.
-//!
-//! Covered:
-//! - `POST /thought` with `X-HI-From` returns 202 and writes `SignalIn` to
-//!   the journal.
-//! - `POST /thought` without `X-HI-From` returns 400.
-//! - `POST /vision` returns 501 with a non-empty body.
-//! - `GET /` returns 200 with `text/html`.
-//!
-//! NOT covered (these need the reactor + ACP backend; see
-//! `tests/interruption.rs` and `tests/approval_flow.rs`):
-//! - End-to-end routing through claude-code.
-//! - The /thought GET long-poll receiving anything (the broadcast has no
-//!   publisher in this test).
+//! Builds the axum router via [`hi_agent::server::build`] directly. The
+//! reactor seams are returned alongside so the test holds them past the
+//! handlers' send into `inbound` — otherwise the receiver drops and
+//! POST /thought returns 503.
 
 use std::time::Duration;
 
 use hi_agent::memory::Memory;
-use hi_agent::server;
+use hi_agent::server::{self, ServerSeams};
 use hi_agent::types::JournalEntry;
 use tempfile::tempdir;
 use tokio::net::TcpListener;
 
-/// Bring up the server on an ephemeral port. Returns `(base_url, data_dir)`.
-/// The `data_dir` is kept alive by the returned `tempfile::TempDir` so files
-/// stick around until the caller drops it.
-async fn spawn_server() -> (String, tempfile::TempDir) {
+async fn spawn_server() -> (String, tempfile::TempDir, ServerSeams) {
     let dir = tempdir().expect("tempdir");
     let memory = Memory::open(dir.path()).await.expect("memory");
-    let (router, _seams) = server::build(memory, dir.path().to_path_buf(), None);
+    let (router, seams) = server::build(memory, dir.path().to_path_buf(), None);
 
     let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
     let addr = listener.local_addr().expect("local_addr");
 
     tokio::spawn(async move {
-        // If serve returns an error we have nowhere useful to report it
-        // from a background task; the test will just time out on the
-        // request side, which is the right failure signal.
         let _ = axum::serve(listener, router).await;
     });
 
-    // Give the listener a tick to start accepting. axum::serve binds
-    // immediately so this is belt-and-braces.
     tokio::time::sleep(Duration::from_millis(20)).await;
 
-    (format!("http://{addr}"), dir)
+    (format!("http://{addr}"), dir, seams)
 }
 
 /// Read every line of `journal.jsonl` into typed entries.
@@ -68,7 +47,7 @@ async fn read_journal(dir: &std::path::Path) -> Vec<JournalEntry> {
 
 #[tokio::test]
 async fn post_thought_accepts_and_journals() {
-    let (base, dir) = spawn_server().await;
+    let (base, dir, _seams) = spawn_server().await;
     let client = reqwest::Client::new();
 
     let resp = client
@@ -80,10 +59,6 @@ async fn post_thought_accepts_and_journals() {
         .expect("send");
     assert_eq!(resp.status(), reqwest::StatusCode::ACCEPTED);
 
-    // The reactor isn't running, so the inbound mpsc receiver still holds
-    // the signal; we don't care. What we do care about: the POST handler
-    // journaled the SignalIn before dispatching (impl.md
-    // "journal-before-dispatch"). Give the disk a beat to settle.
     tokio::time::sleep(Duration::from_millis(50)).await;
     let entries = read_journal(dir.path()).await;
     assert_eq!(entries.len(), 1, "expected one journal entry, got {entries:?}");
@@ -97,8 +72,10 @@ async fn post_thought_accepts_and_journals() {
 }
 
 #[tokio::test]
-async fn post_thought_without_peer_header_is_400() {
-    let (base, _dir) = spawn_server().await;
+async fn post_thought_without_peer_header_is_anonymous() {
+    // X-HI-From is "recommended" per spec; we default missing/empty to a
+    // stable anonymous peer id so per-peer routing still has a key.
+    let (base, dir, _seams) = spawn_server().await;
     let client = reqwest::Client::new();
 
     let resp = client
@@ -107,12 +84,20 @@ async fn post_thought_without_peer_header_is_400() {
         .send()
         .await
         .expect("send");
-    assert_eq!(resp.status(), reqwest::StatusCode::BAD_REQUEST);
+    assert_eq!(resp.status(), reqwest::StatusCode::ACCEPTED);
+
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    let entries = read_journal(dir.path()).await;
+    assert_eq!(entries.len(), 1);
+    match &entries[0] {
+        JournalEntry::SignalIn { from, .. } => assert_eq!(from.0, "anonymous"),
+        other => panic!("expected SignalIn, got {other:?}"),
+    }
 }
 
 #[tokio::test]
 async fn post_vision_returns_501() {
-    let (base, _dir) = spawn_server().await;
+    let (base, _dir, _seams) = spawn_server().await;
     let client = reqwest::Client::new();
 
     let resp = client
@@ -129,11 +114,9 @@ async fn post_vision_returns_501() {
 
 #[tokio::test]
 async fn all_sensory_stubs_return_501() {
-    // touch/smell/taste are still 501 in v0. Audio has a real handler now
-    // (Step 11 voice channel) but returns 501 when STT_PROVIDER is unset,
-    // which is the case in this test — the test fixture builds the server
-    // with `stt: None`.
-    let (base, _dir) = spawn_server().await;
+    // touch/smell/taste are still 501 in v0. /audio returns 501 only when
+    // STT is unconfigured, which the test fixture forces with stt: None.
+    let (base, _dir, _seams) = spawn_server().await;
     let client = reqwest::Client::new();
 
     for ch in ["touch", "smell", "taste"] {
@@ -171,7 +154,7 @@ async fn all_sensory_stubs_return_501() {
 
 #[tokio::test]
 async fn homepage_returns_html() {
-    let (base, _dir) = spawn_server().await;
+    let (base, _dir, _seams) = spawn_server().await;
     let client = reqwest::Client::new();
 
     let resp = client.get(format!("{base}/")).send().await.expect("send");

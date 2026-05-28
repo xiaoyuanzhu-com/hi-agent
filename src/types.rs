@@ -1,7 +1,4 @@
-//! Public types — the spec primitives plus journal/intent records.
-//!
-//! These signatures are the contract that the rest of the codebase (and the
-//! subsequent implementation steps) build against. Treat them as stable.
+//! Public types — spec primitives plus journal records.
 
 use std::fmt;
 use std::str::FromStr;
@@ -9,7 +6,6 @@ use std::str::FromStr;
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
-use uuid::Uuid;
 
 // -----------------------------------------------------------------------------
 // PeerId
@@ -43,10 +39,9 @@ impl FromStr for PeerId {
 }
 
 // -----------------------------------------------------------------------------
-// Channel
+// Channel — the six spec channels
 // -----------------------------------------------------------------------------
 
-/// The eight spec channels. Serialized lowercase.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Channel {
@@ -56,8 +51,6 @@ pub enum Channel {
     Touch,
     Smell,
     Taste,
-    Approval,
-    Intent,
 }
 
 impl Channel {
@@ -69,8 +62,6 @@ impl Channel {
             Channel::Touch => "touch",
             Channel::Smell => "smell",
             Channel::Taste => "taste",
-            Channel::Approval => "approval",
-            Channel::Intent => "intent",
         }
     }
 }
@@ -96,8 +87,6 @@ impl FromStr for Channel {
             "touch" => Ok(Channel::Touch),
             "smell" => Ok(Channel::Smell),
             "taste" => Ok(Channel::Taste),
-            "approval" => Ok(Channel::Approval),
-            "intent" => Ok(Channel::Intent),
             other => Err(ChannelParseError(other.to_owned())),
         }
     }
@@ -117,69 +106,6 @@ pub struct Signal {
 }
 
 // -----------------------------------------------------------------------------
-// Stable IDs — UUIDv7, serialize as string
-// -----------------------------------------------------------------------------
-
-macro_rules! define_id {
-    ($name:ident) => {
-        #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
-        #[serde(transparent)]
-        pub struct $name(pub Uuid);
-
-        impl $name {
-            pub fn new() -> Self {
-                Self(Uuid::now_v7())
-            }
-        }
-
-        impl Default for $name {
-            fn default() -> Self {
-                Self::new()
-            }
-        }
-
-        impl fmt::Display for $name {
-            fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-                self.0.fmt(f)
-            }
-        }
-
-        impl FromStr for $name {
-            type Err = uuid::Error;
-
-            fn from_str(s: &str) -> Result<Self, Self::Err> {
-                Uuid::parse_str(s).map(Self)
-            }
-        }
-    };
-}
-
-define_id!(WorkerId);
-define_id!(IntentId);
-define_id!(ApprovalId);
-
-// -----------------------------------------------------------------------------
-// IntentTrigger
-// -----------------------------------------------------------------------------
-
-/// When a deferred intention should fire. Only `Absolute` is implemented in v0.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(tag = "type", rename_all = "snake_case")]
-pub enum IntentTrigger {
-    Absolute { ts: DateTime<Utc> },
-    // Cron and Relative are deferred to v0.1.
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct Intent {
-    pub id: IntentId,
-    pub created: DateTime<Utc>,
-    pub peer: PeerId,
-    pub when: IntentTrigger,
-    pub what: String,
-}
-
-// -----------------------------------------------------------------------------
 // JournalEntry — the discriminated union written to journal.jsonl
 // -----------------------------------------------------------------------------
 
@@ -191,12 +117,9 @@ pub enum JournalEntry {
         channel: Channel,
         from: PeerId,
         body: String,
-        /// Path under `data/media/` for a stored audio/image/etc. blob when the
-        /// signal arrived on a media channel. `body` is the textual
-        /// representation (e.g. the STT transcript); `media_path` lets
-        /// downstream tooling replay the original bytes. `#[serde(default)]`
-        /// keeps pre-voice journals readable.
-        #[serde(default, skip_serializing_if = "Option::is_none")]
+        /// Stable file reference for non-text bodies (audio bytes, future
+        /// images). `body` stays the text representation (e.g. STT transcript).
+        #[serde(default)]
         media_path: Option<String>,
     },
     SignalOut {
@@ -204,58 +127,8 @@ pub enum JournalEntry {
         channel: Channel,
         to: PeerId,
         body: String,
-        /// Path under `data/media/` for an outbound media blob (TTS output,
-        /// future image generations). `body` is the text the agent produced;
-        /// `media_path` points at the rendered bytes.
-        #[serde(default, skip_serializing_if = "Option::is_none")]
+        /// For outbound audio: where the rendered bytes live.
+        #[serde(default)]
         media_path: Option<String>,
-    },
-    WorkerSpawn {
-        ts: DateTime<Utc>,
-        id: WorkerId,
-        peer: PeerId,
-        brief: String,
-    },
-    WorkerCancel {
-        ts: DateTime<Utc>,
-        id: WorkerId,
-    },
-    WorkerComplete {
-        ts: DateTime<Utc>,
-        id: WorkerId,
-    },
-    ApprovalRequest {
-        ts: DateTime<Utc>,
-        id: ApprovalId,
-        peer: PeerId,
-        action: String,
-        summary: String,
-        details: serde_json::Value,
-    },
-    ApprovalDecision {
-        ts: DateTime<Utc>,
-        id: ApprovalId,
-        allow: bool,
-        reason: Option<String>,
-    },
-    ApprovalExpired {
-        ts: DateTime<Utc>,
-        id: ApprovalId,
-    },
-    IntentSet {
-        ts: DateTime<Utc>,
-        id: IntentId,
-        peer: PeerId,
-        when: IntentTrigger,
-        what: String,
-    },
-    IntentFired {
-        ts: DateTime<Utc>,
-        id: IntentId,
-    },
-    Note {
-        ts: DateTime<Utc>,
-        peer: Option<PeerId>,
-        content: String,
     },
 }
