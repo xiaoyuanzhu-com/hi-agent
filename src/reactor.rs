@@ -20,6 +20,7 @@
 //! re-prompts with the merged batch.
 
 use std::collections::HashMap;
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -30,8 +31,11 @@ use tokio::sync::{Mutex, broadcast, mpsc, oneshot};
 use crate::acp::{AcpProcess, AcpSession, SessionOpts, SessionUpdate};
 use crate::mcp::{McpHub, ReactorHandle, SessionTag};
 use crate::memory::{Memory, WorkerSummary, build_for_peer};
+use crate::memory::media::{self, Direction as MediaDirection};
+use crate::server::AudioEvent;
 use crate::server::approval::{ApprovalDecision, ApprovalEvent};
 use crate::types::{ApprovalId, Channel, JournalEntry, PeerId, Signal, WorkerId};
+use crate::voice::Tts;
 
 /// Router system prompt. Step 4 instructs the model to dispatch through the
 /// MCP toolbelt rather than reply inline. Inline text continues to be
@@ -41,6 +45,9 @@ const ROUTER_SYSTEM_PROMPT: &str = "You are the router for a human-interface age
 You do not perform tasks — you dispatch. \
 You have these tools: speak, spawn_worker, cancel_worker, list_workers, set_intent, recall, note. \
 For a normal text reply to the peer, call `speak` with channel=\"thought\". \
+For a brief, personal, or urgent reply where voice fits better than text, call `speak` with channel=\"audio\" \
+(the body is the text to be spoken — keep it natural and conversational; no markdown, no code). \
+If audio is unavailable the tool returns an error string — retry with channel=\"thought\". \
 For deferred reminders, call `set_intent`. \
 For research or multi-step work, call `spawn_worker`. \
 Use `recall` to search memory, `note` to write a journal entry without speaking, \
@@ -100,7 +107,16 @@ struct ReactorInner {
     acp: Arc<AcpProcess>,
     mcp_hub: Arc<McpHub>,
     thought_out: broadcast::Sender<Signal>,
+    audio_out: broadcast::Sender<AudioEvent>,
     approval_out: broadcast::Sender<ApprovalEvent>,
+    /// Path under which `media::store_audio` persists outbound TTS bytes.
+    /// Mirror of `AppState.data_dir`.
+    data_dir: PathBuf,
+    /// Text-to-speech provider, if configured. `None` causes `emit_audio` to
+    /// return an error string visible to the calling MCP tool — the agent's
+    /// reasonable next step is to retry with channel=thought. No silent
+    /// fallback: TTS is an independent capability, fail loudly when missing.
+    tts: Option<Arc<dyn Tts>>,
     /// Outstanding approval requests, keyed by id. Each entry holds a oneshot
     /// sender the bridge resolves on decision or timeout. See Step 7.
     pending_approvals: Mutex<HashMap<ApprovalId, PendingApproval>>,
@@ -163,8 +179,11 @@ pub fn start(
     memory: Memory,
     acp: Arc<AcpProcess>,
     mcp_hub: Arc<McpHub>,
+    data_dir: PathBuf,
+    tts: Option<Arc<dyn Tts>>,
     mut inbound_rx: mpsc::Receiver<Signal>,
     thought_out: broadcast::Sender<Signal>,
+    audio_out: broadcast::Sender<AudioEvent>,
     approval_out: broadcast::Sender<ApprovalEvent>,
     mut approval_decisions_rx: mpsc::Receiver<ApprovalDecision>,
 ) -> Reactor {
@@ -174,7 +193,10 @@ pub fn start(
             acp,
             mcp_hub,
             thought_out,
+            audio_out,
             approval_out,
+            data_dir,
+            tts,
             pending_approvals: Mutex::new(HashMap::new()),
             session_peers: Mutex::new(HashMap::new()),
             peers: Mutex::new(HashMap::new()),
@@ -267,6 +289,7 @@ impl Reactor {
             channel,
             from: signal.from.clone(),
             body,
+            media_path: None,
         };
         if let Err(err) = self.inner.memory.journal.append(entry).await {
             tracing::error!(error = %err, "journal append failed for synthetic signal");
@@ -585,6 +608,7 @@ impl ReactorHandle for ReactorInner {
             channel: Channel::Thought,
             to: peer.clone(),
             body,
+            media_path: None,
         };
         if let Err(err) = self.memory.journal.append(entry).await {
             tracing::error!(peer = %peer, error = %err, "journal append failed for emit_thought (mcp)");
@@ -592,6 +616,41 @@ impl ReactorHandle for ReactorInner {
         if let Err(err) = self.thought_out.send(signal) {
             tracing::debug!(peer = %peer, error = %err, "no thought subscribers for mcp emission");
         }
+    }
+
+    async fn emit_audio(&self, peer: &PeerId, body: String) -> anyhow::Result<()> {
+        let tts = self
+            .tts
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!(
+                "audio output not configured (set TTS_PROVIDER); retry with channel=\"thought\""
+            ))?;
+        let blob = tts.synthesize(&body).await?;
+        let media_path =
+            media::store_audio(&self.data_dir, MediaDirection::Out, blob.ext, &blob.bytes).await?;
+
+        let ts = Utc::now();
+        let entry = JournalEntry::SignalOut {
+            ts,
+            channel: Channel::Audio,
+            to: peer.clone(),
+            body: body.clone(),
+            media_path: Some(media_path.clone()),
+        };
+        if let Err(err) = self.memory.journal.append(entry).await {
+            tracing::error!(peer = %peer, error = %err, "journal append failed for emit_audio");
+        }
+
+        let event = AudioEvent {
+            to: Some(peer.clone()),
+            mime: blob.mime,
+            bytes: blob.bytes,
+            ts,
+        };
+        if let Err(err) = self.audio_out.send(event) {
+            tracing::debug!(peer = %peer, error = %err, "no audio subscribers for emission");
+        }
+        Ok(())
     }
 }
 
@@ -782,6 +841,7 @@ async fn emit_thought(reactor: &Reactor, peer: &PeerId, body: String) {
         channel: Channel::Thought,
         to: peer.clone(),
         body,
+        media_path: None,
     };
     if let Err(err) = reactor.inner.memory.journal.append(entry).await {
         tracing::error!(peer = %peer, error = %err, "journal append failed for outbound thought");

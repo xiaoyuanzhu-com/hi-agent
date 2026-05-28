@@ -112,7 +112,7 @@ See [`docs/impl.md`](docs/impl.md) for the full architecture document.
 | `POST /approval` | Y | JSON `{id, allow, reason?}`; reactor relays decision into ACP `session/request_permission` |
 | `GET /approval` long-poll | Y | JSON event; 5-minute timeout on the requesting side |
 | `POST /vision` | 501 | Per v0 scope; body describes the omission |
-| `POST /audio`, `GET /audio` | 501 | Per v0 scope |
+| `POST /audio`, `GET /audio` | Y when configured | STT transcribes the body and routes the text; the router may reply via `speak(channel="audio")` which is synthesized back through TTS and broadcast on the long-poll. 501 on POST when `STT_PROVIDER` is unset. |
 | `POST /touch`, `POST /smell`, `POST /taste` | 501 | Per v0 scope |
 | Per-peer ephemeral routing | Y | One ACP session per routing turn, scoped by `X-HI-From` |
 | Workers (parallel ACP sessions) | Y | `spawn_worker` MCP tool; one session per worker; auto-stamp `X-HI-To` |
@@ -135,6 +135,26 @@ Env vars consulted at startup:
 | `HI_AGENT_MCP_SOCK` | `<data_dir>/mcp.sock` | Unix socket the MCP hub listens on |
 | `HI_AGENT_SHIM_BIN` | `current_exe()` | Program to re-exec as the MCP stdio↔socket shim |
 | `RUST_LOG` | `info` | Standard `tracing-subscriber` env filter |
+
+### Voice (optional, additive)
+
+Speech-to-text and text-to-speech are independent capabilities. Each is off by
+default; enabling either is a one-provider switch. Both happen to use
+Volcengine in this release; swapping either is a single file under
+`src/voice/`.
+
+| Variable | Default | Purpose |
+|---|---|---|
+| `STT_PROVIDER` | `none` | `none` → `POST /audio` returns 501. `volcengine` → enable transcription. |
+| `TTS_PROVIDER` | `none` | `none` → `speak(channel="audio")` returns an error string (the agent retries with text). `volcengine` → enable synthesis. |
+| `VOLCENGINE_STT_APPID`, `VOLCENGINE_STT_ACCESS_TOKEN` | — | Required when `STT_PROVIDER=volcengine` |
+| `VOLCENGINE_STT_CLUSTER`, `VOLCENGINE_STT_MODEL` | sensible defaults | Optional STT tuning |
+| `VOLCENGINE_TTS_APPID`, `VOLCENGINE_TTS_ACCESS_TOKEN` | — | Required when `TTS_PROVIDER=volcengine` |
+| `VOLCENGINE_TTS_CLUSTER`, `VOLCENGINE_TTS_VOICE`, `VOLCENGINE_TTS_ENCODING` | sensible defaults | Optional TTS tuning |
+
+STT and TTS having separate credentials is deliberate — each capability is
+self-contained, so one can be moved to a different provider without touching
+the other.
 
 CLI flags:
 

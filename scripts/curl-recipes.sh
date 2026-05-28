@@ -16,10 +16,11 @@
 #   4. approve                  — POST a decision on a pending approval
 #   5. ask_for_reminder         — send a thought the router will likely turn into set_intent
 #   6. stub_vision              — confirm /vision is 501 in v0
-#   7. stub_audio               — confirm POST and GET /audio are 501
-#   8. stub_touch_smell_taste   — confirm the other three are 501
-#   9. interruption_demo        — two POSTs in rapid succession to the same peer
-#  10. health_check             — fetch the homepage and confirm 200 + text/html
+#   7. send_audio               — POST an audio file; STT transcribes and routes it
+#   8. open_audio               — long-poll on /audio; saves the next TTS reply to a file
+#   9. stub_touch_smell_taste   — confirm the other three are 501
+#  10. interruption_demo        — two POSTs in rapid succession to the same peer
+#  11. health_check             — fetch the homepage and confirm 200 + text/html
 #
 # Notes:
 # - `curl -N` (`--no-buffer`) is required on GETs so the long-poll body
@@ -111,18 +112,36 @@ stub_vision() {
 }
 
 # ---------------------------------------------------------------------------
-# 7. stub_audio
-# Both POST and GET return 501.
+# 7. send_audio
+# POST an audio file to /audio. STT transcribes the bytes and the transcript
+# is routed through the same per-peer queue that /thought uses.
+# Usage:   send_audio path/to/clip.wav [mime]
+# Default mime is audio/wav. Requires STT_PROVIDER configured server-side
+# (otherwise the server returns 501).
 # ---------------------------------------------------------------------------
-stub_audio() {
-  echo '# POST /audio'
+send_audio() {
+  local file="${1:?audio file required}"
+  local mime="${2:-audio/wav}"
   curl -i -X POST \
     -H "X-HI-From: ${ME}" \
-    --data-binary 'voice clip placeholder' \
+    -H "Content-Type: ${mime}" \
+    --data-binary "@${file}" \
     "${BASE}/audio"
-  echo
-  echo '# GET /audio'
-  curl -i "${BASE}/audio"
+}
+
+# ---------------------------------------------------------------------------
+# 8. open_audio
+# Long-poll on /audio. When the router decides to speak (calls
+# `speak(channel="audio", ...)`), the synthesized bytes stream back here.
+# Usage: open_audio [output-file]
+# Default output file is reply.mp3 (Volcengine TTS default encoding).
+# Requires TTS_PROVIDER configured server-side, otherwise this blocks
+# indefinitely — the agent simply never has anywhere to speak from.
+# ---------------------------------------------------------------------------
+open_audio() {
+  local out="${1:-reply.mp3}"
+  curl -N -H "X-HI-To: ${ME}" -o "${out}" "${BASE}/audio"
+  echo "saved to ${out}"
 }
 
 # ---------------------------------------------------------------------------

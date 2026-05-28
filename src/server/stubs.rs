@@ -10,20 +10,6 @@ pub async fn post_vision() -> impl IntoResponse {
     )
 }
 
-pub async fn post_audio() -> impl IntoResponse {
-    (
-        StatusCode::NOT_IMPLEMENTED,
-        "audio channel is not implemented in v0\n",
-    )
-}
-
-pub async fn get_audio() -> impl IntoResponse {
-    (
-        StatusCode::NOT_IMPLEMENTED,
-        "audio channel is not implemented in v0\n",
-    )
-}
-
 pub async fn post_touch() -> impl IntoResponse {
     (
         StatusCode::NOT_IMPLEMENTED,

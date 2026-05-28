@@ -191,12 +191,24 @@ pub enum JournalEntry {
         channel: Channel,
         from: PeerId,
         body: String,
+        /// Path under `data/media/` for a stored audio/image/etc. blob when the
+        /// signal arrived on a media channel. `body` is the textual
+        /// representation (e.g. the STT transcript); `media_path` lets
+        /// downstream tooling replay the original bytes. `#[serde(default)]`
+        /// keeps pre-voice journals readable.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        media_path: Option<String>,
     },
     SignalOut {
         ts: DateTime<Utc>,
         channel: Channel,
         to: PeerId,
         body: String,
+        /// Path under `data/media/` for an outbound media blob (TTS output,
+        /// future image generations). `body` is the text the agent produced;
+        /// `media_path` points at the rendered bytes.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        media_path: Option<String>,
     },
     WorkerSpawn {
         ts: DateTime<Utc>,

@@ -37,9 +37,14 @@ agent-client-protocol = { version = "0.12", features = ["unstable_session_usage"
 # Random bytes for session-tag generation (Step 4 — MCP hub).
 rand = "0.8"
 
-[dev-dependencies]
-# HTTP client for integration tests in `tests/`. rustls-tls keeps the test
-# binary free of OpenSSL system deps; JSON is for /approval round-trips.
+# Voice capabilities (Step 11): HTTP client for STT/TTS providers and helpers
+# for the audio bytes flowing through them. `bytes` is also re-exported via
+# `Bytes` in axum extractors; keeping it explicit makes the voice traits
+# legible without depending on a particular axum version.
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
-# Throwaway data dirs so tests don't collide on the default ./data path.
+bytes = "1"
+base64 = "0.22"
+
+[dev-dependencies]
+# tempfile is used by integration tests for throwaway data dirs.
 tempfile = "3"

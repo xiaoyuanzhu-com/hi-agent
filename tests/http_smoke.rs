@@ -32,7 +32,7 @@ use tokio::net::TcpListener;
 async fn spawn_server() -> (String, tempfile::TempDir) {
     let dir = tempdir().expect("tempdir");
     let memory = Memory::open(dir.path()).await.expect("memory");
-    let (router, _seams) = server::build(memory);
+    let (router, _seams) = server::build(memory, dir.path().to_path_buf(), None);
 
     let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
     let addr = listener.local_addr().expect("local_addr");
@@ -129,8 +129,10 @@ async fn post_vision_returns_501() {
 
 #[tokio::test]
 async fn all_sensory_stubs_return_501() {
-    // GET /audio + every other POST stub. Touch, smell, taste, audio POST,
-    // audio GET, vision POST.
+    // touch/smell/taste are still 501 in v0. Audio has a real handler now
+    // (Step 11 voice channel) but returns 501 when STT_PROVIDER is unset,
+    // which is the case in this test — the test fixture builds the server
+    // with `stt: None`.
     let (base, _dir) = spawn_server().await;
     let client = reqwest::Client::new();
 
@@ -149,12 +151,22 @@ async fn all_sensory_stubs_return_501() {
         );
     }
 
+    // POST /audio with no STT configured: 501 with the new (capability-gated)
+    // body.
     let resp = client
-        .get(format!("{base}/audio"))
+        .post(format!("{base}/audio"))
+        .header("X-HI-From", "alice@phone")
+        .header("Content-Type", "audio/wav")
+        .body(vec![0u8; 16])
         .send()
         .await
         .expect("send");
     assert_eq!(resp.status(), reqwest::StatusCode::NOT_IMPLEMENTED);
+    let body = resp.text().await.expect("body");
+    assert!(
+        body.contains("STT_PROVIDER"),
+        "501 body should explain the capability gate, got: {body}"
+    );
 }
 
 #[tokio::test]

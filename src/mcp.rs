@@ -102,8 +102,15 @@ pub trait ReactorHandle: Send + Sync {
         self: Arc<Self>,
         id: crate::types::WorkerId,
     ) -> anyhow::Result<()>;
-    /// Emit on the thought broadcast and journal a SignalOut. Used by `speak`.
+    /// Emit on the thought broadcast and journal a SignalOut. Used by `speak`
+    /// with `channel="thought"`.
     async fn emit_thought(&self, peer: &PeerId, body: String);
+    /// Synthesize `body` via the configured TTS provider, persist the rendered
+    /// audio under `data/media/audio/out/`, journal a SignalOut on the Audio
+    /// channel with the media_path, and broadcast on `/audio`. Returns an
+    /// error string (surfaced to the LLM in the tool result) when TTS is not
+    /// configured — by design, so the agent retries with channel="thought".
+    async fn emit_audio(&self, peer: &PeerId, body: String) -> anyhow::Result<()>;
 }
 
 // ---------------------------------------------------------------------------
@@ -429,13 +436,13 @@ fn tool_list(role: SessionRole) -> Value {
     // Common to both roles.
     let speak = json!({
         "name": "speak",
-        "description": "Send a reply to the peer on a channel. Use this for normal text replies — the router does not speak inline.",
+        "description": "Send a reply to the peer on a channel. Choose the channel deliberately: `thought` is text (the default — best for long, technical, or quoted answers and anything the peer may want to re-read). `audio` is voice (best for short, personal, or urgent replies; the text you pass is what will be spoken, so keep it natural and conversational — no markdown, no code). If audio is not configured the call returns an error string; retry with channel=\"thought\".",
         "inputSchema": {
             "type": "object",
             "properties": {
-                "channel": { "type": "string", "enum": ["thought"], "description": "Output channel. v0 only supports `thought`." },
+                "channel": { "type": "string", "enum": ["thought", "audio"], "description": "Output channel — `thought` for text, `audio` for voice." },
                 "to": { "type": "string", "description": "The peer to address. Usually the peer this session is for." },
-                "body": { "type": "string", "description": "The text to emit." }
+                "body": { "type": "string", "description": "The text to emit (also the text that will be spoken when channel=\"audio\")." }
             },
             "required": ["channel", "to", "body"]
         }
@@ -597,12 +604,6 @@ async fn tool_speak(
 ) -> Result<String, ToolError> {
     let args: SpeakArgs = serde_json::from_value(args)
         .map_err(|e| ToolError::BadParams(format!("speak args: {e}")))?;
-    if args.channel != "thought" {
-        return Err(ToolError::User(format!(
-            "channel '{}' is not implemented in v0 (only 'thought' is supported; see 501 stubs)",
-            args.channel
-        )));
-    }
     let to = PeerId(args.to);
     // The session is registered as acting for `peer`. We respect the
     // caller's `to` field but warn (in logs) if it diverges — v0 does not
@@ -618,8 +619,19 @@ async fn tool_speak(
         Some(r) => r,
         None => return Err(ToolError::Internal("reactor handle gone".into())),
     };
-    reactor.emit_thought(&to, args.body).await;
-    Ok(format!("emitted on /thought to {}", to))
+    match args.channel.as_str() {
+        "thought" => {
+            reactor.emit_thought(&to, args.body).await;
+            Ok(format!("emitted on /thought to {}", to))
+        }
+        "audio" => match reactor.emit_audio(&to, args.body).await {
+            Ok(()) => Ok(format!("spoken on /audio to {}", to)),
+            Err(err) => Err(ToolError::User(err.to_string())),
+        },
+        other => Err(ToolError::User(format!(
+            "channel '{other}' is not implemented in v0 (use 'thought' or 'audio')"
+        ))),
+    }
 }
 
 #[derive(Debug, Deserialize)]

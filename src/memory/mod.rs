@@ -15,6 +15,7 @@ use std::path::Path;
 
 pub mod intents;
 pub mod journal;
+pub mod media;
 pub mod snapshot;
 
 pub use intents::IntentStore;

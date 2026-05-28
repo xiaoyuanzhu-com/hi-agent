@@ -57,6 +57,7 @@ pub async fn post_thought(
         channel: signal.channel,
         from: signal.from.clone(),
         body: signal.body.clone(),
+        media_path: None,
     };
     if let Err(err) = state.memory.journal.append(entry).await {
         tracing::error!(error = %err, "journal append failed; accepting signal anyway");

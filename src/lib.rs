@@ -17,6 +17,7 @@ pub mod memory;
 pub mod reactor;
 pub mod server;
 pub mod types;
+pub mod voice;
 
 #[derive(Debug, Clone)]
 pub struct Config {
@@ -36,7 +37,18 @@ pub async fn run(config: Config) -> anyhow::Result<()> {
     let memory = memory::Memory::open(&config.data_dir).await?;
     tracing::info!(data_dir = %config.data_dir.display(), "memory opened");
 
-    let (router, seams) = server::build(memory.clone());
+    // Voice capabilities (independent of each other; either may be None).
+    // Construction is fail-fast: an unknown provider name or missing creds
+    // here is better than a 501/500 at request time.
+    let stt = voice::build_stt()?;
+    let tts = voice::build_tts()?;
+    tracing::info!(
+        stt = stt.is_some(),
+        tts = tts.is_some(),
+        "voice capabilities resolved"
+    );
+
+    let (router, seams) = server::build(memory.clone(), config.data_dir.clone(), stt);
 
     // ACP subprocess: held for the lifetime of hi-agent (impl.md § "Four
     // primitives → ACP").
@@ -65,8 +77,11 @@ pub async fn run(config: Config) -> anyhow::Result<()> {
         memory.clone(),
         acp.clone(),
         mcp_hub.clone(),
+        config.data_dir.clone(),
+        tts,
         seams.inbound_rx,
         seams.thought_out,
+        seams.audio_out,
         seams.approval_out,
         seams.approval_decisions_rx,
     );
