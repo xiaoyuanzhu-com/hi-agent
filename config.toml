@@ -1,0 +1,10 @@
+# hi-agent cognition config (dev-managed). The upstream credential is NOT here —
+# it is read from HI_AGENT_UPSTREAM_KEY (see .env).
+
+upstream_base_url = "https://api.anthropic.com"
+
+# Managed parameters pushed to the bundled Claude adapter.
+model               = "claude-opus-4-8"
+effort              = "high"          # adapter settings.json: effortLevel
+permission_mode     = "acceptEdits"   # adapter settings.json: permissions.defaultMode
+max_thinking_tokens = 10000
