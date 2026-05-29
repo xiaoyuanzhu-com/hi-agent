@@ -14,18 +14,28 @@ use std::sync::Arc;
 
 use chrono::Utc;
 use tokio::sync::{Mutex, broadcast, mpsc};
+use uuid::Uuid;
 
 use crate::acp::{AcpProcess, AcpSession, SessionOpts, SessionUpdate};
 use crate::memory::{Memory, build_for_peer};
-use crate::server::{AudioEvent, ThoughtBus};
-use crate::types::{Channel, JournalEntry, PeerId, Signal};
+use crate::server::{AudioEvent, SurfaceEvent, ThoughtBus};
+use crate::types::{Channel, JournalEntry, PeerId, Signal, SurfaceEnvelope, SurfaceMode, SurfaceOp};
 use crate::voice::Tts;
 
 const ROUTER_SYSTEM_PROMPT: &str = "You are a human-interface agent. \
-A peer is talking to you over /thought. Reply naturally with text — \
-your reply streams back to them and closes when you stop talking. \
-You have file access, code execution, and the rest of your harness's \
-tools; use them freely when helpful.";
+A peer is talking to you over /thought. Reply naturally with text — your reply \
+streams back to them and is spoken aloud, so keep it conversational. You have \
+file access, code execution, and the rest of your harness's tools; use them \
+freely when helpful.\n\
+\n\
+To show rich visual content (an image, a chart, a web page, a table, a \
+preview), emit a self-contained HTML block wrapped in surface markers: \
+`[[surface:card]]` … `[[/surface]]` for a focused card, or `[[surface:full]]` \
+… `[[/surface]]` for a full-screen view. The HTML renders in a sandboxed \
+frame: inline all CSS/JS, reference no external resources, and assume a dark \
+background. Everything OUTSIDE the markers is what you say aloud — keep the \
+spoken part natural and let the surface carry the visuals. Use surfaces \
+sparingly, only when a visual genuinely helps.";
 
 const PEER_QUEUE_CAPACITY: usize = 64;
 
@@ -43,6 +53,8 @@ struct ReactorInner {
     tts: Option<Arc<dyn Tts>>,
     /// Outbound audio broadcast that GET /audio subscribers drain.
     audio_out: broadcast::Sender<AudioEvent>,
+    /// Outbound rich-content broadcast that GET /surface subscribers drain.
+    surface_out: broadcast::Sender<SurfaceEvent>,
     peers: Mutex<HashMap<PeerId, PeerHandle>>,
 }
 
@@ -60,6 +72,7 @@ pub fn start(
     thought_bus: ThoughtBus,
     tts: Option<Arc<dyn Tts>>,
     audio_out: broadcast::Sender<AudioEvent>,
+    surface_out: broadcast::Sender<SurfaceEvent>,
 ) -> Reactor {
     let reactor = Reactor {
         inner: Arc::new(ReactorInner {
@@ -68,6 +81,7 @@ pub fn start(
             thought_bus,
             tts,
             audio_out,
+            surface_out,
             peers: Mutex::new(HashMap::new()),
         }),
     };
@@ -204,6 +218,7 @@ async fn run_routing_turn(
         // streaming is never blocked on synthesis. The queue/task exist only
         // when TTS is configured.
         let mut splitter = SentenceSplitter::new();
+        let mut extractor = SurfaceExtractor::new();
         let (synth_tx, synth_handle) = match tts {
             Some(tts) => {
                 let (tx, rx) = mpsc::channel::<String>(64);
@@ -217,12 +232,19 @@ async fn run_routing_turn(
         loop {
             match run.next_update().await {
                 Some(SessionUpdate::Text(text)) => {
-                    if let Some(tx) = &synth_tx {
-                        for sentence in splitter.push(&text) {
-                            let _ = tx.send(sentence).await;
-                        }
+                    // Split rich-content surface blocks out of the spoken text.
+                    let (clean, surfaces) = extractor.push(&text);
+                    for envelope in surfaces {
+                        emit_surface(reactor, peer, envelope);
                     }
-                    emit_thought_chunk(reactor, peer, text).await;
+                    if !clean.is_empty() {
+                        if let Some(tx) = &synth_tx {
+                            for sentence in splitter.push(&clean) {
+                                let _ = tx.send(sentence).await;
+                            }
+                        }
+                        emit_thought_chunk(reactor, peer, clean).await;
+                    }
                 }
                 Some(SessionUpdate::Thought(_)) => {
                     // Internal reasoning; do not surface.
@@ -237,7 +259,17 @@ async fn run_routing_turn(
             }
         }
 
-        // Flush the trailing partial sentence to TTS.
+        // Drain any text the surface extractor was still holding, then flush
+        // the trailing partial sentence to TTS.
+        let clean_tail = extractor.flush();
+        if !clean_tail.is_empty() {
+            if let Some(tx) = &synth_tx {
+                for sentence in splitter.push(&clean_tail) {
+                    let _ = tx.send(sentence).await;
+                }
+            }
+            emit_thought_chunk(reactor, peer, clean_tail).await;
+        }
         if let Some(tx) = &synth_tx {
             if let Some(tail) = splitter.flush() {
                 let _ = tx.send(tail).await;
@@ -391,6 +423,157 @@ fn find_boundary(s: &str) -> Option<usize> {
         }
     }
     None
+}
+
+/// Emit one rich-content envelope to GET /surface subscribers for this peer.
+fn emit_surface(reactor: &Reactor, peer: &PeerId, envelope: SurfaceEnvelope) {
+    let event = SurfaceEvent {
+        to: Some(peer.clone()),
+        envelope,
+        ts: Utc::now(),
+    };
+    let _ = reactor.inner.surface_out.send(event);
+}
+
+const OPEN_CARD: &str = "[[surface:card]]";
+const OPEN_FULL: &str = "[[surface:full]]";
+const CLOSE: &str = "[[/surface]]";
+
+/// Streaming extractor that pulls `[[surface:…]] … [[/surface]]` HTML blocks out
+/// of the agent's text. Text outside the markers passes through (spoken +
+/// displayed); the inner HTML becomes a `SurfaceEnvelope`. A short tail that
+/// could be a partial opener is held back so a marker split across chunks is
+/// still recognized. Mirrors the convention taught in ROUTER_SYSTEM_PROMPT.
+struct SurfaceExtractor {
+    buf: String,
+    inside: Option<SurfaceMode>,
+}
+
+impl SurfaceExtractor {
+    fn new() -> Self {
+        Self { buf: String::new(), inside: None }
+    }
+
+    fn push(&mut self, chunk: &str) -> (String, Vec<SurfaceEnvelope>) {
+        self.buf.push_str(chunk);
+        let mut text_out = String::new();
+        let mut envelopes = Vec::new();
+
+        loop {
+            match self.inside {
+                None => {
+                    let card = self.buf.find(OPEN_CARD);
+                    let full = self.buf.find(OPEN_FULL);
+                    let opener = match (card, full) {
+                        (Some(c), Some(f)) if c <= f => Some((c, SurfaceMode::Card, OPEN_CARD.len())),
+                        (Some(_), Some(f)) => Some((f, SurfaceMode::Full, OPEN_FULL.len())),
+                        (Some(c), None) => Some((c, SurfaceMode::Card, OPEN_CARD.len())),
+                        (None, Some(f)) => Some((f, SurfaceMode::Full, OPEN_FULL.len())),
+                        (None, None) => None,
+                    };
+                    if let Some((idx, mode, tok_len)) = opener {
+                        text_out.push_str(&self.buf[..idx]);
+                        self.buf = self.buf[idx + tok_len..].to_string();
+                        self.inside = Some(mode);
+                        continue;
+                    }
+                    // No opener: emit everything except a tail that could be the
+                    // start of one continuing in the next chunk.
+                    let keep = partial_open_suffix_len(&self.buf);
+                    let emit_to = self.buf.len() - keep;
+                    text_out.push_str(&self.buf[..emit_to]);
+                    self.buf = self.buf[emit_to..].to_string();
+                    break;
+                }
+                Some(mode) => {
+                    if let Some(idx) = self.buf.find(CLOSE) {
+                        let html = self.buf[..idx].trim().to_string();
+                        self.buf = self.buf[idx + CLOSE.len()..].to_string();
+                        self.inside = None;
+                        envelopes.push(SurfaceEnvelope {
+                            id: Uuid::now_v7().to_string(),
+                            op: SurfaceOp::Show,
+                            mode: Some(mode),
+                            html: Some(html),
+                            ttl_ms: None,
+                        });
+                        continue;
+                    }
+                    break; // close not present yet; keep buffering the HTML
+                }
+            }
+        }
+        (text_out, envelopes)
+    }
+
+    /// Emit any held-back text at end of turn. An unterminated block is dropped.
+    fn flush(&mut self) -> String {
+        let out = if self.inside.is_none() {
+            std::mem::take(&mut self.buf)
+        } else {
+            String::new()
+        };
+        self.buf.clear();
+        self.inside = None;
+        out
+    }
+}
+
+/// Length (bytes) of the longest suffix of `buf` that is a proper prefix of a
+/// surface opener — i.e. a marker possibly split across chunks.
+fn partial_open_suffix_len(buf: &str) -> usize {
+    let max = OPEN_CARD.len().max(OPEN_FULL.len()) - 1;
+    let start = buf.len().saturating_sub(max);
+    for i in start..buf.len() {
+        if !buf.is_char_boundary(i) {
+            continue;
+        }
+        let suffix = &buf[i..];
+        if OPEN_CARD.starts_with(suffix) || OPEN_FULL.starts_with(suffix) {
+            return buf.len() - i;
+        }
+    }
+    0
+}
+
+#[cfg(test)]
+mod surface_tests {
+    use super::SurfaceExtractor;
+    use crate::types::SurfaceMode;
+
+    #[test]
+    fn passes_plain_text_through() {
+        let mut e = SurfaceExtractor::new();
+        let (t, s) = e.push("just talking, nothing to show");
+        assert!(s.is_empty());
+        assert_eq!(format!("{t}{}", e.flush()), "just talking, nothing to show");
+    }
+
+    #[test]
+    fn extracts_a_card_across_chunks() {
+        let mut e = SurfaceExtractor::new();
+        let (t1, s1) = e.push("Here you go. [[surface:card]]<b>hi</b>");
+        assert!(s1.is_empty());
+        assert_eq!(t1, "Here you go. ");
+        let (t2, s2) = e.push("[[/surface]] Done.");
+        assert_eq!(s2.len(), 1);
+        assert_eq!(s2[0].mode, Some(SurfaceMode::Card));
+        assert_eq!(s2[0].html.as_deref(), Some("<b>hi</b>"));
+        assert_eq!(format!("{t2}{}", e.flush()), " Done.");
+    }
+
+    #[test]
+    fn recognizes_marker_split_across_chunks() {
+        let mut e = SurfaceExtractor::new();
+        let (t1, s1) = e.push("look [[surf");
+        assert!(s1.is_empty());
+        assert_eq!(t1, "look ");
+        let (t2, s2) = e.push("ace:full]]<p>x</p>[[/surface]]");
+        assert_eq!(s2.len(), 1);
+        assert_eq!(s2[0].mode, Some(SurfaceMode::Full));
+        assert_eq!(s2[0].html.as_deref(), Some("<p>x</p>"));
+        assert_eq!(t2, "");
+    }
 }
 
 #[cfg(test)]

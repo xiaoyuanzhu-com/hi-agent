@@ -5,19 +5,20 @@ use std::sync::Arc;
 
 use axum::Router;
 use axum::http::StatusCode;
-use axum::routing::post;
+use axum::routing::{get, post};
 use bytes::Bytes;
 use chrono::{DateTime, Utc};
 use tokio::sync::{broadcast, mpsc};
 use tower_http::trace::TraceLayer;
 
 use crate::memory::Memory;
-use crate::types::{PeerId, Signal};
+use crate::types::{PeerId, Signal, SurfaceEnvelope};
 use crate::voice::Stt;
 
 pub mod audio;
 pub mod headers;
 pub mod stubs;
+pub mod surface;
 pub mod thought;
 pub mod thought_bus;
 
@@ -33,6 +34,15 @@ pub struct AudioEvent {
     pub ts: DateTime<Utc>,
 }
 
+/// Outbound rich-content event. Carries the envelope plus the routing target
+/// that the GET /surface long-poll filters on.
+#[derive(Debug, Clone)]
+pub struct SurfaceEvent {
+    pub to: Option<PeerId>,
+    pub envelope: SurfaceEnvelope,
+    pub ts: DateTime<Utc>,
+}
+
 /// Shared state passed to every handler via `axum::extract::State`.
 pub struct AppState {
     /// Inbound signals from every channel POST. The reactor consumes these.
@@ -43,10 +53,13 @@ pub struct AppState {
     /// for the next GET instead of being dropped.
     pub thought_bus: ThoughtBus,
 
-    /// Outbound audio broadcast. GET /audio subscribers receive from this.
-    /// No producer wired yet post-MCP; subscribers will hang until the agent
-    /// gets an audio-emit path.
+    /// Outbound audio broadcast. GET /audio subscribers receive from this; the
+    /// reactor produces TTS clips here when a TTS provider is configured.
     pub audio_out: broadcast::Sender<AudioEvent>,
+
+    /// Outbound rich-content broadcast. GET /surface subscribers receive from
+    /// this; the reactor produces envelopes when the agent emits a surface block.
+    pub surface_out: broadcast::Sender<SurfaceEvent>,
 
     /// Memory substrate — journal. Cloneable handle.
     pub memory: Memory,
@@ -67,11 +80,13 @@ pub fn build(
     let (inbound_tx, inbound_rx) = mpsc::channel::<Signal>(1024);
     let thought_bus = ThoughtBus::new();
     let (audio_tx, _) = broadcast::channel::<AudioEvent>(64);
+    let (surface_tx, _) = broadcast::channel::<SurfaceEvent>(64);
 
     let state = Arc::new(AppState {
         inbound: inbound_tx,
         thought_bus: thought_bus.clone(),
         audio_out: audio_tx.clone(),
+        surface_out: surface_tx.clone(),
         memory,
         data_dir,
         stt,
@@ -80,6 +95,7 @@ pub fn build(
     let router = Router::new()
         .route("/thought", post(thought::post_thought).get(thought::get_thought))
         .route("/audio", post(audio::post_audio).get(audio::get_audio))
+        .route("/surface", get(surface::get_surface))
         .route("/vision", post(stubs::post_vision))
         .route("/touch", post(stubs::post_touch))
         .route("/smell", post(stubs::post_smell))
@@ -93,6 +109,7 @@ pub fn build(
         inbound_rx,
         thought_bus,
         audio_out: audio_tx,
+        surface_out: surface_tx,
     };
 
     (router, seams)
@@ -102,6 +119,7 @@ pub struct ServerSeams {
     pub inbound_rx: mpsc::Receiver<Signal>,
     pub thought_bus: ThoughtBus,
     pub audio_out: broadcast::Sender<AudioEvent>,
+    pub surface_out: broadcast::Sender<SurfaceEvent>,
 }
 
 async fn not_found() -> (StatusCode, &'static str) {

@@ -53,12 +53,14 @@ pub async fn run(config: Config) -> anyhow::Result<()> {
         seams.thought_bus,
         tts,
         seams.audio_out.clone(),
+        seams.surface_out.clone(),
     );
     tracing::info!("reactor started");
 
-    // Hold a clone of the audio_out broadcast sender so subscribers see Lagged
-    // not Closed even between turns (the reactor holds the producing clone).
+    // Hold clones of the broadcast senders so subscribers see Lagged not Closed
+    // even between turns (the reactor holds the producing clones).
     let _audio_out = seams.audio_out;
+    let _surface_out = seams.surface_out;
 
     let addr = ("0.0.0.0", config.port);
     let listener = TcpListener::bind(addr).await?;

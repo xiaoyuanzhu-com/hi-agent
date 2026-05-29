@@ -1,6 +1,7 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { subscribeThought, postThought } from "../channels/thought";
 import { postAudio, subscribeAudio } from "../channels/audio";
+import { subscribeSurface, type SurfaceEnvelope } from "../channels/surface";
 import { AudioBus } from "../lib/audioBus";
 import { MicCapture } from "../lib/micCapture";
 import { VoicePlayer } from "../lib/voicePlayer";
@@ -15,13 +16,19 @@ const SENTENCE_WINDOW = 2;
 export interface AgentSession {
   state: PresenceState;
   reactive: boolean;
+  /** 0..1 — how much the presence should dim for the content overlay. */
+  demote: number;
   bus: AudioBus | null;
   sentences: SpeechItem[];
+  activeSurface: SurfaceEnvelope | null;
+  surfaceHistory: SurfaceEnvelope[];
   woken: boolean;
   waking: boolean;
   wakeError: string | null;
   wake: () => void;
   sendText: (text: string) => void;
+  dismissSurface: () => void;
+  openSurface: (surface: SurfaceEnvelope) => void;
 }
 
 /**
@@ -46,6 +53,8 @@ export function useAgentSession(): AgentSession {
   const [awaiting, setAwaiting] = useState(false);
   const [ttsPlaying, setTtsPlaying] = useState(false);
   const [offline, setOffline] = useState(false);
+  const [activeSurface, setActiveSurface] = useState<SurfaceEnvelope | null>(null);
+  const [surfaceHistory, setSurfaceHistory] = useState<SurfaceEnvelope[]>([]);
 
   const busRef = useRef<AudioBus | null>(null);
   const micRef = useRef<MicCapture | null>(null);
@@ -53,6 +62,7 @@ export function useAgentSession(): AgentSession {
   const voiceRef = useRef<VoicePlayer | null>(null);
   const userSpeakingRef = useRef(false);
   const sentenceIdRef = useRef(0);
+  const surfaceTtlRef = useRef<number | null>(null);
 
   // ---- GET /thought subscription loop (after wake) -----------------------
   useEffect(() => {
@@ -119,6 +129,41 @@ export function useAgentSession(): AgentSession {
             if (cancelled) break;
             // drop audio that arrives while the user talks (post barge-in staleness)
             if (!userSpeakingRef.current) voiceRef.current?.enqueue(blob);
+          }
+        } catch {
+          if (cancelled || ctrl.signal.aborted) break;
+          await new Promise((r) => setTimeout(r, 1500));
+        }
+      }
+    })();
+    return () => {
+      cancelled = true;
+      ctrl.abort();
+    };
+  }, [woken, peer]);
+
+  // ---- GET /surface subscription loop (Phase 3: content overlays) --------
+  useEffect(() => {
+    if (!woken) return;
+    const ctrl = new AbortController();
+    let cancelled = false;
+    void (async () => {
+      while (!cancelled) {
+        try {
+          for await (const env of subscribeSurface({ peer, signal: ctrl.signal })) {
+            if (cancelled) break;
+            if (env.op === "dismiss") {
+              setActiveSurface((cur) => (cur && cur.id === env.id ? null : cur));
+              continue;
+            }
+            setActiveSurface(env);
+            setSurfaceHistory((prev) => [...prev, env]);
+            if (surfaceTtlRef.current) window.clearTimeout(surfaceTtlRef.current);
+            if (env.ttl_ms && env.ttl_ms > 0) {
+              surfaceTtlRef.current = window.setTimeout(() => {
+                setActiveSurface((cur) => (cur && cur.id === env.id ? null : cur));
+              }, env.ttl_ms);
+            }
           }
         } catch {
           if (cancelled || ctrl.signal.aborted) break;
@@ -207,6 +252,16 @@ export function useAgentSession(): AgentSession {
     [peer],
   );
 
+  const dismissSurface = useCallback(() => {
+    if (surfaceTtlRef.current) window.clearTimeout(surfaceTtlRef.current);
+    setActiveSurface(null);
+  }, []);
+
+  const openSurface = useCallback((surface: SurfaceEnvelope) => {
+    if (surfaceTtlRef.current) window.clearTimeout(surfaceTtlRef.current);
+    setActiveSurface(surface);
+  }, []);
+
   const state: PresenceState = !woken
     ? "waking"
     : offline
@@ -222,5 +277,23 @@ export function useAgentSession(): AgentSession {
   // Dots track live audio while listening (mic) or while the agent's voice plays.
   const reactive = state === "listening" || (state === "speaking" && ttsPlaying);
 
-  return { state, reactive, bus, sentences, woken, waking, wakeError, wake, sendText };
+  // The content overlay dims/demotes the presence — more for full-screen.
+  const demote = activeSurface ? (activeSurface.mode === "full" ? 1 : 0.72) : 0;
+
+  return {
+    state,
+    reactive,
+    demote,
+    bus,
+    sentences,
+    activeSurface,
+    surfaceHistory,
+    woken,
+    waking,
+    wakeError,
+    wake,
+    sendText,
+    dismissSurface,
+    openSurface,
+  };
 }

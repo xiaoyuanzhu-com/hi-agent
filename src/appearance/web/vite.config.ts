@@ -13,6 +13,7 @@ const HI_CHANNELS = [
   "/approval",
   "/vision",
   "/audio",
+  "/surface",
   "/touch",
   "/smell",
   "/taste",
