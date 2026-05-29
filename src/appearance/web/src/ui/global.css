@@ -1,51 +1,31 @@
-/* hi-agent — sci-fi shell tokens & resets
+/* hi-agent — human interface
  *
- * The whole surface is a full-bleed dark cosmos. Tokens prefer cool blues
- * with cyan and magenta accents that pulse at peak signal moments.
+ * A calm, breathing room. Near-black atmosphere, a dot-matrix presence, and the
+ * agent's words fading in as whole sentences. Minimal by construction: no input
+ * box, no buttons (a hidden keyboard fallback aside).
  */
 
 :root {
-  /* Palette */
-  --bg-0: #04060d;        /* deepest space */
-  --bg-1: #070b18;        /* card body */
-  --bg-2: #0b1126;        /* lifted panel */
-  --line: rgba(120, 180, 255, 0.14);
-  --line-strong: rgba(140, 200, 255, 0.32);
+  --bg-0: #04060d;
 
   --fg: #d6e4ff;
   --fg-dim: #8fa0c8;
   --fg-mute: #5a6b91;
 
   --cyan: #5af6ff;
-  --cyan-soft: #7afbffaa;
-  --mint: #75ffd0;
-  --magenta: #ff4ecb;
-  --amber: #ffb469;
-  --danger: #ff5d7a;
-  --ok: #4cf0a0;
+  --violet: #9b8cff;
 
-  /* Glows */
-  --glow-cyan: 0 0 18px rgba(90, 246, 255, 0.55), 0 0 48px rgba(90, 246, 255, 0.25);
-  --glow-cyan-soft: 0 0 10px rgba(90, 246, 255, 0.28);
-  --glow-magenta: 0 0 18px rgba(255, 78, 203, 0.55), 0 0 48px rgba(255, 78, 203, 0.2);
-  --glow-mint: 0 0 14px rgba(117, 255, 208, 0.42);
+  --line: rgba(120, 180, 255, 0.14);
+  --line-strong: rgba(140, 200, 255, 0.3);
 
-  /* Geometry */
-  --radius-sm: 6px;
-  --radius: 12px;
-  --radius-lg: 20px;
-  --panel-blur: blur(14px) saturate(140%);
-
-  /* Type */
   --font-display:
     "Geist", "Inter", -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto,
     Helvetica, Arial, sans-serif;
   --font-mono:
     "Geist Mono", "JetBrains Mono", "IBM Plex Mono", ui-monospace, SFMono-Regular,
-    "SF Mono", Menlo, Consolas, "Liberation Mono", monospace;
+    "SF Mono", Menlo, Consolas, monospace;
 
-  /* Motion */
-  --ease-out: cubic-bezier(0.2, 0.7, 0.2, 1);
+  --ease: cubic-bezier(0.22, 0.7, 0.2, 1);
 }
 
 * {
@@ -71,10 +51,9 @@ body {
   font-family: var(--font-display);
   font-size: 14px;
   line-height: 1.5;
-  letter-spacing: 0.005em;
   -webkit-font-smoothing: antialiased;
   -moz-osx-font-smoothing: grayscale;
-  overflow: hidden; /* full-bleed shell scrolls locally */
+  overflow: hidden;
 }
 
 #root {
@@ -82,97 +61,193 @@ body {
   isolation: isolate;
 }
 
-button,
-input,
-textarea,
-select {
-  font: inherit;
-  color: inherit;
-}
-
-button {
-  background: none;
-  border: none;
-  padding: 0;
-  cursor: pointer;
-}
-
 ::selection {
-  background: rgba(90, 246, 255, 0.32);
+  background: rgba(90, 246, 255, 0.28);
   color: #ffffff;
 }
 
-/* --- Scrollbars (transcript, etc.) ----------------------------------- */
-*::-webkit-scrollbar {
-  width: 8px;
-  height: 8px;
-}
-*::-webkit-scrollbar-track {
-  background: transparent;
-}
-*::-webkit-scrollbar-thumb {
-  background: rgba(120, 180, 255, 0.18);
-  border-radius: 999px;
-}
-*::-webkit-scrollbar-thumb:hover {
-  background: rgba(120, 180, 255, 0.32);
+button {
+  font: inherit;
+  color: inherit;
+  background: none;
+  border: none;
+  cursor: pointer;
 }
 
-/* --- Reusable surfaces ----------------------------------------------- */
-.glass {
-  background: linear-gradient(
-      180deg,
-      rgba(20, 30, 60, 0.55) 0%,
-      rgba(8, 12, 28, 0.65) 100%
+/* --- Root shell ------------------------------------------------------- */
+.hi-root {
+  position: relative;
+  width: 100vw;
+  height: 100dvh;
+  overflow: hidden;
+  isolation: isolate;
+}
+
+/* --- Atmosphere ------------------------------------------------------- */
+.hi-atmosphere {
+  position: absolute;
+  inset: 0;
+  z-index: -1;
+  overflow: hidden;
+  pointer-events: none;
+}
+
+.hi-atmo-glow {
+  position: absolute;
+  inset: -25%;
+  background:
+    radial-gradient(
+      closest-side at 50% 42%,
+      rgba(50, 96, 180, 0.26),
+      rgba(24, 48, 100, 0.1) 46%,
+      transparent 72%
     );
-  border: 1px solid var(--line);
-  border-radius: var(--radius);
-  backdrop-filter: var(--panel-blur);
-  -webkit-backdrop-filter: var(--panel-blur);
-  box-shadow:
-    inset 0 1px 0 rgba(255, 255, 255, 0.04),
-    0 8px 40px rgba(0, 0, 0, 0.45);
+  filter: blur(24px);
+  animation: hi-breathe 16s ease-in-out infinite;
 }
 
-/* --- Animations ------------------------------------------------------ */
-@keyframes hi-spin {
-  to { transform: rotate(360deg); }
+.hi-atmo-grain {
+  position: absolute;
+  inset: 0;
+  background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='160' height='160'%3E%3Cfilter id='n'%3E%3CfeTurbulence type='fractalNoise' baseFrequency='0.9' numOctaves='2' stitchTiles='stitch'/%3E%3C/filter%3E%3Crect width='100%25' height='100%25' filter='url(%23n)'/%3E%3C/svg%3E");
+  background-size: 160px 160px;
+  opacity: 0.045;
+  mix-blend-mode: overlay;
 }
 
-@keyframes hi-pulse {
-  0%, 100% { opacity: 0.35; transform: scale(1); }
-  50%      { opacity: 0.85; transform: scale(1.04); }
+/* --- Speech (the agent's words) --------------------------------------- */
+.hi-stage {
+  position: absolute;
+  left: 50%;
+  top: 54%;
+  transform: translate(-50%, -50%);
+  width: min(720px, 86vw);
+  z-index: 2;
+  pointer-events: none;
+  text-align: center;
 }
 
-@keyframes hi-ring-expand {
-  0%   { transform: scale(0.65); opacity: 0.55; }
-  100% { transform: scale(1.55); opacity: 0; }
+.hi-speech {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 10px;
 }
 
-@keyframes hi-flicker {
-  0%, 100% { opacity: 1; }
-  43%      { opacity: 0.6; }
-  47%      { opacity: 1; }
+.hi-sentence {
+  margin: 0;
+  max-width: 100%;
+  font-family: var(--font-display);
+  font-size: clamp(18px, 2.6vw, 26px);
+  line-height: 1.5;
+  letter-spacing: 0.01em;
+  color: var(--fg);
+  text-wrap: balance;
+  text-shadow:
+    0 0 22px rgba(4, 6, 13, 0.85),
+    0 2px 34px rgba(4, 6, 13, 0.7);
+  transition:
+    opacity 600ms var(--ease),
+    transform 600ms var(--ease),
+    color 600ms var(--ease);
+  animation: hi-sentence-in 700ms var(--ease);
 }
 
-@keyframes hi-caret {
-  0%, 60% { opacity: 1; }
-  61%, 100% { opacity: 0; }
+.hi-sentence--prev {
+  opacity: 0.4;
+  color: var(--fg-dim);
+  transform: translateY(-2px) scale(0.99);
 }
 
-/* Typewriter caret used after streaming text */
-.hi-caret {
-  display: inline-block;
-  width: 0.55ch;
-  height: 1em;
-  margin-left: 2px;
+/* --- Wake gate -------------------------------------------------------- */
+.hi-wake {
+  position: fixed;
+  inset: 0;
+  z-index: 10;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: 22px;
+  background: rgba(4, 6, 13, 0.55);
+  backdrop-filter: blur(6px);
+  -webkit-backdrop-filter: blur(6px);
+}
+
+.hi-wake:disabled {
+  cursor: default;
+}
+
+.hi-wake-dot {
+  width: 14px;
+  height: 14px;
+  border-radius: 50%;
   background: var(--cyan);
-  vertical-align: -2px;
-  box-shadow: var(--glow-cyan-soft);
-  animation: hi-caret 1s steps(1) infinite;
+  box-shadow: 0 0 18px var(--cyan);
+  animation: hi-wake-pulse 2.4s ease-in-out infinite;
 }
 
-/* --- Reduced motion -------------------------------------------------- */
+.hi-wake-label {
+  font-family: var(--font-mono);
+  font-size: 12px;
+  letter-spacing: 0.32em;
+  text-transform: uppercase;
+  color: var(--fg-dim);
+}
+
+/* --- Keyboard fallback ------------------------------------------------ */
+.hi-kbd {
+  position: fixed;
+  left: 50%;
+  bottom: max(24px, env(safe-area-inset-bottom));
+  transform: translateX(-50%);
+  width: min(640px, 88vw);
+  z-index: 10;
+}
+
+.hi-kbd input {
+  width: 100%;
+  padding: 12px 18px;
+  border-radius: 999px;
+  border: 1px solid var(--line-strong);
+  background: rgba(8, 12, 24, 0.72);
+  backdrop-filter: blur(12px);
+  -webkit-backdrop-filter: blur(12px);
+  color: var(--fg);
+  font-family: var(--font-mono);
+  font-size: 14px;
+  letter-spacing: 0.01em;
+  outline: none;
+  box-shadow: 0 8px 40px rgba(0, 0, 0, 0.5);
+  transition: border-color 200ms var(--ease), box-shadow 200ms var(--ease);
+}
+
+.hi-kbd input:focus {
+  border-color: rgba(90, 246, 255, 0.5);
+  box-shadow: 0 0 0 1px rgba(90, 246, 255, 0.3), 0 8px 40px rgba(0, 0, 0, 0.5);
+}
+
+.hi-kbd input::placeholder {
+  color: var(--fg-mute);
+}
+
+/* --- Animations ------------------------------------------------------- */
+@keyframes hi-breathe {
+  0%, 100% { transform: scale(1) translateY(0); opacity: 0.72; }
+  50%      { transform: scale(1.08) translateY(-1.5%); opacity: 1; }
+}
+
+@keyframes hi-sentence-in {
+  from { opacity: 0; transform: translateY(10px); filter: blur(3px); }
+  to   { opacity: 1; transform: none; filter: blur(0); }
+}
+
+@keyframes hi-wake-pulse {
+  0%, 100% { transform: scale(1); opacity: 0.6; box-shadow: 0 0 14px var(--cyan); }
+  50%      { transform: scale(1.25); opacity: 1; box-shadow: 0 0 30px var(--cyan); }
+}
+
+/* --- Reduced motion --------------------------------------------------- */
 @media (prefers-reduced-motion: reduce) {
   *,
   *::before,
