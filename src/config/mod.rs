@@ -85,6 +85,53 @@ impl AgentConfig {
             .with_context(|| format!("writing {}", path.display()))?;
         Ok(())
     }
+
+    /// Placeholder API key handed to the adapter. The proxy supplies the real
+    /// upstream key; the SDK only requires *some* non-empty value here.
+    pub const PLACEHOLDER_KEY: &'static str = "hi-agent-proxy";
+
+    /// Build the env var pairs for the ACP child process.
+    ///
+    /// `proxy_port` is the local proxy's bound port; `config_dir` is the managed
+    /// `CLAUDE_CONFIG_DIR`; `node_bin_dir` is the directory containing the
+    /// bundled `node`; `claude_bin` is the bundled claude executable.
+    pub fn child_env(
+        &self,
+        proxy_port: u16,
+        config_dir: &Path,
+        node_bin_dir: &Path,
+        claude_bin: &Path,
+    ) -> Vec<(String, String)> {
+        let mut env = vec![
+            (
+                "ANTHROPIC_BASE_URL".to_string(),
+                format!("http://127.0.0.1:{proxy_port}"),
+            ),
+            ("ANTHROPIC_API_KEY".to_string(), Self::PLACEHOLDER_KEY.to_string()),
+            (
+                "CLAUDE_CONFIG_DIR".to_string(),
+                config_dir.to_string_lossy().into_owned(),
+            ),
+            (
+                "CLAUDE_CODE_EXECUTABLE".to_string(),
+                claude_bin.to_string_lossy().into_owned(),
+            ),
+        ];
+        if let Some(model) = &self.model {
+            env.push(("ANTHROPIC_MODEL".to_string(), model.clone()));
+        }
+        if let Some(tokens) = self.max_thinking_tokens {
+            env.push(("MAX_THINKING_TOKENS".to_string(), tokens.to_string()));
+        }
+        // Prepend the bundled node dir to PATH so the adapter resolves `node`.
+        let sep = if cfg!(windows) { ';' } else { ':' };
+        let existing = std::env::var("PATH").unwrap_or_default();
+        env.push((
+            "PATH".to_string(),
+            format!("{}{sep}{existing}", node_bin_dir.to_string_lossy()),
+        ));
+        env
+    }
 }
 
 #[cfg(test)]
@@ -162,5 +209,32 @@ mod tests {
                 .unwrap();
         assert!(v.get("effortLevel").is_none());
         assert!(v.get("permissions").is_none());
+    }
+
+    #[test]
+    fn child_env_sets_proxy_and_managed_vars() {
+        let cfg = AgentConfig::from_toml_str(
+            r#"
+                upstream_base_url = "https://x/v1"
+                model = "claude-opus-4-8"
+                max_thinking_tokens = 10000
+            "#,
+            "k".to_string(),
+        )
+        .unwrap();
+        let env = cfg.child_env(
+            7777,
+            std::path::Path::new("/cache/config"),
+            std::path::Path::new("/cache/runtime/node/bin"),
+            std::path::Path::new("/cache/runtime/claude"),
+        );
+        let map: std::collections::HashMap<_, _> = env.into_iter().collect();
+        assert_eq!(map["ANTHROPIC_BASE_URL"], "http://127.0.0.1:7777");
+        assert_eq!(map["ANTHROPIC_API_KEY"], "hi-agent-proxy");
+        assert_eq!(map["ANTHROPIC_MODEL"], "claude-opus-4-8");
+        assert_eq!(map["MAX_THINKING_TOKENS"], "10000");
+        assert_eq!(map["CLAUDE_CONFIG_DIR"], "/cache/config");
+        assert_eq!(map["CLAUDE_CODE_EXECUTABLE"], "/cache/runtime/claude");
+        assert!(map["PATH"].starts_with("/cache/runtime/node/bin"));
     }
 }
