@@ -1,0 +1,611 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>hi-agent · presence gallery</title>
+<style>
+  :root {
+    --bg-0: #04060d;
+    --bg-1: #080c18;
+    --line: rgba(120,180,255,0.14);
+    --line-strong: rgba(140,200,255,0.30);
+    --fg: #d6e4ff;
+    --fg-dim: #8fa0c8;
+    --fg-mute: #5a6b91;
+    --mono: "Geist Mono","JetBrains Mono",ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;
+    --sans: "Geist","Inter",-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif;
+  }
+  * { box-sizing: border-box; }
+  html, body { margin: 0; height: 100%; }
+  body {
+    background:
+      radial-gradient(1200px 800px at 50% -10%, #0a1224 0%, var(--bg-0) 60%),
+      var(--bg-0);
+    color: var(--fg);
+    font-family: var(--sans);
+    -webkit-font-smoothing: antialiased;
+  }
+
+  header {
+    position: sticky; top: 0; z-index: 10;
+    display: flex; flex-wrap: wrap; align-items: center; gap: 14px;
+    padding: 14px 20px;
+    background: rgba(4,6,13,0.72);
+    backdrop-filter: blur(14px) saturate(140%);
+    -webkit-backdrop-filter: blur(14px) saturate(140%);
+    border-bottom: 1px solid var(--line);
+  }
+  .title { font-family: var(--mono); font-size: 12px; letter-spacing: 0.26em; text-transform: uppercase; color: var(--fg); }
+  .title b { color: #5af6ff; font-weight: 600; }
+  .spacer { flex: 1; }
+
+  .ctl { display: inline-flex; align-items: center; gap: 8px; }
+  button.btn, .seg button {
+    font-family: var(--mono); font-size: 11px; letter-spacing: 0.12em; text-transform: uppercase;
+    color: var(--fg-dim); background: rgba(120,180,255,0.06);
+    border: 1px solid var(--line-strong); border-radius: 8px;
+    padding: 8px 12px; cursor: pointer; transition: all .18s ease;
+  }
+  button.btn:hover, .seg button:hover { color: var(--fg); border-color: #5af6ff66; }
+  button.btn.on { color: #04060d; background: linear-gradient(135deg,#5af6ff,#75ffd0); border-color: #5af6ff; }
+  .seg { display: inline-flex; border: 1px solid var(--line-strong); border-radius: 8px; overflow: hidden; }
+  .seg button { border: none; border-radius: 0; padding: 8px 10px; }
+  .seg button.on { color: #04060d; background: #5af6ff; }
+  label.ctl span { font-family: var(--mono); font-size: 10px; letter-spacing: 0.18em; text-transform: uppercase; color: var(--fg-mute); }
+  input[type=range] { accent-color: #5af6ff; width: 120px; }
+
+  .meter { width: 90px; height: 6px; border-radius: 999px; background: rgba(120,180,255,0.12); overflow: hidden; }
+  .meter > i { display: block; height: 100%; width: 0%; background: linear-gradient(90deg,#5af6ff,#75ffd0); box-shadow: 0 0 10px #5af6ff88; transition: width .06s linear; }
+
+  .hint { padding: 8px 20px 0; font-family: var(--mono); font-size: 11px; color: var(--fg-mute); letter-spacing: 0.04em; }
+
+  main {
+    display: grid; gap: 16px; padding: 18px 20px 60px;
+    grid-template-columns: repeat(auto-fill, minmax(320px, 1fr));
+  }
+  figure {
+    margin: 0; position: relative; border: 1px solid var(--line);
+    border-radius: 16px; overflow: hidden; background: linear-gradient(180deg, rgba(16,24,48,0.5), rgba(6,10,22,0.6));
+    cursor: pointer; transition: border-color .2s ease, transform .2s ease;
+  }
+  figure:hover { border-color: var(--line-strong); transform: translateY(-2px); }
+  figure canvas { display: block; width: 100%; height: 210px; }
+  figcaption { padding: 11px 14px 13px; border-top: 1px solid var(--line); }
+  .cap-row { display: flex; align-items: baseline; gap: 8px; }
+  .num { font-family: var(--mono); font-size: 11px; color: #5af6ff; letter-spacing: 0.1em; }
+  .name { font-size: 13px; color: var(--fg); font-weight: 500; }
+  .blurb { margin-top: 4px; font-size: 12px; line-height: 1.45; color: var(--fg-dim); }
+  .ref { margin-top: 5px; font-family: var(--mono); font-size: 10px; letter-spacing: 0.06em; color: var(--fg-mute); }
+  .expand { position: absolute; top: 10px; right: 12px; font-family: var(--mono); font-size: 10px; letter-spacing: 0.14em; text-transform: uppercase; color: var(--fg-mute); opacity: 0; transition: opacity .2s; }
+  figure:hover .expand { opacity: 1; }
+
+  /* focus overlay */
+  #focus { position: fixed; inset: 0; z-index: 50; display: none; place-items: center;
+    background: rgba(2,4,10,0.86); backdrop-filter: blur(10px); -webkit-backdrop-filter: blur(10px); }
+  #focus.show { display: grid; }
+  #focus .wrap { width: min(86vw, 1100px); }
+  #focus canvas { display: block; width: 100%; height: min(68vh, 620px);
+    border: 1px solid var(--line-strong); border-radius: 20px;
+    background: radial-gradient(900px 600px at 50% 40%, #0a1326 0%, #04060d 70%); }
+  #focus .fcap { margin-top: 14px; display: flex; align-items: baseline; gap: 10px; }
+  #focus .fname { font-size: 16px; }
+  #focus .fblurb { color: var(--fg-dim); font-size: 13px; }
+  #focus .close { margin-top: 6px; font-family: var(--mono); font-size: 11px; color: var(--fg-mute); letter-spacing: 0.14em; }
+</style>
+</head>
+<body>
+  <header>
+    <span class="title">hi-agent · <b>presence</b> gallery</span>
+    <div class="spacer"></div>
+
+    <button id="play" class="btn on" title="play / pause">⏸ running</button>
+
+    <div class="seg" id="mode">
+      <button data-mode="speech" class="on">speech sim</button>
+      <button data-mode="steady">steady</button>
+    </div>
+
+    <label class="ctl"><span>boost</span><input id="boost" type="range" min="0" max="1" step="0.01" value="0" /></label>
+
+    <button id="mic" class="btn" title="drive with your real voice">🎤 use mic</button>
+
+    <div class="ctl"><span style="font-family:var(--mono);font-size:10px;letter-spacing:.18em;color:var(--fg-mute)">level</span>
+      <div class="meter"><i id="meter"></i></div>
+    </div>
+
+    <div class="seg" id="pal">
+      <button data-pal="cool" class="on">cool</button>
+      <button data-pal="warm">warm</button>
+      <button data-pal="mono">mono</button>
+    </div>
+  </header>
+
+  <div class="hint">Driven by a simulated speech rhythm so everything moves on load · click <b>🎤 use mic</b> to react to your real voice · click any tile to enlarge · pick the one that feels right.</div>
+
+  <main id="grid"></main>
+
+  <div id="focus">
+    <div class="wrap">
+      <canvas id="fcanvas"></canvas>
+      <div class="fcap"><span class="num" id="fnum"></span><span class="fname" id="fname"></span><span class="fblurb" id="fblurb"></span></div>
+      <div class="close">click anywhere to close</div>
+    </div>
+  </div>
+
+<script>
+"use strict";
+
+/* ---------- palettes ---------- */
+const PALETTES = {
+  cool: { primary: "#5af6ff", secondary: "#9b8cff", soft: "#75ffd0" },
+  warm: { primary: "#ffcf8f", secondary: "#ff7aa8", soft: "#ffd9b0" },
+  mono: { primary: "#e6eeff", secondary: "#9fb0d6", soft: "#c9d6f5" },
+};
+let palette = PALETTES.cool;
+
+/* ---------- signal source ---------- */
+const NBINS = 64;
+const FREQ = new Float32Array(NBINS);
+let mode = "speech";       // "speech" | "steady"
+let boost = 0;             // manual floor 0..1
+let running = true;
+
+let usingMic = false;
+let audioCtx = null, analyser = null, micStream = null;
+let micFreq = null, micTime = null;
+let micLevel = 0;
+
+function fillSimFreq(t, lvl) {
+  for (let i = 0; i < NBINS; i++) {
+    const f = i / NBINS;
+    const shape = Math.exp(-f * 2.0) * 0.85 + 0.15;         // more energy low-end
+    const wob = (Math.sin(t * 5.0 + i * 0.55) * 0.5 + 0.5) * 0.6
+              + (Math.sin(t * 3.1 + i * 0.27) * 0.5 + 0.5) * 0.4;
+    FREQ[i] = Math.max(0, Math.min(1, lvl * shape * (0.45 + wob * 0.8)));
+  }
+}
+
+function computeSignal(t) {
+  if (usingMic && analyser) {
+    analyser.getByteFrequencyData(micFreq);                 // 128 bins
+    analyser.getByteTimeDomainData(micTime);                // 256 samples
+    let sum = 0;
+    for (let i = 0; i < micTime.length; i++) { const v = (micTime[i] - 128) / 128; sum += v * v; }
+    let lvl = Math.sqrt(sum / micTime.length) * 3.2;        // RMS, amplified
+    lvl = Math.max(lvl, boost);
+    micLevel = Math.max(lvl, micLevel * 0.86);              // smooth decay
+    const m = Math.min(1, micLevel);
+    for (let i = 0; i < NBINS; i++) {
+      const a = micFreq[2 * i] || 0, b = micFreq[2 * i + 1] || 0;
+      FREQ[i] = Math.max((a + b) / 510, boost * 0.5);
+    }
+    return m;
+  }
+  // simulated
+  let lvl;
+  if (mode === "speech") {
+    const slow = Math.sin(t * 0.6) + Math.sin(t * 0.27 + 1.3);   // irregular talk/pause
+    if (slow > 0.2) {
+      const w = (Math.sin(t * 11) + Math.sin(t * 17.3) + Math.sin(t * 23.1)) / 3;
+      lvl = 0.32 + Math.abs(w) * 0.6;
+    } else {
+      lvl = 0.05 + (Math.sin(t * 1.5) * 0.5 + 0.5) * 0.05;       // quiet breathing
+    }
+  } else {
+    lvl = 0.55;
+  }
+  lvl = Math.max(lvl, boost);
+  fillSimFreq(t, lvl);
+  return lvl;
+}
+
+/* ---------- small helpers ---------- */
+function lerp(a, b, t) { return a + (b - a) * t; }
+function spindle(fx) { return Math.sin(fx * Math.PI); }      // 0 at ends, 1 in middle
+function withGlow(ctx, color, blur, fn) {
+  ctx.save(); ctx.shadowColor = color; ctx.shadowBlur = blur; fn(); ctx.restore();
+}
+
+/* ---------- visualizers ---------- */
+/* each: { name, blurb, ref, draw(ctx,w,h,t,level,freq,pal,state) } */
+const VIS = [
+  {
+    name: "Flowing waveform ribbon",
+    blurb: "Layered translucent sine ribbons that taper at the ends and swell with the voice.",
+    ref: "ref · Siri iOS 9–13",
+    draw(ctx, w, h, t, level, freq, pal) {
+      const cy = h / 2;
+      const layers = [
+        { amp: 1.0, sp: 2.6, col: pal.primary, a: 0.95, k: 4 },
+        { amp: 0.7, sp: 1.8, col: pal.secondary, a: 0.6, k: 6 },
+        { amp: 0.45, sp: 3.4, col: pal.soft, a: 0.4, k: 3 },
+      ];
+      for (let li = 0; li < layers.length; li++) {
+        const L = layers[li];
+        ctx.beginPath();
+        for (let x = 0; x <= w; x += 3) {
+          const fx = x / w;
+          const fi = (fx * (NBINS - 1)) | 0;
+          const amp = (0.18 + level * 0.95) * L.amp * h * 0.34 * spindle(fx) * (0.5 + freq[fi]);
+          const y = cy + Math.sin(fx * Math.PI * L.k + t * L.sp + li * 1.7) * amp;
+          x === 0 ? ctx.moveTo(x, y) : ctx.lineTo(x, y);
+        }
+        ctx.globalAlpha = L.a; ctx.lineWidth = 2; ctx.strokeStyle = L.col;
+        ctx.shadowColor = L.col; ctx.shadowBlur = 14; ctx.stroke();
+      }
+      ctx.globalAlpha = 1; ctx.shadowBlur = 0;
+    },
+  },
+  {
+    name: "Oscilloscope line",
+    blurb: "A single high-frequency trace, like a calm heart-monitor. Amplitude rides the voice.",
+    ref: "ref · scope / EKG",
+    draw(ctx, w, h, t, level, freq, pal) {
+      const cy = h / 2;
+      // faint baseline
+      ctx.globalAlpha = 0.18; ctx.strokeStyle = pal.secondary; ctx.lineWidth = 1;
+      ctx.beginPath(); ctx.moveTo(0, cy); ctx.lineTo(w, cy); ctx.stroke(); ctx.globalAlpha = 1;
+      ctx.beginPath();
+      for (let x = 0; x <= w; x += 2) {
+        const fx = x / w;
+        const fi = (fx * (NBINS - 1)) | 0;
+        const y = cy + Math.sin(fx * 44 - t * 7) * (level * h * 0.4) * spindle(fx) * (0.35 + freq[fi] * 0.9);
+        x === 0 ? ctx.moveTo(x, y) : ctx.lineTo(x, y);
+      }
+      ctx.lineWidth = 2.2; ctx.strokeStyle = pal.primary;
+      ctx.shadowColor = pal.primary; ctx.shadowBlur = 16; ctx.stroke(); ctx.shadowBlur = 0;
+    },
+  },
+  {
+    name: "Mirror frequency bars",
+    blurb: "Classic equalizer mirrored around the center line. Reads instantly as 'sound'.",
+    ref: "ref · spectrum / EQ",
+    draw(ctx, w, h, t, level, freq, pal) {
+      const N = 44, cy = h / 2, gap = 3;
+      const bw = (w - (N + 1) * gap) / N;
+      for (let i = 0; i < N; i++) {
+        const fi = (i / N * (NBINS - 1)) | 0;
+        const v = freq[fi] * (0.4 + level);
+        const bh = Math.max(2, v * h * 0.44);
+        const x = gap + i * (bw + gap);
+        const col = i % 2 ? pal.secondary : pal.primary;
+        ctx.fillStyle = col; ctx.shadowColor = col; ctx.shadowBlur = 8;
+        if (ctx.roundRect) { ctx.beginPath(); ctx.roundRect(x, cy - bh, bw, bh * 2, bw / 2); ctx.fill(); }
+        else ctx.fillRect(x, cy - bh, bw, bh * 2);
+      }
+      ctx.shadowBlur = 0;
+    },
+  },
+  {
+    name: "Radial ring + rim spectrum",
+    blurb: "A hollow aperture; the spectrum stands on the rim. Center stays empty — not a ball.",
+    ref: "ref · Alexa ring / HAL",
+    draw(ctx, w, h, t, level, freq, pal) {
+      const cx = w / 2, cy = h / 2, md = Math.min(w, h);
+      const R = md * 0.24 * (1 + level * 0.14);
+      ctx.globalAlpha = 0.5; ctx.strokeStyle = pal.secondary; ctx.lineWidth = 1;
+      ctx.shadowColor = pal.secondary; ctx.shadowBlur = 8;
+      ctx.beginPath(); ctx.arc(cx, cy, R, 0, Math.PI * 2); ctx.stroke();
+      ctx.globalAlpha = 1; ctx.shadowBlur = 0;
+      const N = 80;
+      for (let i = 0; i < N; i++) {
+        const a = (i / N) * Math.PI * 2 + t * 0.25;
+        const fi = (i / N * (NBINS - 1)) | 0;
+        const len = 4 + freq[fi] * (0.35 + level) * md * 0.22;
+        const x1 = cx + Math.cos(a) * R, y1 = cy + Math.sin(a) * R;
+        const x2 = cx + Math.cos(a) * (R + len), y2 = cy + Math.sin(a) * (R + len);
+        ctx.strokeStyle = pal.primary; ctx.lineWidth = 2;
+        ctx.shadowColor = pal.primary; ctx.shadowBlur = 8;
+        ctx.beginPath(); ctx.moveTo(x1, y1); ctx.lineTo(x2, y2); ctx.stroke();
+      }
+      ctx.shadowBlur = 0;
+    },
+  },
+  {
+    name: "Sunburst spikes",
+    blurb: "Rays radiating from a pulsing core; length tracks each frequency. Slowly rotating.",
+    ref: "ref · radial burst",
+    draw(ctx, w, h, t, level, freq, pal) {
+      const cx = w / 2, cy = h / 2, md = Math.min(w, h);
+      const inner = md * 0.05;
+      const N = 72;
+      for (let i = 0; i < N; i++) {
+        const a = (i / N) * Math.PI * 2 + t * 0.5;
+        const fi = (i / N * (NBINS - 1)) | 0;
+        const len = inner + (0.06 + freq[fi] * (0.45 + level)) * md * 0.4;
+        const x1 = cx + Math.cos(a) * inner, y1 = cy + Math.sin(a) * inner;
+        const x2 = cx + Math.cos(a) * len, y2 = cy + Math.sin(a) * len;
+        const grad = ctx.createLinearGradient(x1, y1, x2, y2);
+        grad.addColorStop(0, pal.primary); grad.addColorStop(1, pal.secondary);
+        ctx.strokeStyle = grad; ctx.lineWidth = 1.6;
+        ctx.shadowColor = pal.primary; ctx.shadowBlur = 6;
+        ctx.beginPath(); ctx.moveTo(x1, y1); ctx.lineTo(x2, y2); ctx.stroke();
+      }
+      ctx.shadowBlur = 0;
+      const cr = inner * (1 + level * 1.8);
+      ctx.fillStyle = pal.soft; ctx.shadowColor = pal.soft; ctx.shadowBlur = 18;
+      ctx.beginPath(); ctx.arc(cx, cy, cr, 0, Math.PI * 2); ctx.fill(); ctx.shadowBlur = 0;
+    },
+  },
+  {
+    name: "Sonar ripples",
+    blurb: "Concentric rings emanate from a still core; faster, brighter rings as the voice rises.",
+    ref: "ref · radar / ripple",
+    draw(ctx, w, h, t, level, freq, pal, st) {
+      const cx = w / 2, cy = h / 2, maxR = Math.min(w, h) * 0.46, life = 2.4;
+      if (!st.rings) { st.rings = []; st.last = t; }
+      const interval = 0.7 - level * 0.5;
+      if (t - st.last > interval) { st.rings.push(t); st.last = t; }
+      st.rings = st.rings.filter((born) => t - born < life);
+      for (const born of st.rings) {
+        const age = (t - born) / life;
+        const r = age * maxR;
+        ctx.globalAlpha = (1 - age) * 0.7;
+        ctx.strokeStyle = pal.primary; ctx.lineWidth = 1.5;
+        ctx.shadowColor = pal.primary; ctx.shadowBlur = 10;
+        ctx.beginPath(); ctx.arc(cx, cy, r, 0, Math.PI * 2); ctx.stroke();
+      }
+      ctx.globalAlpha = 1; ctx.shadowBlur = 0;
+      const cr = 4 + level * 16;
+      ctx.fillStyle = pal.soft; ctx.shadowColor = pal.soft; ctx.shadowBlur = 20;
+      ctx.beginPath(); ctx.arc(cx, cy, cr, 0, Math.PI * 2); ctx.fill(); ctx.shadowBlur = 0;
+    },
+  },
+  {
+    name: "Particle field → wave",
+    blurb: "Points drift in a calm cloud, then gather into a clean wave as you speak, then scatter back.",
+    ref: "ref · generative swarm",
+    draw(ctx, w, h, t, level, freq, pal, st) {
+      const N = 90, cy = h / 2;
+      if (!st.p) {
+        st.p = [];
+        for (let i = 0; i < N; i++) st.p.push({
+          bx: Math.random() * w, by: Math.random() * h,
+          ph: Math.random() * Math.PI * 2, sp: 0.4 + Math.random() * 0.8,
+        });
+      }
+      const g = Math.min(1, level * 1.2);   // gather amount
+      for (let i = 0; i < N; i++) {
+        const p = st.p[i];
+        const dx = p.bx + Math.sin(t * p.sp + p.ph) * 10;
+        const dy = p.by + Math.cos(t * p.sp * 0.9 + p.ph) * 10;
+        const fx = i / (N - 1);
+        const fi = (fx * (NBINS - 1)) | 0;
+        const wx = fx * w;
+        const wy = cy + Math.sin(fx * Math.PI * 5 + t * 4) * spindle(fx) * h * 0.36 * (0.4 + freq[fi]);
+        const x = lerp(dx, wx, g), y = lerp(dy, wy, g);
+        const r = 1.2 + level * 2.2;
+        ctx.fillStyle = i % 3 ? pal.primary : pal.secondary;
+        ctx.globalAlpha = 0.5 + g * 0.5;
+        ctx.shadowColor = pal.primary; ctx.shadowBlur = 6;
+        ctx.beginPath(); ctx.arc(x, y, r, 0, Math.PI * 2); ctx.fill();
+      }
+      ctx.globalAlpha = 1; ctx.shadowBlur = 0;
+    },
+  },
+  {
+    name: "Constellation web",
+    blurb: "Nodes connected by hairlines; the lattice tightens and brightens with the voice.",
+    ref: "ref · network graph",
+    draw(ctx, w, h, t, level, freq, pal, st) {
+      const N = 26;
+      if (!st.n) {
+        st.n = [];
+        for (let i = 0; i < N; i++) st.n.push({
+          x: Math.random() * w, y: Math.random() * h,
+          vx: (Math.random() - 0.5) * 18, vy: (Math.random() - 0.5) * 18,
+        });
+        st.t = t;
+      }
+      const dt = Math.min(0.05, t - st.t); st.t = t;
+      const dist = 86 + level * 50;
+      for (const p of st.n) {
+        p.x += p.vx * dt; p.y += p.vy * dt;
+        if (p.x < 0 || p.x > w) p.vx *= -1; if (p.y < 0 || p.y > h) p.vy *= -1;
+        p.x = Math.max(0, Math.min(w, p.x)); p.y = Math.max(0, Math.min(h, p.y));
+      }
+      for (let i = 0; i < N; i++) for (let j = i + 1; j < N; j++) {
+        const a = st.n[i], b = st.n[j];
+        const d = Math.hypot(a.x - b.x, a.y - b.y);
+        if (d < dist) {
+          ctx.globalAlpha = (1 - d / dist) * (0.25 + level * 0.6);
+          ctx.strokeStyle = pal.primary; ctx.lineWidth = 1;
+          ctx.beginPath(); ctx.moveTo(a.x, a.y); ctx.lineTo(b.x, b.y); ctx.stroke();
+        }
+      }
+      ctx.globalAlpha = 1;
+      for (const p of st.n) {
+        const r = 1.5 + level * 2.5;
+        ctx.fillStyle = pal.soft; ctx.shadowColor = pal.primary; ctx.shadowBlur = 8;
+        ctx.beginPath(); ctx.arc(p.x, p.y, r, 0, Math.PI * 2); ctx.fill();
+      }
+      ctx.shadowBlur = 0;
+    },
+  },
+  {
+    name: "Dot-matrix pulse",
+    blurb: "LED grid as a radial spectrogram: distance = pitch, brightness = energy. Different sounds light different rings — try the mic.",
+    ref: "ref · LED panel / radial spectrogram",
+    draw(ctx, w, h, t, level, freq, pal) {
+      const step = 22;
+      const cols = Math.floor(w / step), rows = Math.floor(h / step);
+      const ox = (w - (cols - 1) * step) / 2, oy = (h - (rows - 1) * step) / 2;
+      const cx = w / 2, cy = h / 2, md = Math.min(w, h) * 0.55;
+      for (let r = 0; r < rows; r++) for (let c = 0; c < cols; c++) {
+        const x = ox + c * step, y = oy + r * step;
+        const d = Math.min(1, Math.hypot(x - cx, y - cy) / md);
+        const fi = Math.min(NBINS - 1, Math.max(0, (d * NBINS) | 0));
+        const idle = (Math.sin(d * 6 - t * 1.6) * 0.5 + 0.5) * 0.06;     // never fully dead
+        const energy = freq[fi] * (0.55 + level * 0.7);
+        const b = Math.max(idle, Math.min(1, energy));
+        const rad = 1 + b * 3.4;
+        ctx.globalAlpha = 0.14 + b * 0.86;
+        ctx.fillStyle = b > 0.6 ? pal.soft : pal.primary;
+        ctx.shadowColor = pal.primary; ctx.shadowBlur = b * 9;
+        ctx.beginPath(); ctx.arc(x, y, rad, 0, Math.PI * 2); ctx.fill();
+      }
+      ctx.globalAlpha = 1; ctx.shadowBlur = 0;
+    },
+  },
+  {
+    name: "Aurora / edge-glow field",
+    blurb: "No object — soft light-blobs drift and the frame breathes. The waveform IS the glow.",
+    ref: "ref · Siri iOS 18 / 'Her'",
+    draw(ctx, w, h, t, level, freq, pal) {
+      ctx.save();
+      ctx.globalCompositeOperation = "lighter";
+      const blobs = [
+        { x: 0.32, y: 0.42, col: pal.primary, ph: 0 },
+        { x: 0.66, y: 0.56, col: pal.secondary, ph: 2.1 },
+        { x: 0.5, y: 0.38, col: pal.soft, ph: 4.0 },
+      ];
+      for (const b of blobs) {
+        const bx = (b.x + Math.sin(t * 0.4 + b.ph) * 0.06) * w;
+        const by = (b.y + Math.cos(t * 0.33 + b.ph) * 0.06) * h;
+        const R = (0.22 + level * 0.5) * Math.min(w, h);
+        const g = ctx.createRadialGradient(bx, by, 0, bx, by, R);
+        g.addColorStop(0, b.col); g.addColorStop(1, "transparent");
+        ctx.globalAlpha = 0.16 + level * 0.42;
+        ctx.fillStyle = g; ctx.beginPath(); ctx.arc(bx, by, R, 0, Math.PI * 2); ctx.fill();
+      }
+      ctx.restore();
+      // breathing edge frame
+      ctx.globalAlpha = 0.5 + level * 0.5;
+      ctx.strokeStyle = pal.primary; ctx.lineWidth = 1.5;
+      ctx.shadowColor = pal.primary; ctx.shadowBlur = 14 + level * 26;
+      const m = 10;
+      if (ctx.roundRect) { ctx.beginPath(); ctx.roundRect(m, m, w - 2 * m, h - 2 * m, 18); ctx.stroke(); }
+      else ctx.strokeRect(m, m, w - 2 * m, h - 2 * m);
+      ctx.globalAlpha = 1; ctx.shadowBlur = 0;
+    },
+  },
+];
+
+/* ---------- canvas setup ---------- */
+const grid = document.getElementById("grid");
+const tiles = [];
+const DPR = Math.min(2, window.devicePixelRatio || 1);
+
+function makeCanvas(el) {
+  const w = el.clientWidth, h = el.clientHeight;
+  el.width = Math.round(w * DPR); el.height = Math.round(h * DPR);
+  const ctx = el.getContext("2d");
+  ctx.setTransform(DPR, 0, 0, DPR, 0, 0);
+  return { el, ctx, w, h };
+}
+
+VIS.forEach((v, i) => {
+  const fig = document.createElement("figure");
+  fig.innerHTML =
+    '<canvas></canvas>' +
+    '<div class="expand">enlarge ⤢</div>' +
+    '<figcaption><div class="cap-row"><span class="num">' + String(i + 1).padStart(2, "0") + '</span>' +
+    '<span class="name">' + v.name + '</span></div>' +
+    '<div class="blurb">' + v.blurb + '</div><div class="ref">' + v.ref + '</div></figcaption>';
+  grid.appendChild(fig);
+  const canvasEl = fig.querySelector("canvas");
+  const cv = makeCanvas(canvasEl);
+  const state = {};
+  tiles.push({ cv, state, vis: v });
+  fig.addEventListener("click", () => openFocus(i));
+});
+
+window.addEventListener("resize", () => {
+  for (const t of tiles) {
+    const c = makeCanvas(t.cv.el); t.cv.w = c.w; t.cv.h = c.h;
+    t.cv.el.width = c.el.width; t.cv.el.height = c.el.height;
+    t.cv.ctx = c.ctx;
+  }
+  if (focusIndex != null) sizeFocus();
+});
+
+/* ---------- focus overlay ---------- */
+const focusEl = document.getElementById("focus");
+const fcanvas = document.getElementById("fcanvas");
+let fctx = null, focusIndex = null, focusState = {};
+function sizeFocus() {
+  const w = fcanvas.clientWidth, h = fcanvas.clientHeight;
+  fcanvas.width = Math.round(w * DPR); fcanvas.height = Math.round(h * DPR);
+  fctx = fcanvas.getContext("2d");
+  fctx.setTransform(DPR, 0, 0, DPR, 0, 0);
+  fcanvas._w = w; fcanvas._h = h;
+}
+function openFocus(i) {
+  focusIndex = i; focusState = {};
+  const v = VIS[i];
+  document.getElementById("fnum").textContent = String(i + 1).padStart(2, "0");
+  document.getElementById("fname").textContent = v.name;
+  document.getElementById("fblurb").textContent = v.blurb;
+  focusEl.classList.add("show");
+  sizeFocus();
+}
+focusEl.addEventListener("click", () => { focusEl.classList.remove("show"); focusIndex = null; });
+
+/* ---------- controls ---------- */
+const playBtn = document.getElementById("play");
+playBtn.addEventListener("click", () => {
+  running = !running;
+  playBtn.classList.toggle("on", running);
+  playBtn.textContent = running ? "⏸ running" : "▶ paused";
+  if (running) raf = requestAnimationFrame(frame);
+});
+document.querySelectorAll("#mode button").forEach((b) => b.addEventListener("click", () => {
+  mode = b.dataset.mode;
+  document.querySelectorAll("#mode button").forEach((x) => x.classList.toggle("on", x === b));
+}));
+document.querySelectorAll("#pal button").forEach((b) => b.addEventListener("click", () => {
+  palette = PALETTES[b.dataset.pal];
+  document.querySelectorAll("#pal button").forEach((x) => x.classList.toggle("on", x === b));
+}));
+document.getElementById("boost").addEventListener("input", (e) => { boost = parseFloat(e.target.value); });
+
+const micBtn = document.getElementById("mic");
+micBtn.addEventListener("click", async () => {
+  if (usingMic) {
+    usingMic = false; micBtn.classList.remove("on"); micBtn.textContent = "🎤 use mic";
+    if (micStream) micStream.getTracks().forEach((t) => t.stop());
+    if (audioCtx) audioCtx.close();
+    audioCtx = null; analyser = null; micStream = null;
+    return;
+  }
+  try {
+    micStream = await navigator.mediaDevices.getUserMedia({ audio: { echoCancellation: true, noiseSuppression: true } });
+    audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+    const src = audioCtx.createMediaStreamSource(micStream);
+    analyser = audioCtx.createAnalyser();
+    analyser.fftSize = 256; analyser.smoothingTimeConstant = 0.8;
+    src.connect(analyser);
+    micFreq = new Uint8Array(analyser.frequencyBinCount); // 128
+    micTime = new Uint8Array(analyser.fftSize);           // 256
+    usingMic = true; micBtn.classList.add("on"); micBtn.textContent = "🎤 mic on";
+  } catch (err) {
+    micBtn.textContent = "🎤 mic blocked";
+    console.warn("mic error", err);
+    setTimeout(() => { micBtn.textContent = "🎤 use mic"; }, 1800);
+  }
+});
+
+/* ---------- main loop ---------- */
+const meter = document.getElementById("meter");
+let raf = 0;
+function frame(now) {
+  const t = now / 1000;
+  const level = computeSignal(t);
+  meter.style.width = (Math.min(1, level) * 100).toFixed(0) + "%";
+  for (const tile of tiles) {
+    const { ctx, w, h } = tile.cv;
+    ctx.clearRect(0, 0, w, h);
+    tile.vis.draw(ctx, w, h, t, level, FREQ, palette, tile.state);
+  }
+  if (focusIndex != null && fctx) {
+    const w = fcanvas._w, h = fcanvas._h;
+    fctx.clearRect(0, 0, w, h);
+    VIS[focusIndex].draw(fctx, w, h, t, level, FREQ, palette, focusState);
+  }
+  if (running) raf = requestAnimationFrame(frame);
+}
+raf = requestAnimationFrame(frame);
+</script>
+</body>
+</html>
