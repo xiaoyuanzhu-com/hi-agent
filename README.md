@@ -135,16 +135,18 @@ Env vars consulted at startup:
 
 | Variable | Default | Purpose |
 |---|---|---|
-| `HI_AGENT_UPSTREAM_KEY` | — | Upstream LLM credential, injected by the local proxy. Required; read from env only, never written to disk. |
-| `HI_AGENT_CONFIG` | `config.toml` | Path to the dev-managed config file (model / effort / permission mode / thinking budget / upstream URL) |
+| `AI_API_KEY` | — | Upstream LLM credential, injected by the local proxy. Required; read from env only, never written to disk. |
+| `AI_API_BASE` | `https://api.anthropic.com` | Upstream LLM base URL the proxy forwards to. |
+| `HI_AGENT_CONFIG` | `config.toml` | Path to the dev-managed config file (model / effort / permission mode) |
 | `HI_AGENT_RUNTIME_DIR` | OS cache dir | Override the dir the runtime is installed into |
 | `HI_AGENT_MCP_SOCK` | `<data_dir>/mcp.sock` | Unix socket the MCP hub listens on |
 | `HI_AGENT_SHIM_BIN` | `current_exe()` | Program to re-exec as the MCP stdio↔socket shim |
 | `RUST_LOG` | `info` | Standard `tracing-subscriber` env filter |
 
-Managed cognition parameters (model, effort, permission mode, max thinking
-tokens, and the upstream base URL) live in [`config.toml`](config.toml), not in
-env vars. The dev-only `HI_AGENT_DEV_NODE` / `HI_AGENT_DEV_ADAPTER` /
+Managed cognition parameters (model, effort, permission mode) live in
+[`config.toml`](config.toml), not in env vars; the upstream credential and base
+URL come from `AI_API_KEY` / `AI_API_BASE`. The dev-only `HI_AGENT_DEV_NODE` /
+`HI_AGENT_DEV_ADAPTER` /
 `HI_AGENT_DEV_CLAUDE` overrides let you point at an external runtime when
 developing offline or skipping the first-run download (debug use only).
 
@@ -244,7 +246,7 @@ docker build -t hi-agent:dev .
 On first run the binary installs its own runtime (downloads the pinned Node and
 `npm ci`s the ACP adapter + `claude` CLI into a cache dir), so the image needs
 no separate claude-code container. First run therefore needs network access and
-the system `tar`. The image still needs `HI_AGENT_UPSTREAM_KEY` supplied at
+the system `tar`. The image still needs `AI_API_KEY` supplied at
 runtime for cognition to work.
 
 ## Risks and known unverified things
