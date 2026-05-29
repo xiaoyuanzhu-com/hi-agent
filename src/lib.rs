@@ -20,6 +20,7 @@ pub mod voice;
 pub struct Config {
     pub port: u16,
     pub data_dir: PathBuf,
+    pub agent: config::AgentConfig,
 }
 
 /// Build the axum app, spawn the ACP subprocess + reactor, bind, and serve
@@ -41,10 +42,40 @@ pub async fn run(config: Config) -> anyhow::Result<()> {
 
     let (router, seams) = server::build(memory.clone(), config.data_dir.clone(), stt);
 
-    let acp = Arc::new(
-        acp::AcpProcess::spawn("claude-agent-acp".into(), Vec::new()).await?,
+    // Resolve the bundled runtime (extract on first run).
+    let runtime = runtime::ensure()?;
+    tracing::info!(bundle_id = runtime::BUNDLE_ID, "runtime resolved");
+
+    // Start the local LLM proxy; the adapter talks to it instead of the upstream.
+    let proxy = llm_proxy::LlmProxy::start(
+        config.agent.upstream_base_url.clone(),
+        config.agent.upstream_key.clone(),
+    )
+    .await?;
+
+    // Render the managed settings.json into a hi-agent-owned config dir.
+    let claude_config_dir = config.data_dir.join("claude-config");
+    config.agent.render_settings_json(&claude_config_dir)?;
+
+    // Spawn the adapter via the bundled node, with managed env.
+    let child_env = config.agent.child_env(
+        proxy.port(),
+        &claude_config_dir,
+        runtime.node_bin_dir(),
+        &runtime.claude_bin,
     );
-    tracing::info!("ACP subprocess up");
+    let adapter_entry = runtime
+        .adapter_entry
+        .to_str()
+        .ok_or_else(|| anyhow::anyhow!("adapter path not UTF-8"))?
+        .to_string();
+    let acp = Arc::new(
+        acp::AcpProcess::spawn(runtime.node_bin.clone(), vec![adapter_entry], child_env).await?,
+    );
+    tracing::info!("ACP subprocess up (bundled node + adapter)");
+
+    // Keep the proxy alive for the life of the process.
+    let _proxy = proxy;
 
     let _reactor = reactor::start(memory, acp, seams.inbound_rx, seams.thought_bus);
     tracing::info!("reactor started");

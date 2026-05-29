@@ -284,8 +284,6 @@ fn auto_allow(
 
 #[cfg(test)]
 mod tests {
-    use super::*;
-
     #[test]
     fn spawn_argv_prepends_env_pairs() {
         // White-box the argv assembly used by spawn(): env pairs come first as
