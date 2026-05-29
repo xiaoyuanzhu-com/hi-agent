@@ -17,6 +17,12 @@ struct Cli {
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
+    // Load `.env` if present so `cargo run` picks up STT_PROVIDER and friends
+    // without a separate `set -a; source .env` dance. Existing process env
+    // takes precedence (dotenvy::dotenv never overwrites), so production
+    // deployments that inject env via systemd/k8s/compose are unaffected.
+    let _ = dotenvy::dotenv();
+
     let cli = Cli::parse();
 
     tracing_subscriber::fmt()

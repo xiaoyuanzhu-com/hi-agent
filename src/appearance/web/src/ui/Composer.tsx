@@ -6,27 +6,37 @@ import {
   type KeyboardEvent,
 } from "react";
 import { Waveform } from "./Waveform";
+import { startRecording, type AudioRecorder } from "../channels/audio";
 
 export interface ComposerProps {
   onSend: (text: string) => void | Promise<void>;
+  /** Called with the captured audio blob when the user stops recording. */
+  onAudio?: (blob: Blob, mime: string) => void | Promise<void>;
+  /** Surfaces capture errors (mic permission denied, etc) to the parent. */
+  onError?: (message: string) => void;
   disabled?: boolean;
   placeholder?: string;
-  /** Called when the user starts/stops the mic placeholder. */
+  /** Called when the user starts/stops the mic. */
   onMicChange?: (recording: boolean) => void;
 }
+
+const MIN_DURATION_MS = 250;
+const MAX_DURATION_MS = 60_000;
 
 /**
  * Bottom-center pill composer.
  *
  * Three controls, left to right:
- *   * Mic button — PLACEHOLDER for the /audio channel. Clicking enters a
- *     fake "recording" state, animates a waveform inside the pill, and
- *     after a short delay drops back to idle. No actual audio is captured.
+ *   * Mic button — toggles voice capture. Tap to start, tap again to stop;
+ *     auto-stops after MAX_DURATION_MS. On stop the WAV blob is handed off
+ *     to onAudio (the App posts it to /audio).
  *   * Multiline textarea — autosizes. Enter sends, Shift+Enter newlines.
  *   * Send button — submits the trimmed text via onSend.
  */
 export function Composer({
   onSend,
+  onAudio,
+  onError,
   disabled,
   placeholder,
   onMicChange,
@@ -35,8 +45,11 @@ export function Composer({
   const [busy, setBusy] = useState(false);
   const [focused, setFocused] = useState(false);
   const [recording, setRecording] = useState(false);
+  const [transcribing, setTranscribing] = useState(false);
   const taRef = useRef<HTMLTextAreaElement | null>(null);
   const stopTimerRef = useRef<number | null>(null);
+  const recorderRef = useRef<AudioRecorder | null>(null);
+  const startedAtRef = useRef<number>(0);
 
   // Autosize the textarea up to a max height.
   useEffect(() => {
@@ -53,6 +66,12 @@ export function Composer({
   useEffect(() => {
     return () => {
       if (stopTimerRef.current) window.clearTimeout(stopTimerRef.current);
+      if (recorderRef.current) {
+        try {
+          recorderRef.current.cancel();
+        } catch { /* ignore */ }
+        recorderRef.current = null;
+      }
     };
   }, []);
 
@@ -80,23 +99,58 @@ export function Composer({
     }
   };
 
-  const toggleMic = () => {
-    // Placeholder for the /audio channel — flip a recording state, auto-stop
-    // after a few seconds. No audio is actually captured or transmitted.
-    setRecording((r) => {
-      const next = !r;
-      if (stopTimerRef.current) {
-        window.clearTimeout(stopTimerRef.current);
-        stopTimerRef.current = null;
+  const clearStopTimer = () => {
+    if (stopTimerRef.current) {
+      window.clearTimeout(stopTimerRef.current);
+      stopTimerRef.current = null;
+    }
+  };
+
+  const finishRecording = async () => {
+    const rec = recorderRef.current;
+    if (!rec) return;
+    recorderRef.current = null;
+    clearStopTimer();
+    setRecording(false);
+    const elapsed = performance.now() - startedAtRef.current;
+    try {
+      const { blob, mime } = await rec.stop();
+      if (elapsed < MIN_DURATION_MS) {
+        onError?.("recording too short — hold the mic a moment longer");
+        return;
       }
-      if (next) {
-        stopTimerRef.current = window.setTimeout(() => {
-          setRecording(false);
-          stopTimerRef.current = null;
-        }, 4200);
+      if (onAudio) {
+        setTranscribing(true);
+        try {
+          await onAudio(blob, mime);
+        } finally {
+          setTranscribing(false);
+        }
       }
-      return next;
-    });
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
+      onError?.(msg);
+    }
+  };
+
+  const toggleMic = async () => {
+    if (disabled || transcribing) return;
+    if (recording) {
+      await finishRecording();
+      return;
+    }
+    try {
+      const rec = await startRecording();
+      recorderRef.current = rec;
+      startedAtRef.current = performance.now();
+      setRecording(true);
+      stopTimerRef.current = window.setTimeout(() => {
+        void finishRecording();
+      }, MAX_DURATION_MS);
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
+      onError?.(`mic unavailable: ${msg}`);
+    }
   };
 
   const canSend = text.trim().length > 0 && !busy && !disabled;
@@ -129,7 +183,11 @@ export function Composer({
           transition: "box-shadow 220ms var(--ease-out), border-color 220ms var(--ease-out)",
         }}
       >
-        <MicButton recording={recording} onClick={toggleMic} disabled={disabled} />
+        <MicButton
+          recording={recording}
+          onClick={() => { void toggleMic(); }}
+          disabled={disabled || transcribing}
+        />
 
         <div
           style={{
@@ -182,7 +240,7 @@ export function Composer({
 
         <SendButton canSend={canSend} busy={busy} />
       </div>
-      {recording && (
+      {(recording || transcribing) && (
         <div
           style={{
             marginTop: 8,
@@ -195,7 +253,9 @@ export function Composer({
             textShadow: "var(--glow-magenta)",
           }}
         >
-          /audio · placeholder · capture not wired
+          {recording
+            ? "/audio · capturing · tap mic to stop"
+            : "/audio · transcribing…"}
         </div>
       )}
     </form>
@@ -219,7 +279,7 @@ function MicButton({
       disabled={disabled}
       aria-pressed={recording}
       aria-label={recording ? "stop voice capture" : "start voice capture"}
-      title="placeholder — /audio channel not wired in v0"
+      title={recording ? "tap to stop and transcribe" : "tap to record"}
       style={{
         width: 44,
         height: 44,

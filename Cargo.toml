@@ -25,6 +25,7 @@ serde_json = "1"
 thiserror = "1"
 anyhow = "1"
 clap = { version = "4", features = ["derive"] }
+dotenvy = "0.15"
 uuid = { version = "1.10", features = ["v7", "serde"] }
 chrono = { version = "0.4", features = ["serde"] }
 futures = "0.3"
@@ -39,6 +40,7 @@ agent-client-protocol = { version = "0.12", features = ["unstable_session_usage"
 # `Bytes` in axum extractors; keeping it explicit makes the voice traits
 # legible without depending on a particular axum version.
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+tokio-tungstenite = { version = "0.24", default-features = false, features = ["rustls-tls-webpki-roots", "connect"] }
 bytes = "1"
 base64 = "0.22"
 
