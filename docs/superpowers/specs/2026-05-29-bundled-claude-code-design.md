@@ -2,6 +2,19 @@
 
 design v0.1 · 2026-05-29
 
+> **Update 2026-05-29 — pivot to first-run install.** Component 1 below
+> ("embed the runtime in the binary, extract on startup") was implemented and
+> then reversed. The runtime is now **installed on first run instead of
+> embedded**: hi-agent downloads the pinned Node tarball and `npm ci`s the
+> adapter + `claude` CLI (from the committed `runtime/package.json` /
+> `runtime/package-lock.json`) into an OS cache dir, marks it complete, and
+> reuses it thereafter. This keeps the binary small and drops the `make bundle`
+> step / per-target `.tar.zst` embedding. Components 2 (local LLM proxy) and 3
+> (managed config via `settings.json` + child env) are unchanged. The
+> `runtime::ensure()` contract, `HI_AGENT_RUNTIME_DIR`, and the
+> `HI_AGENT_DEV_*` overrides are preserved; `ensure()` is now async. SHA-256
+> verification of the Node download and Windows support are deferred.
+
 ## Goal
 
 Two outcomes:

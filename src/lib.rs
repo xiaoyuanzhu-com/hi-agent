@@ -42,8 +42,8 @@ pub async fn run(config: Config) -> anyhow::Result<()> {
 
     let (router, seams) = server::build(memory.clone(), config.data_dir.clone(), stt);
 
-    // Resolve the bundled runtime (extract on first run).
-    let runtime = runtime::ensure()?;
+    // Resolve the runtime (download + install on first run, reuse thereafter).
+    let runtime = runtime::ensure().await?;
     tracing::info!(bundle_id = runtime::BUNDLE_ID, "runtime resolved");
 
     // Start the local LLM proxy; the adapter talks to it instead of the upstream.
