@@ -43,7 +43,7 @@ pub async fn run(config: Config) -> anyhow::Result<()> {
     );
     tracing::info!("ACP subprocess up");
 
-    let _reactor = reactor::start(memory, acp, seams.inbound_rx, seams.thought_out);
+    let _reactor = reactor::start(memory, acp, seams.inbound_rx, seams.thought_bus);
     tracing::info!("reactor started");
 
     // Hold the audio_out broadcast sender so subscribers see Lagged not Closed

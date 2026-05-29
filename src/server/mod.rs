@@ -19,8 +19,9 @@ pub mod audio;
 pub mod headers;
 pub mod stubs;
 pub mod thought;
+pub mod thought_bus;
 
-pub use thought::ThoughtEvent;
+pub use thought_bus::ThoughtBus;
 
 /// Outbound synthesized-audio event. Carries the bytes plus the mime type the
 /// GET /audio long-poll should serve.
@@ -37,8 +38,10 @@ pub struct AppState {
     /// Inbound signals from every channel POST. The reactor consumes these.
     pub inbound: mpsc::Sender<Signal>,
 
-    /// Outbound thought broadcast. GET /thought subscribers receive from this.
-    pub thought_out: broadcast::Sender<ThoughtEvent>,
+    /// Outbound thought buffer. GET /thought readers drain it per peer. Unlike
+    /// a broadcast, a reply produced while no reader is connected is retained
+    /// for the next GET instead of being dropped.
+    pub thought_bus: ThoughtBus,
 
     /// Outbound audio broadcast. GET /audio subscribers receive from this.
     /// No producer wired yet post-MCP; subscribers will hang until the agent
@@ -62,12 +65,12 @@ pub fn build(
     stt: Option<Arc<dyn Stt>>,
 ) -> (Router, ServerSeams) {
     let (inbound_tx, inbound_rx) = mpsc::channel::<Signal>(1024);
-    let (thought_tx, _) = broadcast::channel::<ThoughtEvent>(256);
+    let thought_bus = ThoughtBus::new();
     let (audio_tx, _) = broadcast::channel::<AudioEvent>(64);
 
     let state = Arc::new(AppState {
         inbound: inbound_tx,
-        thought_out: thought_tx.clone(),
+        thought_bus: thought_bus.clone(),
         audio_out: audio_tx.clone(),
         memory,
         data_dir,
@@ -88,7 +91,7 @@ pub fn build(
 
     let seams = ServerSeams {
         inbound_rx,
-        thought_out: thought_tx,
+        thought_bus,
         audio_out: audio_tx,
     };
 
@@ -97,7 +100,7 @@ pub fn build(
 
 pub struct ServerSeams {
     pub inbound_rx: mpsc::Receiver<Signal>,
-    pub thought_out: broadcast::Sender<ThoughtEvent>,
+    pub thought_bus: ThoughtBus,
     pub audio_out: broadcast::Sender<AudioEvent>,
 }
 

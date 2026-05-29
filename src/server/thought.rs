@@ -1,11 +1,14 @@
 //! POST /thought and GET /thought.
 //!
-//! GET /thought is a long-poll. The handler subscribes to the agent's outbound
-//! event stream, holds the connection open until the first matching `Chunk`
-//! arrives, then streams every chunk into the response body until the matching
-//! `EndOfUtterance` fires. Closing the body is the spec's "end of utterance".
+//! GET /thought is a long-poll. The handler binds to the next buffered
+//! utterance for the subscriber's peer, holds the connection open, and streams
+//! each chunk into the response body until the utterance completes. Closing the
+//! body is the spec's "end of utterance".
 //!
-//! Per the spec, a fresh GET re-subscribes for the next utterance.
+//! Per the spec, a fresh GET re-subscribes for the next utterance. Because the
+//! [`ThoughtBus`](crate::server::ThoughtBus) buffers per peer, a reply produced
+//! between polls (or before the first poll) is retained for the next GET rather
+//! than lost — see that module for the race this fixes.
 
 use std::sync::Arc;
 
@@ -14,30 +17,10 @@ use axum::extract::State;
 use axum::http::{StatusCode, header};
 use axum::response::{IntoResponse, Response};
 use chrono::Utc;
-use futures::stream::unfold;
-use serde::{Deserialize, Serialize};
-use tokio::sync::broadcast::error::RecvError;
 
 use crate::server::AppState;
 use crate::server::headers::{AuthBearer, PeerHeader, ToHeader};
-use crate::types::{Channel, JournalEntry, PeerId, Signal};
-
-/// One event on the agent's outbound `/thought` stream.
-///
-/// The reactor broadcasts `Chunk` for each ACP text delta and `EndOfUtterance`
-/// when a routing turn finishes (clean or cancelled). The GET handler turns
-/// this into HTTP chunked body + close.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub enum ThoughtEvent {
-    Chunk {
-        to: Option<PeerId>,
-        from: PeerId,
-        text: String,
-    },
-    EndOfUtterance {
-        to: Option<PeerId>,
-    },
-}
+use crate::types::{Channel, JournalEntry, Signal};
 
 pub async fn post_thought(
     State(state): State<Arc<AppState>>,
@@ -93,70 +76,24 @@ pub async fn get_thought(
     ToHeader(subscriber): ToHeader,
     AuthBearer(auth): AuthBearer,
 ) -> Response {
-    let rx = state.thought_out.subscribe();
-    tracing::info!(subscriber = ?subscriber, auth = ?auth, "GET /thought long-poll opened");
+    // A reader drains one peer's mailbox, so it must say who it is. The spec
+    // has the subscriber identify themselves via X-HI-To; without it we can't
+    // route the buffered reply.
+    let Some(peer) = subscriber else {
+        return (
+            StatusCode::BAD_REQUEST,
+            "GET /thought requires X-HI-To to name the subscribing peer\n",
+        )
+            .into_response();
+    };
 
-    let stream = build_utterance_stream(rx, subscriber);
+    tracing::info!(subscriber = %peer, auth = ?auth, "GET /thought long-poll opened");
+
+    let stream = state.thought_bus.subscribe(peer);
 
     Response::builder()
         .status(StatusCode::OK)
         .header(header::CONTENT_TYPE, "text/plain; charset=utf-8")
         .body(Body::from_stream(stream))
         .unwrap()
-}
-
-/// Convert the broadcast subscription into a `Stream<Result<Bytes, _>>` that
-/// yields the bytes of one utterance and closes when that utterance ends.
-fn build_utterance_stream(
-    rx: tokio::sync::broadcast::Receiver<ThoughtEvent>,
-    subscriber: Option<PeerId>,
-) -> impl futures::Stream<Item = Result<Bytes, std::convert::Infallible>> {
-    // Once `started` is true, an EndOfUtterance for our filter closes the stream.
-    struct S {
-        rx: tokio::sync::broadcast::Receiver<ThoughtEvent>,
-        subscriber: Option<PeerId>,
-        started: bool,
-    }
-
-    unfold(
-        S {
-            rx,
-            subscriber,
-            started: false,
-        },
-        |mut s| async move {
-            loop {
-                match s.rx.recv().await {
-                    Ok(ThoughtEvent::Chunk { to, text, .. }) => {
-                        if !matches_filter(&to, &s.subscriber) {
-                            continue;
-                        }
-                        s.started = true;
-                        return Some((Ok(Bytes::from(text)), s));
-                    }
-                    Ok(ThoughtEvent::EndOfUtterance { to }) => {
-                        if !s.started {
-                            continue;
-                        }
-                        if matches_filter(&to, &s.subscriber) {
-                            return None;
-                        }
-                    }
-                    Err(RecvError::Lagged(n)) => {
-                        tracing::warn!(missed = n, "thought subscriber lagged");
-                        continue;
-                    }
-                    Err(RecvError::Closed) => return None,
-                }
-            }
-        },
-    )
-}
-
-fn matches_filter(to: &Option<PeerId>, subscriber: &Option<PeerId>) -> bool {
-    match (to, subscriber) {
-        (None, _) => true,
-        (Some(target), Some(sub)) => target == sub,
-        (Some(_), None) => true,
-    }
 }

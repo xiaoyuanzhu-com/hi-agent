@@ -13,11 +13,11 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use chrono::Utc;
-use tokio::sync::{Mutex, broadcast, mpsc};
+use tokio::sync::{Mutex, mpsc};
 
 use crate::acp::{AcpProcess, AcpSession, SessionOpts, SessionUpdate};
 use crate::memory::{Memory, build_for_peer};
-use crate::server::ThoughtEvent;
+use crate::server::ThoughtBus;
 use crate::types::{Channel, JournalEntry, PeerId, Signal};
 
 const ROUTER_SYSTEM_PROMPT: &str = "You are a human-interface agent. \
@@ -27,7 +27,6 @@ You have file access, code execution, and the rest of your harness's \
 tools; use them freely when helpful.";
 
 const PEER_QUEUE_CAPACITY: usize = 64;
-const AGENT_SENDER: &str = "agent@self";
 
 #[derive(Clone)]
 pub struct Reactor {
@@ -37,7 +36,7 @@ pub struct Reactor {
 struct ReactorInner {
     memory: Memory,
     acp: Arc<AcpProcess>,
-    thought_out: broadcast::Sender<ThoughtEvent>,
+    thought_bus: ThoughtBus,
     peers: Mutex<HashMap<PeerId, PeerHandle>>,
 }
 
@@ -52,13 +51,13 @@ pub fn start(
     memory: Memory,
     acp: Arc<AcpProcess>,
     mut inbound_rx: mpsc::Receiver<Signal>,
-    thought_out: broadcast::Sender<ThoughtEvent>,
+    thought_bus: ThoughtBus,
 ) -> Reactor {
     let reactor = Reactor {
         inner: Arc::new(ReactorInner {
             memory,
             acp,
-            thought_out,
+            thought_bus,
             peers: Mutex::new(HashMap::new()),
         }),
     };
@@ -219,7 +218,7 @@ async fn run_routing_turn(
 
     // End of utterance — closes the GET /thought response that's been
     // streaming this turn's chunks.
-    emit_end_of_utterance(reactor, peer);
+    emit_end_of_utterance(reactor, peer).await;
 
     {
         let mut guard = in_flight.lock().await;
@@ -242,21 +241,11 @@ async fn emit_thought_chunk(reactor: &Reactor, peer: &PeerId, text: String) {
     if let Err(err) = reactor.inner.memory.journal.append(entry).await {
         tracing::error!(peer = %peer, error = %err, "journal append failed for outbound thought");
     }
-    let event = ThoughtEvent::Chunk {
-        to: Some(peer.clone()),
-        from: PeerId(AGENT_SENDER.to_string()),
-        text,
-    };
-    if let Err(err) = reactor.inner.thought_out.send(event) {
-        tracing::debug!(peer = %peer, error = %err, "no thought subscribers for chunk");
-    }
+    reactor.inner.thought_bus.push_chunk(peer, text).await;
 }
 
-fn emit_end_of_utterance(reactor: &Reactor, peer: &PeerId) {
-    let event = ThoughtEvent::EndOfUtterance {
-        to: Some(peer.clone()),
-    };
-    let _ = reactor.inner.thought_out.send(event);
+async fn emit_end_of_utterance(reactor: &Reactor, peer: &PeerId) {
+    reactor.inner.thought_bus.end_utterance(peer).await;
 }
 
 fn render_batch(batch: &[Signal]) -> String {
