@@ -30,7 +30,7 @@ async fn main() -> Result<()> {
     let args: Vec<String> = env::args().skip(1).collect();
 
     tracing::info!(binary = %binary.display(), ?args, "spawning ACP child");
-    let process = Arc::new(AcpProcess::spawn(binary, args).await?);
+    let process = Arc::new(AcpProcess::spawn(binary, args, Vec::new()).await?);
 
     let prompts = [
         ("session-1", "Count to 3."),
