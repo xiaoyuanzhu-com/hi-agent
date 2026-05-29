@@ -46,12 +46,13 @@ struct ManifestVersions {
 /// back to "dev" placeholders when the manifest or bundle is absent.
 fn read_manifest_versions() -> ManifestVersions {
     let text = std::fs::read_to_string("runtime/manifest.toml").unwrap_or_default();
+    // Match `key = "value"` tolerating arbitrary whitespace around `=` (the
+    // manifest column-aligns its keys, so a fixed-space prefix would miss them).
     let get = |key: &str| -> Option<String> {
         text.lines().find_map(|l| {
-            let l = l.trim();
-            let prefix = format!("{key} =");
-            l.strip_prefix(&prefix)
-                .map(|v| v.trim().trim_matches('"').to_string())
+            let rest = l.trim().strip_prefix(key)?;
+            let rest = rest.trim_start().strip_prefix('=')?;
+            Some(rest.trim().trim_matches('"').to_string())
         })
     };
     let node_version = get("node_version").unwrap_or_else(|| "dev".to_string());
