@@ -27,3 +27,33 @@ export async function postAudio(opts: {
   }
   return (await res.json()) as { transcript: string; media_path: string };
 }
+
+export interface SubscribeAudioOpts {
+  /** Peer identity we receive on (sent as X-HI-To). */
+  peer: string;
+  signal: AbortSignal;
+}
+
+/**
+ * Outbound TTS (Phase 2). GET /audio is a long-poll that returns one
+ * synthesized clip per response, so we re-subscribe after each. Yields each
+ * audio blob as it arrives; the caller plays them in order.
+ */
+export async function* subscribeAudio(
+  opts: SubscribeAudioOpts,
+): AsyncGenerator<Blob, void, void> {
+  while (!opts.signal.aborted) {
+    const res = await fetch("/audio", {
+      method: "GET",
+      headers: { "X-HI-To": opts.peer, Accept: "audio/*" },
+      signal: opts.signal,
+      cache: "no-store",
+    });
+    if (!res.ok) {
+      throw new Error(`/audio subscribe failed: ${res.status} ${res.statusText}`);
+    }
+    const blob = await res.blob();
+    if (blob.size > 0) yield blob;
+  }
+}
+

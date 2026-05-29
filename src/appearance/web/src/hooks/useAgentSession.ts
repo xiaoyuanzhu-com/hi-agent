@@ -1,8 +1,9 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { subscribeThought, postThought } from "../channels/thought";
-import { postAudio } from "../channels/audio";
+import { postAudio, subscribeAudio } from "../channels/audio";
 import { AudioBus } from "../lib/audioBus";
 import { MicCapture } from "../lib/micCapture";
+import { VoicePlayer } from "../lib/voicePlayer";
 import { SentenceBuffer } from "../lib/sentences";
 import { getPeer } from "../lib/peer";
 import type { PresenceState } from "../ui/Presence";
@@ -43,11 +44,14 @@ export function useAgentSession(): AgentSession {
   const [userSpeaking, setUserSpeaking] = useState(false);
   const [agentStreaming, setAgentStreaming] = useState(false);
   const [awaiting, setAwaiting] = useState(false);
+  const [ttsPlaying, setTtsPlaying] = useState(false);
   const [offline, setOffline] = useState(false);
 
   const busRef = useRef<AudioBus | null>(null);
   const micRef = useRef<MicCapture | null>(null);
   const micStreamRef = useRef<MediaStream | null>(null);
+  const voiceRef = useRef<VoicePlayer | null>(null);
+  const userSpeakingRef = useRef(false);
   const sentenceIdRef = useRef(0);
 
   // ---- GET /thought subscription loop (after wake) -----------------------
@@ -103,6 +107,31 @@ export function useAgentSession(): AgentSession {
     };
   }, [woken, peer]);
 
+  // ---- GET /audio subscription loop (Phase 2: TTS playback) --------------
+  useEffect(() => {
+    if (!woken) return;
+    const ctrl = new AbortController();
+    let cancelled = false;
+    void (async () => {
+      while (!cancelled) {
+        try {
+          for await (const blob of subscribeAudio({ peer, signal: ctrl.signal })) {
+            if (cancelled) break;
+            // drop audio that arrives while the user talks (post barge-in staleness)
+            if (!userSpeakingRef.current) voiceRef.current?.enqueue(blob);
+          }
+        } catch {
+          if (cancelled || ctrl.signal.aborted) break;
+          await new Promise((r) => setTimeout(r, 1500));
+        }
+      }
+    })();
+    return () => {
+      cancelled = true;
+      ctrl.abort();
+    };
+  }, [woken, peer]);
+
   // ---- wake: acquire mic, build the audio graph --------------------------
   const wake = useCallback(() => {
     if (woken || waking) return;
@@ -117,9 +146,21 @@ export function useAgentSession(): AgentSession {
         await audioBus.resume();
         const micNode = audioBus.ctx.createMediaStreamSource(stream);
         audioBus.attachMic(micNode);
+        const voice = new VoicePlayer(
+          audioBus,
+          () => setTtsPlaying(true),
+          () => setTtsPlaying(false),
+        );
         const mic = new MicCapture(audioBus.ctx, micNode, {
-          onSpeechStart: () => setUserSpeaking(true),
-          onSpeechEnd: () => setUserSpeaking(false),
+          onSpeechStart: () => {
+            userSpeakingRef.current = true;
+            setUserSpeaking(true);
+            voice.stop(); // barge-in: stop speaking the moment the user does
+          },
+          onSpeechEnd: () => {
+            userSpeakingRef.current = false;
+            setUserSpeaking(false);
+          },
           onUtterance: ({ blob, mime }) => {
             setAwaiting(true);
             postAudio({ from: peer, blob, mime }).catch(() => setAwaiting(false));
@@ -128,6 +169,7 @@ export function useAgentSession(): AgentSession {
         micStreamRef.current = stream;
         busRef.current = audioBus;
         micRef.current = mic;
+        voiceRef.current = voice;
         setBus(audioBus);
         setWoken(true);
         setWaking(false);
@@ -147,6 +189,7 @@ export function useAgentSession(): AgentSession {
   useEffect(() => {
     return () => {
       micRef.current?.stop();
+      voiceRef.current?.stop();
       micStreamRef.current?.getTracks().forEach((t) => t.stop());
       busRef.current?.close();
     };
@@ -170,15 +213,14 @@ export function useAgentSession(): AgentSession {
       ? "offline"
       : userSpeaking
         ? "listening"
-        : agentStreaming
+        : agentStreaming || ttsPlaying
           ? "speaking"
           : awaiting
             ? "thinking"
             : "idle";
 
-  // Phase 1: dots track live audio only while listening to the user.
-  // Phase 2 will also set this true during TTS playback.
-  const reactive = state === "listening";
+  // Dots track live audio while listening (mic) or while the agent's voice plays.
+  const reactive = state === "listening" || (state === "speaking" && ttsPlaying);
 
   return { state, reactive, bus, sentences, woken, waking, wakeError, wake, sendText };
 }

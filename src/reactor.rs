@@ -13,12 +13,13 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use chrono::Utc;
-use tokio::sync::{Mutex, mpsc};
+use tokio::sync::{Mutex, broadcast, mpsc};
 
 use crate::acp::{AcpProcess, AcpSession, SessionOpts, SessionUpdate};
 use crate::memory::{Memory, build_for_peer};
-use crate::server::ThoughtBus;
+use crate::server::{AudioEvent, ThoughtBus};
 use crate::types::{Channel, JournalEntry, PeerId, Signal};
+use crate::voice::Tts;
 
 const ROUTER_SYSTEM_PROMPT: &str = "You are a human-interface agent. \
 A peer is talking to you over /thought. Reply naturally with text — \
@@ -37,6 +38,11 @@ struct ReactorInner {
     memory: Memory,
     acp: Arc<AcpProcess>,
     thought_bus: ThoughtBus,
+    /// Speech synthesis. `None` → the agent's replies are text-only (Phase 1
+    /// behavior); when set, each sentence is synthesized and broadcast on /audio.
+    tts: Option<Arc<dyn Tts>>,
+    /// Outbound audio broadcast that GET /audio subscribers drain.
+    audio_out: broadcast::Sender<AudioEvent>,
     peers: Mutex<HashMap<PeerId, PeerHandle>>,
 }
 
@@ -52,12 +58,16 @@ pub fn start(
     acp: Arc<AcpProcess>,
     mut inbound_rx: mpsc::Receiver<Signal>,
     thought_bus: ThoughtBus,
+    tts: Option<Arc<dyn Tts>>,
+    audio_out: broadcast::Sender<AudioEvent>,
 ) -> Reactor {
     let reactor = Reactor {
         inner: Arc::new(ReactorInner {
             memory,
             acp,
             thought_bus,
+            tts,
+            audio_out,
             peers: Mutex::new(HashMap::new()),
         }),
     };
@@ -184,12 +194,34 @@ async fn run_routing_turn(
         *guard = Some(session.clone());
     }
 
+    let tts = reactor.inner.tts.clone();
+
     let outcome: anyhow::Result<()> = async {
         let mut run = session.prompt(prompt_text).await?;
+
+        // Per-sentence TTS: a background task fed by an mpsc queue synthesizes
+        // completed sentences in order and broadcasts them on /audio, so text
+        // streaming is never blocked on synthesis. The queue/task exist only
+        // when TTS is configured.
+        let mut splitter = SentenceSplitter::new();
+        let (synth_tx, synth_handle) = match tts {
+            Some(tts) => {
+                let (tx, rx) = mpsc::channel::<String>(64);
+                let handle =
+                    tokio::spawn(synth_loop(tts, reactor.inner.audio_out.clone(), peer.clone(), rx));
+                (Some(tx), Some(handle))
+            }
+            None => (None, None),
+        };
+
         loop {
-            let update = run.next_update().await;
-            match update {
+            match run.next_update().await {
                 Some(SessionUpdate::Text(text)) => {
+                    if let Some(tx) = &synth_tx {
+                        for sentence in splitter.push(&text) {
+                            let _ = tx.send(sentence).await;
+                        }
+                    }
                     emit_thought_chunk(reactor, peer, text).await;
                 }
                 Some(SessionUpdate::Thought(_)) => {
@@ -204,12 +236,31 @@ async fn run_routing_turn(
                 None => break,
             }
         }
+
+        // Flush the trailing partial sentence to TTS.
+        if let Some(tx) = &synth_tx {
+            if let Some(tail) = splitter.flush() {
+                let _ = tx.send(tail).await;
+            }
+        }
+
+        let mut cancelled = false;
         match run.wait().await {
             Ok(result) => {
                 tracing::debug!(peer = %peer, stop = ?result.stop_reason, "routing turn finished");
             }
             Err(err) => {
+                cancelled = true;
                 tracing::debug!(peer = %peer, error = %err, "routing run ended with error (likely cancel)");
+            }
+        }
+
+        // Closing the queue lets the synth task drain queued sentences; on a
+        // cancel (barge-in) abort it so stale audio isn't spoken over the user.
+        drop(synth_tx);
+        if let Some(handle) = synth_handle {
+            if cancelled {
+                handle.abort();
             }
         }
         Ok(())
@@ -260,4 +311,112 @@ fn render_batch(batch: &[Signal]) -> String {
         );
     }
     s
+}
+
+/// Background task: synthesize each queued sentence and broadcast it on /audio.
+/// One queue, sequential await → audio plays in order. Send errors are ignored
+/// (no subscriber connected is fine); synth failures are logged, not fatal.
+async fn synth_loop(
+    tts: Arc<dyn Tts>,
+    audio_out: broadcast::Sender<AudioEvent>,
+    peer: PeerId,
+    mut rx: mpsc::Receiver<String>,
+) {
+    while let Some(sentence) = rx.recv().await {
+        match tts.synthesize(&sentence).await {
+            Ok(blob) => {
+                let event = AudioEvent {
+                    to: Some(peer.clone()),
+                    mime: blob.mime,
+                    bytes: blob.bytes,
+                    ts: Utc::now(),
+                };
+                let _ = audio_out.send(event);
+            }
+            Err(err) => {
+                tracing::warn!(peer = %peer, error = %err, "TTS synthesize failed");
+            }
+        }
+    }
+}
+
+/// Minimal incremental sentence splitter for per-sentence TTS, mirroring the
+/// frontend `sentences.ts`: CJK terminators (。！？) split immediately; Latin
+/// terminators (.!?…) split only when followed by whitespace, so decimals and
+/// abbreviations aren't broken. The trailing partial waits for `flush()`.
+struct SentenceSplitter {
+    buf: String,
+}
+
+impl SentenceSplitter {
+    fn new() -> Self {
+        Self { buf: String::new() }
+    }
+
+    fn push(&mut self, chunk: &str) -> Vec<String> {
+        self.buf.push_str(chunk);
+        let mut out = Vec::new();
+        while let Some(idx) = find_boundary(&self.buf) {
+            let sentence = self.buf[..idx].trim().to_string();
+            self.buf = self.buf[idx..].trim_start().to_string();
+            if !sentence.is_empty() {
+                out.push(sentence);
+            }
+        }
+        out
+    }
+
+    fn flush(&mut self) -> Option<String> {
+        let s = self.buf.trim().to_string();
+        self.buf.clear();
+        if s.is_empty() { None } else { Some(s) }
+    }
+}
+
+/// Byte index just past the first sentence terminator that qualifies as a
+/// boundary, or `None` if the buffer holds no complete sentence yet.
+fn find_boundary(s: &str) -> Option<usize> {
+    let mut chars = s.char_indices().peekable();
+    while let Some((off, c)) = chars.next() {
+        let end = off + c.len_utf8();
+        if matches!(c, '。' | '！' | '？') {
+            return Some(end);
+        }
+        if matches!(c, '.' | '!' | '?' | '…') {
+            if let Some(&(_, next)) = chars.peek() {
+                if next.is_whitespace() {
+                    return Some(end);
+                }
+            }
+        }
+    }
+    None
+}
+
+#[cfg(test)]
+mod tests {
+    use super::SentenceSplitter;
+
+    #[test]
+    fn splits_latin_on_terminator_plus_space() {
+        let mut s = SentenceSplitter::new();
+        assert_eq!(s.push("Hello world"), Vec::<String>::new());
+        assert_eq!(s.push(". How are"), vec!["Hello world.".to_string()]);
+        assert_eq!(s.flush(), Some("How are".to_string()));
+    }
+
+    #[test]
+    fn does_not_split_decimals() {
+        let mut s = SentenceSplitter::new();
+        assert_eq!(s.push("pi is 3.14 today"), Vec::<String>::new());
+    }
+
+    #[test]
+    fn splits_cjk_immediately() {
+        let mut s = SentenceSplitter::new();
+        assert_eq!(
+            s.push("你好。最近怎么样？"),
+            vec!["你好。".to_string(), "最近怎么样？".to_string()]
+        );
+    }
 }

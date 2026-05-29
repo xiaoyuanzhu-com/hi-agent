@@ -32,10 +32,10 @@ pub async fn run(config: Config) -> anyhow::Result<()> {
 
     // Voice capabilities. `None` is fine; gates affect /audio only.
     let stt = voice::build_stt()?;
-    let _tts = voice::build_tts()?;
+    let tts = voice::build_tts()?;
     tracing::info!(
         stt = stt.is_some(),
-        tts = _tts.is_some(),
+        tts = tts.is_some(),
         "voice capabilities resolved"
     );
 
@@ -46,11 +46,18 @@ pub async fn run(config: Config) -> anyhow::Result<()> {
     );
     tracing::info!("ACP subprocess up");
 
-    let _reactor = reactor::start(memory, acp, seams.inbound_rx, seams.thought_bus);
+    let _reactor = reactor::start(
+        memory,
+        acp,
+        seams.inbound_rx,
+        seams.thought_bus,
+        tts,
+        seams.audio_out.clone(),
+    );
     tracing::info!("reactor started");
 
-    // Hold the audio_out broadcast sender so subscribers see Lagged not Closed
-    // while there is no producer.
+    // Hold a clone of the audio_out broadcast sender so subscribers see Lagged
+    // not Closed even between turns (the reactor holds the producing clone).
     let _audio_out = seams.audio_out;
 
     let addr = ("0.0.0.0", config.port);
