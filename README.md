@@ -1,6 +1,6 @@
 # hi-agent
 
-A reference implementation of the [human-interface](../human-interface/docs/human-interface.md) spec — a small Rust agent that talks over HTTP channels, delegates cognition to `claude-code` over ACP, and persists everything to JSONL.
+A reference implementation of the [human-interface](../human-interface/docs/human-interface.md) spec — a small Rust agent that talks over HTTP channels, delegates cognition to a bundled Claude Code runtime over ACP, and persists everything to JSONL.
 
 ## Status
 
@@ -11,8 +11,11 @@ design v0.1 · 2026-05-28 · v0 implementation complete · not load-tested.
 ### Prerequisites
 
 - Rust toolchain (2024 edition — `rustc` 1.85 or newer)
-- Node 22+ (npm ships with Node)
-- `claude-code` available on `PATH`, or set `CLAUDE_CODE_BIN`
+- A running binary needs no separate runtime — Node, the ACP adapter, and the
+  `claude` CLI are bundled into the binary and extracted to an OS cache dir on
+  first run.
+- Building from source additionally needs Node 22+ (npm ships with Node), used
+  only to produce that bundle via `make bundle`.
 
 ### Build and run
 
@@ -74,7 +77,7 @@ curl -X POST -H 'X-HI-From: alice@phone' \
 
 ## Architecture
 
-One Rust process per agent. Inside it: an axum HTTP server, a reactor that owns per-peer queues and a worker registry, a memory facade backed by two JSONL files, an in-process MCP hub the router/worker sessions reach over a Unix socket, and a heartbeat that injects synthetic signals when intents come due. Cognition is delegated: hi-agent spawns one `claude-code` subprocess at startup and creates one fresh ACP session per routing turn (and one per long-lived worker).
+One Rust process per agent. Inside it: an axum HTTP server, a reactor that owns per-peer queues and a worker registry, a memory facade backed by two JSONL files, an in-process MCP hub the router/worker sessions reach over a Unix socket, and a heartbeat that injects synthetic signals when intents come due. Cognition is delegated: hi-agent extracts its bundled runtime, spawns the bundled ACP adapter (via the bundled `node`) at startup, and creates one fresh ACP session per routing turn (and one per long-lived worker). The adapter talks to a local Anthropic-compatible proxy that injects the real upstream credential, so the key never lands in any on-disk adapter config.
 
 ```
   peers              hi-agent  (Rust process)              claude-code subprocess
@@ -130,11 +133,29 @@ Env vars consulted at startup:
 
 | Variable | Default | Purpose |
 |---|---|---|
-| `CLAUDE_CODE_BIN` | `claude-code` | Program to spawn for the ACP subprocess |
-| `CLAUDE_CODE_ARGS` | (empty) | Whitespace-split args appended to the ACP launch |
+| `HI_AGENT_UPSTREAM_KEY` | — | Upstream LLM credential, injected by the local proxy. Required; read from env only, never written to disk. |
+| `HI_AGENT_CONFIG` | `config.toml` | Path to the dev-managed config file (model / effort / permission mode / thinking budget / upstream URL) |
+| `HI_AGENT_RUNTIME_DIR` | OS cache dir | Override the dir the bundled runtime is extracted into |
 | `HI_AGENT_MCP_SOCK` | `<data_dir>/mcp.sock` | Unix socket the MCP hub listens on |
 | `HI_AGENT_SHIM_BIN` | `current_exe()` | Program to re-exec as the MCP stdio↔socket shim |
 | `RUST_LOG` | `info` | Standard `tracing-subscriber` env filter |
+
+Managed cognition parameters (model, effort, permission mode, max thinking
+tokens, and the upstream base URL) live in [`config.toml`](config.toml), not in
+env vars. The dev-only `HI_AGENT_DEV_NODE` / `HI_AGENT_DEV_ADAPTER` /
+`HI_AGENT_DEV_CLAUDE` overrides let you point at an external runtime when
+building without `make bundle` (unsupported; debug use only).
+
+### Bundled runtime & versioning
+
+The Node version, ACP adapter version, and per-target Node download URLs +
+SHA256 checksums are pinned in [`runtime/manifest.toml`](runtime/manifest.toml).
+`make bundle` fetches and checksum-verifies Node, runs `npm ci` against the
+committed lockfile, and packs a per-target `runtime/embed/<target>.tar.zst`;
+`build.rs` embeds the archive for the active target into the binary (or a
+zero-byte placeholder when no bundle is present). `hi-agent --version` reports
+the crate version alongside the bundled component versions (bundle id, node,
+adapter, claude).
 
 ### Voice (optional, additive)
 
@@ -168,9 +189,9 @@ CLI flags:
 ```
 hi-agent/
 ├── Cargo.toml                              # crate + dev-dependencies
-├── build.rs                                # rerun-if-changed for the SPA
+├── build.rs                                # embeds the SPA + runtime archive, stamps versions
 ├── Dockerfile                              # multi-stage build (SPA → rust → debian-slim)
-├── docker-compose.yml                      # sibling-container layout for claude-code (illustrative)
+├── docker-compose.yml                      # compose layout (illustrative)
 ├── Makefile                                # build / dev / run / test / docker
 ├── docs/
 │   ├── impl.md                             # architecture and step plan
@@ -185,7 +206,7 @@ hi-agent/
 │   ├── types.rs                            # PeerId, Channel, Signal, JournalEntry, Intent
 │   ├── server/                             # axum router + extractors + handlers
 │   ├── reactor.rs                          # per-peer queues, worker registry, interruption
-│   ├── acp/                                # claude-code subprocess + per-session helpers
+│   ├── acp/                                # bundled adapter subprocess + per-session helpers
 │   ├── mcp.rs                              # in-process MCP hub + the seven tools
 │   ├── memory/                             # journal, intents, snapshot builder
 │   ├── heartbeat.rs                        # 1 Hz tick; absolute-intent firing
@@ -214,11 +235,14 @@ The browser talks to `:5173`. HMR works for the SPA; Rust reloads on file change
 docker build -t hi-agent:dev .
 ```
 
-The image is self-contained for the Rust binary but **does not include `claude-code`**. The v0 strategy is a sibling container reached over a Unix socket; see [`docker-compose.yml`](docker-compose.yml) for the layout. The exact `claude-code` image and command are not pinned in this repo — treat the compose file as illustrative and adjust to whatever `claude-code` distribution you have access to.
+The binary bundles its own runtime (Node + ACP adapter + `claude` CLI), so the
+image needs no separate claude-code container — the runtime is extracted to a
+cache dir on first run. The image still needs `HI_AGENT_UPSTREAM_KEY` supplied
+at runtime for cognition to work.
 
 ## Risks and known unverified things
 
-See [`docs/risks.md`](docs/risks.md). The headline items: concurrent ACP sessions in `claude-code` have not been measured under load, and the Docker sibling-container story is illustrative rather than tested. Run `cargo run --example acp_spike` after first build to validate the concurrency assumption before trusting the architecture in production.
+See [`docs/risks.md`](docs/risks.md). The headline item: concurrent ACP sessions in the bundled Claude Code runtime have not been measured under load. Run `cargo run --example acp_spike` after first build to validate the concurrency assumption before trusting the architecture in production.
 
 ## License
 
