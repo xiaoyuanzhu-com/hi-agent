@@ -1,0 +1,7 @@
+{
+  "name": "hi-agent-runtime",
+  "private": true,
+  "dependencies": {
+    "@agentclientprotocol/claude-agent-acp": "0.36.1"
+  }
+}

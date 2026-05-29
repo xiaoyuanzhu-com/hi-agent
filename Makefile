@@ -1,4 +1,4 @@
-.PHONY: help build dev run test docker
+.PHONY: help build dev run test docker bundle
 
 help:
 	@grep -E '^[a-zA-Z_-]+:.*?## .*$$' $(MAKEFILE_LIST) | awk 'BEGIN {FS = ":.*?## "}; {printf "  %-8s %s\n", $$1, $$2}'
@@ -22,3 +22,6 @@ test: ## run rust + web tests
 
 docker: ## build the docker image
 	docker build -t hi-agent:dev .
+
+bundle: ## Build the embedded runtime archive for the host target
+	@scripts/bundle.sh $$(rustc -vV | sed -n 's/host: //p')
