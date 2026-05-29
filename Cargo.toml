@@ -39,7 +39,7 @@ agent-client-protocol = { version = "0.12", features = ["unstable_session_usage"
 # for the audio bytes flowing through them. `bytes` is also re-exported via
 # `Bytes` in axum extractors; keeping it explicit makes the voice traits
 # legible without depending on a particular axum version.
-reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls", "stream"] }
 tokio-tungstenite = { version = "0.24", default-features = false, features = ["rustls-tls-webpki-roots", "connect"] }
 bytes = "1"
 base64 = "0.22"
