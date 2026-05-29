@@ -12,7 +12,7 @@ pub const ENV_CONFIG_PATH: &str = "HI_AGENT_CONFIG";
 
 /// Dev-managed cognition parameters. Non-secret fields come from `config.toml`;
 /// `upstream_key` is injected from the environment so it never lives in git.
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct AgentConfig {
     pub upstream_base_url: String,
     pub model: Option<String>,
@@ -20,6 +20,21 @@ pub struct AgentConfig {
     pub permission_mode: Option<String>,
     pub max_thinking_tokens: Option<u32>,
     pub upstream_key: String,
+}
+
+// Hand-written so the upstream credential never lands in logs (`Config` derives
+// Debug and is traced at startup). The key is reduced to a redaction marker.
+impl std::fmt::Debug for AgentConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("AgentConfig")
+            .field("upstream_base_url", &self.upstream_base_url)
+            .field("model", &self.model)
+            .field("effort", &self.effort)
+            .field("permission_mode", &self.permission_mode)
+            .field("max_thinking_tokens", &self.max_thinking_tokens)
+            .field("upstream_key", &"<redacted>")
+            .finish()
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -154,6 +169,18 @@ mod tests {
         assert_eq!(cfg.permission_mode.as_deref(), Some("acceptEdits"));
         assert_eq!(cfg.max_thinking_tokens, Some(10000));
         assert_eq!(cfg.upstream_key, "secret-key");
+    }
+
+    #[test]
+    fn debug_redacts_the_upstream_key() {
+        let cfg = AgentConfig::from_toml_str(
+            r#"upstream_base_url = "https://x/v1""#,
+            "super-secret-key".to_string(),
+        )
+        .unwrap();
+        let rendered = format!("{cfg:?}");
+        assert!(!rendered.contains("super-secret-key"), "key leaked: {rendered}");
+        assert!(rendered.contains("<redacted>"));
     }
 
     #[test]

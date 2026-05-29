@@ -53,14 +53,16 @@ pub struct AcpProcess {
 }
 
 impl AcpProcess {
-    pub async fn spawn(program: PathBuf, args: Vec<String>) -> anyhow::Result<Self> {
+    pub async fn spawn(
+        program: PathBuf,
+        args: Vec<String>,
+        env: Vec<(String, String)>,
+    ) -> anyhow::Result<Self> {
         let program_str = program
             .to_str()
             .ok_or_else(|| anyhow!("program path is not valid UTF-8: {}", program.display()))?
             .to_string();
-        let mut argv: Vec<String> = Vec::with_capacity(1 + args.len());
-        argv.push(program_str);
-        argv.extend(args);
+        let argv = build_argv(&program_str, &args, &env);
 
         let agent = acp::AcpAgent::from_args(argv.iter())
             .with_context(|| format!("constructing AcpAgent for {}", program.display()))?;
@@ -202,6 +204,19 @@ impl AcpProcess {
     }
 }
 
+/// Assemble the argv for `AcpAgent::from_args`: leading `NAME=value` env pairs,
+/// then the program and its args. `from_args` parses leading env pairs into the
+/// child process env (applied atop the inherited parent env).
+fn build_argv(program: &str, args: &[String], env: &[(String, String)]) -> Vec<String> {
+    let mut argv = Vec::with_capacity(env.len() + 1 + args.len());
+    for (k, v) in env {
+        argv.push(format!("{k}={v}"));
+    }
+    argv.push(program.to_string());
+    argv.extend(args.iter().cloned());
+    argv
+}
+
 impl Drop for AcpProcess {
     fn drop(&mut self) {
         self.signal_shutdown();
@@ -264,5 +279,20 @@ fn auto_allow(
 
     if let Err(err) = responder.respond(response) {
         tracing::warn!(error = %err, "auto_allow respond failed");
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn spawn_argv_prepends_env_pairs() {
+        // White-box the argv assembly used by spawn(): env pairs come first as
+        // NAME=value so AcpAgent::from_args treats them as child env.
+        let env = vec![
+            ("FOO".to_string(), "bar".to_string()),
+            ("BAZ".to_string(), "qux".to_string()),
+        ];
+        let argv = super::build_argv("node", &["adapter.js".to_string()], &env);
+        assert_eq!(argv, vec!["FOO=bar", "BAZ=qux", "node", "adapter.js"]);
     }
 }
