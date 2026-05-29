@@ -44,6 +44,11 @@ tokio-tungstenite = { version = "0.24", default-features = false, features = ["r
 bytes = "1"
 base64 = "0.22"
 
+toml = "0.8"
+tar = "0.4"
+zstd = "0.13"
+directories = "5"
+
 [dev-dependencies]
 # tempfile is used by integration tests for throwaway data dirs.
 tempfile = "3"

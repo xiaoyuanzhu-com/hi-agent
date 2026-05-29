@@ -7,7 +7,10 @@ use tokio::net::TcpListener;
 
 pub mod acp;
 pub mod appearance;
+pub mod config;
+pub mod llm_proxy;
 pub mod memory;
+pub mod runtime;
 pub mod reactor;
 pub mod server;
 pub mod types;
