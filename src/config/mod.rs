@@ -63,6 +63,28 @@ impl AgentConfig {
             upstream_key,
         })
     }
+
+    /// Write a managed `settings.json` into `config_dir` (the adapter's
+    /// `CLAUDE_CONFIG_DIR`). Only fields that are set are emitted.
+    pub fn render_settings_json(&self, config_dir: &Path) -> anyhow::Result<()> {
+        std::fs::create_dir_all(config_dir)
+            .with_context(|| format!("creating config dir {}", config_dir.display()))?;
+        let mut root = serde_json::Map::new();
+        if let Some(effort) = &self.effort {
+            root.insert("effortLevel".into(), serde_json::json!(effort));
+        }
+        if let Some(mode) = &self.permission_mode {
+            root.insert(
+                "permissions".into(),
+                serde_json::json!({ "defaultMode": mode }),
+            );
+        }
+        let value = serde_json::Value::Object(root);
+        let path = config_dir.join("settings.json");
+        std::fs::write(&path, serde_json::to_vec_pretty(&value)?)
+            .with_context(|| format!("writing {}", path.display()))?;
+        Ok(())
+    }
 }
 
 #[cfg(test)]
@@ -105,5 +127,40 @@ mod tests {
         assert!(cfg.effort.is_none());
         assert!(cfg.permission_mode.is_none());
         assert!(cfg.max_thinking_tokens.is_none());
+    }
+
+    #[test]
+    fn renders_settings_json_with_set_fields() {
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = AgentConfig::from_toml_str(
+            r#"
+                upstream_base_url = "https://x/v1"
+                effort = "high"
+                permission_mode = "acceptEdits"
+            "#,
+            "k".to_string(),
+        )
+        .unwrap();
+        cfg.render_settings_json(dir.path()).unwrap();
+        let written = std::fs::read_to_string(dir.path().join("settings.json")).unwrap();
+        let v: serde_json::Value = serde_json::from_str(&written).unwrap();
+        assert_eq!(v["effortLevel"], "high");
+        assert_eq!(v["permissions"]["defaultMode"], "acceptEdits");
+    }
+
+    #[test]
+    fn omits_unset_fields() {
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = AgentConfig::from_toml_str(
+            r#"upstream_base_url = "https://x/v1""#,
+            "k".to_string(),
+        )
+        .unwrap();
+        cfg.render_settings_json(dir.path()).unwrap();
+        let v: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(dir.path().join("settings.json")).unwrap())
+                .unwrap();
+        assert!(v.get("effortLevel").is_none());
+        assert!(v.get("permissions").is_none());
     }
 }
