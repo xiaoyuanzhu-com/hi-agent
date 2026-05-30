@@ -51,6 +51,7 @@ pub async fn post_thought(
         len = signal.body.len(),
         "POST /thought"
     );
+    crate::channel_log::inbound(Channel::Thought, &from, &signal.body);
 
     let entry = JournalEntry::SignalIn {
         ts: signal.ts,

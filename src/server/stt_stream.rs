@@ -73,8 +73,16 @@ async fn drive(
 
     // Forward each transcript update to the browser as JSON. Ends when the STT
     // task drops `tr_tx` (i.e. recognition finished).
+    let log_peer = peer.clone();
     let send_task = tokio::spawn(async move {
         while let Some(t) = tr_rx.recv().await {
+            // Rolling preliminaries are noisy → debug; the polished final is the
+            // turn's input and is logged on the `channel` stream below.
+            if t.is_final {
+                tracing::debug!(target: "channel", peer = %log_peer, text = %t.text, "stt final (pre-journal)");
+            } else {
+                tracing::debug!(target: "channel", peer = %log_peer, text = %t.text, "stt partial");
+            }
             let frame = serde_json::json!({ "text": t.text, "final": t.is_final }).to_string();
             if ws_tx.send(Message::Text(frame.into())).await.is_err() {
                 break;
@@ -131,6 +139,7 @@ async fn journal_and_dispatch(state: &Arc<AppState>, peer: &PeerId, transcript: 
         }
     };
 
+    crate::channel_log::inbound(Channel::Audio, peer, &transcript);
     let ts = Utc::now();
     let entry = JournalEntry::SignalIn {
         ts,

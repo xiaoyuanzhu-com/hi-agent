@@ -32,6 +32,10 @@ pub struct AudioEvent {
     pub to: Option<PeerId>,
     pub mime: String,
     pub bytes: Bytes,
+    /// Monotonic id of the cognition turn that produced this clip. The client
+    /// voices only the latest turn it has seen and discards superseded drafts,
+    /// so a turn that was cancelled mid-flight never speaks over a newer reply.
+    pub turn: u64,
     pub ts: DateTime<Utc>,
 }
 

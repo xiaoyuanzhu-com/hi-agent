@@ -114,6 +114,7 @@ pub async fn post_audio(
         body: transcript.clone(),
         ts,
     };
+    crate::channel_log::inbound(Channel::Audio, &from, &transcript);
     let entry = JournalEntry::SignalIn {
         ts,
         channel: Channel::Audio,
@@ -154,8 +155,12 @@ pub async fn get_audio(
                     continue;
                 }
                 let mut response = (StatusCode::OK, event.bytes).into_response();
+                let headers = response.headers_mut();
                 if let Ok(val) = HeaderValue::from_str(&event.mime) {
-                    response.headers_mut().insert(CONTENT_TYPE, val);
+                    headers.insert(CONTENT_TYPE, val);
+                }
+                if let Ok(val) = HeaderValue::from_str(&event.turn.to_string()) {
+                    headers.insert("X-HI-Turn", val);
                 }
                 return response;
             }

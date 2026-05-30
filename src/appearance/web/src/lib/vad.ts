@@ -32,7 +32,13 @@ export class Vad {
     this.o = {
       startThreshold: opts.startThreshold ?? 0.045,
       endThreshold: opts.endThreshold ?? 0.025,
-      endSilenceMs: opts.endSilenceMs ?? 700,
+      // Trailing silence that commits the turn. Energy VAD can't tell a
+      // mid-thought pause from a real end-of-turn, so this is a blunt tradeoff:
+      // too low and a pause ends the turn early (the agent replies, then the
+      // user keeps talking and the stale reply gets cut off); too high and
+      // replies feel laggy. ~1s is a calmer default than 700ms; for real
+      // turn-taking, gate this with a semantic end-of-utterance model (see notes).
+      endSilenceMs: opts.endSilenceMs ?? 1000,
       minVoicedMs: opts.minVoicedMs ?? 300,
     };
   }

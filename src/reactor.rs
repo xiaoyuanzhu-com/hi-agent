@@ -11,6 +11,7 @@
 
 use std::collections::HashMap;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use chrono::Utc;
 use tokio::sync::{Mutex, broadcast, mpsc};
@@ -27,6 +28,15 @@ A peer is talking to you over /thought. Reply naturally with text — your reply
 streams back to them and is spoken aloud, so keep it conversational. You have \
 file access, code execution, and the rest of your harness's tools; use them \
 freely when helpful.\n\
+\n\
+The peer often speaks in several short bursts with pauses between them, so by \
+the time you reply you may be seeing the whole thing at once under \"New \
+signals\". Respond the way a person who was listening the whole time would: \
+take in everything they said and answer it as one. When it feels natural, open \
+with a brief acknowledgement of what you've understood before your considered \
+answer (\"got it — for the flights…\"); if you're still missing something, keep \
+it short rather than guessing. Don't pad: a little to say means a short reply. \
+What you say is for when they've finished a thought — never talk over them.\n\
 \n\
 To show rich visual content (an image, a chart, a web page, a table, a \
 preview), emit a self-contained HTML block wrapped in surface markers: \
@@ -55,6 +65,9 @@ struct ReactorInner {
     audio_out: broadcast::Sender<AudioEvent>,
     /// Outbound rich-content broadcast that GET /surface subscribers drain.
     surface_out: broadcast::Sender<SurfaceEvent>,
+    /// Monotonic cognition-turn counter. Each routing turn claims the next id so
+    /// the client can tell a fresh reply from a superseded draft (see AudioEvent).
+    turn_seq: AtomicU64,
     peers: Mutex<HashMap<PeerId, PeerHandle>>,
 }
 
@@ -82,6 +95,7 @@ pub fn start(
             tts,
             audio_out,
             surface_out,
+            turn_seq: AtomicU64::new(0),
             peers: Mutex::new(HashMap::new()),
         }),
     };
@@ -185,6 +199,7 @@ async fn run_routing_turn(
     batch: &[Signal],
     in_flight: &Arc<Mutex<Option<Arc<AcpSession>>>>,
 ) -> anyhow::Result<()> {
+    let turn_id = reactor.inner.turn_seq.fetch_add(1, Ordering::Relaxed);
     let snap = build_for_peer(&reactor.inner.memory, peer).await?;
     let prompt_text = format!(
         "{}\n\n## New signals\n{}",
@@ -219,11 +234,19 @@ async fn run_routing_turn(
         // when TTS is configured.
         let mut splitter = SentenceSplitter::new();
         let mut extractor = SurfaceExtractor::new();
+        // Accumulate the spoken text so the whole reply is logged once at end of
+        // turn on the `channel` stream, rather than per-chunk (which is noisy).
+        let mut full_reply = String::new();
         let (synth_tx, synth_handle) = match tts {
             Some(tts) => {
                 let (tx, rx) = mpsc::channel::<String>(64);
-                let handle =
-                    tokio::spawn(synth_loop(tts, reactor.inner.audio_out.clone(), peer.clone(), rx));
+                let handle = tokio::spawn(synth_loop(
+                    tts,
+                    reactor.inner.audio_out.clone(),
+                    peer.clone(),
+                    turn_id,
+                    rx,
+                ));
                 (Some(tx), Some(handle))
             }
             None => (None, None),
@@ -238,6 +261,7 @@ async fn run_routing_turn(
                         emit_surface(reactor, peer, envelope);
                     }
                     if !clean.is_empty() {
+                        full_reply.push_str(&clean);
                         if let Some(tx) = &synth_tx {
                             for sentence in splitter.push(&clean) {
                                 let _ = tx.send(sentence).await;
@@ -263,12 +287,16 @@ async fn run_routing_turn(
         // the trailing partial sentence to TTS.
         let clean_tail = extractor.flush();
         if !clean_tail.is_empty() {
+            full_reply.push_str(&clean_tail);
             if let Some(tx) = &synth_tx {
                 for sentence in splitter.push(&clean_tail) {
                     let _ = tx.send(sentence).await;
                 }
             }
             emit_thought_chunk(reactor, peer, clean_tail).await;
+        }
+        if !full_reply.trim().is_empty() {
+            crate::channel_log::outbound(Channel::Thought, peer, full_reply.trim());
         }
         if let Some(tx) = &synth_tx {
             if let Some(tail) = splitter.flush() {
@@ -352,15 +380,27 @@ async fn synth_loop(
     tts: Arc<dyn Tts>,
     audio_out: broadcast::Sender<AudioEvent>,
     peer: PeerId,
+    turn: u64,
     mut rx: mpsc::Receiver<String>,
 ) {
     while let Some(sentence) = rx.recv().await {
         match tts.synthesize(&sentence).await {
             Ok(blob) => {
+                tracing::info!(
+                    target: "channel",
+                    dir = "out",
+                    channel = "audio",
+                    peer = %peer,
+                    turn = turn,
+                    bytes = blob.bytes.len(),
+                    text = %sentence,
+                    "channel out (tts)",
+                );
                 let event = AudioEvent {
                     to: Some(peer.clone()),
                     mime: blob.mime,
                     bytes: blob.bytes,
+                    turn,
                     ts: Utc::now(),
                 };
                 let _ = audio_out.send(event);
@@ -427,6 +467,16 @@ fn find_boundary(s: &str) -> Option<usize> {
 
 /// Emit one rich-content envelope to GET /surface subscribers for this peer.
 fn emit_surface(reactor: &Reactor, peer: &PeerId, envelope: SurfaceEnvelope) {
+    tracing::info!(
+        target: "channel",
+        dir = "out",
+        channel = "surface",
+        peer = %peer,
+        op = ?envelope.op,
+        mode = ?envelope.mode,
+        html_len = envelope.html.as_deref().map(str::len).unwrap_or(0),
+        "channel out (surface)",
+    );
     let event = SurfaceEvent {
         to: Some(peer.clone()),
         envelope,

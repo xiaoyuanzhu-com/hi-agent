@@ -15,6 +15,10 @@ import type { SpeechItem } from "../ui/SpeechText";
 const SENTENCE_WINDOW = 2;
 // Stable id for the in-progress user line so React updates it in place.
 const LIVE_USER_ID = -1;
+// Courtesy pause after the user stops before the agent's held reply is voiced —
+// a small floor-yield margin so a quick follow-up breath isn't talked over. The
+// VAD's endSilenceMs already gates *detecting* the stop; this is on top.
+const FLOOR_SETTLE_MS = 350;
 
 export interface AgentSession {
   state: PresenceState;
@@ -67,9 +71,30 @@ export function useAgentSession(): AgentSession {
   const micStreamRef = useRef<MediaStream | null>(null);
   const voiceRef = useRef<VoicePlayer | null>(null);
   const sttRef = useRef<SttStream | null>(null);
-  const userSpeakingRef = useRef(false);
   const sentenceIdRef = useRef(0);
   const surfaceTtlRef = useRef<number | null>(null);
+
+  // ---- output floor control (turn-tagged TTS) ----------------------------
+  // The agent's speaking is its own channel: we voice only the latest cognition
+  // turn and hold it until the user yields the floor. `activeTurnRef` is the
+  // highest turn id seen; clips from older (superseded) turns are discarded.
+  // `pendingAudioRef` buffers the live turn's clips while the floor is closed so
+  // the kept reply's opening is never dropped — it's released, in order, once
+  // the floor opens.
+  const activeTurnRef = useRef(-1);
+  const pendingAudioRef = useRef<Blob[]>([]);
+  const floorOpenRef = useRef(true);
+  const settleTimerRef = useRef<number | null>(null);
+
+  const releasePending = useCallback(() => {
+    if (!floorOpenRef.current) return;
+    const voice = voiceRef.current;
+    if (!voice) return;
+    const clips = pendingAudioRef.current;
+    if (clips.length === 0) return;
+    pendingAudioRef.current = [];
+    for (const blob of clips) voice.enqueue(blob);
+  }, []);
 
   // ---- GET /thought subscription loop (after wake) -----------------------
   useEffect(() => {
@@ -132,10 +157,18 @@ export function useAgentSession(): AgentSession {
     void (async () => {
       while (!cancelled) {
         try {
-          for await (const blob of subscribeAudio({ peer, signal: ctrl.signal })) {
+          for await (const { blob, turn } of subscribeAudio({ peer, signal: ctrl.signal })) {
             if (cancelled) break;
-            // drop audio that arrives while the user talks (post barge-in staleness)
-            if (!userSpeakingRef.current) voiceRef.current?.enqueue(blob);
+            if (turn < activeTurnRef.current) continue; // superseded draft — discard
+            if (turn > activeTurnRef.current) {
+              // A newer cognition turn supersedes the old: drop any buffered or
+              // playing clips from the previous turn so only the latest reply speaks.
+              activeTurnRef.current = turn;
+              pendingAudioRef.current = [];
+              voiceRef.current?.stop();
+            }
+            pendingAudioRef.current.push(blob);
+            releasePending(); // voices now if the floor is open, else holds
           }
         } catch {
           if (cancelled || ctrl.signal.aborted) break;
@@ -196,6 +229,18 @@ export function useAgentSession(): AgentSession {
         });
         const audioBus = new AudioBus();
         await audioBus.resume();
+        // Autoplay policy: on an auto-wake with no user gesture this page load,
+        // the context can stay suspended — which mutes TTS *and* stalls the
+        // mic's ScriptProcessor (no listening). If so, resume on the first
+        // incidental interaction so audio unlocks without a dedicated tap.
+        if (audioBus.ctx.state !== "running") {
+          const events = ["pointerdown", "keydown", "touchstart"];
+          const resumeOnGesture = () => {
+            void audioBus.resume();
+            for (const ev of events) window.removeEventListener(ev, resumeOnGesture);
+          };
+          for (const ev of events) window.addEventListener(ev, resumeOnGesture);
+        }
         const micNode = audioBus.ctx.createMediaStreamSource(stream);
         audioBus.attachMic(micNode);
         const voice = new VoicePlayer(
@@ -224,8 +269,14 @@ export function useAgentSession(): AgentSession {
 
         const mic = new MicCapture(audioBus.ctx, micNode, {
           onSpeechStart: () => {
-            userSpeakingRef.current = true;
             setUserSpeaking(true);
+            // User takes the floor: hold output. Keep any buffered reply (it's
+            // the latest known) — it's only discarded once a newer turn lands.
+            floorOpenRef.current = false;
+            if (settleTimerRef.current !== null) {
+              window.clearTimeout(settleTimerRef.current);
+              settleTimerRef.current = null;
+            }
             voice.stop(); // barge-in: stop speaking the moment the user does
             sttRef.current?.close(); // drop any prior utterance's socket
             sttRef.current = new SttStream(peer, {
@@ -242,8 +293,15 @@ export function useAgentSession(): AgentSession {
             });
           },
           onSpeechEnd: () => {
-            userSpeakingRef.current = false;
             setUserSpeaking(false);
+            // Yield the floor after a short settle, then voice whatever reply
+            // has buffered for the live turn.
+            if (settleTimerRef.current !== null) window.clearTimeout(settleTimerRef.current);
+            settleTimerRef.current = window.setTimeout(() => {
+              settleTimerRef.current = null;
+              floorOpenRef.current = true;
+              releasePending();
+            }, FLOOR_SETTLE_MS);
             sttRef.current?.end(); // finalize; socket stays open for the final
           },
           onChunk: (pcm16) => sttRef.current?.sendPcm(pcm16),
@@ -267,9 +325,31 @@ export function useAgentSession(): AgentSession {
     })();
   }, [woken, waking, peer]);
 
+  // Auto-wake on repeat visits: if the mic was already granted on a prior
+  // visit, skip the "tap to begin" gate and start listening straight away. The
+  // gate still appears on the first-ever visit (permission "prompt") or after a
+  // denial, where a user gesture is genuinely required to request the mic.
+  useEffect(() => {
+    let cancelled = false;
+    const perms = navigator.permissions;
+    if (!perms?.query) return;
+    perms
+      .query({ name: "microphone" as PermissionName })
+      .then((status) => {
+        if (!cancelled && status.state === "granted") wake();
+      })
+      .catch(() => {
+        /* 'microphone' not queryable (e.g. Firefox) — keep the manual gate. */
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [wake]);
+
   // cleanup on unmount
   useEffect(() => {
     return () => {
+      if (settleTimerRef.current !== null) window.clearTimeout(settleTimerRef.current);
       micRef.current?.stop();
       sttRef.current?.close();
       voiceRef.current?.stop();
