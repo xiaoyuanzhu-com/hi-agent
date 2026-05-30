@@ -1,25 +1,28 @@
-// MicCapture — continuous mic tap that segments speech with VAD and emits one
-// WAV blob per finished utterance. This is what replaces push-to-talk: the mic
-// stays open, the user just talks, and each utterance is posted to /audio.
+// MicCapture — continuous mic tap that segments speech with VAD and streams
+// live PCM while the user talks. This replaces the buffer-one-WAV-per-utterance
+// model: the mic stays open, VAD marks speech boundaries, and each captured
+// frame is resampled to 16 kHz mono 16-bit PCM and handed to `onChunk` in real
+// time so the upstream can return rolling transcripts as the user speaks.
 //
 // A ScriptProcessorNode (deprecated but universally available; matches the old
 // recorder) delivers raw Float32 frames. We keep a short pre-roll ring so the
-// onset isn't clipped, seed the active buffer with it on speech start, and on
-// VAD end encode the buffer to a 16 kHz WAV.
+// onset isn't clipped; on speech start the ring is flushed as the first chunks.
 
 import { Vad, type VadOptions } from "./vad";
-import { floatToWavBlob } from "./wav";
+import { resample } from "./wav";
 
 export interface MicCaptureOptions {
   vad?: VadOptions;
   preRollMs?: number;
   maxUtteranceMs?: number;
-  onUtterance: (wav: { blob: Blob; mime: string }) => void;
+  /** Live PCM during a speech segment: 16 kHz mono 16-bit LE samples. */
+  onChunk: (pcm16: Int16Array) => void;
   onSpeechStart?: () => void;
   onSpeechEnd?: () => void;
 }
 
 const FRAME = 2048;
+const TARGET_SR = 16000;
 
 export class MicCapture {
   private proc: ScriptProcessorNode;
@@ -28,7 +31,6 @@ export class MicCapture {
   private readonly sr: number;
   private readonly opts: Required<Omit<MicCaptureOptions, "vad">>;
 
-  private active: Float32Array[] = [];
   private activeSamples = 0;
   private preRoll: Float32Array[] = [];
   private preRollSamples = 0;
@@ -42,7 +44,7 @@ export class MicCapture {
     this.opts = {
       preRollMs: options.preRollMs ?? 250,
       maxUtteranceMs: options.maxUtteranceMs ?? 30000,
-      onUtterance: options.onUtterance,
+      onChunk: options.onChunk,
       onSpeechStart: options.onSpeechStart ?? (() => {}),
       onSpeechEnd: options.onSpeechEnd ?? (() => {}),
     };
@@ -58,6 +60,16 @@ export class MicCapture {
     this.sink.connect(ctx.destination);
   }
 
+  private emit(frame: Float32Array): void {
+    const pcm = this.sr === TARGET_SR ? frame : resample(frame, this.sr, TARGET_SR);
+    const out = new Int16Array(pcm.length);
+    for (let i = 0; i < pcm.length; i++) {
+      const s = Math.max(-1, Math.min(1, pcm[i]!));
+      out[i] = s < 0 ? s * 0x8000 : s * 0x7fff;
+    }
+    if (out.length > 0) this.opts.onChunk(out);
+  }
+
   private onFrame(input: Float32Array): void {
     if (this.stopped || this.suspended) return;
 
@@ -70,11 +82,11 @@ export class MicCapture {
     const dtMs = (frame.length / this.sr) * 1000;
 
     if (this.capturing) {
-      this.active.push(frame);
+      this.emit(frame);
       this.activeSamples += frame.length;
       const maxSamples = (this.opts.maxUtteranceMs / 1000) * this.sr;
       if (this.activeSamples >= maxSamples) {
-        this.endUtterance(false);
+        this.endUtterance();
         return;
       }
     } else {
@@ -89,38 +101,29 @@ export class MicCapture {
     const ev = this.vad.push(rms, dtMs);
     if (ev?.type === "start") {
       this.capturing = true;
-      this.active = this.preRoll.slice();
       this.activeSamples = this.preRollSamples;
+      this.opts.onSpeechStart();
+      // Flush the pre-roll so the onset isn't clipped, then drop the ring.
+      for (const f of this.preRoll) this.emit(f);
       this.preRoll = [];
       this.preRollSamples = 0;
-      this.opts.onSpeechStart();
     } else if (ev?.type === "end") {
-      this.endUtterance(ev.droppedTooShort);
+      this.endUtterance();
     }
   }
 
-  private endUtterance(dropped: boolean): void {
-    const frames = this.active;
-    const total = this.activeSamples;
+  private endUtterance(): void {
+    if (!this.capturing) return;
     this.capturing = false;
-    this.active = [];
     this.activeSamples = 0;
     this.vad.reset();
     this.opts.onSpeechEnd();
-    if (dropped || total === 0) return;
-    const pcm = new Float32Array(total);
-    let off = 0;
-    for (const f of frames) {
-      pcm.set(f, off);
-      off += f.length;
-    }
-    this.opts.onUtterance(floatToWavBlob(pcm, this.sr));
   }
 
   /** Pause/resume capture without tearing down the graph (used during TTS). */
   setSuspended(on: boolean): void {
     this.suspended = on;
-    if (on && this.capturing) this.endUtterance(true);
+    if (on && this.capturing) this.endUtterance();
     if (on) this.vad.reset();
   }
 

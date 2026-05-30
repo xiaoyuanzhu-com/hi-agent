@@ -17,6 +17,7 @@ use crate::voice::Stt;
 
 pub mod audio;
 pub mod headers;
+pub mod stt_stream;
 pub mod stubs;
 pub mod surface;
 pub mod thought;
@@ -95,6 +96,7 @@ pub fn build(
     let router = Router::new()
         .route("/thought", post(thought::post_thought).get(thought::get_thought))
         .route("/audio", post(audio::post_audio).get(audio::get_audio))
+        .route("/stt/stream", get(stt_stream::get_stt_stream))
         .route("/surface", get(surface::get_surface))
         .route("/vision", post(stubs::post_vision))
         .route("/touch", post(stubs::post_touch))

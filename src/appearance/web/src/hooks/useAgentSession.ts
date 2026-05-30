@@ -1,6 +1,7 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { subscribeThought, postThought } from "../channels/thought";
-import { postAudio, subscribeAudio } from "../channels/audio";
+import { subscribeAudio } from "../channels/audio";
+import { SttStream } from "../channels/stt";
 import { subscribeSurface, type SurfaceEnvelope } from "../channels/surface";
 import { AudioBus } from "../lib/audioBus";
 import { MicCapture } from "../lib/micCapture";
@@ -12,6 +13,8 @@ import type { SpeechItem } from "../ui/SpeechText";
 
 // How many recent sentences stay on screen (calm, 1–2 at a time).
 const SENTENCE_WINDOW = 2;
+// Stable id for the in-progress user line so React updates it in place.
+const LIVE_USER_ID = -1;
 
 export interface AgentSession {
   state: PresenceState;
@@ -47,6 +50,9 @@ export function useAgentSession(): AgentSession {
   const [wakeError, setWakeError] = useState<string | null>(null);
   const [bus, setBus] = useState<AudioBus | null>(null);
   const [sentences, setSentences] = useState<SpeechItem[]>([]);
+  // The user's live transcript while they speak: a rolling preliminary until
+  // the polished final lands and is folded into `sentences`.
+  const [userLive, setUserLive] = useState<string | null>(null);
 
   const [userSpeaking, setUserSpeaking] = useState(false);
   const [agentStreaming, setAgentStreaming] = useState(false);
@@ -60,6 +66,7 @@ export function useAgentSession(): AgentSession {
   const micRef = useRef<MicCapture | null>(null);
   const micStreamRef = useRef<MediaStream | null>(null);
   const voiceRef = useRef<VoicePlayer | null>(null);
+  const sttRef = useRef<SttStream | null>(null);
   const userSpeakingRef = useRef(false);
   const sentenceIdRef = useRef(0);
   const surfaceTtlRef = useRef<number | null>(null);
@@ -77,7 +84,7 @@ export function useAgentSession(): AgentSession {
         let next = prev;
         for (const text of list) {
           sentenceIdRef.current += 1;
-          next = [...next, { id: sentenceIdRef.current, text }];
+          next = [...next, { id: sentenceIdRef.current, text, speaker: "agent" }];
         }
         return next.length > SENTENCE_WINDOW
           ? next.slice(next.length - SENTENCE_WINDOW)
@@ -196,20 +203,50 @@ export function useAgentSession(): AgentSession {
           () => setTtsPlaying(true),
           () => setTtsPlaying(false),
         );
+        // Fold a polished final transcript into the sentence timeline as a
+        // user line, then let the agent's reply stream in over /thought.
+        const finalizeUser = (text: string) => {
+          const trimmed = text.trim();
+          setUserLive(null);
+          if (!trimmed) return;
+          sentenceIdRef.current += 1;
+          const item: SpeechItem = {
+            id: sentenceIdRef.current,
+            text: trimmed,
+            speaker: "user",
+          };
+          setSentences((prev) => {
+            const next = [...prev, item];
+            return next.length > SENTENCE_WINDOW ? next.slice(next.length - SENTENCE_WINDOW) : next;
+          });
+          setAwaiting(true); // agent is now thinking until /thought chunks arrive
+        };
+
         const mic = new MicCapture(audioBus.ctx, micNode, {
           onSpeechStart: () => {
             userSpeakingRef.current = true;
             setUserSpeaking(true);
             voice.stop(); // barge-in: stop speaking the moment the user does
+            sttRef.current?.close(); // drop any prior utterance's socket
+            sttRef.current = new SttStream(peer, {
+              onPartial: (text) => setUserLive(text),
+              onFinal: (text) => {
+                finalizeUser(text);
+                sttRef.current?.close();
+                sttRef.current = null;
+              },
+              onClose: () => {
+                setUserLive(null);
+                sttRef.current = null;
+              },
+            });
           },
           onSpeechEnd: () => {
             userSpeakingRef.current = false;
             setUserSpeaking(false);
+            sttRef.current?.end(); // finalize; socket stays open for the final
           },
-          onUtterance: ({ blob, mime }) => {
-            setAwaiting(true);
-            postAudio({ from: peer, blob, mime }).catch(() => setAwaiting(false));
-          },
+          onChunk: (pcm16) => sttRef.current?.sendPcm(pcm16),
         });
         micStreamRef.current = stream;
         busRef.current = audioBus;
@@ -234,6 +271,7 @@ export function useAgentSession(): AgentSession {
   useEffect(() => {
     return () => {
       micRef.current?.stop();
+      sttRef.current?.close();
       voiceRef.current?.stop();
       micStreamRef.current?.getTracks().forEach((t) => t.stop());
       busRef.current?.close();
@@ -280,12 +318,22 @@ export function useAgentSession(): AgentSession {
   // The content overlay dims/demotes the presence — more for full-screen.
   const demote = activeSurface ? (activeSurface.mode === "full" ? 1 : 0.72) : 0;
 
+  // Render the finalized timeline plus the user's in-progress line (if any),
+  // windowed to keep the display calm.
+  const displaySentences = useMemo<SpeechItem[]>(() => {
+    const base =
+      userLive !== null
+        ? [...sentences, { id: LIVE_USER_ID, text: userLive, speaker: "user" as const, pending: true }]
+        : sentences;
+    return base.length > SENTENCE_WINDOW ? base.slice(base.length - SENTENCE_WINDOW) : base;
+  }, [sentences, userLive]);
+
   return {
     state,
     reactive,
     demote,
     bus,
-    sentences,
+    sentences: displaySentences,
     activeSurface,
     surfaceHistory,
     woken,

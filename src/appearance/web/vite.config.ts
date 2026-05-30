@@ -19,6 +19,12 @@ const HI_CHANNELS = [
   "/taste",
 ];
 
+// /stt/stream is a WebSocket (live ASR). Unlike the long-poll channels it needs
+// ws:true so the proxy performs the Upgrade handshake.
+const WS_PROXY = {
+  "/stt": { target: "ws://127.0.0.1:8080", ws: true, changeOrigin: false },
+};
+
 const proxy = Object.fromEntries(
   HI_CHANNELS.map((path) => [
     path,
@@ -60,6 +66,7 @@ const proxy = Object.fromEntries(
     },
   ]),
 );
+Object.assign(proxy, WS_PROXY);
 
 export default defineConfig({
   plugins: [react()],

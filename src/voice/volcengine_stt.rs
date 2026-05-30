@@ -54,13 +54,16 @@ use bytes::Bytes;
 use futures::{SinkExt, StreamExt};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
+use tokio::net::TcpStream;
+use tokio::sync::mpsc;
 use tokio::time::timeout;
 use tokio_tungstenite::tungstenite::client::IntoClientRequest;
 use tokio_tungstenite::tungstenite::http::HeaderValue;
 use tokio_tungstenite::tungstenite::Message;
+use tokio_tungstenite::{MaybeTlsStream, WebSocketStream};
 use uuid::Uuid;
 
-use super::stt::Stt;
+use super::stt::{Stt, Transcript};
 
 // Defaults target the recommended async (optimized) endpoint + doubao 2.0
 // hour version. Override the resource id to point at concurrent variants or
@@ -80,6 +83,9 @@ const DEFAULT_MODEL: &str = "bigmodel";
 const PCM_CHUNK_BYTES: usize = 3200;
 // Generous overall budget. Real recognitions complete in seconds.
 const TOTAL_TIMEOUT: Duration = Duration::from_secs(30);
+// Streaming spans the whole utterance (up to the 30 s mic cap) plus the trailing
+// finalization, so it gets a longer ceiling than the batch path.
+const STREAM_TIMEOUT: Duration = Duration::from_secs(90);
 
 const WAV_HEADER_BYTES: usize = 44;
 
@@ -125,15 +131,24 @@ impl Stt for VolcengineStt {
             .await
             .map_err(|_| anyhow::anyhow!("volcengine STT timed out after {TOTAL_TIMEOUT:?}"))?
     }
+
+    async fn transcribe_streaming(
+        &self,
+        audio_rx: mpsc::Receiver<Bytes>,
+        out: mpsc::Sender<Transcript>,
+    ) -> anyhow::Result<String> {
+        timeout(STREAM_TIMEOUT, self.transcribe_streaming_inner(audio_rx, out))
+            .await
+            .map_err(|_| anyhow::anyhow!("volcengine STT stream timed out after {STREAM_TIMEOUT:?}"))?
+    }
 }
 
 impl VolcengineStt {
-    async fn transcribe_inner(&self, audio: Bytes, mime: &str) -> anyhow::Result<String> {
-        let pcm = extract_pcm(&audio, mime)?;
+    /// Open the upstream WS with the custom auth headers shared by both the
+    /// batch and streaming paths.
+    async fn connect(&self) -> anyhow::Result<WebSocketStream<MaybeTlsStream<TcpStream>>> {
         let connect_id = Uuid::now_v7().to_string();
         let request_id = Uuid::now_v7().to_string();
-
-        // Build the WS handshake with custom auth headers.
         let mut request = self.endpoint.as_str().into_client_request()?;
         let headers = request.headers_mut();
         headers.insert("X-Api-Key", HeaderValue::from_str(&self.api_key)?);
@@ -142,18 +157,21 @@ impl VolcengineStt {
         headers.insert("X-Api-Connect-Id", HeaderValue::from_str(&connect_id)?);
         headers.insert("X-Api-Sequence", HeaderValue::from_static("-1"));
 
-        let (ws, response) = tokio_tungstenite::connect_async(request).await.map_err(
-            |e| anyhow::anyhow!("volcengine STT WS connect failed: {e}"),
-        )?;
+        let (ws, response) = tokio_tungstenite::connect_async(request)
+            .await
+            .map_err(|e| anyhow::anyhow!("volcengine STT WS connect failed: {e}"))?;
         tracing::debug!(
             status = %response.status(),
             connect_id = %connect_id,
             "volcengine STT WS connected"
         );
+        Ok(ws)
+    }
 
-        let (mut tx, mut rx) = ws.split();
-
-        // 1. FULL_CLIENT_REQUEST — JSON config.
+    /// Build the FULL_CLIENT_REQUEST config frame. `show_utterances` exposes the
+    /// per-utterance `definite` flag the streaming path uses to tell the fast
+    /// preliminary text from the polished final.
+    fn config_frame(&self, show_utterances: bool) -> anyhow::Result<Vec<u8>> {
         let config = json!({
             "user": { "uid": "hi-agent" },
             "audio": {
@@ -168,16 +186,18 @@ impl VolcengineStt {
                 "enable_itn": true,
                 "enable_punc": true,
                 "result_type": "single",
+                "show_utterances": show_utterances,
             },
         });
-        let config_bytes = serde_json::to_vec(&config)?;
-        tx.send(Message::Binary(frame(
-            MSG_TYPE_FULL_CLIENT,
-            0,
-            SER_JSON,
-            &config_bytes,
-        )))
-        .await?;
+        Ok(frame(MSG_TYPE_FULL_CLIENT, 0, SER_JSON, &serde_json::to_vec(&config)?))
+    }
+
+    async fn transcribe_inner(&self, audio: Bytes, mime: &str) -> anyhow::Result<String> {
+        let pcm = extract_pcm(&audio, mime)?;
+        let (mut tx, mut rx) = self.connect().await?.split();
+
+        // 1. FULL_CLIENT_REQUEST — JSON config.
+        tx.send(Message::Binary(self.config_frame(false)?)).await?;
 
         // 2. Audio chunks.
         let mut offset = 0;
@@ -289,6 +309,119 @@ impl VolcengineStt {
         }
         Ok(text)
     }
+
+    /// Full-duplex streaming: a sender task forwards incoming PCM as it arrives
+    /// while this task reads incremental results. `audio_rx` carries raw 16 kHz
+    /// mono 16-bit PCM (no WAV header — the caller already stripped/never added
+    /// one). Each non-empty result is emitted on `out`; the polished final is
+    /// returned.
+    async fn transcribe_streaming_inner(
+        &self,
+        mut audio_rx: mpsc::Receiver<Bytes>,
+        out: mpsc::Sender<Transcript>,
+    ) -> anyhow::Result<String> {
+        let (mut tx, mut rx) = self.connect().await?.split();
+        tx.send(Message::Binary(self.config_frame(true)?)).await?;
+
+        // Sender task: stream PCM chunks until the input closes, then mark the
+        // last chunk so the upstream finalizes.
+        let send_task = tokio::spawn(async move {
+            while let Some(chunk) = audio_rx.recv().await {
+                let mut offset = 0;
+                while offset < chunk.len() {
+                    let end = (offset + PCM_CHUNK_BYTES).min(chunk.len());
+                    tx.send(Message::Binary(frame(
+                        MSG_TYPE_AUDIO_ONLY,
+                        0,
+                        SER_RAW,
+                        &chunk[offset..end],
+                    )))
+                    .await?;
+                    offset = end;
+                }
+            }
+            tx.send(Message::Binary(frame(MSG_TYPE_AUDIO_ONLY, FLAG_LAST_CHUNK, SER_RAW, &[])))
+                .await?;
+            anyhow::Ok(())
+        });
+
+        // Reader: emit each new result; the upstream sends rolling preliminaries
+        // (definite=false) then a definite/final result per utterance.
+        let mut last_emitted = String::new();
+        let mut final_text = String::new();
+        while let Some(msg) = rx.next().await {
+            let msg = msg.map_err(|e| anyhow::anyhow!("volcengine STT WS recv: {e}"))?;
+            let bytes = match msg {
+                Message::Binary(b) => b,
+                Message::Close(_) => break,
+                _ => continue,
+            };
+            if bytes.len() < 4 {
+                continue;
+            }
+            let msg_type = (bytes[1] >> 4) & 0x0F;
+            let tail = &bytes[4..];
+            match msg_type {
+                MSG_TYPE_FULL_SERVER => {
+                    let Some(payload) = extract_json(tail) else { continue };
+                    let parsed: ServerResponse = match serde_json::from_slice(payload) {
+                        Ok(p) => p,
+                        Err(err) => {
+                            tracing::warn!(error = %err, "volcengine STT JSON parse failed");
+                            continue;
+                        }
+                    };
+                    if let Some(status) = parsed.header.as_ref().and_then(|h| h.status) {
+                        if status != SUCCESS_STATUS && status != 0 {
+                            anyhow::bail!(
+                                "volcengine STT error status={status} message={:?}",
+                                parsed.header.as_ref().and_then(|h| h.message.clone())
+                            );
+                        }
+                    }
+                    let is_final =
+                        parsed.kind.as_deref() == Some("final") || parsed.is_final == Some(true);
+                    if let Some(text) = parsed.result.as_ref().and_then(|r| r.first_text()) {
+                        if !text.is_empty() {
+                            if is_final {
+                                final_text = text.clone();
+                            }
+                            // Dedupe identical rolling updates; always pass a final.
+                            if is_final || text != last_emitted {
+                                last_emitted = text.clone();
+                                let _ = out.send(Transcript { text, is_final }).await;
+                            }
+                        }
+                    }
+                    if is_final {
+                        break;
+                    }
+                }
+                MSG_TYPE_SERVER_ERROR => {
+                    let payload = extract_json(tail).unwrap_or(tail);
+                    anyhow::bail!(
+                        "volcengine STT server error: {}",
+                        String::from_utf8_lossy(payload)
+                    );
+                }
+                _ => continue,
+            }
+        }
+
+        send_task.abort();
+
+        let text = if final_text.trim().is_empty() {
+            last_emitted.trim().to_owned()
+        } else {
+            final_text.trim().to_owned()
+        };
+        // A final emit may not have been flagged (e.g. stream closed early); make
+        // sure the caller's last view matches what we return.
+        if !text.is_empty() && text != last_emitted {
+            let _ = out.send(Transcript { text: text.clone(), is_final: true }).await;
+        }
+        Ok(text)
+    }
 }
 
 /// Build a single protocol frame: 4-byte header + uint32 BE payload size + payload bytes.
@@ -335,6 +468,10 @@ struct ServerResponse {
     /// Volcengine sends this as the discriminator (`"final"`, `"partial"`, etc).
     #[serde(rename = "type", default)]
     kind: Option<String>,
+    /// Some streaming responses carry an explicit finality flag instead of/in
+    /// addition to `type`.
+    #[serde(default)]
+    is_final: Option<bool>,
     #[serde(default)]
     header: Option<ServerHeader>,
     #[serde(default)]

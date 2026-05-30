@@ -159,6 +159,20 @@ button {
   transform: translateY(-2px) scale(0.99);
 }
 
+/* The user's own transcribed speech — set apart from the agent's reply by a
+   lighter, slightly smaller, accented treatment. */
+.hi-sentence--user {
+  font-size: clamp(15px, 2.1vw, 21px);
+  color: var(--accent, #8fb8ff);
+  font-weight: 400;
+}
+
+/* A rolling preliminary (still being recognized): softened until polished. */
+.hi-sentence--pending {
+  opacity: 0.66;
+  font-style: italic;
+}
+
 /* --- Wake gate -------------------------------------------------------- */
 .hi-wake {
   position: fixed;
