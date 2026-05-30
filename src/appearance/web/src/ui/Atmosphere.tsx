@@ -1,12 +1,12 @@
 /**
- * The background "room" — a near-black field with a slow-drifting radial glow
- * and faint grain that breathes on a ~16s cycle. Pure CSS (see global.css);
- * never competes with the presence or content.
+ * A faint film of grain laid over the presence field (see Presence.tsx, which
+ * renders the breathing background on a canvas beneath this layer). Grain alone
+ * keeps the near-black field from banding; it never competes with the words or
+ * content. Pure CSS — see `.hi-atmo-grain` in global.css.
  */
 export function Atmosphere() {
   return (
     <div aria-hidden className="hi-atmosphere">
-      <div className="hi-atmo-glow" />
       <div className="hi-atmo-grain" />
     </div>
   );

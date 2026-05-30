@@ -21,6 +21,36 @@
 //! independent of that timing, `router()` is generic over `S`. When Step 1
 //! lands, `crate::server::AppState` can be substituted in directly without
 //! touching this file.
+//!
+//! ## Future seam: agent-authored, runtime-swappable skins (NOT built yet)
+//!
+//! The embedded SPA below is intentionally "skin 0": the default appearance.
+//! The design leaves room for the agent to author and evolve its own
+//! appearance at runtime without a rebuild. None of this is implemented today;
+//! it is recorded here so the seam is cheap to pick up later:
+//!
+//! - **Storage.** Runtime skins live under `<data_dir>/appearance/skins/<id>/`
+//!   (self-contained HTML/JS/CSS), with an `active.json` pointer. The embedded
+//!   default is the un-deletable fallback and is served whenever no runtime
+//!   skin is active.
+//! - **Serving.** New routes (e.g. `GET /appearance/active`,
+//!   `GET /appearance/skin/{id}/*path`) serve the active skin; a long-poll
+//!   mirroring `GET /surface` lets the shell hot-swap when the active skin
+//!   changes.
+//! - **Bridge.** A skin renders in a sandboxed iframe and talks to the host
+//!   over `postMessage` only — the host streams it presence state / sentences /
+//!   surfaces and accepts a narrow `sendText`. Mic, credentials and the upstream
+//!   proxy stay strictly host-side; a skin never gets same-origin.
+//! - **Authoring.** The agent would emit skins the same way it already emits
+//!   rich content: a streaming marker the reactor extracts (cf. the
+//!   `[[surface:…]]` extractor in `reactor.rs`), e.g. `[[skin:register]]` /
+//!   `[[skin:activate]]`, driven in the background by the heartbeat.
+//! - **Safety.** Activation is gated (preview + approval) and auto-reverts to
+//!   the embedded default if a skin fails to load; `GET /?skin=default` is the
+//!   escape hatch. The session core (channels, presence state machine, mic) is
+//!   skin-independent — today it lives in `web/src/hooks/useAgentSession.ts`,
+//!   and look-and-feel is centralized in the `:root` tokens of
+//!   `web/src/ui/global.css`, so a token-only re-theme needs no canvas changes.
 
 pub mod embed;
 pub mod og;
