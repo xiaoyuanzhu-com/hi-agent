@@ -7,10 +7,9 @@ build: ## install web deps, build SPA, build release binary
 	cd src/appearance/web && npm ci && npm run build
 	cargo build --release
 
-dev: ## run rust + vite dev servers (backend first, Ctrl-C stops both)
+dev: ## run rust + vite dev servers (Ctrl-C stops both)
 	trap 'kill 0' INT TERM EXIT; \
 	cargo watch -x 'run -- --port 8080' & \
-	until nc -z localhost 8080 2>/dev/null; do sleep 0.5; done; \
 	(cd src/appearance/web && npm run dev) & \
 	wait
 
