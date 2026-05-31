@@ -42,7 +42,7 @@ async fn get_thought(base: &str, peer: &str, budget: Duration) -> Result<String,
     let client = reqwest::Client::new();
     tokio::time::timeout(budget, async {
         client
-            .get(format!("{base}/thought"))
+            .get(format!("{base}/api/thought"))
             .header("X-HI-To", peer)
             .send()
             .await
@@ -134,7 +134,7 @@ async fn get_without_peer_is_bad_request() {
     let client = reqwest::Client::new();
 
     let resp = client
-        .get(format!("{base}/thought"))
+        .get(format!("{base}/api/thought"))
         .send()
         .await
         .expect("send");

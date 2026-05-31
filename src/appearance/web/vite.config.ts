@@ -2,31 +2,15 @@ import { defineConfig } from "vite";
 import react from "@vitejs/plugin-react";
 
 // During dev, the browser only talks to Vite (:5173). Vite proxies every
-// human-interface channel route to the Rust server on :8080.
+// human-interface channel route — all under `/api/*` — to the Rust server on
+// :8080.
 //
-// The proxy MUST NOT buffer: /thought and /approval are long-poll endpoints
-// where the response body trickles in and body-close ends the utterance.
-// http-proxy streams by default (selfHandleResponse stays false). We disable
-// timeouts so a quiet long-poll is not killed mid-flight.
-const HI_CHANNELS = [
-  "/thought",
-  "/approval",
-  "/vision",
-  "/audio",
-  "/surface",
-  "/touch",
-  "/smell",
-  "/taste",
-];
-
-// /stt/stream is a WebSocket (live ASR). Unlike the long-poll channels it needs
-// ws:true so the proxy performs the Upgrade handshake.
-const WS_PROXY = {
-  "/stt": { target: "ws://127.0.0.1:8080", ws: true, changeOrigin: false },
-};
-
+// The proxy MUST NOT buffer: /api/thought is a long-poll endpoint where the
+// response body trickles in and body-close ends the utterance. http-proxy
+// streams by default (selfHandleResponse stays false). We disable timeouts so a
+// quiet long-poll is not killed mid-flight.
 const proxy = Object.fromEntries(
-  HI_CHANNELS.map((path) => [
+  ["/api"].map((path) => [
     path,
     {
       target: "http://127.0.0.1:8080",
@@ -66,7 +50,6 @@ const proxy = Object.fromEntries(
     },
   ]),
 );
-Object.assign(proxy, WS_PROXY);
 
 export default defineConfig({
   plugins: [react()],

@@ -25,7 +25,7 @@ export async function* subscribeSurface(
   opts: SubscribeSurfaceOpts,
 ): AsyncGenerator<SurfaceEnvelope, void, void> {
   while (!opts.signal.aborted) {
-    const res = await fetch("/surface", {
+    const res = await fetch("/api/surface", {
       method: "GET",
       headers: { "X-HI-To": opts.peer, Accept: "application/json" },
       signal: opts.signal,

@@ -33,7 +33,7 @@ export interface SubscribeOpts {
 export async function* subscribeThought(
   opts: SubscribeOpts,
 ): AsyncGenerator<ThoughtChunk, void, void> {
-  const res = await fetch("/thought", {
+  const res = await fetch("/api/thought", {
     method: "GET",
     headers: {
       "X-HI-To": opts.peer,
@@ -102,7 +102,7 @@ export async function postThought(opts: {
   };
   if (opts.to) headers["X-HI-To"] = opts.to;
 
-  const res = await fetch("/thought", {
+  const res = await fetch("/api/thought", {
     method: "POST",
     headers,
     body: opts.body,

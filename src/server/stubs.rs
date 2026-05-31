@@ -3,13 +3,6 @@
 use axum::http::StatusCode;
 use axum::response::IntoResponse;
 
-pub async fn post_vision() -> impl IntoResponse {
-    (
-        StatusCode::NOT_IMPLEMENTED,
-        "vision channel is not implemented in v0\n",
-    )
-}
-
 pub async fn post_touch() -> impl IntoResponse {
     (
         StatusCode::NOT_IMPLEMENTED,

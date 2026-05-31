@@ -1,11 +1,12 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { subscribeThought, postThought } from "../channels/thought";
-import { subscribeAudio } from "../channels/audio";
-import { SttStream } from "../channels/stt";
+import { subscribeAudio, postAudio } from "../channels/audio";
+import { postVision } from "../channels/vision";
 import { subscribeSurface, type SurfaceEnvelope } from "../channels/surface";
 import { AudioBus } from "../lib/audioBus";
 import { ActivityMeter } from "../lib/activityMeter";
 import { MicCapture } from "../lib/micCapture";
+import { VisionCapture } from "../lib/visionCapture";
 import { VoicePlayer } from "../lib/voicePlayer";
 import { SentenceBuffer } from "../lib/sentences";
 import { getPeer } from "../lib/peer";
@@ -14,8 +15,6 @@ import type { SpeechItem } from "../ui/SpeechText";
 
 // How many recent sentences stay on screen (calm, 1–2 at a time).
 const SENTENCE_WINDOW = 2;
-// Stable id for the in-progress user line so React updates it in place.
-const LIVE_USER_ID = -1;
 
 export interface AgentSession {
   state: PresenceState;
@@ -39,17 +38,17 @@ export interface AgentSession {
 
 /**
  * The coordinator — deliberately a *dumb face*. After the wake gesture it owns
- * the mic (AudioBus + MicCapture/VAD → streaming STT) and subscribes to the
- * output channels, rendering whatever arrives: /audio clips play on arrival,
- * /thought chunks fade in as whole sentences.
+ * the input channels (mic → /api/audio, one VAD-segmented WAV per utterance;
+ * camera → /api/vision, a frame every couple seconds) and subscribes to the
+ * output channels, rendering whatever arrives: /api/audio clips play on arrival,
+ * /api/thought chunks fade in as whole sentences.
  *
- * Crucially it does NOT decide turns. Turn-taking — when the agent speaks, what
- * counts as the human yielding the floor, which drafts to suppress — lives in
- * the mind (the reactor). The face contributes exactly one output-side behavior:
- * a local **barge-in reflex**, muting the speaker the instant its own mic goes
- * hot (don't talk over the human, don't play into a hot mic). Everything else is
- * pass-through. The reactor learns the live floor state from the STT socket's
- * lifetime, so the client needs no extra control channel.
+ * Crucially it does NOT decide turns. Turn-taking — when the agent speaks, which
+ * drafts to suppress — lives in the mind (the reactor), which commits after the
+ * inbound signal stream goes quiet. The face contributes exactly one output-side
+ * behavior: a local **barge-in reflex**, muting the speaker the instant its own
+ * mic goes hot (don't talk over the human, don't play into a hot mic).
+ * Everything else is pass-through: the input channels just stream the signal.
  */
 export function useAgentSession(): AgentSession {
   const peer = useMemo(() => getPeer(), []);
@@ -59,9 +58,6 @@ export function useAgentSession(): AgentSession {
   const [wakeError, setWakeError] = useState<string | null>(null);
   const [bus, setBus] = useState<AudioBus | null>(null);
   const [sentences, setSentences] = useState<SpeechItem[]>([]);
-  // The user's live transcript while they speak: a rolling preliminary until
-  // the polished final lands and is folded into `sentences`.
-  const [userLive, setUserLive] = useState<string | null>(null);
 
   const [userSpeaking, setUserSpeaking] = useState(false);
   const [agentStreaming, setAgentStreaming] = useState(false);
@@ -75,7 +71,8 @@ export function useAgentSession(): AgentSession {
   const micRef = useRef<MicCapture | null>(null);
   const micStreamRef = useRef<MediaStream | null>(null);
   const voiceRef = useRef<VoicePlayer | null>(null);
-  const sttRef = useRef<SttStream | null>(null);
+  const visionRef = useRef<VisionCapture | null>(null);
+  const visionStreamRef = useRef<MediaStream | null>(null);
   const sentenceIdRef = useRef(0);
   const surfaceTtlRef = useRef<number | null>(null);
   // Live cognition cadence: bumped per streamed chunk, decays between them, so
@@ -233,60 +230,48 @@ export function useAgentSession(): AgentSession {
           () => setTtsPlaying(true),
           () => setTtsPlaying(false),
         );
-        // Fold a polished final transcript into the sentence timeline as a
-        // user line, then let the agent's reply stream in over /thought.
-        const finalizeUser = (text: string) => {
-          const trimmed = text.trim();
-          setUserLive(null);
-          if (!trimmed) return;
-          sentenceIdRef.current += 1;
-          const item: SpeechItem = {
-            id: sentenceIdRef.current,
-            text: trimmed,
-            speaker: "user",
-          };
-          setSentences((prev) => {
-            const next = [...prev, item];
-            return next.length > SENTENCE_WINDOW ? next.slice(next.length - SENTENCE_WINDOW) : next;
-          });
-          setAwaiting(true); // agent is now thinking until /thought chunks arrive
-        };
 
         const mic = new MicCapture(audioBus.ctx, micNode, {
           onSpeechStart: () => {
             setUserSpeaking(true);
             // Barge-in reflex: the moment our mic goes hot, mute the speaker so
             // we never play over the human. This is the face's *only* output
-            // decision; whether/what to say next is the mind's call. Opening the
-            // STT socket below also signals the reactor that the floor is held.
+            // decision; whether/what to say next is the mind's call.
             voice.stop();
-            sttRef.current?.close(); // drop any prior utterance's socket
-            sttRef.current = new SttStream(peer, {
-              onPartial: (text) => setUserLive(text),
-              onFinal: (text) => {
-                finalizeUser(text);
-                sttRef.current?.close();
-                sttRef.current = null;
-              },
-              onClose: () => {
-                setUserLive(null);
-                sttRef.current = null;
-              },
-            });
           },
-          onSpeechEnd: () => {
+          onSpeechEnd: ({ blob, mime }) => {
             setUserSpeaking(false);
-            // Finalize this utterance. The socket stays open until the final
-            // lands, then closes — which is what tells the reactor the floor has
-            // been released. The mind decides if/when to reply from there.
-            sttRef.current?.end();
+            // Ship the utterance as one WAV; the backend transcribes and the
+            // mind decides if/when to reply. Show "thinking" immediately; if the
+            // clip held no speech (empty transcript) drop back to idle.
+            setAwaiting(true);
+            postAudio({ from: peer, blob, mime })
+              .then(({ transcript }) => {
+                if (!transcript.trim()) setAwaiting(false);
+              })
+              .catch(() => setAwaiting(false));
           },
-          onChunk: (pcm16) => sttRef.current?.sendPcm(pcm16),
         });
         micStreamRef.current = stream;
         busRef.current = audioBus;
         micRef.current = mic;
         voiceRef.current = voice;
+
+        // Vision: a continuous channel like the mic. Best-effort — if the
+        // camera is unavailable or denied, listening still works.
+        try {
+          const videoStream = await navigator.mediaDevices.getUserMedia({ video: true });
+          visionStreamRef.current = videoStream;
+          visionRef.current = new VisionCapture(videoStream, {
+            onFrame: (frameBlob, frameMime) => {
+              // Fire-and-forget; a dropped frame is fine on a continuous channel.
+              postVision({ from: peer, blob: frameBlob, mime: frameMime }).catch(() => {});
+            },
+          });
+        } catch {
+          /* no camera / permission denied — vision stays dark, audio continues */
+        }
+
         setBus(audioBus);
         setWoken(true);
         setWaking(false);
@@ -327,9 +312,10 @@ export function useAgentSession(): AgentSession {
   useEffect(() => {
     return () => {
       micRef.current?.stop();
-      sttRef.current?.close();
+      visionRef.current?.stop();
       voiceRef.current?.stop();
       micStreamRef.current?.getTracks().forEach((t) => t.stop());
+      visionStreamRef.current?.getTracks().forEach((t) => t.stop());
       busRef.current?.close();
     };
   }, []);
@@ -374,15 +360,13 @@ export function useAgentSession(): AgentSession {
   // The content overlay dims/demotes the presence — more for full-screen.
   const demote = activeSurface ? (activeSurface.mode === "full" ? 1 : 0.72) : 0;
 
-  // Render the finalized timeline plus the user's in-progress line (if any),
-  // windowed to keep the display calm.
+  // Render the agent's recent words, windowed to keep the display calm. (User
+  // speech isn't shown as text for now — that feature is deferred.)
   const displaySentences = useMemo<SpeechItem[]>(() => {
-    const base =
-      userLive !== null
-        ? [...sentences, { id: LIVE_USER_ID, text: userLive, speaker: "user" as const, pending: true }]
-        : sentences;
-    return base.length > SENTENCE_WINDOW ? base.slice(base.length - SENTENCE_WINDOW) : base;
-  }, [sentences, userLive]);
+    return sentences.length > SENTENCE_WINDOW
+      ? sentences.slice(sentences.length - SENTENCE_WINDOW)
+      : sentences;
+  }, [sentences]);
 
   return {
     state,

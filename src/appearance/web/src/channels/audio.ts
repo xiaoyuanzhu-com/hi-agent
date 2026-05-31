@@ -10,7 +10,7 @@ export async function postAudio(opts: {
   mime: string;
   signal?: AbortSignal;
 }): Promise<{ transcript: string; media_path: string }> {
-  const res = await fetch("/audio", {
+  const res = await fetch("/api/audio", {
     method: "POST",
     headers: {
       "Content-Type": opts.mime,
@@ -22,7 +22,7 @@ export async function postAudio(opts: {
   if (!res.ok) {
     const detail = await res.text().catch(() => "");
     throw new Error(
-      `/audio POST failed: ${res.status} ${res.statusText}${detail ? ` — ${detail.trim()}` : ""}`,
+      `/api/audio POST failed: ${res.status} ${res.statusText}${detail ? ` — ${detail.trim()}` : ""}`,
     );
   }
   return (await res.json()) as { transcript: string; media_path: string };
@@ -45,14 +45,14 @@ export async function* subscribeAudio(
   opts: SubscribeAudioOpts,
 ): AsyncGenerator<Blob, void, void> {
   while (!opts.signal.aborted) {
-    const res = await fetch("/audio", {
+    const res = await fetch("/api/audio", {
       method: "GET",
       headers: { "X-HI-To": opts.peer, Accept: "audio/*" },
       signal: opts.signal,
       cache: "no-store",
     });
     if (!res.ok) {
-      throw new Error(`/audio subscribe failed: ${res.status} ${res.statusText}`);
+      throw new Error(`/api/audio subscribe failed: ${res.status} ${res.statusText}`);
     }
     const blob = await res.blob();
     if (blob.size > 0) yield blob;

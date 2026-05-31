@@ -11,17 +11,15 @@
 //! two rules:
 //!
 //! 1. **Commit-after-quiet.** A finalized utterance does not immediately make
-//!    the agent reply. The human often speaks in bursts; the mind waits until
-//!    the floor has been quiet for a short settle before it responds, absorbing
-//!    every burst that lands in the meantime into one consolidated prompt. The
-//!    live "is the human speaking" signal comes from [`crate::floor`] (the open
-//!    mic socket), so a settle that expires *while the human is mid-burst* — its
-//!    final not yet landed — simply waits longer. The cost is a little latency;
-//!    the win is that the agent never jumps in on a thinking pause, and nothing
-//!    the human says is lost. Because the reply only starts once the floor is
-//!    yielded, its output can stream straight to the client — no holding, no
-//!    turn-tagging on the wire; superseded drafts are *never generated* rather
-//!    than generated-then-discarded.
+//!    the agent reply. The human often speaks in bursts; each burst arrives as
+//!    its own inbound signal (one VAD-segmented `POST /api/audio`), and the mind
+//!    waits until no new signal has landed for a short settle before it
+//!    responds, absorbing every burst in the meantime into one consolidated
+//!    prompt. The cost is a little latency; the win is that the agent doesn't
+//!    answer a half-finished thought, and nothing the human says is lost.
+//!    Because the reply only starts once things have gone quiet, its output can
+//!    stream straight to the client — no holding, no turn-tagging on the wire;
+//!    superseded drafts are *never generated* rather than generated-then-discarded.
 //! 2. **Barge-in.** If the human starts talking again *during* generation, the
 //!    new signal cancels the in-flight ACP session (`session/cancel`); the loop
 //!    re-settles and re-prompts with the merged batch. (The client mutes its
@@ -39,7 +37,6 @@ use tokio::time::timeout;
 use uuid::Uuid;
 
 use crate::acp::{AcpProcess, AcpSession, SessionOpts, SessionUpdate};
-use crate::floor::FloorState;
 use crate::memory::{Memory, build_for_peer};
 use crate::server::{AudioEvent, SurfaceEvent, ThoughtBus};
 use crate::types::{Channel, JournalEntry, PeerId, Signal, SurfaceEnvelope, SurfaceMode, SurfaceOp};
@@ -50,7 +47,8 @@ use crate::voice::Tts;
 /// more patient (never talks over a multi-burst thought) but more latency;
 /// lower = snappier but more likely to answer a half-finished thought. Paired
 /// with the client VAD's `endSilenceMs`, which governs how fast an utterance is
-/// *finalized*; this governs how long we wait to see if another one follows.
+/// *finalized* (and POSTed); this governs how long we wait to see if another one
+/// follows.
 const RESPONSE_SETTLE: Duration = Duration::from_millis(700);
 
 const ROUTER_SYSTEM_PROMPT: &str = "You are a human-interface agent. \
@@ -99,8 +97,6 @@ struct ReactorInner {
     /// it tags AudioEvents and the channel logs so a reply is traceable end to
     /// end. (The client no longer needs it — turns are internal to the mind.)
     turn_seq: AtomicU64,
-    /// Live per-peer floor signal, read by the commit-after-quiet settle.
-    floor: FloorState,
     peers: Mutex<HashMap<PeerId, PeerHandle>>,
 }
 
@@ -119,7 +115,6 @@ pub fn start(
     tts: Option<Arc<dyn Tts>>,
     audio_out: broadcast::Sender<AudioEvent>,
     surface_out: broadcast::Sender<SurfaceEvent>,
-    floor: FloorState,
 ) -> Reactor {
     let reactor = Reactor {
         inner: Arc::new(ReactorInner {
@@ -130,7 +125,6 @@ pub fn start(
             audio_out,
             surface_out,
             turn_seq: AtomicU64::new(0),
-            floor,
             peers: Mutex::new(HashMap::new()),
         }),
     };
@@ -215,11 +209,9 @@ async fn per_peer_loop(
         };
         let mut batch: Vec<Signal> = vec![first];
 
-        // Commit-after-quiet: wait for the floor to settle before replying.
-        // Keep absorbing utterances; each one that lands resets the wait. When
-        // the settle elapses with nothing new, only respond if the human has
-        // actually stopped — if a mic socket is still open they're mid-burst and
-        // its final just hasn't landed yet, so wait again.
+        // Commit-after-quiet: wait for things to settle before replying. Keep
+        // absorbing utterances; each one that lands resets the wait. When the
+        // settle elapses with nothing new, commit to a reply.
         let closed = loop {
             while let Ok(extra) = inbound.try_recv() {
                 batch.push(extra);
@@ -227,12 +219,7 @@ async fn per_peer_loop(
             match timeout(RESPONSE_SETTLE, inbound.recv()).await {
                 Ok(Some(extra)) => batch.push(extra), // another utterance — keep collecting
                 Ok(None) => break true,               // inbound closed mid-settle
-                Err(_) => {
-                    if reactor.inner.floor.is_speaking(&peer).await {
-                        continue; // still talking; their final hasn't landed yet
-                    }
-                    break false; // floor yielded → commit to a reply
-                }
+                Err(_) => break false,                // quiet elapsed → commit to a reply
             }
         };
         if closed {

@@ -11,18 +11,17 @@ use chrono::{DateTime, Utc};
 use tokio::sync::{broadcast, mpsc};
 use tower_http::trace::TraceLayer;
 
-use crate::floor::FloorState;
 use crate::memory::Memory;
 use crate::types::{PeerId, Signal, SurfaceEnvelope};
 use crate::voice::Stt;
 
 pub mod audio;
 pub mod headers;
-pub mod stt_stream;
 pub mod stubs;
 pub mod surface;
 pub mod thought;
 pub mod thought_bus;
+pub mod vision;
 
 pub use thought_bus::ThoughtBus;
 
@@ -72,17 +71,12 @@ pub struct AppState {
     /// Memory substrate — journal. Cloneable handle.
     pub memory: Memory,
 
-    /// Where blob media lives. POST /audio writes incoming bytes here before
-    /// dispatching the transcript through the journal.
+    /// Where blob media lives. POST /api/audio and POST /api/vision write
+    /// incoming bytes here before journaling the reference.
     pub data_dir: PathBuf,
 
-    /// Speech-to-text capability. `None` → POST /audio returns 501.
+    /// Speech-to-text capability. `None` → POST /api/audio returns 501.
     pub stt: Option<Arc<dyn Stt>>,
-
-    /// Live per-peer floor signal. The streaming-STT handler marks a peer
-    /// "speaking" for each mic socket's lifetime; the reactor reads it to wait
-    /// for a settled silence before replying. See [`crate::floor`].
-    pub floor: FloorState,
 }
 
 pub fn build(
@@ -94,7 +88,6 @@ pub fn build(
     let thought_bus = ThoughtBus::new();
     let (audio_tx, _) = broadcast::channel::<AudioEvent>(64);
     let (surface_tx, _) = broadcast::channel::<SurfaceEvent>(64);
-    let floor = FloorState::new();
 
     let state = Arc::new(AppState {
         inbound: inbound_tx,
@@ -104,18 +97,18 @@ pub fn build(
         memory,
         data_dir,
         stt,
-        floor: floor.clone(),
     });
 
+    // Every channel lives under `/api/*`; the appearance router owns the rest
+    // (SPA shell + static assets).
     let router = Router::new()
-        .route("/thought", post(thought::post_thought).get(thought::get_thought))
-        .route("/audio", post(audio::post_audio).get(audio::get_audio))
-        .route("/stt/stream", get(stt_stream::get_stt_stream))
-        .route("/surface", get(surface::get_surface))
-        .route("/vision", post(stubs::post_vision))
-        .route("/touch", post(stubs::post_touch))
-        .route("/smell", post(stubs::post_smell))
-        .route("/taste", post(stubs::post_taste))
+        .route("/api/thought", post(thought::post_thought).get(thought::get_thought))
+        .route("/api/audio", post(audio::post_audio).get(audio::get_audio))
+        .route("/api/surface", get(surface::get_surface))
+        .route("/api/vision", post(vision::post_vision))
+        .route("/api/touch", post(stubs::post_touch))
+        .route("/api/smell", post(stubs::post_smell))
+        .route("/api/taste", post(stubs::post_taste))
         .with_state(state)
         .merge(crate::appearance::router())
         .fallback(not_found)
@@ -126,7 +119,6 @@ pub fn build(
         thought_bus,
         audio_out: audio_tx,
         surface_out: surface_tx,
-        floor,
     };
 
     (router, seams)
@@ -137,7 +129,6 @@ pub struct ServerSeams {
     pub thought_bus: ThoughtBus,
     pub audio_out: broadcast::Sender<AudioEvent>,
     pub surface_out: broadcast::Sender<SurfaceEvent>,
-    pub floor: FloorState,
 }
 
 async fn not_found() -> (StatusCode, &'static str) {

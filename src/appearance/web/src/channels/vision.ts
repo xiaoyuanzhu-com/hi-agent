@@ -1,0 +1,30 @@
+// Client for the human-interface /vision channel (inbound camera frames).
+//
+// Vision mirrors audio: a continuous input channel. The client captures frames
+// from the camera and POSTs each one here; there is no commit — the backend
+// brain decides what (if anything) to do with the signal. The server currently
+// just persists the frame (it can't perceive images yet), so this is
+// fire-and-forget; we don't read the response body.
+
+export async function postVision(opts: {
+  from: string;
+  blob: Blob;
+  mime: string;
+  signal?: AbortSignal;
+}): Promise<void> {
+  const res = await fetch("/api/vision", {
+    method: "POST",
+    headers: {
+      "Content-Type": opts.mime,
+      "X-HI-From": opts.from,
+    },
+    body: opts.blob,
+    signal: opts.signal,
+  });
+  if (!res.ok) {
+    const detail = await res.text().catch(() => "");
+    throw new Error(
+      `/api/vision POST failed: ${res.status} ${res.statusText}${detail ? ` — ${detail.trim()}` : ""}`,
+    );
+  }
+}
