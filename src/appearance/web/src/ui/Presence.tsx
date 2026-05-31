@@ -27,12 +27,8 @@ interface PresenceProps {
 
 type RGB = [number, number, number];
 
-const mix = (a: RGB, b: RGB, t: number): RGB => [
-  a[0] + (b[0] - a[0]) * t,
-  a[1] + (b[1] - a[1]) * t,
-  a[2] + (b[2] - a[2]) * t,
-];
 const rgba = (c: RGB, a: number) => `rgba(${c[0]},${c[1]},${c[2]},${a})`;
+const hsla = (h: number, s: number, l: number, a: number) => `hsla(${h},${s}%,${l}%,${a})`;
 
 function hexToRgb(hex: string, fallback: RGB): RGB {
   const m = /^#?([0-9a-f]{6})$/i.exec(hex.trim());
@@ -69,24 +65,76 @@ function readPalette(): Palette {
   };
 }
 
-/** The halo colour for an interaction state. The room glows blue at rest, teal
- *  while the human holds the floor, violet while the agent thinks, and warm
- *  amber while it speaks — so the colour alone reads the state. */
-function stateAccent(state: PresenceState, pal: Palette): RGB {
-  switch (state) {
-    case "listening":
-      return pal.listen;
-    case "thinking":
-      return pal.think;
-    case "speaking":
-      return pal.speak;
-    case "offline":
-      return pal.offline;
-    case "waking":
-    case "idle":
-    default:
-      return pal.idle;
-  }
+/** Convert an RGB token to HSL so halos can jitter their hue around it. */
+function rgb2hsl([r, g, b]: RGB): [number, number, number] {
+  const rr = r / 255, gg = g / 255, bb = b / 255;
+  const max = Math.max(rr, gg, bb);
+  const min = Math.min(rr, gg, bb);
+  const l = (max + min) / 2;
+  const d = max - min;
+  if (d === 0) return [0, 0, l * 100];
+  const s = l > 0.5 ? d / (2 - max - min) : d / (max + min);
+  let h: number;
+  if (max === rr) h = (gg - bb) / d + (gg < bb ? 6 : 0);
+  else if (max === gg) h = (bb - rr) / d + 2;
+  else h = (rr - gg) / d + 4;
+  return [h * 60, s * 100, l * 100];
+}
+
+/** The base hue/sat for an interaction state, read from the tokens: blue at
+ *  rest, teal while the human holds the floor, violet while thinking, amber
+ *  while speaking. Each halo jitters around this, so the field still reads the
+ *  state while the individuals vary. */
+function stateHsl(state: PresenceState, pal: Palette): [number, number, number] {
+  const c =
+    state === "listening" ? pal.listen
+    : state === "thinking" ? pal.think
+    : state === "speaking" ? pal.speak
+    : state === "offline" ? pal.offline
+    : pal.idle;
+  return rgb2hsl(c);
+}
+
+const rand = (a: number, b: number) => a + Math.random() * (b - a);
+
+/**
+ * A living halo. Short-lived by design: over its `life` it fades in, grows,
+ * drifts and shifts hue, then shrinks and fades back out. Born with properties
+ * sampled from the current state's colour but jittered per-individual, so no two
+ * are alike and the field stays alive as halos are continually born and die.
+ */
+interface Halo {
+  x: number; y: number;        // normalized birth position
+  vx: number; vy: number;      // slow linear drift (per second)
+  wax: number; way: number;    // wander amplitude
+  wpx: number; wpy: number;    // wander phase
+  born: number; life: number;  // seconds
+  rMax: number;                // peak radius (× min(W,H))
+  h0: number; h1: number;      // hue birth → death (its colour gradient)
+  sat: number; lig: number;
+  w: number;                   // intensity weight
+}
+
+function spawnHalo(t: number, state: PresenceState, pal: Palette): Halo {
+  const [h, s] = stateHsl(state, pal);
+  return {
+    x: rand(0.1, 0.9),
+    y: rand(0.12, 0.88),
+    vx: rand(-0.016, 0.016),
+    vy: rand(-0.016, 0.016),
+    wax: rand(0.01, 0.045),
+    way: rand(0.01, 0.045),
+    wpx: rand(0, Math.PI * 2),
+    wpy: rand(0, Math.PI * 2),
+    born: t,
+    life: rand(7, 15),
+    rMax: rand(0.12, 0.28),
+    h0: h + rand(-22, 22),
+    h1: h + rand(-22, 22),
+    sat: Math.min(96, s + rand(-4, 14)),
+    lig: rand(56, 66),
+    w: rand(0.7, 1),
+  };
 }
 
 /** Synthetic 0..1 envelope when there is no live audio to read. */
@@ -118,26 +166,20 @@ function synthLevel(state: PresenceState, t: number): number {
   }
 }
 
-// Soft drifting light-pools. The whole room breathes; there is never a central
-// object competing with the words or a content card on top.
-const POOLS = [
-  { px: 0.26, py: 0.28, ax: 0.1, ay: 0.07, fx: 0.013, fy: 0.009, fr: 1 / 19, ph: 0.0, w: 1.0 },
-  { px: 0.74, py: 0.34, ax: 0.09, ay: 0.09, fx: 0.011, fy: 0.015, fr: 1 / 23, ph: 2.1, w: 0.9 },
-  { px: 0.5, py: 0.78, ax: 0.12, ay: 0.06, fx: 0.009, fy: 0.012, fr: 1 / 27, ph: 4.2, w: 0.85 },
-];
-
 /**
  * The agent's presence — expressed entirely in the background.
  *
- * A neutral white field with a few large, soft colour-pools that drift and
- * breathe on long cycles, seen through the frosted glass above (Atmosphere).
- * The agent's internal state lives here, carried by colour: the room glows blue
- * at idle (one slow breath), teal while the human holds the floor, violet while
- * thinking, and warm amber while it speaks — deepening/receding with the voice.
- * Audio reactivity reads the live `AudioBus` when `reactive`; otherwise a gentle
- * synthetic envelope. A content-safe vignette keeps the centre calm so words and
- * cards stay legible; `demote` makes the whole field step back when a surface is
- * up. Mounted once and driven by refs so it never unmounts across state changes.
+ * A neutral white field behind frosted glass (Atmosphere), populated by a small
+ * shifting cast of *living halos*: each is born somewhere random, fades in,
+ * grows, drifts, shifts hue, then shrinks and fades out — so the field is never
+ * static. Their colour is sampled from the current interaction state (blue at
+ * rest, teal while the human holds the floor, violet while thinking, amber while
+ * speaking), jittered per-individual, so the field reads the state while every
+ * halo is its own. Brightness and population ride live audio (`reactive`, via
+ * the `AudioBus`) or the cognition cadence (`activity`), else a gentle synthetic
+ * breath. A light vignette keeps the centre calm for words; `demote` steps the
+ * field back when a surface is up. Mounted once and driven by refs so it never
+ * unmounts across state changes.
  */
 export function Presence({ bus, state, reactive = false, activity = null, demote = 0 }: PresenceProps) {
   const canvasRef = useRef<HTMLCanvasElement | null>(null);
@@ -177,60 +219,50 @@ export function Presence({ bus, state, reactive = false, activity = null, demote
     ro.observe(canvas);
 
     let level = 0.1;
-    let drift = 0; // integral of the (smoothed) motion rate — see tick()
-    let moveScale = 1.0; // eased per-state motion rate; never stepped
-    let accentCur: RGB | null = null; // crossfaded tint; never snapped
+    let halos: Halo[] = [];
     let raf = 0;
-    let last = performance.now();
-    const t0 = last;
+    const t0 = performance.now();
 
     const draw = (t: number) => {
-      const st = stateRef.current;
       const dem = demoteRef.current;
 
-      // base wash
+      // base wash — neutral white paper
       const bg = ctx.createLinearGradient(0, 0, 0, H);
       bg.addColorStop(0, rgba(pal.bg0, 1));
       bg.addColorStop(1, rgba(pal.bg1, 1));
       ctx.fillStyle = bg;
       ctx.fillRect(0, 0, W, H);
 
-      // Target halo colour for the state, then crossfade toward it so a state
-      // flip eases the hue rather than snapping it in one frame.
-      const accentTarget = stateAccent(st, pal);
-      accentCur = accentCur ? mix(accentCur, accentTarget, 0.05) : accentTarget;
-      const accent = accentCur;
       const md = Math.min(W, H);
       const demoteMul = 1 - dem * 0.72;
 
-      // Paint the pools as clean coloured *light*, not pigment: normal
-      // compositing with saturated hues, so they read as a glow behind the
-      // frosted glass. (multiply darkens toward grey here — looked muddy/dirty.)
-      // The white veil on top desaturates ~half, so paint them strong & vivid.
-      for (const pool of POOLS) {
-        // drift already carries the motion rate (∫ moveScale dt), so the phase
-        // stays continuous across state changes — no positional teleport.
-        const dx = Math.sin(2 * Math.PI * pool.fx * drift + pool.ph) * pool.ax;
-        const dy = Math.sin(2 * Math.PI * pool.fy * drift + pool.ph * 1.3) * pool.ay;
-        const cx = (pool.px + dx) * W;
-        const cy = (pool.py + dy) * H;
-        const breath = Math.sin(2 * Math.PI * pool.fr * t + pool.ph) * 0.5 + 0.5;
-        const R = md * (0.34 + breath * 0.05) * (1 + level * 0.35);
-        const a = (0.4 + breath * 0.1 + level * 0.4) * pool.w * demoteMul;
-        const g = ctx.createRadialGradient(cx, cy, 0, cx, cy, R);
-        // Fade to the SAME hue at alpha 0 — never to "transparent" (= transparent
-        // *black*), which interpolates RGB toward black and leaves a dirty grey
-        // ring at the edge.
-        g.addColorStop(0, rgba(accent, Math.min(0.9, a)));
-        g.addColorStop(0.4, rgba(accent, a * 0.55));
-        g.addColorStop(1, rgba(accent, 0));
+      // Each halo: a vivid radial of clean coloured light. Its life maps to a
+      // single sine arc — born small & dim, swelling bright at mid-life, then
+      // shrinking and fading away. Tight core + quick fade keeps the colour
+      // concentrated (the glass above does the softening); the edge fades to the
+      // SAME hue at alpha 0, so there's never a grey ring.
+      for (const o of halos) {
+        const age = t - o.born;
+        const u = age / o.life; // 0..1 over its life
+        const env = Math.sin(Math.PI * u) ** 0.7; // fade in → out
+        if (env <= 0.002) continue;
+        const grow = 0.5 + 0.5 * Math.sin(Math.PI * u); // small → big → small
+        const x = (o.x + o.vx * age + o.wax * Math.sin(o.wpx + age * 0.24)) * W;
+        const y = (o.y + o.vy * age + o.way * Math.sin(o.wpy + age * 0.2)) * H;
+        const R = md * o.rMax * (0.55 + 0.45 * grow);
+        const hue = o.h0 + (o.h1 - o.h0) * u; // drifts hue across its life
+        const a = (0.55 + level * 0.4) * env * o.w * demoteMul;
+        const g = ctx.createRadialGradient(x, y, 0, x, y, R);
+        g.addColorStop(0, hsla(hue, o.sat, o.lig, Math.min(0.95, a)));
+        g.addColorStop(0.5, hsla(hue, o.sat, o.lig, a * 0.42));
+        g.addColorStop(1, hsla(hue, o.sat, o.lig, 0));
         ctx.fillStyle = g;
         ctx.fillRect(0, 0, W, H);
       }
 
-      // Legibility now comes from the frosted glass above, so the centre wash is
+      // Legibility comes from the frosted glass above, so the centre wash is
       // light — just enough to settle the field, plus the demote push when a
-      // content surface is up, and a soft warm edge for depth.
+      // content surface is up, and a soft edge for depth.
       const vx = W / 2;
       const vy = H * 0.52;
       const vig = ctx.createRadialGradient(vx, vy, 0, vx, vy, md * 0.7);
@@ -243,18 +275,10 @@ export function Presence({ bus, state, reactive = false, activity = null, demote
 
     const tick = (now: number) => {
       const t = (now - t0) / 1000;
-      const dt = Math.min(0.05, (now - last) / 1000);
-      last = now;
 
       const liveBus = busRef.current;
       const act = activityRef.current;
       const st = stateRef.current;
-
-      // Ease the motion rate between states, then integrate it: pools drift on a
-      // continuous phase, so a state flip changes their *speed*, never their spot.
-      const targetMove = st === "thinking" ? 1.5 : st === "idle" ? 0.8 : st === "waking" ? 0.5 : 1.0;
-      moveScale += (targetMove - moveScale) * 0.05;
-      drift += moveScale * dt;
 
       // Brightness target: live audio when reactive; otherwise a synthetic breath
       // lifted by real cognition cadence (streamed-chunk pulses) while
@@ -272,12 +296,26 @@ export function Presence({ bus, state, reactive = false, activity = null, demote
       }
       level += (target - level) * 0.06; // heavy smoothing → calm
 
+      // Tend the population: cull the dead, and let a few more be born when the
+      // field is livelier. New halos sample the *current* state's colour, so a
+      // state change re-tints the field organically as old halos age out — no
+      // snap, because the change rides in on the next births.
+      halos = halos.filter((o) => t - o.born < o.life);
+      const targetCount = 4 + Math.round(level * 4);
+      if (halos.length < targetCount) halos.push(spawnHalo(t, st, pal));
+
       draw(t);
       raf = requestAnimationFrame(tick);
     };
 
     if (reduce) {
+      // A still frame: a few halos frozen mid-life so the field isn't blank.
       level = synthLevel(stateRef.current, 0);
+      for (let i = 0; i < 5; i++) {
+        const o = spawnHalo(0, stateRef.current, pal);
+        o.born = -o.life * rand(0.3, 0.6); // placed past their fade-in
+        halos.push(o);
+      }
       draw(0);
     } else {
       raf = requestAnimationFrame(tick);
