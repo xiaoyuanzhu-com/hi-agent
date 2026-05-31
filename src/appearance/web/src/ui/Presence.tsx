@@ -44,9 +44,13 @@ function hexToRgb(hex: string, fallback: RGB): RGB {
 interface Palette {
   bg0: RGB;
   bg1: RGB;
-  accent: RGB;
-  hot: RGB;
+  // One halo colour per interaction state — this is the *only* colour in the
+  // scene; the paper and the glass stay neutral white.
+  idle: RGB;
+  listen: RGB;
   think: RGB;
+  speak: RGB;
+  offline: RGB;
 }
 
 /** Read the look-and-feel from the centralized CSS tokens so a future skin can
@@ -55,12 +59,34 @@ function readPalette(): Palette {
   const cs = getComputedStyle(document.documentElement);
   const v = (name: string, fb: RGB) => hexToRgb(cs.getPropertyValue(name), fb);
   return {
-    bg0: v("--bg-0", [9, 11, 15]),
-    bg1: v("--bg-1", [4, 5, 10]),
-    accent: v("--presence-accent", [120, 150, 200]),
-    hot: v("--presence-hot", [200, 216, 245]),
-    think: v("--presence-think", [140, 138, 196]),
+    bg0: v("--bg-0", [246, 248, 251]),
+    bg1: v("--bg-1", [238, 241, 246]),
+    idle: v("--presence-idle", [90, 155, 242]),
+    listen: v("--presence-listen", [32, 194, 160]),
+    think: v("--presence-think", [147, 116, 255]),
+    speak: v("--presence-speak", [255, 140, 63]),
+    offline: v("--presence-offline", [154, 163, 178]),
   };
+}
+
+/** The halo colour for an interaction state. The room glows blue at rest, teal
+ *  while the human holds the floor, violet while the agent thinks, and warm
+ *  amber while it speaks — so the colour alone reads the state. */
+function stateAccent(state: PresenceState, pal: Palette): RGB {
+  switch (state) {
+    case "listening":
+      return pal.listen;
+    case "thinking":
+      return pal.think;
+    case "speaking":
+      return pal.speak;
+    case "offline":
+      return pal.offline;
+    case "waking":
+    case "idle":
+    default:
+      return pal.idle;
+  }
 }
 
 /** Synthetic 0..1 envelope when there is no live audio to read. */
@@ -103,10 +129,11 @@ const POOLS = [
 /**
  * The agent's presence — expressed entirely in the background.
  *
- * A near-black field with a few large, soft light-pools that drift and breathe
- * on long cycles. The agent's internal state lives here: the room is nearly
- * still at idle (one slow breath), wanders a touch faster and cooler while
- * thinking, and brightens/recedes with the voice while listening or speaking.
+ * A neutral white field with a few large, soft colour-pools that drift and
+ * breathe on long cycles, seen through the frosted glass above (Atmosphere).
+ * The agent's internal state lives here, carried by colour: the room glows blue
+ * at idle (one slow breath), teal while the human holds the floor, violet while
+ * thinking, and warm amber while it speaks — deepening/receding with the voice.
  * Audio reactivity reads the live `AudioBus` when `reactive`; otherwise a gentle
  * synthetic envelope. A content-safe vignette keeps the centre calm so words and
  * cards stay legible; `demote` makes the whole field step back when a surface is
@@ -168,21 +195,18 @@ export function Presence({ bus, state, reactive = false, activity = null, demote
       ctx.fillStyle = bg;
       ctx.fillRect(0, 0, W, H);
 
-      // Target tint per state, then crossfade toward it so a state flip eases
-      // the hue rather than snapping it in one frame.
-      const accent0 = st === "thinking" ? pal.think : pal.accent;
-      const accentTarget =
-        st === "speaking"
-          ? mix(accent0, pal.hot, 0.18)
-          : st === "offline"
-            ? mix(pal.accent, [120, 128, 150], 0.7)
-            : accent0;
+      // Target halo colour for the state, then crossfade toward it so a state
+      // flip eases the hue rather than snapping it in one frame.
+      const accentTarget = stateAccent(st, pal);
       accentCur = accentCur ? mix(accentCur, accentTarget, 0.05) : accentTarget;
       const accent = accentCur;
       const md = Math.min(W, H);
       const demoteMul = 1 - dem * 0.72;
 
-      ctx.globalCompositeOperation = "lighter";
+      // Paint the pools as clean coloured *light*, not pigment: normal
+      // compositing with saturated hues, so they read as a glow behind the
+      // frosted glass. (multiply darkens toward grey here — looked muddy/dirty.)
+      // The white veil on top desaturates ~half, so paint them strong & vivid.
       for (const pool of POOLS) {
         // drift already carries the motion rate (∫ moveScale dt), so the phase
         // stays continuous across state changes — no positional teleport.
@@ -192,23 +216,27 @@ export function Presence({ bus, state, reactive = false, activity = null, demote
         const cy = (pool.py + dy) * H;
         const breath = Math.sin(2 * Math.PI * pool.fr * t + pool.ph) * 0.5 + 0.5;
         const R = md * (0.34 + breath * 0.05) * (1 + level * 0.35);
-        const a = (0.05 + breath * 0.05 + level * 0.16) * pool.w * demoteMul;
+        const a = (0.4 + breath * 0.1 + level * 0.4) * pool.w * demoteMul;
         const g = ctx.createRadialGradient(cx, cy, 0, cx, cy, R);
-        g.addColorStop(0, rgba(accent, Math.min(0.4, a)));
-        g.addColorStop(0.45, rgba(accent, a * 0.4));
-        g.addColorStop(1, "transparent");
+        // Fade to the SAME hue at alpha 0 — never to "transparent" (= transparent
+        // *black*), which interpolates RGB toward black and leaves a dirty grey
+        // ring at the edge.
+        g.addColorStop(0, rgba(accent, Math.min(0.9, a)));
+        g.addColorStop(0.4, rgba(accent, a * 0.55));
+        g.addColorStop(1, rgba(accent, 0));
         ctx.fillStyle = g;
         ctx.fillRect(0, 0, W, H);
       }
-      ctx.globalCompositeOperation = "source-over";
 
-      // content-safe vignette: keep the centre (words / cards) calm and readable
+      // Legibility now comes from the frosted glass above, so the centre wash is
+      // light — just enough to settle the field, plus the demote push when a
+      // content surface is up, and a soft warm edge for depth.
       const vx = W / 2;
       const vy = H * 0.52;
       const vig = ctx.createRadialGradient(vx, vy, 0, vx, vy, md * 0.7);
-      vig.addColorStop(0, rgba(pal.bg1, 0.3 + dem * 0.28));
-      vig.addColorStop(0.6, rgba(pal.bg1, 0));
-      vig.addColorStop(1, rgba(pal.bg1, 0.28));
+      vig.addColorStop(0, rgba(pal.bg0, 0.12 + dem * 0.36));
+      vig.addColorStop(0.6, rgba(pal.bg0, 0));
+      vig.addColorStop(1, rgba(pal.bg1, 0.22));
       ctx.fillStyle = vig;
       ctx.fillRect(0, 0, W, H);
     };
