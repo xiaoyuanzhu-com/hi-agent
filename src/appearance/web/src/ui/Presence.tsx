@@ -40,62 +40,46 @@ function hexToRgb(hex: string, fallback: RGB): RGB {
 interface Palette {
   bg0: RGB;
   bg1: RGB;
-  // One halo colour per interaction state — this is the *only* colour in the
-  // scene; the paper and the glass stay neutral white.
-  idle: RGB;
-  listen: RGB;
-  think: RGB;
-  speak: RGB;
-  offline: RGB;
 }
 
-/** Read the look-and-feel from the centralized CSS tokens so a future skin can
- *  re-tint the field purely by swapping `:root` variables (no canvas changes). */
+/** Read the neutral paper tokens from CSS. (Halo colours are the curated
+ *  PALETTE below — not tokens — so the spectrum stays hand-tuned.) */
 function readPalette(): Palette {
   const cs = getComputedStyle(document.documentElement);
   const v = (name: string, fb: RGB) => hexToRgb(cs.getPropertyValue(name), fb);
   return {
     bg0: v("--bg-0", [246, 248, 251]),
     bg1: v("--bg-1", [238, 241, 246]),
-    idle: v("--presence-idle", [90, 155, 242]),
-    listen: v("--presence-listen", [32, 194, 160]),
-    think: v("--presence-think", [147, 116, 255]),
-    speak: v("--presence-speak", [255, 140, 63]),
-    offline: v("--presence-offline", [154, 163, 178]),
   };
 }
 
-/** Convert an RGB token to HSL so halos can jitter their hue around it. */
-function rgb2hsl([r, g, b]: RGB): [number, number, number] {
-  const rr = r / 255, gg = g / 255, bb = b / 255;
-  const max = Math.max(rr, gg, bb);
-  const min = Math.min(rr, gg, bb);
-  const l = (max + min) / 2;
-  const d = max - min;
-  if (d === 0) return [0, 0, l * 100];
-  const s = l > 0.5 ? d / (2 - max - min) : d / (max + min);
-  let h: number;
-  if (max === rr) h = (gg - bb) / d + (gg < bb ? 6 : 0);
-  else if (max === gg) h = (bb - rr) / d + 2;
-  else h = (rr - gg) / d + 4;
-  return [h * 60, s * 100, l * 100];
-}
-
-/** The base hue/sat for an interaction state, read from the tokens: blue at
- *  rest, teal while the human holds the floor, violet while thinking, amber
- *  while speaking. Each halo jitters around this, so the field still reads the
- *  state while the individuals vary. */
-function stateHsl(state: PresenceState, pal: Palette): [number, number, number] {
-  const c =
-    state === "listening" ? pal.listen
-    : state === "thinking" ? pal.think
-    : state === "speaking" ? pal.speak
-    : state === "offline" ? pal.offline
-    : pal.idle;
-  return rgb2hsl(c);
-}
+// ── Curated halo palette ─────────────────────────────────────────────────────
+// A hand-picked "tech" spectrum (in the spirit of Apple Intelligence / OpenAI
+// voice): a cohesive cyan → blue → indigo → magenta → pink sweep, all cool and
+// vivid, so *any* combination stays harmonious. Halos only ever draw from this —
+// never a free random hue — so nothing clashes. Each state picks a small subset;
+// a halo is born on one entry and drifts toward another in the same subset over
+// its life. Edit these HSL triples to re-skin the whole field.
+type HSL = [number, number, number];
+const C = {
+  cyan: [186, 90, 58] as HSL,
+  blue: [214, 92, 62] as HSL,
+  indigo: [250, 84, 66] as HSL,
+  magenta: [296, 74, 64] as HSL,
+  pink: [336, 90, 68] as HSL,
+  slate: [214, 16, 62] as HSL, // offline — desaturated
+};
+const STATE_COLORS: Record<PresenceState, HSL[]> = {
+  idle: [C.blue, C.indigo],       // resting — calm cool
+  listening: [C.cyan, C.blue],    // human has the floor — bright cool
+  thinking: [C.indigo, C.magenta],// cognition — purple swirl
+  speaking: [C.magenta, C.pink],  // agent voice — warm glow
+  offline: [C.slate],             // disconnected
+  waking: [C.blue],
+};
 
 const rand = (a: number, b: number) => a + Math.random() * (b - a);
+const pick = <T,>(arr: T[]): T => arr[Math.floor(Math.random() * arr.length)]!;
 
 /**
  * A living halo. Short-lived by design: over its `life` it fades in, grows,
@@ -115,8 +99,10 @@ interface Halo {
   w: number;                   // intensity weight
 }
 
-function spawnHalo(t: number, state: PresenceState, pal: Palette): Halo {
-  const [h, s] = stateHsl(state, pal);
+function spawnHalo(t: number, state: PresenceState): Halo {
+  const set = STATE_COLORS[state] ?? STATE_COLORS.idle;
+  const c0 = pick(set); // born on this colour…
+  const c1 = pick(set); // …drifts toward this one (same subset → stays in key)
   return {
     x: rand(0.1, 0.9),
     y: rand(0.12, 0.88),
@@ -129,10 +115,10 @@ function spawnHalo(t: number, state: PresenceState, pal: Palette): Halo {
     born: t,
     life: rand(7, 15),
     rMax: rand(0.12, 0.28),
-    h0: h + rand(-22, 22),
-    h1: h + rand(-22, 22),
-    sat: Math.min(96, s + rand(-4, 14)),
-    lig: rand(56, 66),
+    h0: c0[0] + rand(-5, 5), // tiny jitter only — never off-palette
+    h1: c1[0] + rand(-5, 5),
+    sat: Math.min(100, c0[1] + rand(-3, 5)),
+    lig: c0[2] + rand(-3, 3),
     w: rand(0.7, 1),
   };
 }
@@ -251,10 +237,10 @@ export function Presence({ bus, state, reactive = false, activity = null, demote
         const y = (o.y + o.vy * age + o.way * Math.sin(o.wpy + age * 0.2)) * H;
         const R = md * o.rMax * (0.55 + 0.45 * grow);
         const hue = o.h0 + (o.h1 - o.h0) * u; // drifts hue across its life
-        const a = (0.55 + level * 0.4) * env * o.w * demoteMul;
+        const a = (0.64 + level * 0.4) * env * o.w * demoteMul;
         const g = ctx.createRadialGradient(x, y, 0, x, y, R);
-        g.addColorStop(0, hsla(hue, o.sat, o.lig, Math.min(0.95, a)));
-        g.addColorStop(0.5, hsla(hue, o.sat, o.lig, a * 0.42));
+        g.addColorStop(0, hsla(hue, o.sat, o.lig, Math.min(0.98, a)));
+        g.addColorStop(0.5, hsla(hue, o.sat, o.lig, a * 0.52));
         g.addColorStop(1, hsla(hue, o.sat, o.lig, 0));
         ctx.fillStyle = g;
         ctx.fillRect(0, 0, W, H);
@@ -302,7 +288,7 @@ export function Presence({ bus, state, reactive = false, activity = null, demote
       // snap, because the change rides in on the next births.
       halos = halos.filter((o) => t - o.born < o.life);
       const targetCount = 4 + Math.round(level * 4);
-      if (halos.length < targetCount) halos.push(spawnHalo(t, st, pal));
+      if (halos.length < targetCount) halos.push(spawnHalo(t, st));
 
       draw(t);
       raf = requestAnimationFrame(tick);
@@ -312,7 +298,7 @@ export function Presence({ bus, state, reactive = false, activity = null, demote
       // A still frame: a few halos frozen mid-life so the field isn't blank.
       level = synthLevel(stateRef.current, 0);
       for (let i = 0; i < 5; i++) {
-        const o = spawnHalo(0, stateRef.current, pal);
+        const o = spawnHalo(0, stateRef.current);
         o.born = -o.life * rand(0.3, 0.6); // placed past their fade-in
         halos.push(o);
       }
