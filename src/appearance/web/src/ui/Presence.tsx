@@ -1,5 +1,6 @@
 import { useEffect, useRef } from "react";
 import type { AudioBus } from "../lib/audioBus";
+import type { ActivityMeter } from "../lib/activityMeter";
 
 export type PresenceState =
   | "waking"
@@ -16,6 +17,10 @@ interface PresenceProps {
   /** When true the field tracks live audio (mic, or — Phase 2 — TTS playback);
    *  otherwise it breathes on a synthetic, state-dependent envelope. */
   reactive?: boolean;
+  /** Live cognition cadence (streamed-chunk pulses). When not audio-reactive,
+   *  this lifts the field while thinking/speaking so it rides real output, not a
+   *  canned loop. Null before wake → pure synthetic breath. */
+  activity?: ActivityMeter | null;
   /** 0..1 — how much a content overlay is up; the field recedes as this rises. */
   demote?: number;
 }
@@ -107,16 +112,18 @@ const POOLS = [
  * cards stay legible; `demote` makes the whole field step back when a surface is
  * up. Mounted once and driven by refs so it never unmounts across state changes.
  */
-export function Presence({ bus, state, reactive = false, demote = 0 }: PresenceProps) {
+export function Presence({ bus, state, reactive = false, activity = null, demote = 0 }: PresenceProps) {
   const canvasRef = useRef<HTMLCanvasElement | null>(null);
   const stateRef = useRef(state);
   const reactiveRef = useRef(reactive);
   const demoteRef = useRef(demote);
   const busRef = useRef(bus);
+  const activityRef = useRef(activity);
   useEffect(() => { stateRef.current = state; }, [state]);
   useEffect(() => { reactiveRef.current = reactive; }, [reactive]);
   useEffect(() => { demoteRef.current = demote; }, [demote]);
   useEffect(() => { busRef.current = bus; }, [bus]);
+  useEffect(() => { activityRef.current = activity; }, [activity]);
 
   useEffect(() => {
     const canvas = canvasRef.current;
@@ -143,7 +150,9 @@ export function Presence({ bus, state, reactive = false, demote = 0 }: PresenceP
     ro.observe(canvas);
 
     let level = 0.1;
-    let drift = 0;
+    let drift = 0; // integral of the (smoothed) motion rate — see tick()
+    let moveScale = 1.0; // eased per-state motion rate; never stepped
+    let accentCur: RGB | null = null; // crossfaded tint; never snapped
     let raf = 0;
     let last = performance.now();
     const t0 = last;
@@ -159,21 +168,26 @@ export function Presence({ bus, state, reactive = false, demote = 0 }: PresenceP
       ctx.fillStyle = bg;
       ctx.fillRect(0, 0, W, H);
 
+      // Target tint per state, then crossfade toward it so a state flip eases
+      // the hue rather than snapping it in one frame.
       const accent0 = st === "thinking" ? pal.think : pal.accent;
-      const accent =
+      const accentTarget =
         st === "speaking"
           ? mix(accent0, pal.hot, 0.18)
           : st === "offline"
             ? mix(pal.accent, [120, 128, 150], 0.7)
             : accent0;
+      accentCur = accentCur ? mix(accentCur, accentTarget, 0.05) : accentTarget;
+      const accent = accentCur;
       const md = Math.min(W, H);
-      const moveScale = st === "thinking" ? 1.5 : st === "idle" ? 0.8 : st === "waking" ? 0.5 : 1.0;
       const demoteMul = 1 - dem * 0.72;
 
       ctx.globalCompositeOperation = "lighter";
       for (const pool of POOLS) {
-        const dx = Math.sin(2 * Math.PI * pool.fx * drift * moveScale + pool.ph) * pool.ax;
-        const dy = Math.sin(2 * Math.PI * pool.fy * drift * moveScale + pool.ph * 1.3) * pool.ay;
+        // drift already carries the motion rate (∫ moveScale dt), so the phase
+        // stays continuous across state changes — no positional teleport.
+        const dx = Math.sin(2 * Math.PI * pool.fx * drift + pool.ph) * pool.ax;
+        const dy = Math.sin(2 * Math.PI * pool.fy * drift + pool.ph * 1.3) * pool.ay;
         const cx = (pool.px + dx) * W;
         const cy = (pool.py + dy) * H;
         const breath = Math.sin(2 * Math.PI * pool.fr * t + pool.ph) * 0.5 + 0.5;
@@ -205,13 +219,30 @@ export function Presence({ bus, state, reactive = false, demote = 0 }: PresenceP
       last = now;
 
       const liveBus = busRef.current;
+      const act = activityRef.current;
       const st = stateRef.current;
-      const target =
-        liveBus && reactiveRef.current
-          ? Math.min(0.6, 0.12 + liveBus.read().level * 0.42)
-          : synthLevel(st, t);
+
+      // Ease the motion rate between states, then integrate it: pools drift on a
+      // continuous phase, so a state flip changes their *speed*, never their spot.
+      const targetMove = st === "thinking" ? 1.5 : st === "idle" ? 0.8 : st === "waking" ? 0.5 : 1.0;
+      moveScale += (targetMove - moveScale) * 0.05;
+      drift += moveScale * dt;
+
+      // Brightness target: live audio when reactive; otherwise a synthetic breath
+      // lifted by real cognition cadence (streamed-chunk pulses) while
+      // thinking/speaking, so the field rides actual output, not a canned loop.
+      let target: number;
+      if (liveBus && reactiveRef.current) {
+        target = Math.min(0.6, 0.12 + liveBus.read().level * 0.42);
+      } else {
+        const synth = synthLevel(st, t);
+        const pulse = act ? act.read() : 0;
+        target =
+          st === "thinking" || st === "speaking"
+            ? Math.max(synth, 0.14 + pulse * 0.42)
+            : synth;
+      }
       level += (target - level) * 0.06; // heavy smoothing → calm
-      drift += dt; // pools drift continuously but slowly
 
       draw(t);
       raf = requestAnimationFrame(tick);

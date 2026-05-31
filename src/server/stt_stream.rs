@@ -63,6 +63,11 @@ async fn drive(
     stt: Arc<dyn crate::voice::Stt>,
     peer: PeerId,
 ) {
+    // This socket is open for exactly one utterance, so its lifetime is the
+    // live "floor held" signal the reactor waits on. Mark speaking now; clear
+    // it on every exit path below (empty result, error, or normal finish).
+    state.floor.enter_speaking(&peer).await;
+
     let (audio_tx, audio_rx) = mpsc::channel::<Bytes>(64);
     let (tr_tx, mut tr_rx) = mpsc::channel::<Transcript>(64);
     let (mut ws_tx, mut ws_rx) = socket.split();
@@ -122,10 +127,15 @@ async fn drive(
     let _ = send_task.await;
 
     if final_text.trim().is_empty() {
-        return; // nothing recognized (silence / dropped) — no signal to dispatch
+        // nothing recognized (silence / dropped) — no signal to dispatch
+        state.floor.leave_speaking(&peer).await;
+        return;
     }
 
     journal_and_dispatch(&state, &peer, final_text, &pcm).await;
+    // Utterance fully handled and dispatched: the floor is released. The reactor
+    // sees this drop to silence and, after its settle, decides whether to reply.
+    state.floor.leave_speaking(&peer).await;
 }
 
 /// Persist the utterance audio and feed the transcript into the same per-peer

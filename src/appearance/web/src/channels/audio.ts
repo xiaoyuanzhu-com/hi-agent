@@ -34,22 +34,16 @@ export interface SubscribeAudioOpts {
   signal: AbortSignal;
 }
 
-/** One synthesized clip plus the cognition-turn that produced it. */
-export interface AudioClip {
-  blob: Blob;
-  /** Monotonic turn id (from the `X-HI-Turn` header); 0 if absent. */
-  turn: number;
-}
-
 /**
  * Outbound TTS (Phase 2). GET /audio is a long-poll that returns one
  * synthesized clip per response, so we re-subscribe after each. Yields each
- * clip with its turn id as it arrives; the caller voices only the latest turn
- * and discards superseded drafts.
+ * clip as it arrives; the caller just plays them in order. Turn-taking (which
+ * reply to voice, when) is decided server-side — the client only renders, so
+ * there's no turn metadata to read here.
  */
 export async function* subscribeAudio(
   opts: SubscribeAudioOpts,
-): AsyncGenerator<AudioClip, void, void> {
+): AsyncGenerator<Blob, void, void> {
   while (!opts.signal.aborted) {
     const res = await fetch("/audio", {
       method: "GET",
@@ -60,9 +54,8 @@ export async function* subscribeAudio(
     if (!res.ok) {
       throw new Error(`/audio subscribe failed: ${res.status} ${res.statusText}`);
     }
-    const turn = Number.parseInt(res.headers.get("X-HI-Turn") ?? "", 10);
     const blob = await res.blob();
-    if (blob.size > 0) yield { blob, turn: Number.isNaN(turn) ? 0 : turn };
+    if (blob.size > 0) yield blob;
   }
 }
 

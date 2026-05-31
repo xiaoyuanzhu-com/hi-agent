@@ -23,7 +23,7 @@ export function App() {
   return (
     <div className="hi-root">
       <Atmosphere />
-      <Presence bus={s.bus} state={s.state} reactive={s.reactive} demote={s.demote} />
+      <Presence bus={s.bus} state={s.state} reactive={s.reactive} activity={s.activity} demote={s.demote} />
 
       <div className="hi-stage">
         <SpeechText items={s.sentences} />

@@ -4,6 +4,7 @@ import { subscribeAudio } from "../channels/audio";
 import { SttStream } from "../channels/stt";
 import { subscribeSurface, type SurfaceEnvelope } from "../channels/surface";
 import { AudioBus } from "../lib/audioBus";
+import { ActivityMeter } from "../lib/activityMeter";
 import { MicCapture } from "../lib/micCapture";
 import { VoicePlayer } from "../lib/voicePlayer";
 import { SentenceBuffer } from "../lib/sentences";
@@ -15,10 +16,6 @@ import type { SpeechItem } from "../ui/SpeechText";
 const SENTENCE_WINDOW = 2;
 // Stable id for the in-progress user line so React updates it in place.
 const LIVE_USER_ID = -1;
-// Courtesy pause after the user stops before the agent's held reply is voiced —
-// a small floor-yield margin so a quick follow-up breath isn't talked over. The
-// VAD's endSilenceMs already gates *detecting* the stop; this is on top.
-const FLOOR_SETTLE_MS = 350;
 
 export interface AgentSession {
   state: PresenceState;
@@ -26,6 +23,8 @@ export interface AgentSession {
   /** 0..1 — how much the presence should dim for the content overlay. */
   demote: number;
   bus: AudioBus | null;
+  /** Live cognition cadence (streamed-chunk pulses) the field reacts to. */
+  activity: ActivityMeter;
   sentences: SpeechItem[];
   activeSurface: SurfaceEnvelope | null;
   surfaceHistory: SurfaceEnvelope[];
@@ -39,12 +38,18 @@ export interface AgentSession {
 }
 
 /**
- * The coordinator. After the wake gesture it owns the mic (AudioBus +
- * MicCapture/VAD → POST /audio), the GET /thought subscription (chunks →
- * whole-sentence fade), and the derived presence state machine.
+ * The coordinator — deliberately a *dumb face*. After the wake gesture it owns
+ * the mic (AudioBus + MicCapture/VAD → streaming STT) and subscribes to the
+ * output channels, rendering whatever arrives: /audio clips play on arrival,
+ * /thought chunks fade in as whole sentences.
  *
- * Barge-in is free in Phase 1: a new POST /audio cancels the in-flight routing
- * turn server-side, which closes the streaming /thought body and re-subscribes.
+ * Crucially it does NOT decide turns. Turn-taking — when the agent speaks, what
+ * counts as the human yielding the floor, which drafts to suppress — lives in
+ * the mind (the reactor). The face contributes exactly one output-side behavior:
+ * a local **barge-in reflex**, muting the speaker the instant its own mic goes
+ * hot (don't talk over the human, don't play into a hot mic). Everything else is
+ * pass-through. The reactor learns the live floor state from the STT socket's
+ * lifetime, so the client needs no extra control channel.
  */
 export function useAgentSession(): AgentSession {
   const peer = useMemo(() => getPeer(), []);
@@ -73,28 +78,9 @@ export function useAgentSession(): AgentSession {
   const sttRef = useRef<SttStream | null>(null);
   const sentenceIdRef = useRef(0);
   const surfaceTtlRef = useRef<number | null>(null);
-
-  // ---- output floor control (turn-tagged TTS) ----------------------------
-  // The agent's speaking is its own channel: we voice only the latest cognition
-  // turn and hold it until the user yields the floor. `activeTurnRef` is the
-  // highest turn id seen; clips from older (superseded) turns are discarded.
-  // `pendingAudioRef` buffers the live turn's clips while the floor is closed so
-  // the kept reply's opening is never dropped — it's released, in order, once
-  // the floor opens.
-  const activeTurnRef = useRef(-1);
-  const pendingAudioRef = useRef<Blob[]>([]);
-  const floorOpenRef = useRef(true);
-  const settleTimerRef = useRef<number | null>(null);
-
-  const releasePending = useCallback(() => {
-    if (!floorOpenRef.current) return;
-    const voice = voiceRef.current;
-    if (!voice) return;
-    const clips = pendingAudioRef.current;
-    if (clips.length === 0) return;
-    pendingAudioRef.current = [];
-    for (const blob of clips) voice.enqueue(blob);
-  }, []);
+  // Live cognition cadence: bumped per streamed chunk, decays between them, so
+  // the Presence pulses with the agent's real output rate (not a canned loop).
+  const activityRef = useRef(new ActivityMeter());
 
   // ---- GET /thought subscription loop (after wake) -----------------------
   useEffect(() => {
@@ -121,6 +107,9 @@ export function useAgentSession(): AgentSession {
       while (!cancelled) {
         try {
           let gotChunk = false;
+          // Render the agent's words as they arrive. The mind only streams a
+          // reply once it has committed to speaking (the human yielded the
+          // floor), so there are no superseded drafts to untangle here.
           for await (const chunk of subscribeThought({ peer, signal: ctrl.signal })) {
             if (cancelled) break;
             setOffline(false);
@@ -129,6 +118,8 @@ export function useAgentSession(): AgentSession {
               setAwaiting(false);
               setAgentStreaming(true);
             }
+            // Pulse the field with this chunk; larger bursts lift it more.
+            activityRef.current.bump(Math.min(1, chunk.text.length / 40));
             pushSentences(buffer.push(chunk.text));
           }
           pushSentences(buffer.flush()); // body closed → utterance complete
@@ -150,6 +141,9 @@ export function useAgentSession(): AgentSession {
   }, [woken, peer]);
 
   // ---- GET /audio subscription loop (Phase 2: TTS playback) --------------
+  // Pure render: play each clip as it arrives. The mind only puts speech on the
+  // wire once it has committed to it, so there's nothing to gate or discard
+  // here. Barge-in is handled locally in onSpeechStart (voice.stop()).
   useEffect(() => {
     if (!woken) return;
     const ctrl = new AbortController();
@@ -157,18 +151,9 @@ export function useAgentSession(): AgentSession {
     void (async () => {
       while (!cancelled) {
         try {
-          for await (const { blob, turn } of subscribeAudio({ peer, signal: ctrl.signal })) {
+          for await (const blob of subscribeAudio({ peer, signal: ctrl.signal })) {
             if (cancelled) break;
-            if (turn < activeTurnRef.current) continue; // superseded draft — discard
-            if (turn > activeTurnRef.current) {
-              // A newer cognition turn supersedes the old: drop any buffered or
-              // playing clips from the previous turn so only the latest reply speaks.
-              activeTurnRef.current = turn;
-              pendingAudioRef.current = [];
-              voiceRef.current?.stop();
-            }
-            pendingAudioRef.current.push(blob);
-            releasePending(); // voices now if the floor is open, else holds
+            voiceRef.current?.enqueue(blob);
           }
         } catch {
           if (cancelled || ctrl.signal.aborted) break;
@@ -270,14 +255,11 @@ export function useAgentSession(): AgentSession {
         const mic = new MicCapture(audioBus.ctx, micNode, {
           onSpeechStart: () => {
             setUserSpeaking(true);
-            // User takes the floor: hold output. Keep any buffered reply (it's
-            // the latest known) — it's only discarded once a newer turn lands.
-            floorOpenRef.current = false;
-            if (settleTimerRef.current !== null) {
-              window.clearTimeout(settleTimerRef.current);
-              settleTimerRef.current = null;
-            }
-            voice.stop(); // barge-in: stop speaking the moment the user does
+            // Barge-in reflex: the moment our mic goes hot, mute the speaker so
+            // we never play over the human. This is the face's *only* output
+            // decision; whether/what to say next is the mind's call. Opening the
+            // STT socket below also signals the reactor that the floor is held.
+            voice.stop();
             sttRef.current?.close(); // drop any prior utterance's socket
             sttRef.current = new SttStream(peer, {
               onPartial: (text) => setUserLive(text),
@@ -294,15 +276,10 @@ export function useAgentSession(): AgentSession {
           },
           onSpeechEnd: () => {
             setUserSpeaking(false);
-            // Yield the floor after a short settle, then voice whatever reply
-            // has buffered for the live turn.
-            if (settleTimerRef.current !== null) window.clearTimeout(settleTimerRef.current);
-            settleTimerRef.current = window.setTimeout(() => {
-              settleTimerRef.current = null;
-              floorOpenRef.current = true;
-              releasePending();
-            }, FLOOR_SETTLE_MS);
-            sttRef.current?.end(); // finalize; socket stays open for the final
+            // Finalize this utterance. The socket stays open until the final
+            // lands, then closes — which is what tells the reactor the floor has
+            // been released. The mind decides if/when to reply from there.
+            sttRef.current?.end();
           },
           onChunk: (pcm16) => sttRef.current?.sendPcm(pcm16),
         });
@@ -349,7 +326,6 @@ export function useAgentSession(): AgentSession {
   // cleanup on unmount
   useEffect(() => {
     return () => {
-      if (settleTimerRef.current !== null) window.clearTimeout(settleTimerRef.current);
       micRef.current?.stop();
       sttRef.current?.close();
       voiceRef.current?.stop();
@@ -413,6 +389,7 @@ export function useAgentSession(): AgentSession {
     reactive,
     demote,
     bus,
+    activity: activityRef.current,
     sentences: displaySentences,
     activeSurface,
     surfaceHistory,

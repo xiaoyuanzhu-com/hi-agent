@@ -154,13 +154,12 @@ pub async fn get_audio(
                 if !deliver {
                     continue;
                 }
+                // Just the bytes + mime — no turn metadata on the wire. The
+                // client is a renderer; whatever reaches it is already the
+                // committed reply (turn-taking decided server-side).
                 let mut response = (StatusCode::OK, event.bytes).into_response();
-                let headers = response.headers_mut();
                 if let Ok(val) = HeaderValue::from_str(&event.mime) {
-                    headers.insert(CONTENT_TYPE, val);
-                }
-                if let Ok(val) = HeaderValue::from_str(&event.turn.to_string()) {
-                    headers.insert("X-HI-Turn", val);
+                    response.headers_mut().insert(CONTENT_TYPE, val);
                 }
                 return response;
             }

@@ -1,27 +1,57 @@
-//! Reactor — per-peer queues + ephemeral routing sessions.
+//! Reactor — the *mind*. Per-peer queues + ephemeral routing sessions.
 //!
 //! One mpsc per peer, one task per peer; routing turns run serially against
 //! an ephemeral ACP session. Cognition is delegated to that session; the
 //! reactor never blocks on it.
 //!
-//! Interruption policy: a new POST for a peer whose routing turn is in
-//! progress cancels the in-flight ACP session (`session/cancel`). The
-//! per-peer task observes the cancel via the session stream ending, drains
-//! anything else in the queue, and re-prompts with the merged batch.
+//! ## Turn-taking lives here, not in the client
+//!
+//! The client is a dumb face: it streams the mic and renders what arrives. It
+//! does not decide *when* the agent speaks — the mind does, and these are the
+//! two rules:
+//!
+//! 1. **Commit-after-quiet.** A finalized utterance does not immediately make
+//!    the agent reply. The human often speaks in bursts; the mind waits until
+//!    the floor has been quiet for a short settle before it responds, absorbing
+//!    every burst that lands in the meantime into one consolidated prompt. The
+//!    live "is the human speaking" signal comes from [`crate::floor`] (the open
+//!    mic socket), so a settle that expires *while the human is mid-burst* — its
+//!    final not yet landed — simply waits longer. The cost is a little latency;
+//!    the win is that the agent never jumps in on a thinking pause, and nothing
+//!    the human says is lost. Because the reply only starts once the floor is
+//!    yielded, its output can stream straight to the client — no holding, no
+//!    turn-tagging on the wire; superseded drafts are *never generated* rather
+//!    than generated-then-discarded.
+//! 2. **Barge-in.** If the human starts talking again *during* generation, the
+//!    new signal cancels the in-flight ACP session (`session/cancel`); the loop
+//!    re-settles and re-prompts with the merged batch. (The client mutes its
+//!    own speaker reflexively the instant its mic goes hot, so the interruption
+//!    feels instant regardless of this round-trip.)
 
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::Duration;
 
 use chrono::Utc;
 use tokio::sync::{Mutex, broadcast, mpsc};
+use tokio::time::timeout;
 use uuid::Uuid;
 
 use crate::acp::{AcpProcess, AcpSession, SessionOpts, SessionUpdate};
+use crate::floor::FloorState;
 use crate::memory::{Memory, build_for_peer};
 use crate::server::{AudioEvent, SurfaceEvent, ThoughtBus};
 use crate::types::{Channel, JournalEntry, PeerId, Signal, SurfaceEnvelope, SurfaceMode, SurfaceOp};
 use crate::voice::Tts;
+
+/// How long the floor must stay quiet after the last finalized utterance before
+/// the mind commits to replying. The human-interface tradeoff knob: higher =
+/// more patient (never talks over a multi-burst thought) but more latency;
+/// lower = snappier but more likely to answer a half-finished thought. Paired
+/// with the client VAD's `endSilenceMs`, which governs how fast an utterance is
+/// *finalized*; this governs how long we wait to see if another one follows.
+const RESPONSE_SETTLE: Duration = Duration::from_millis(700);
 
 const ROUTER_SYSTEM_PROMPT: &str = "You are a human-interface agent. \
 A peer is talking to you over /thought. Reply naturally with text — your reply \
@@ -65,9 +95,12 @@ struct ReactorInner {
     audio_out: broadcast::Sender<AudioEvent>,
     /// Outbound rich-content broadcast that GET /surface subscribers drain.
     surface_out: broadcast::Sender<SurfaceEvent>,
-    /// Monotonic cognition-turn counter. Each routing turn claims the next id so
-    /// the client can tell a fresh reply from a superseded draft (see AudioEvent).
+    /// Monotonic cognition-turn counter. Each routing turn claims the next id;
+    /// it tags AudioEvents and the channel logs so a reply is traceable end to
+    /// end. (The client no longer needs it — turns are internal to the mind.)
     turn_seq: AtomicU64,
+    /// Live per-peer floor signal, read by the commit-after-quiet settle.
+    floor: FloorState,
     peers: Mutex<HashMap<PeerId, PeerHandle>>,
 }
 
@@ -86,6 +119,7 @@ pub fn start(
     tts: Option<Arc<dyn Tts>>,
     audio_out: broadcast::Sender<AudioEvent>,
     surface_out: broadcast::Sender<SurfaceEvent>,
+    floor: FloorState,
 ) -> Reactor {
     let reactor = Reactor {
         inner: Arc::new(ReactorInner {
@@ -96,6 +130,7 @@ pub fn start(
             audio_out,
             surface_out,
             turn_seq: AtomicU64::new(0),
+            floor,
             peers: Mutex::new(HashMap::new()),
         }),
     };
@@ -179,8 +214,30 @@ async fn per_peer_loop(
             }
         };
         let mut batch: Vec<Signal> = vec![first];
-        while let Ok(extra) = inbound.try_recv() {
-            batch.push(extra);
+
+        // Commit-after-quiet: wait for the floor to settle before replying.
+        // Keep absorbing utterances; each one that lands resets the wait. When
+        // the settle elapses with nothing new, only respond if the human has
+        // actually stopped — if a mic socket is still open they're mid-burst and
+        // its final just hasn't landed yet, so wait again.
+        let closed = loop {
+            while let Ok(extra) = inbound.try_recv() {
+                batch.push(extra);
+            }
+            match timeout(RESPONSE_SETTLE, inbound.recv()).await {
+                Ok(Some(extra)) => batch.push(extra), // another utterance — keep collecting
+                Ok(None) => break true,               // inbound closed mid-settle
+                Err(_) => {
+                    if reactor.inner.floor.is_speaking(&peer).await {
+                        continue; // still talking; their final hasn't landed yet
+                    }
+                    break false; // floor yielded → commit to a reply
+                }
+            }
+        };
+        if closed {
+            tracing::info!(peer = %peer, "per-peer inbound closed; exiting loop");
+            return;
         }
 
         if let Err(err) = run_routing_turn(&reactor, &peer, &batch, &in_flight).await {

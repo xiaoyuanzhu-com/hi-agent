@@ -11,6 +11,7 @@ use chrono::{DateTime, Utc};
 use tokio::sync::{broadcast, mpsc};
 use tower_http::trace::TraceLayer;
 
+use crate::floor::FloorState;
 use crate::memory::Memory;
 use crate::types::{PeerId, Signal, SurfaceEnvelope};
 use crate::voice::Stt;
@@ -32,9 +33,11 @@ pub struct AudioEvent {
     pub to: Option<PeerId>,
     pub mime: String,
     pub bytes: Bytes,
-    /// Monotonic id of the cognition turn that produced this clip. The client
-    /// voices only the latest turn it has seen and discards superseded drafts,
-    /// so a turn that was cancelled mid-flight never speaks over a newer reply.
+    /// Monotonic id of the cognition turn that produced this clip. Internal to
+    /// the mind now — it tags the channel logs so a reply is traceable across
+    /// the thought + audio streams. The client never sees it: turn-taking is
+    /// decided server-side (commit-after-quiet), so by the time a clip is on the
+    /// wire it's already the committed reply, and the client just plays it.
     pub turn: u64,
     pub ts: DateTime<Utc>,
 }
@@ -75,6 +78,11 @@ pub struct AppState {
 
     /// Speech-to-text capability. `None` → POST /audio returns 501.
     pub stt: Option<Arc<dyn Stt>>,
+
+    /// Live per-peer floor signal. The streaming-STT handler marks a peer
+    /// "speaking" for each mic socket's lifetime; the reactor reads it to wait
+    /// for a settled silence before replying. See [`crate::floor`].
+    pub floor: FloorState,
 }
 
 pub fn build(
@@ -86,6 +94,7 @@ pub fn build(
     let thought_bus = ThoughtBus::new();
     let (audio_tx, _) = broadcast::channel::<AudioEvent>(64);
     let (surface_tx, _) = broadcast::channel::<SurfaceEvent>(64);
+    let floor = FloorState::new();
 
     let state = Arc::new(AppState {
         inbound: inbound_tx,
@@ -95,6 +104,7 @@ pub fn build(
         memory,
         data_dir,
         stt,
+        floor: floor.clone(),
     });
 
     let router = Router::new()
@@ -116,6 +126,7 @@ pub fn build(
         thought_bus,
         audio_out: audio_tx,
         surface_out: surface_tx,
+        floor,
     };
 
     (router, seams)
@@ -126,6 +137,7 @@ pub struct ServerSeams {
     pub thought_bus: ThoughtBus,
     pub audio_out: broadcast::Sender<AudioEvent>,
     pub surface_out: broadcast::Sender<SurfaceEvent>,
+    pub floor: FloorState,
 }
 
 async fn not_found() -> (StatusCode, &'static str) {

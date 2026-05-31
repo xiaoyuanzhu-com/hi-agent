@@ -9,6 +9,7 @@ pub mod acp;
 pub mod appearance;
 pub mod channel_log;
 pub mod config;
+pub mod floor;
 pub mod llm_proxy;
 pub mod memory;
 pub mod runtime;
@@ -86,6 +87,7 @@ pub async fn run(config: Config) -> anyhow::Result<()> {
         tts,
         seams.audio_out.clone(),
         seams.surface_out.clone(),
+        seams.floor,
     );
     tracing::info!("reactor started");
 
