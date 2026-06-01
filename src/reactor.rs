@@ -40,7 +40,8 @@ use crate::acp::{AcpProcess, AcpSession, SessionOpts, SessionUpdate};
 use crate::memory::{Memory, build_for_peer};
 use crate::server::{AudioEvent, SurfaceEvent, ThoughtBus};
 use crate::types::{Channel, JournalEntry, PeerId, Signal, SurfaceEnvelope, SurfaceMode, SurfaceOp};
-use crate::voice::Tts;
+use crate::voice::{Tts, TtsStream};
+use bytes::Bytes;
 
 /// How long the floor must stay quiet after the last finalized utterance before
 /// the mind commits to replying. The human-interface tradeoff knob: higher =
@@ -272,27 +273,39 @@ async fn run_routing_turn(
     let outcome: anyhow::Result<()> = async {
         let mut run = session.prompt(prompt_text).await?;
 
-        // Per-sentence TTS: a background task fed by an mpsc queue synthesizes
-        // completed sentences in order and broadcasts them on /audio, so text
-        // streaming is never blocked on synthesis. The queue/task exist only
-        // when TTS is configured.
+        // Per-turn streaming TTS: open ONE synthesis session for the whole turn
+        // and push text into it as the agent produces it. Audio frames stream
+        // back on a drain task as a single Start/Frame*/End run on /audio, so a
+        // turn's speech is one continuous stream rather than per-sentence clips.
+        // The sentence splitter survives only as a coalescer — it decides *when*
+        // to push text (for prosody/request size), not playback boundaries; the
+        // session stays open across sentences. All of this exists only when TTS
+        // is configured.
         let mut splitter = SentenceSplitter::new();
         let mut extractor = SurfaceExtractor::new();
         // Accumulate the spoken text so the whole reply is logged once at end of
         // turn on the `channel` stream, rather than per-chunk (which is noisy).
         let mut full_reply = String::new();
-        let (synth_tx, synth_handle) = match tts {
-            Some(tts) => {
-                let (tx, rx) = mpsc::channel::<String>(64);
-                let handle = tokio::spawn(synth_loop(
-                    tts,
-                    reactor.inner.audio_out.clone(),
-                    peer.clone(),
-                    turn_id,
-                    rx,
-                ));
-                (Some(tx), Some(handle))
-            }
+        let (synth_tx, synth_handle) = match &tts {
+            Some(tts) => match tts.start().await {
+                Ok(TtsStream { mime, text, frames }) => {
+                    let audio_out = reactor.inner.audio_out.clone();
+                    // Announce the turn first so a GET /audio response can open
+                    // with the right Content-Type before any frame arrives.
+                    let _ = audio_out.send(AudioEvent::Start {
+                        to: Some(peer.clone()),
+                        turn: turn_id,
+                        mime,
+                    });
+                    let handle =
+                        tokio::spawn(forward_frames(frames, audio_out, peer.clone(), turn_id));
+                    (Some(text), Some(handle))
+                }
+                Err(err) => {
+                    tracing::warn!(peer = %peer, error = %err, "TTS session start failed; turn is silent");
+                    (None, None)
+                }
+            },
             None => (None, None),
         };
 
@@ -359,12 +372,19 @@ async fn run_routing_turn(
             }
         }
 
-        // Closing the queue lets the synth task drain queued sentences; on a
-        // cancel (barge-in) abort it so stale audio isn't spoken over the user.
+        // Dropping the text sender signals end-of-input: the TTS session sends
+        // FinishSession, the drain task forwards trailing frames, then emits the
+        // turn's `End`. On a cancel (barge-in) abort the drain so stale frames
+        // aren't spoken over the user, and emit `End` ourselves so any open
+        // GET /audio response for this turn closes promptly.
         drop(synth_tx);
         if let Some(handle) = synth_handle {
             if cancelled {
                 handle.abort();
+                let _ = reactor.inner.audio_out.send(AudioEvent::End {
+                    to: Some(peer.clone()),
+                    turn: turn_id,
+                });
             }
         }
         Ok(())
@@ -417,43 +437,39 @@ fn render_batch(batch: &[Signal]) -> String {
     s
 }
 
-/// Background task: synthesize each queued sentence and broadcast it on /audio.
-/// One queue, sequential await → audio plays in order. Send errors are ignored
-/// (no subscriber connected is fine); synth failures are logged, not fatal.
-async fn synth_loop(
-    tts: Arc<dyn Tts>,
+/// Background task: drain one turn's synthesized audio frames onto /audio,
+/// emitting a `Frame` per chunk and a closing `End`. The turn's `Start` (which
+/// carries the mime) is sent by the caller before this task is spawned. Send
+/// errors are ignored — no subscriber connected is fine. Logs the turn's total
+/// bytes once at the end; the spoken text is already logged on /thought.
+async fn forward_frames(
+    mut frames: mpsc::Receiver<Bytes>,
     audio_out: broadcast::Sender<AudioEvent>,
     peer: PeerId,
     turn: u64,
-    mut rx: mpsc::Receiver<String>,
 ) {
-    while let Some(sentence) = rx.recv().await {
-        match tts.synthesize(&sentence).await {
-            Ok(blob) => {
-                tracing::info!(
-                    target: "channel",
-                    dir = "out",
-                    channel = "audio",
-                    peer = %peer,
-                    turn = turn,
-                    bytes = blob.bytes.len(),
-                    text = %sentence,
-                    "channel out (tts)",
-                );
-                let event = AudioEvent {
-                    to: Some(peer.clone()),
-                    mime: blob.mime,
-                    bytes: blob.bytes,
-                    turn,
-                    ts: Utc::now(),
-                };
-                let _ = audio_out.send(event);
-            }
-            Err(err) => {
-                tracing::warn!(peer = %peer, error = %err, "TTS synthesize failed");
-            }
-        }
+    let mut total = 0usize;
+    while let Some(bytes) = frames.recv().await {
+        total += bytes.len();
+        let _ = audio_out.send(AudioEvent::Frame {
+            to: Some(peer.clone()),
+            turn,
+            bytes,
+        });
     }
+    let _ = audio_out.send(AudioEvent::End {
+        to: Some(peer.clone()),
+        turn,
+    });
+    tracing::info!(
+        target: "channel",
+        dir = "out",
+        channel = "audio",
+        peer = %peer,
+        turn = turn,
+        bytes = total,
+        "channel out (tts stream)",
+    );
 }
 
 /// Minimal incremental sentence splitter for per-sentence TTS, mirroring the

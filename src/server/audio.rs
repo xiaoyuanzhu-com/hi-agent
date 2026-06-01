@@ -8,10 +8,13 @@
 //! so the router's snapshot can show that this signal arrived as speech
 //! while the body remains text-searchable.
 //!
-//! Outbound (`GET /audio`): long-poll subscriber to the reactor's `audio_out`
-//! broadcast. When the router (or worker) calls `speak(channel="audio", ...)`
-//! the reactor synthesizes via [`Tts`](crate::voice::Tts), broadcasts here,
-//! and the subscriber receives one event per request.
+//! Outbound (`GET /audio`): subscriber to the reactor's `audio_out` broadcast.
+//! A turn's speech arrives as a `Start`/`Frame`*/`End` run; this handler blocks
+//! until a `Start` for the subscriber, then streams that turn's frames as one
+//! chunked HTTP response until the matching `End`. The client appends the bytes
+//! to a single sink and plays — one continuous utterance per response, no
+//! per-clip reassembly. After the response closes the client re-GETs for the
+//! next turn (same loop shape as the other channels).
 //!
 //! Capability gating: missing STT → 501 on POST. Missing TTS → no audio events
 //! will ever be broadcast; GET /audio blocks forever (same long-poll semantics
@@ -19,7 +22,7 @@
 
 use std::sync::Arc;
 
-use axum::body::Bytes;
+use axum::body::{Body, Bytes};
 use axum::extract::State;
 use axum::http::header::CONTENT_TYPE;
 use axum::http::{HeaderMap, HeaderValue, StatusCode};
@@ -29,9 +32,9 @@ use serde::Serialize;
 use tokio::sync::broadcast::error::RecvError;
 
 use crate::memory::media::{self, Direction};
-use crate::server::AppState;
+use crate::server::{AppState, AudioEvent};
 use crate::server::headers::{AuthBearer, PeerHeader, ToHeader};
-use crate::types::{Channel, JournalEntry, Signal};
+use crate::types::{Channel, JournalEntry, PeerId, Signal};
 
 const DEFAULT_MIME: &str = "audio/wav";
 
@@ -134,6 +137,15 @@ pub async fn post_audio(
     (StatusCode::ACCEPTED, axum::Json(ack)).into_response()
 }
 
+/// Whether an event routed to `target` should reach this `subscriber`.
+fn routed(target: &Option<PeerId>, subscriber: &Option<PeerId>) -> bool {
+    match (target, subscriber) {
+        (None, _) => true,
+        (Some(t), Some(s)) => t == s,
+        (Some(_), None) => true,
+    }
+}
+
 pub async fn get_audio(
     State(state): State<Arc<AppState>>,
     ToHeader(subscriber): ToHeader,
@@ -143,25 +155,19 @@ pub async fn get_audio(
 
     tracing::info!(subscriber = ?subscriber, auth = ?auth, "GET /audio long-poll opened");
 
-    loop {
+    // Block until a turn for this subscriber starts. `Start` carries the mime,
+    // which must be set before any body byte; Frame/End seen before a Start
+    // (we subscribed mid-turn) are skipped — the client re-polls and catches
+    // the next turn cleanly.
+    let (turn, mime) = loop {
         match rx.recv().await {
             Ok(event) => {
-                let deliver = match (&event.to, &subscriber) {
-                    (None, _) => true,
-                    (Some(target), Some(sub)) => target == sub,
-                    (Some(_), None) => true,
-                };
-                if !deliver {
+                if !routed(event.to(), &subscriber) {
                     continue;
                 }
-                // Just the bytes + mime — no turn metadata on the wire. The
-                // client is a renderer; whatever reaches it is already the
-                // committed reply (turn-taking decided server-side).
-                let mut response = (StatusCode::OK, event.bytes).into_response();
-                if let Ok(val) = HeaderValue::from_str(&event.mime) {
-                    response.headers_mut().insert(CONTENT_TYPE, val);
+                if let AudioEvent::Start { turn, mime, .. } = event {
+                    break (turn, mime);
                 }
-                return response;
             }
             Err(RecvError::Lagged(n)) => {
                 tracing::warn!(missed = n, "audio subscriber lagged");
@@ -171,7 +177,49 @@ pub async fn get_audio(
                 return (StatusCode::SERVICE_UNAVAILABLE, "broadcast closed\n").into_response();
             }
         }
+    };
+
+    // Stream this turn's frames as a chunked body until its `End`. Frames from
+    // any other turn or peer are filtered out, so a response stays bound to the
+    // single turn it opened on.
+    let stream = futures::stream::unfold(
+        (rx, subscriber, turn, false),
+        |(mut rx, subscriber, turn, done)| async move {
+            if done {
+                return None;
+            }
+            loop {
+                match rx.recv().await {
+                    Ok(event) => {
+                        if !routed(event.to(), &subscriber) || event.turn() != turn {
+                            continue;
+                        }
+                        match event {
+                            AudioEvent::Frame { bytes, .. } => {
+                                return Some((
+                                    Ok::<Bytes, std::convert::Infallible>(bytes),
+                                    (rx, subscriber, turn, false),
+                                ));
+                            }
+                            AudioEvent::End { .. } => return None,
+                            AudioEvent::Start { .. } => continue,
+                        }
+                    }
+                    Err(RecvError::Lagged(n)) => {
+                        tracing::warn!(missed = n, "audio subscriber lagged mid-turn");
+                        continue;
+                    }
+                    Err(RecvError::Closed) => return None,
+                }
+            }
+        },
+    );
+
+    let mut response = Body::from_stream(stream).into_response();
+    if let Ok(val) = HeaderValue::from_str(&mime) {
+        response.headers_mut().insert(CONTENT_TYPE, val);
     }
+    response
 }
 
 fn mime_to_ext(mime: &str) -> &'static str {

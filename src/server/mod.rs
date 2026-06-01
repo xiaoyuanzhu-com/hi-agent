@@ -25,20 +25,40 @@ pub mod vision;
 
 pub use thought_bus::ThoughtBus;
 
-/// Outbound synthesized-audio event. Carries the bytes plus the mime type the
-/// GET /audio long-poll should serve.
+/// Outbound synthesized-audio event. One turn's speech is a continuous stream:
+/// a `Start` (carrying the mime so GET /audio can set `Content-Type` before the
+/// first byte), then a run of `Frame`s as the brain synthesizes them, then an
+/// `End`. The GET /audio handler turns one such run into one chunked HTTP
+/// response — the client just appends bytes and plays, no per-clip reassembly.
+///
+/// `to` routes to a peer (or broadcast when `None`); `turn` is the monotonic
+/// cognition turn, used to keep a handler's response bound to a single turn so
+/// frames from a later turn never bleed into an earlier response.
 #[derive(Debug, Clone)]
-pub struct AudioEvent {
-    pub to: Option<PeerId>,
-    pub mime: String,
-    pub bytes: Bytes,
-    /// Monotonic id of the cognition turn that produced this clip. Internal to
-    /// the mind now — it tags the channel logs so a reply is traceable across
-    /// the thought + audio streams. The client never sees it: turn-taking is
-    /// decided server-side (commit-after-quiet), so by the time a clip is on the
-    /// wire it's already the committed reply, and the client just plays it.
-    pub turn: u64,
-    pub ts: DateTime<Utc>,
+pub enum AudioEvent {
+    Start { to: Option<PeerId>, turn: u64, mime: String },
+    Frame { to: Option<PeerId>, turn: u64, bytes: Bytes },
+    End { to: Option<PeerId>, turn: u64 },
+}
+
+impl AudioEvent {
+    /// The routing target, common to every variant.
+    pub fn to(&self) -> &Option<PeerId> {
+        match self {
+            AudioEvent::Start { to, .. }
+            | AudioEvent::Frame { to, .. }
+            | AudioEvent::End { to, .. } => to,
+        }
+    }
+
+    /// The cognition turn this event belongs to.
+    pub fn turn(&self) -> u64 {
+        match self {
+            AudioEvent::Start { turn, .. }
+            | AudioEvent::Frame { turn, .. }
+            | AudioEvent::End { turn, .. } => *turn,
+        }
+    }
 }
 
 /// Outbound rich-content event. Carries the envelope plus the routing target

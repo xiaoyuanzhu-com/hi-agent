@@ -19,7 +19,7 @@ pub mod volcengine_stt;
 pub mod volcengine_tts;
 
 pub use stt::Stt;
-pub use tts::{AudioBlob, Tts};
+pub use tts::{Tts, TtsStream};
 
 const ENV_STT_PROVIDER: &str = "STT_PROVIDER";
 const ENV_TTS_PROVIDER: &str = "TTS_PROVIDER";

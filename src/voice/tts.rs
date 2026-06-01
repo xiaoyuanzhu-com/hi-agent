@@ -1,25 +1,37 @@
 //! Text-to-speech capability trait.
 //!
-//! A `Tts` impl renders text into an audio blob. The trait is
-//! provider-agnostic; see `volcengine_tts` for the v0 concrete impl. The
-//! returned `AudioBlob` carries enough information for the audio long-poll to
-//! stream the bytes with a correct `Content-Type` and for the media-storage
-//! helper to pick a file extension.
+//! A `Tts` impl renders text into audio. Synthesis is a *streaming session*,
+//! not a one-shot call: [`Tts::start`] opens a session, the caller pushes text
+//! incrementally as the agent produces it, and audio frames stream back as they
+//! are synthesized. One session spans a whole turn, so the audio is one
+//! continuous stream rather than a sequence of per-sentence clips — the brain
+//! consolidates, the client just plays.
 
 use async_trait::async_trait;
 use bytes::Bytes;
+use tokio::sync::mpsc;
 
-/// One synthesized audio clip — the bytes plus enough metadata to serve them.
-pub struct AudioBlob {
-    pub bytes: Bytes,
-    /// IANA mime type, e.g. `audio/mpeg`, `audio/wav`, `audio/ogg`.
+/// A live synthesis session. Feed text via [`text`](Self::text) as it becomes
+/// available; drop the sender to signal end-of-input (the provider flushes any
+/// trailing audio and closes). Drain [`frames`](Self::frames) for the audio
+/// bytes; the receiver closes when synthesis ends or the session errors.
+///
+/// Every frame shares the same [`mime`](Self::mime) — it is fixed for the life
+/// of the session and known the moment the session opens, so the HTTP layer can
+/// set `Content-Type` before the first byte.
+pub struct TtsStream {
+    /// IANA mime type for every frame in this stream, e.g. `audio/mpeg`.
     pub mime: String,
-    /// File extension to use under `data/media/audio/out/<id>.<ext>`. Kept
-    /// `&'static str` because impls return one of a small fixed set.
-    pub ext: &'static str,
+    /// Push text to be spoken. Send each chunk as it arrives; dropping the
+    /// sender signals that no more text is coming.
+    pub text: mpsc::Sender<String>,
+    /// Synthesized audio frames, in order. Closes when synthesis completes.
+    pub frames: mpsc::Receiver<Bytes>,
 }
 
 #[async_trait]
 pub trait Tts: Send + Sync {
-    async fn synthesize(&self, text: &str) -> anyhow::Result<AudioBlob>;
+    /// Open a streaming synthesis session. Returns once the session is ready to
+    /// accept text; synthesis is driven by pushing text and draining frames.
+    async fn start(&self) -> anyhow::Result<TtsStream>;
 }

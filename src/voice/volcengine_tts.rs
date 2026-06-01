@@ -33,14 +33,19 @@
 //! Event sequence (client → / server ←):
 //!   → StartConnection(1)   ← ConnectionStarted(50)
 //!   → StartSession(100)    ← SessionStarted(150)
-//!   → TaskRequest(200)     (text to synthesize)
+//!   → TaskRequest(200)     (text to synthesize — sent MANY times per session)
 //!   → FinishSession(102)
 //!   ← AudioOnlyServer(0xB) frames (raw audio) … until TTSEnded(359)/SessionFinished(152)
 //!   → FinishConnection(2)  ← ConnectionFinished(52)
 //!
-//! We expose the provider-agnostic `Tts::synthesize(text) -> AudioBlob`: one
-//! sentence per call, one WS connection per call, all returned audio frames
-//! concatenated into a single clip.
+//! We expose the provider-agnostic streaming [`Tts::start`]: one WS session per
+//! turn. [`start`](VolcengineTts::start) performs the connection + session
+//! handshake and returns a [`TtsStream`]; a background driver task then feeds
+//! each pushed text chunk as its own `TaskRequest` into the *same open session*
+//! and forwards every `AudioOnlyServer` frame to the stream's receiver as it
+//! arrives. Dropping the text sender sends `FinishSession`; the task tears the
+//! connection down once the session ends. The audio is thus one continuous
+//! stream for the whole turn, never a sequence of per-sentence clips.
 
 use std::time::Duration;
 
@@ -48,13 +53,14 @@ use async_trait::async_trait;
 use bytes::Bytes;
 use futures::{SinkExt, StreamExt};
 use serde_json::json;
+use tokio::sync::mpsc;
 use tokio::time::timeout;
 use tokio_tungstenite::tungstenite::client::IntoClientRequest;
 use tokio_tungstenite::tungstenite::http::HeaderValue;
 use tokio_tungstenite::tungstenite::Message;
 use uuid::Uuid;
 
-use super::tts::{AudioBlob, Tts};
+use super::tts::{Tts, TtsStream};
 
 const DEFAULT_ENDPOINT: &str = "wss://openspeech.bytedance.com/api/v3/tts/bidirection";
 const DEFAULT_RESOURCE_ID: &str = "seed-tts-2.0";
@@ -69,7 +75,12 @@ const ENV_RESOURCE_ID: &str = "VOLCENGINE_TTS_RESOURCE_ID";
 const ENV_ENDPOINT: &str = "VOLCENGINE_TTS_ENDPOINT";
 
 const NAMESPACE: &str = "BidirectionalTTS";
-const TOTAL_TIMEOUT: Duration = Duration::from_secs(30);
+/// Max quiet gap inside a live session before we assume it has hung and tear
+/// it down. Generous: token gaps while the agent is thinking are far shorter.
+const IDLE_TIMEOUT: Duration = Duration::from_secs(30);
+/// Channel depth for both text-in and frames-out; bounded so a slow consumer
+/// applies backpressure rather than letting audio pile up unbounded.
+const CHAN_DEPTH: usize = 64;
 
 const PROTO_HEADER_BYTE0: u8 = 0x11; // proto v1, header size 1 (= 4 bytes)
 const MSG_TYPE_FULL_CLIENT: u8 = 0b0001;
@@ -128,15 +139,7 @@ impl VolcengineTts {
 
 #[async_trait]
 impl Tts for VolcengineTts {
-    async fn synthesize(&self, text: &str) -> anyhow::Result<AudioBlob> {
-        timeout(TOTAL_TIMEOUT, self.synthesize_inner(text))
-            .await
-            .map_err(|_| anyhow::anyhow!("volcengine TTS timed out after {TOTAL_TIMEOUT:?}"))?
-    }
-}
-
-impl VolcengineTts {
-    async fn synthesize_inner(&self, text: &str) -> anyhow::Result<AudioBlob> {
+    async fn start(&self) -> anyhow::Result<TtsStream> {
         let connect_id = Uuid::now_v7().to_string();
         let session_id = Uuid::now_v7().to_string();
 
@@ -154,9 +157,15 @@ impl VolcengineTts {
             connect_id = %connect_id,
             "volcengine TTS WS connected"
         );
-        let (mut tx, mut rx) = ws.split();
+        let (mut tx, rx) = ws.split();
 
-        // 1. StartConnection — empty JSON payload, no session id.
+        let audio_params = json!({
+            "format": self.encoding,
+            "sample_rate": DEFAULT_SAMPLE_RATE,
+        });
+
+        // Handshake before returning, so `start()` only resolves once the
+        // session can accept text and a connect failure surfaces to the caller.
         tx.send(Message::Binary(frame(
             MSG_TYPE_FULL_CLIENT,
             SER_JSON,
@@ -165,12 +174,6 @@ impl VolcengineTts {
             b"{}",
         )))
         .await?;
-
-        // 2. StartSession — voice + audio params.
-        let audio_params = json!({
-            "format": self.encoding,
-            "sample_rate": DEFAULT_SAMPLE_RATE,
-        });
         let start_payload = json!({
             "user": { "uid": "hi-agent" },
             "namespace": NAMESPACE,
@@ -189,97 +192,160 @@ impl VolcengineTts {
         )))
         .await?;
 
-        // 3. TaskRequest — the text to synthesize.
-        let task_payload = json!({
-            "user": { "uid": "hi-agent" },
-            "namespace": NAMESPACE,
-            "event": EV_TASK_REQUEST,
-            "req_params": {
-                "speaker": self.voice,
-                "audio_params": audio_params,
-                "text": text,
-            },
-        });
-        tx.send(Message::Binary(frame(
-            MSG_TYPE_FULL_CLIENT,
-            SER_JSON,
-            EV_TASK_REQUEST,
-            Some(&session_id),
-            &serde_json::to_vec(&task_payload)?,
-        )))
-        .await?;
+        let (text_tx, text_rx) = mpsc::channel::<String>(CHAN_DEPTH);
+        let (frame_tx, frame_rx) = mpsc::channel::<Bytes>(CHAN_DEPTH);
 
-        // 4. FinishSession — no more text coming.
-        tx.send(Message::Binary(frame(
-            MSG_TYPE_FULL_CLIENT,
-            SER_JSON,
-            EV_FINISH_SESSION,
-            Some(&session_id),
-            b"{}",
-        )))
-        .await?;
+        let voice = self.voice.clone();
+        tokio::spawn(drive_session(
+            tx,
+            rx,
+            session_id,
+            voice,
+            audio_params,
+            text_rx,
+            frame_tx,
+        ));
 
-        // 5. Drain audio frames until the session ends.
-        let mut audio = Vec::new();
-        let mut done = false;
-        while let Some(msg) = rx.next().await {
-            let msg = msg.map_err(|e| anyhow::anyhow!("volcengine TTS WS recv: {e}"))?;
-            let bytes = match msg {
-                Message::Binary(b) => b,
-                Message::Close(_) => break,
-                _ => continue,
-            };
-            let Some(parsed) = parse_frame(&bytes) else {
-                continue;
-            };
-            match parsed.msg_type {
-                MSG_TYPE_AUDIO_SERVER => audio.extend_from_slice(parsed.payload),
-                MSG_TYPE_FULL_SERVER => match parsed.event {
-                    Some(EV_TTS_ENDED) | Some(EV_SESSION_FINISHED) => {
-                        done = true;
-                        break;
+        Ok(TtsStream {
+            mime: encoding_to_mime(&self.encoding).to_string(),
+            text: text_tx,
+            frames: frame_rx,
+        })
+    }
+}
+
+/// Whether the driver loop should keep running after handling an event.
+enum Flow {
+    Continue,
+    Break,
+}
+
+/// Background driver: feed each pushed text chunk as a `TaskRequest` into the
+/// open session and forward every audio frame to `frame_tx` as it arrives.
+/// Ends when the session finishes, the text sender is dropped *and* the server
+/// flushes, the frame receiver is gone (barge-in), or the session goes idle.
+async fn drive_session<Tx, Rx>(
+    mut tx: Tx,
+    mut rx: Rx,
+    session_id: String,
+    voice: String,
+    audio_params: serde_json::Value,
+    mut text_rx: mpsc::Receiver<String>,
+    frame_tx: mpsc::Sender<Bytes>,
+) where
+    Tx: SinkExt<Message> + Unpin,
+    Rx: StreamExt<Item = Result<Message, tokio_tungstenite::tungstenite::Error>> + Unpin,
+{
+    let mut text_done = false;
+    loop {
+        let step = timeout(IDLE_TIMEOUT, async {
+            tokio::select! {
+                maybe_msg = rx.next() => handle_server_msg(maybe_msg, &frame_tx).await,
+                text = text_rx.recv(), if !text_done => {
+                    match text {
+                        Some(t) => {
+                            let task_payload = json!({
+                                "user": { "uid": "hi-agent" },
+                                "namespace": NAMESPACE,
+                                "event": EV_TASK_REQUEST,
+                                "req_params": {
+                                    "speaker": voice,
+                                    "audio_params": audio_params,
+                                    "text": t,
+                                },
+                            });
+                            match serde_json::to_vec(&task_payload) {
+                                Ok(buf) => {
+                                    let f = frame(MSG_TYPE_FULL_CLIENT, SER_JSON, EV_TASK_REQUEST, Some(&session_id), &buf);
+                                    if tx.send(Message::Binary(f)).await.is_err() {
+                                        return Flow::Break;
+                                    }
+                                }
+                                Err(err) => tracing::warn!(error = %err, "volcengine TTS task payload encode failed"),
+                            }
+                            Flow::Continue
+                        }
+                        None => {
+                            // End of input — flush and wait for the server to finish.
+                            text_done = true;
+                            let f = frame(MSG_TYPE_FULL_CLIENT, SER_JSON, EV_FINISH_SESSION, Some(&session_id), b"{}");
+                            let _ = tx.send(Message::Binary(f)).await;
+                            Flow::Continue
+                        }
                     }
-                    Some(EV_CONNECTION_FAILED) | Some(EV_SESSION_FAILED) => {
-                        anyhow::bail!(
-                            "volcengine TTS failed: {}",
-                            String::from_utf8_lossy(parsed.payload)
-                        );
-                    }
-                    _ => {}
-                },
-                MSG_TYPE_ERROR => {
-                    anyhow::bail!(
-                        "volcengine TTS server error: {}",
-                        String::from_utf8_lossy(parsed.payload)
-                    );
                 }
-                _ => {}
+            }
+        })
+        .await;
+
+        match step {
+            Ok(Flow::Continue) => {}
+            Ok(Flow::Break) => break,
+            Err(_) => {
+                tracing::warn!("volcengine TTS session idle for {IDLE_TIMEOUT:?}, tearing down");
+                break;
             }
         }
+    }
 
-        // 6. Best-effort teardown; ignore failures, the audio is already in hand.
-        let _ = tx
-            .send(Message::Binary(frame(
-                MSG_TYPE_FULL_CLIENT,
-                SER_JSON,
-                EV_FINISH_CONNECTION,
-                None,
-                b"{}",
-            )))
-            .await;
-        let _ = tx.send(Message::Close(None)).await;
+    // Best-effort teardown; ignore failures, the audio is already delivered.
+    let _ = tx
+        .send(Message::Binary(frame(
+            MSG_TYPE_FULL_CLIENT,
+            SER_JSON,
+            EV_FINISH_CONNECTION,
+            None,
+            b"{}",
+        )))
+        .await;
+    let _ = tx.send(Message::Close(None)).await;
+}
 
-        if audio.is_empty() {
-            anyhow::bail!(
-                "volcengine TTS returned no audio (session {})",
-                if done { "ended" } else { "interrupted" }
-            );
+/// Handle one server message: forward audio, detect end/error. Returns whether
+/// the driver loop should continue.
+async fn handle_server_msg(
+    maybe_msg: Option<Result<Message, tokio_tungstenite::tungstenite::Error>>,
+    frame_tx: &mpsc::Sender<Bytes>,
+) -> Flow {
+    let bytes = match maybe_msg {
+        Some(Ok(Message::Binary(b))) => b,
+        Some(Ok(Message::Close(_))) | None => return Flow::Break,
+        Some(Ok(_)) => return Flow::Continue,
+        Some(Err(e)) => {
+            tracing::warn!(error = %e, "volcengine TTS WS recv error");
+            return Flow::Break;
         }
-        Ok(AudioBlob {
-            bytes: Bytes::from(audio),
-            mime: encoding_to_mime(&self.encoding).to_string(),
-            ext: encoding_to_ext(&self.encoding),
-        })
+    };
+    let Some(parsed) = parse_frame(&bytes) else {
+        return Flow::Continue;
+    };
+    match parsed.msg_type {
+        MSG_TYPE_AUDIO_SERVER => {
+            // Receiver gone (barge-in / client left) → stop the session.
+            if frame_tx.send(Bytes::copy_from_slice(parsed.payload)).await.is_err() {
+                return Flow::Break;
+            }
+            Flow::Continue
+        }
+        MSG_TYPE_FULL_SERVER => match parsed.event {
+            Some(EV_TTS_ENDED) | Some(EV_SESSION_FINISHED) => Flow::Break,
+            Some(EV_CONNECTION_FAILED) | Some(EV_SESSION_FAILED) => {
+                tracing::warn!(
+                    payload = %String::from_utf8_lossy(parsed.payload),
+                    "volcengine TTS session failed"
+                );
+                Flow::Break
+            }
+            _ => Flow::Continue,
+        },
+        MSG_TYPE_ERROR => {
+            tracing::warn!(
+                payload = %String::from_utf8_lossy(parsed.payload),
+                "volcengine TTS server error"
+            );
+            Flow::Break
+        }
+        _ => Flow::Continue,
     }
 }
 
@@ -361,16 +427,6 @@ fn encoding_to_mime(enc: &str) -> &'static str {
         "ogg_opus" | "ogg" => "audio/ogg",
         "pcm" => "audio/L16",
         _ => "application/octet-stream",
-    }
-}
-
-fn encoding_to_ext(enc: &str) -> &'static str {
-    match enc {
-        "mp3" => "mp3",
-        "wav" => "wav",
-        "ogg_opus" | "ogg" => "ogg",
-        "pcm" => "pcm",
-        _ => "bin",
     }
 }
 

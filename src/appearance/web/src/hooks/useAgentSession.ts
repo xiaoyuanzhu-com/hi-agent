@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { subscribeThought, postThought } from "../channels/thought";
-import { subscribeAudio, postAudio } from "../channels/audio";
+import { subscribeAudioTurns, postAudio } from "../channels/audio";
 import { postVision } from "../channels/vision";
 import { subscribeSurface, type SurfaceEnvelope } from "../channels/surface";
 import { AudioBus } from "../lib/audioBus";
@@ -214,9 +214,11 @@ export function useAgentSession(): AgentSession {
   }, [woken, peer]);
 
   // ---- GET /audio subscription loop (Phase 2: TTS playback) --------------
-  // Pure render: play each clip as it arrives. The mind only puts speech on the
-  // wire once it has committed to it, so there's nothing to gate or discard
-  // here. Barge-in is handled locally in onSpeechStart (voice.stop()).
+  // Pure render: each response is one turn's continuous audio. Stream its body
+  // straight into the player as it arrives — no clip queue. The mind only puts
+  // speech on the wire once it has committed to it, so there's nothing to gate
+  // here. Barge-in is handled locally in onSpeechStart (voice.stop()), which
+  // invalidates the turn so any chunks still in flight are dropped.
   useEffect(() => {
     if (!woken) return;
     const ctrl = new AbortController();
@@ -224,9 +226,22 @@ export function useAgentSession(): AgentSession {
     void (async () => {
       while (!cancelled) {
         try {
-          for await (const blob of subscribeAudio({ peer, signal: ctrl.signal })) {
+          for await (const turn of subscribeAudioTurns({ peer, signal: ctrl.signal })) {
             if (cancelled) break;
-            voiceRef.current?.enqueue(blob);
+            const voice = voiceRef.current;
+            if (!voice) continue;
+            const token = voice.beginTurn(turn.mime);
+            const reader = turn.body.getReader();
+            try {
+              while (!cancelled) {
+                const { value, done } = await reader.read();
+                if (done) break;
+                if (value) voice.pushChunk(token, value);
+              }
+            } finally {
+              voice.endTurn(token);
+              reader.releaseLock();
+            }
           }
         } catch {
           if (cancelled || ctrl.signal.aborted) break;
