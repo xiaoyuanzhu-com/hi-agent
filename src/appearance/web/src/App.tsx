@@ -1,3 +1,4 @@
+import { useState } from "react";
 import { useAgentSession } from "./hooks/useAgentSession";
 import { Atmosphere } from "./ui/Atmosphere";
 import { Presence } from "./ui/Presence";
@@ -6,6 +7,7 @@ import { SurfaceHost } from "./ui/SurfaceHost";
 import { HistoryDrawer } from "./ui/HistoryDrawer";
 import { WakeGate } from "./ui/WakeGate";
 import { KeyboardFallback } from "./ui/KeyboardFallback";
+import { ChannelControls } from "./ui/ChannelControls";
 
 /**
  * The whole surface: a calm, breathing room.
@@ -14,11 +16,15 @@ import { KeyboardFallback } from "./ui/KeyboardFallback";
  *   (the agent's words, fading in as whole sentences) · SurfaceHost (rich
  *   agent-authored content as a card/full overlay) · HistoryDrawer (recall).
  *
- * Before wake, a single tap-to-begin gate; after wake, a hidden keyboard
- * fallback. No input box or buttons by default — it listens, speaks, and shows.
+ * Before entering, a single tap-to-begin gate (with a "type instead" path for
+ * when audio can't be used). After entering, the input channels — mic and text —
+ * are independent and each toggleable via the corner controls.
  */
 export function App() {
   const s = useAgentSession();
+  // Bumped to open the text line from the channel toggle (touch devices have no
+  // keydown to reveal it on their own).
+  const [textOpen, setTextOpen] = useState(0);
 
   return (
     <div className="hi-root">
@@ -36,9 +42,20 @@ export function App() {
       )}
 
       {!s.woken ? (
-        <WakeGate onWake={s.wake} error={s.wakeError} busy={s.waking} />
+        <WakeGate onWake={s.wake} onTextOnly={s.startTextOnly} error={s.wakeError} busy={s.waking} />
       ) : (
-        <KeyboardFallback onSend={s.sendText} />
+        <>
+          <ChannelControls
+            audioOn={s.audioInput}
+            onToggleAudio={s.toggleAudio}
+            audioError={s.audioError}
+            videoOn={s.videoInput}
+            onToggleVideo={s.toggleVideo}
+            videoError={s.videoError}
+            onOpenText={() => setTextOpen((n) => n + 1)}
+          />
+          <KeyboardFallback onSend={s.sendText} openSignal={textOpen} />
+        </>
       )}
     </div>
   );

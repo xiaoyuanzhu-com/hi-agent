@@ -30,7 +30,22 @@ export interface AgentSession {
   woken: boolean;
   waking: boolean;
   wakeError: string | null;
+  /** Whether the mic (audio input) channel is currently live. */
+  audioInput: boolean;
+  /** Surfaced if turning the audio channel on failed (denied / no device). */
+  audioError: string | null;
+  /** Whether the camera (vision input) channel is currently live. */
+  videoInput: boolean;
+  /** Surfaced if turning the vision channel on failed (denied / no device). */
+  videoError: string | null;
+  /** Begin the session with the audio channel on (the default tap). */
   wake: () => void;
+  /** Begin the session text-only — no mic prompt; audio can be toggled on later. */
+  startTextOnly: () => void;
+  /** Flip the audio-input channel on/off independently of the others. */
+  toggleAudio: () => void;
+  /** Flip the vision-input channel on/off independently of the others. */
+  toggleVideo: () => void;
   sendText: (text: string) => void;
   dismissSurface: () => void;
   openSurface: (surface: SurfaceEnvelope) => void;
@@ -59,6 +74,10 @@ export function useAgentSession(): AgentSession {
   const [bus, setBus] = useState<AudioBus | null>(null);
   const [sentences, setSentences] = useState<SpeechItem[]>([]);
 
+  const [audioInput, setAudioInput] = useState(false);
+  const [audioError, setAudioError] = useState<string | null>(null);
+  const [videoInput, setVideoInput] = useState(false);
+  const [videoError, setVideoError] = useState<string | null>(null);
   const [userSpeaking, setUserSpeaking] = useState(false);
   const [agentStreaming, setAgentStreaming] = useState(false);
   const [awaiting, setAwaiting] = useState(false);
@@ -199,95 +218,168 @@ export function useAgentSession(): AgentSession {
     };
   }, [woken, peer]);
 
-  // ---- wake: acquire mic, build the audio graph --------------------------
-  const wake = useCallback(() => {
-    if (woken || waking) return;
-    setWaking(true);
-    setWakeError(null);
-    void (async () => {
-      try {
-        const stream = await navigator.mediaDevices.getUserMedia({
-          audio: { channelCount: 1, echoCancellation: true, noiseSuppression: true },
-        });
-        const audioBus = new AudioBus();
-        await audioBus.resume();
-        // Autoplay policy: on an auto-wake with no user gesture this page load,
-        // the context can stay suspended — which mutes TTS *and* stalls the
-        // mic's ScriptProcessor (no listening). If so, resume on the first
-        // incidental interaction so audio unlocks without a dedicated tap.
-        if (audioBus.ctx.state !== "running") {
-          const events = ["pointerdown", "keydown", "touchstart"];
-          const resumeOnGesture = () => {
-            void audioBus.resume();
-            for (const ev of events) window.removeEventListener(ev, resumeOnGesture);
-          };
-          for (const ev of events) window.addEventListener(ev, resumeOnGesture);
-        }
-        const micNode = audioBus.ctx.createMediaStreamSource(stream);
-        audioBus.attachMic(micNode);
-        const voice = new VoicePlayer(
-          audioBus,
-          () => setTtsPlaying(true),
-          () => setTtsPlaying(false),
-        );
+  // ---- audio-input channel: acquire/release the mic (and vision) ---------
+  // Independent of the session itself — text and audio are coequal input
+  // channels, each freely toggled on or off. Enabling needs the session's
+  // AudioBus to already exist (built in startSession).
+  const enableAudio = useCallback(async () => {
+    const audioBus = busRef.current;
+    if (!audioBus || micRef.current) return; // no session yet, or already live
+    const voice = voiceRef.current;
+    try {
+      const stream = await navigator.mediaDevices.getUserMedia({
+        audio: { channelCount: 1, echoCancellation: true, noiseSuppression: true },
+      });
+      const micNode = audioBus.ctx.createMediaStreamSource(stream);
+      audioBus.attachMic(micNode);
 
-        const mic = new MicCapture(audioBus.ctx, micNode, {
-          onSpeechStart: () => {
-            setUserSpeaking(true);
-            // Barge-in reflex: the moment our mic goes hot, mute the speaker so
-            // we never play over the human. This is the face's *only* output
-            // decision; whether/what to say next is the mind's call.
-            voice.stop();
-          },
-          onSpeechEnd: ({ blob, mime }) => {
-            setUserSpeaking(false);
-            // Ship the utterance as one WAV; the backend transcribes and the
-            // mind decides if/when to reply. Show "thinking" immediately; if the
-            // clip held no speech (empty transcript) drop back to idle.
-            setAwaiting(true);
-            postAudio({ from: peer, blob, mime })
-              .then(({ transcript }) => {
-                if (!transcript.trim()) setAwaiting(false);
-              })
-              .catch(() => setAwaiting(false));
-          },
-        });
-        micStreamRef.current = stream;
-        busRef.current = audioBus;
-        micRef.current = mic;
-        voiceRef.current = voice;
+      const mic = new MicCapture(audioBus.ctx, micNode, {
+        onSpeechStart: () => {
+          setUserSpeaking(true);
+          // Barge-in reflex: the moment our mic goes hot, mute the speaker so
+          // we never play over the human. This is the face's *only* output
+          // decision; whether/what to say next is the mind's call.
+          voice?.stop();
+        },
+        onSpeechEnd: ({ blob, mime }) => {
+          setUserSpeaking(false);
+          // Ship the utterance as one WAV; the backend transcribes and the
+          // mind decides if/when to reply. Show "thinking" immediately; if the
+          // clip held no speech (empty transcript) drop back to idle.
+          setAwaiting(true);
+          postAudio({ from: peer, blob, mime })
+            .then(({ transcript }) => {
+              if (!transcript.trim()) setAwaiting(false);
+            })
+            .catch(() => setAwaiting(false));
+        },
+      });
+      micStreamRef.current = stream;
+      micRef.current = mic;
+      setAudioError(null);
+      setAudioInput(true);
+    } catch (err) {
+      const msg = (err instanceof Error ? err.message : String(err)).toLowerCase();
+      setAudioError(
+        msg.includes("denied") || msg.includes("permission") || msg.includes("notallowed")
+          ? "microphone permission needed"
+          : "couldn't reach the microphone",
+      );
+      setAudioInput(false);
+    }
+  }, [peer]);
 
-        // Vision: a continuous channel like the mic. Best-effort — if the
-        // camera is unavailable or denied, listening still works.
+  const disableAudio = useCallback(() => {
+    micRef.current?.stop();
+    micRef.current = null;
+    micStreamRef.current?.getTracks().forEach((t) => t.stop());
+    micStreamRef.current = null;
+    setUserSpeaking(false);
+    setAudioInput(false);
+  }, []);
+
+  const toggleAudio = useCallback(() => {
+    if (audioInput) disableAudio();
+    else void enableAudio();
+  }, [audioInput, disableAudio, enableAudio]);
+
+  // ---- vision-input channel: acquire/release the camera ------------------
+  // A continuous channel like the mic, but fully independent — usable with or
+  // without audio, and toggled on its own. Frames stream a couple seconds apart
+  // and a dropped frame is fine, so posting is fire-and-forget.
+  const enableVision = useCallback(async () => {
+    if (visionRef.current) return; // already live
+    try {
+      const videoStream = await navigator.mediaDevices.getUserMedia({ video: true });
+      visionStreamRef.current = videoStream;
+      visionRef.current = new VisionCapture(videoStream, {
+        onFrame: (frameBlob, frameMime) => {
+          postVision({ from: peer, blob: frameBlob, mime: frameMime }).catch(() => {});
+        },
+      });
+      setVideoError(null);
+      setVideoInput(true);
+    } catch (err) {
+      const msg = (err instanceof Error ? err.message : String(err)).toLowerCase();
+      setVideoError(
+        msg.includes("denied") || msg.includes("permission") || msg.includes("notallowed")
+          ? "camera permission needed"
+          : "couldn't reach the camera",
+      );
+      setVideoInput(false);
+    }
+  }, [peer]);
+
+  const disableVision = useCallback(() => {
+    visionRef.current?.stop();
+    visionRef.current = null;
+    visionStreamRef.current?.getTracks().forEach((t) => t.stop());
+    visionStreamRef.current = null;
+    setVideoInput(false);
+  }, []);
+
+  const toggleVideo = useCallback(() => {
+    if (videoInput) disableVision();
+    else void enableVision();
+  }, [videoInput, disableVision, enableVision]);
+
+  // ---- start the session: build the output graph (no mic required) -------
+  // A single user gesture is the one unavoidable interaction — browsers need it
+  // to unlock audio *playback*. The mic is a separate, optional channel layered
+  // on top via enableAudio(), so the session (and the text channel) work even
+  // when audio can't be used at all.
+  const startSession = useCallback(
+    (withAudio: boolean) => {
+      if (woken || waking) return;
+      setWaking(true);
+      setWakeError(null);
+      void (async () => {
         try {
-          const videoStream = await navigator.mediaDevices.getUserMedia({ video: true });
-          visionStreamRef.current = videoStream;
-          visionRef.current = new VisionCapture(videoStream, {
-            onFrame: (frameBlob, frameMime) => {
-              // Fire-and-forget; a dropped frame is fine on a continuous channel.
-              postVision({ from: peer, blob: frameBlob, mime: frameMime }).catch(() => {});
-            },
-          });
-        } catch {
-          /* no camera / permission denied — vision stays dark, audio continues */
+          const audioBus = new AudioBus();
+          await audioBus.resume();
+          // Autoplay policy: on an auto-start with no gesture this page load the
+          // context can stay suspended — which mutes TTS. Resume on the first
+          // incidental interaction so audio unlocks without a dedicated tap.
+          if (audioBus.ctx.state !== "running") {
+            const events = ["pointerdown", "keydown", "touchstart"];
+            const resumeOnGesture = () => {
+              void audioBus.resume();
+              for (const ev of events) window.removeEventListener(ev, resumeOnGesture);
+            };
+            for (const ev of events) window.addEventListener(ev, resumeOnGesture);
+          }
+          const voice = new VoicePlayer(
+            audioBus,
+            () => setTtsPlaying(true),
+            () => setTtsPlaying(false),
+          );
+          busRef.current = audioBus;
+          voiceRef.current = voice;
+          setBus(audioBus);
+          setWoken(true);
+          setWaking(false);
+          if (withAudio) {
+            void enableAudio();
+            void enableVision();
+          }
+        } catch (err) {
+          const msg = (err instanceof Error ? err.message : String(err)).toLowerCase();
+          setWakeError(
+            msg.includes("denied") || msg.includes("permission") || msg.includes("notallowed")
+              ? "audio playback blocked — tap to retry"
+              : "couldn't start the session — tap to retry",
+          );
+          setWaking(false);
         }
+      })();
+    },
+    [woken, waking, enableAudio, enableVision],
+  );
 
-        setBus(audioBus);
-        setWoken(true);
-        setWaking(false);
-      } catch (err) {
-        const msg = (err instanceof Error ? err.message : String(err)).toLowerCase();
-        setWakeError(
-          msg.includes("denied") || msg.includes("permission") || msg.includes("notallowed")
-            ? "microphone permission needed — tap to retry"
-            : "couldn't reach the microphone — tap to retry",
-        );
-        setWaking(false);
-      }
-    })();
-  }, [woken, waking, peer]);
+  const wake = useCallback(() => startSession(true), [startSession]);
+  const startTextOnly = useCallback(() => startSession(false), [startSession]);
 
-  // Auto-wake on repeat visits: if the mic was already granted on a prior
+  // Auto-start on repeat visits: if the mic was already granted on a prior
   // visit, skip the "tap to begin" gate and start listening straight away. The
   // gate still appears on the first-ever visit (permission "prompt") or after a
   // denial, where a user gesture is genuinely required to request the mic.
@@ -380,7 +472,14 @@ export function useAgentSession(): AgentSession {
     woken,
     waking,
     wakeError,
+    audioInput,
+    audioError,
+    videoInput,
+    videoError,
     wake,
+    startTextOnly,
+    toggleAudio,
+    toggleVideo,
     sendText,
     dismissSurface,
     openSurface,

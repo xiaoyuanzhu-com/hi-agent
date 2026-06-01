@@ -2,14 +2,21 @@ import { useEffect, useRef, useState } from "react";
 
 interface KeyboardFallbackProps {
   onSend: (text: string) => void;
+  /**
+   * Bump this number to open the input programmatically (e.g. from the text
+   * channel toggle on touch devices, where there's no keydown to reveal it).
+   */
+  openSignal?: number;
 }
 
 /**
- * Hidden text path for noisy rooms / accessibility. The interface has no input
- * box by default; pressing any printable key reveals a minimal single line that
- * posts to /thought. Esc or an empty blur dismisses it.
+ * The text input channel. The interface has no input box by default; pressing
+ * any printable key reveals a minimal single line that posts to /thought, or it
+ * can be opened explicitly via `openSignal` (the channel toggle). Esc or an
+ * empty blur dismisses it. Independent of the audio channel — usable with the
+ * mic on, off, or unavailable.
  */
-export function KeyboardFallback({ onSend }: KeyboardFallbackProps) {
+export function KeyboardFallback({ onSend, openSignal }: KeyboardFallbackProps) {
   const [open, setOpen] = useState(false);
   const [text, setText] = useState("");
   const inputRef = useRef<HTMLInputElement | null>(null);
@@ -27,6 +34,11 @@ export function KeyboardFallback({ onSend }: KeyboardFallbackProps) {
     window.addEventListener("keydown", onKey);
     return () => window.removeEventListener("keydown", onKey);
   }, [open]);
+
+  // Explicit open from the channel toggle. Ignore the initial mount (0).
+  useEffect(() => {
+    if (openSignal) setOpen(true);
+  }, [openSignal]);
 
   useEffect(() => {
     if (open) inputRef.current?.focus();
