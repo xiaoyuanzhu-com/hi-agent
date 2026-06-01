@@ -11,16 +11,22 @@ interface ChannelControlsProps {
   onToggleVideo: () => void;
   /** Surfaced if the last attempt to turn vision on failed. */
   videoError?: string | null;
-  /** Open the text input line. */
-  onOpenText: () => void;
+  /** Whether the text input channel is on. */
+  textOn: boolean;
+  /** Flip the text input channel on/off. */
+  onToggleText: () => void;
+  /** Whether the agent's voice (audio output) is on. */
+  voiceOn: boolean;
+  /** Mute/unmute the agent's voice. */
+  onToggleVoice: () => void;
 }
 
 /**
- * The input-channel controls — a quiet cluster in the corner. Audio and text are
- * independent channels: either can be on or off at any time, and they don't
- * conflict. Kept deliberately minimal to preserve the calm room (no chrome by
- * default), but always present so a user who can't (or won't) use the mic still
- * has a clear way in.
+ * The channel controls — a quiet cluster in the corner. The input channels (mic,
+ * camera, text) and the output channel (voice) are all independent: each can be
+ * on or off at any time, and they don't conflict. Kept deliberately minimal to
+ * preserve the calm room (no chrome by default), but always present so a user
+ * who can't (or won't) use a given channel still has a clear way in or out.
  */
 export function ChannelControls({
   audioOn,
@@ -29,7 +35,10 @@ export function ChannelControls({
   videoOn,
   onToggleVideo,
   videoError,
-  onOpenText,
+  textOn,
+  onToggleText,
+  voiceOn,
+  onToggleVoice,
 }: ChannelControlsProps) {
   return (
     <div className="hi-channels" role="group" aria-label="input channels">
@@ -57,12 +66,26 @@ export function ChannelControls({
 
       <button
         type="button"
-        className="hi-channel"
-        onClick={onOpenText}
-        title="type to the agent"
-        aria-label="type a message"
+        className={`hi-channel${textOn ? " is-on" : ""}`}
+        onClick={onToggleText}
+        title={textOn ? "text on — tap to hide" : "text off — tap to type"}
+        aria-pressed={textOn}
+        aria-label={textOn ? "hide the text input" : "show the text input"}
       >
         <KeyboardGlyph />
+      </button>
+
+      <span className="hi-channel-sep" aria-hidden="true" />
+
+      <button
+        type="button"
+        className={`hi-channel${voiceOn ? " is-on" : ""}`}
+        onClick={onToggleVoice}
+        title={voiceOn ? "voice on — tap to mute" : "voice muted — tap to unmute"}
+        aria-pressed={voiceOn}
+        aria-label={voiceOn ? "mute the agent's voice" : "unmute the agent's voice"}
+      >
+        <SpeakerGlyph muted={!voiceOn} />
       </button>
     </div>
   );
@@ -92,6 +115,29 @@ function CamGlyph({ off }: { off: boolean }) {
       <path d="M16 10l5-3v10l-5-3" stroke="currentColor" strokeWidth="1.6" strokeLinejoin="round" />
       {off && (
         <line x1="4" y1="4" x2="20" y2="20" stroke="currentColor" strokeWidth="1.6" strokeLinecap="round" />
+      )}
+    </svg>
+  );
+}
+
+function SpeakerGlyph({ muted }: { muted: boolean }) {
+  return (
+    <svg viewBox="0 0 24 24" width="18" height="18" fill="none" aria-hidden="true">
+      <path
+        d="M4 9v6h3l5 4V5L7 9H4z"
+        stroke="currentColor"
+        strokeWidth="1.6"
+        strokeLinejoin="round"
+      />
+      {muted ? (
+        <path d="M16 9l5 6M21 9l-5 6" stroke="currentColor" strokeWidth="1.6" strokeLinecap="round" />
+      ) : (
+        <path
+          d="M16 9a4 4 0 0 1 0 6M18.5 6.5a7.5 7.5 0 0 1 0 11"
+          stroke="currentColor"
+          strokeWidth="1.6"
+          strokeLinecap="round"
+        />
       )}
     </svg>
   );

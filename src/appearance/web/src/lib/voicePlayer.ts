@@ -11,6 +11,7 @@ export class VoicePlayer {
   private queue: string[] = [];
   private current: string | null = null;
   private playing = false;
+  private muted = false;
 
   constructor(
     bus: AudioBus,
@@ -26,8 +27,17 @@ export class VoicePlayer {
   }
 
   enqueue(blob: Blob): void {
+    // Output channel muted: discard the clip rather than buffer silenced voice.
+    // The agent's words still render as text via /thought.
+    if (this.muted) return;
     this.queue.push(URL.createObjectURL(blob));
     if (!this.playing) this.advance();
+  }
+
+  /** Toggle the voice output channel. Muting cuts any in-flight playback. */
+  setMuted(on: boolean): void {
+    this.muted = on;
+    if (on) this.stop();
   }
 
   private advance(): void {

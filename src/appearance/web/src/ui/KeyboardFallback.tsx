@@ -2,56 +2,48 @@ import { useEffect, useRef, useState } from "react";
 
 interface KeyboardFallbackProps {
   onSend: (text: string) => void;
-  /**
-   * Bump this number to open the input programmatically (e.g. from the text
-   * channel toggle on touch devices, where there's no keydown to reveal it).
-   */
-  openSignal?: number;
+  /** Whether the text channel is on (input line shown). Persisted by the hook. */
+  open: boolean;
+  /** Turn the channel on — e.g. the user started typing while it was off. */
+  onOpen: () => void;
+  /** Turn the channel off — e.g. Esc. */
+  onClose: () => void;
 }
 
 /**
- * The text input channel. The interface has no input box by default; pressing
- * any printable key reveals a minimal single line that posts to /thought, or it
- * can be opened explicitly via `openSignal` (the channel toggle). Esc or an
- * empty blur dismisses it. Independent of the audio channel — usable with the
- * mic on, off, or unavailable.
+ * The text input channel. When on, a minimal single line is shown that posts to
+ * /thought; sending leaves it open (it's a channel, not a one-shot). When off,
+ * the interface stays clean — but pressing any printable key turns it on and
+ * seeds the first character, so a keyboard user never has to reach for a button.
+ * Independent of the audio channels: usable with the mic on, off, or unavailable.
  */
-export function KeyboardFallback({ onSend, openSignal }: KeyboardFallbackProps) {
-  const [open, setOpen] = useState(false);
+export function KeyboardFallback({ onSend, open, onOpen, onClose }: KeyboardFallbackProps) {
   const [text, setText] = useState("");
   const inputRef = useRef<HTMLInputElement | null>(null);
 
+  // Start-typing-to-open: a single printable key turns the channel on and seeds
+  // the line. Only active while the channel is off.
   useEffect(() => {
+    if (open) return;
     const onKey = (e: KeyboardEvent) => {
-      if (open) return;
       if (e.metaKey || e.ctrlKey || e.altKey) return;
-      // a single printable, non-whitespace character opens the line and seeds it
       if (e.key.length === 1 && /\S/.test(e.key)) {
         setText(e.key);
-        setOpen(true);
+        onOpen();
       }
     };
     window.addEventListener("keydown", onKey);
     return () => window.removeEventListener("keydown", onKey);
-  }, [open]);
-
-  // Explicit open from the channel toggle. Ignore the initial mount (0).
-  useEffect(() => {
-    if (openSignal) setOpen(true);
-  }, [openSignal]);
+  }, [open, onOpen]);
 
   useEffect(() => {
     if (open) inputRef.current?.focus();
   }, [open]);
 
-  const close = () => {
-    setText("");
-    setOpen(false);
-  };
   const submit = () => {
     const trimmed = text.trim();
     if (trimmed) onSend(trimmed);
-    close();
+    setText(""); // clear, but keep the channel open
   };
 
   if (!open) return null;
@@ -69,11 +61,9 @@ export function KeyboardFallback({ onSend, openSignal }: KeyboardFallbackProps) 
             submit();
           } else if (e.key === "Escape") {
             e.preventDefault();
-            close();
+            setText("");
+            onClose();
           }
-        }}
-        onBlur={() => {
-          if (!text.trim()) close();
         }}
         placeholder="type to the agent…"
         aria-label="message the agent"

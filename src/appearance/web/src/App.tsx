@@ -1,4 +1,3 @@
-import { useState } from "react";
 import { useAgentSession } from "./hooks/useAgentSession";
 import { Atmosphere } from "./ui/Atmosphere";
 import { Presence } from "./ui/Presence";
@@ -22,9 +21,6 @@ import { ChannelControls } from "./ui/ChannelControls";
  */
 export function App() {
   const s = useAgentSession();
-  // Bumped to open the text line from the channel toggle (touch devices have no
-  // keydown to reveal it on their own).
-  const [textOpen, setTextOpen] = useState(0);
 
   return (
     <div className="hi-root">
@@ -52,9 +48,17 @@ export function App() {
             videoOn={s.videoInput}
             onToggleVideo={s.toggleVideo}
             videoError={s.videoError}
-            onOpenText={() => setTextOpen((n) => n + 1)}
+            textOn={s.textInput}
+            onToggleText={() => s.setTextChannel(!s.textInput)}
+            voiceOn={s.audioOutput}
+            onToggleVoice={s.toggleAudioOutput}
           />
-          <KeyboardFallback onSend={s.sendText} openSignal={textOpen} />
+          <KeyboardFallback
+            onSend={s.sendText}
+            open={s.textInput}
+            onOpen={() => s.setTextChannel(true)}
+            onClose={() => s.setTextChannel(false)}
+          />
         </>
       )}
     </div>

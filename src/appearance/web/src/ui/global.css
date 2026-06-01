@@ -324,6 +324,15 @@ button {
   box-shadow: 0 0 0 1px rgba(91, 135, 200, 0.22), 0 6px 22px rgba(40, 52, 74, 0.1);
 }
 
+/* Separates the input channels (mic/camera/text) from the output (voice). */
+.hi-channel-sep {
+  align-self: center;
+  width: 1px;
+  height: 20px;
+  background: var(--line-strong);
+  margin: 0 2px;
+}
+
 /* --- Animations ------------------------------------------------------- */
 @keyframes hi-sentence-in {
   from { opacity: 0; transform: translateY(10px); filter: blur(3px); }
