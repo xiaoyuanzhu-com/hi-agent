@@ -193,17 +193,21 @@ impl SessionRun {
         // prompt response if it hasn't arrived yet.
         while self.next_update().await.is_some() {}
 
-        let response = self
-            .response
-            .take()
-            .ok_or_else(|| anyhow!("prompt finished without a response"))?;
-
-        // Park the receiver back so a subsequent prompt on the same session
-        // can pick up where we left off.
+        // Park the receiver back *first* so a subsequent prompt on the same
+        // session can pick up where we left off. This must precede the
+        // response check: a persistent session is reused turn after turn, and
+        // a prompt that finished without a response (e.g. a transport hiccup)
+        // would otherwise leave the rx slot empty forever, wedging every later
+        // turn with "session already has an in-flight prompt".
         if let Some(rx) = self.rx.take() {
             let mut slot = self.rx_slot.lock().await;
             *slot = Some(rx);
         }
+
+        let response = self
+            .response
+            .take()
+            .ok_or_else(|| anyhow!("prompt finished without a response"))?;
 
         Ok(PromptResult {
             stop_reason: response.stop_reason,

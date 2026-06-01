@@ -3,9 +3,9 @@
 //! Inbound (`POST /audio`): the body bytes are audio; we save them under
 //! `data/media/audio/in/<uuid>.<ext>`, transcribe via the configured
 //! [`Stt`](crate::voice::Stt), and feed the transcript into the same
-//! per-peer routing path that `POST /thought` uses. The journal records a
+//! per-peer path that `POST /thought` uses. The journal records a
 //! `SignalIn { channel: Audio, body: <transcript>, media_path: Some(path) }`
-//! so the router's snapshot can show that this signal arrived as speech
+//! so the reactor's snapshot can show that this signal arrived as speech
 //! while the body remains text-searchable.
 //!
 //! Outbound (`GET /audio`): subscriber to the reactor's `audio_out` broadcast.

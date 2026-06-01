@@ -25,7 +25,7 @@ use crate::types::PeerId;
 
 /// Cap on buffered utterances per peer. Bounds growth when a peer produces
 /// output that no client ever connects to consume; the oldest utterances are
-/// evicted first. Per-peer routing turns are serial, so reaching this many
+/// evicted first. Per-peer turns are serial, so reaching this many
 /// undelivered utterances means nobody has polled in a long while.
 const MAX_BUFFERED_PER_PEER: usize = 32;
 

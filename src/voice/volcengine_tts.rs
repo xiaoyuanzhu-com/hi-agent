@@ -75,8 +75,11 @@ const ENV_RESOURCE_ID: &str = "VOLCENGINE_TTS_RESOURCE_ID";
 const ENV_ENDPOINT: &str = "VOLCENGINE_TTS_ENDPOINT";
 
 const NAMESPACE: &str = "BidirectionalTTS";
-/// Max quiet gap inside a live session before we assume it has hung and tear
-/// it down. Generous: token gaps while the agent is thinking are far shorter.
+/// Max quiet gap to wait for the server to flush audio *after* we've finished
+/// sending text (FinishSession), before assuming the session hung. It does NOT
+/// apply while text input is still open: a live turn may go quiet for a long
+/// stretch while the agent searches or thinks, and tearing the session down
+/// then would drop the rest of the turn's speech into a dead socket.
 const IDLE_TIMEOUT: Duration = Duration::from_secs(30);
 /// Channel depth for both text-in and frames-out; bounded so a slow consumer
 /// applies backpressure rather than letting audio pile up unbounded.
@@ -238,7 +241,12 @@ async fn drive_session<Tx, Rx>(
 {
     let mut text_done = false;
     loop {
-        let step = timeout(IDLE_TIMEOUT, async {
+        // While text input is still open (the turn is live), a quiet gap just
+        // means the agent is thinking — wait indefinitely and keep the session
+        // warm. Only once input is finished (FinishSession sent) do we guard the
+        // server's flush with an idle deadline, to catch a hung session.
+        let guard_idle = text_done;
+        let step = async {
             tokio::select! {
                 maybe_msg = rx.next() => handle_server_msg(maybe_msg, &frame_tx).await,
                 text = text_rx.recv(), if !text_done => {
@@ -275,16 +283,25 @@ async fn drive_session<Tx, Rx>(
                     }
                 }
             }
-        })
-        .await;
+        };
 
-        match step {
-            Ok(Flow::Continue) => {}
-            Ok(Flow::Break) => break,
-            Err(_) => {
-                tracing::warn!("volcengine TTS session idle for {IDLE_TIMEOUT:?}, tearing down");
-                break;
+        let flow = if guard_idle {
+            match timeout(IDLE_TIMEOUT, step).await {
+                Ok(flow) => flow,
+                Err(_) => {
+                    tracing::warn!(
+                        "volcengine TTS idle {IDLE_TIMEOUT:?} after finish; tearing down"
+                    );
+                    break;
+                }
             }
+        } else {
+            step.await
+        };
+
+        match flow {
+            Flow::Continue => {}
+            Flow::Break => break,
         }
     }
 

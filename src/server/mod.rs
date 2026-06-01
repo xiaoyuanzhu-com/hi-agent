@@ -12,10 +12,12 @@ use tokio::sync::{broadcast, mpsc};
 use tower_http::trace::TraceLayer;
 
 use crate::memory::Memory;
+use crate::reactor::OutboundSignal;
 use crate::types::{PeerId, Signal, SurfaceEnvelope};
 use crate::voice::Stt;
 
 pub mod audio;
+pub mod binder;
 pub mod headers;
 pub mod stubs;
 pub mod surface;
@@ -109,6 +111,18 @@ pub fn build(
     let (audio_tx, _) = broadcast::channel::<AudioEvent>(64);
     let (surface_tx, _) = broadcast::channel::<SurfaceEvent>(64);
 
+    // The reactor's single transport-free outbound seam. A binder task fans each
+    // `OutboundSignal` out to the HTTP-shaped carriers above — assigning
+    // Content-Type, framing one utterance into one response, closing the body at
+    // an utterance boundary. The reactor knows none of that.
+    let (out_tx, out_rx) = mpsc::channel::<OutboundSignal>(1024);
+    tokio::spawn(binder::bind_outbound(
+        out_rx,
+        thought_bus.clone(),
+        audio_tx.clone(),
+        surface_tx.clone(),
+    ));
+
     let state = Arc::new(AppState {
         inbound: inbound_tx,
         thought_bus: thought_bus.clone(),
@@ -137,18 +151,21 @@ pub fn build(
     let seams = ServerSeams {
         inbound_rx,
         thought_bus,
-        audio_out: audio_tx,
-        surface_out: surface_tx,
+        out_tx,
     };
 
     (router, seams)
 }
 
+/// What `build` hands back to wire the reactor to the HTTP front. `inbound_rx`
+/// is the channel POSTs feed; `out_tx` is the reactor's single transport-free
+/// outbound seam (the binder spawned in `build` carries it to the wire). The
+/// `thought_bus` is exposed only so integration tests can drive utterances
+/// directly without standing up a reactor.
 pub struct ServerSeams {
     pub inbound_rx: mpsc::Receiver<Signal>,
     pub thought_bus: ThoughtBus,
-    pub audio_out: broadcast::Sender<AudioEvent>,
-    pub surface_out: broadcast::Sender<SurfaceEvent>,
+    pub out_tx: mpsc::Sender<OutboundSignal>,
 }
 
 async fn not_found() -> (StatusCode, &'static str) {

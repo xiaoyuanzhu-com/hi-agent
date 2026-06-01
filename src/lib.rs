@@ -1,11 +1,11 @@
 //! hi-agent — reference implementation of the human-interface spec.
 
 use std::path::PathBuf;
-use std::sync::Arc;
 
 use tokio::net::TcpListener;
 
 pub mod acp;
+pub mod agent;
 pub mod appearance;
 pub mod channel_log;
 pub mod config;
@@ -58,7 +58,9 @@ pub async fn run(config: Config) -> anyhow::Result<()> {
     let claude_config_dir = config.data_dir.join("claude-config");
     config.agent.render_settings_json(&claude_config_dir)?;
 
-    // Spawn the adapter via the bundled node, with managed env.
+    // Spawn config for the agent session layer. The subprocess itself is spawned
+    // lazily, one per peer, on that peer's first session (Chrome-style isolation);
+    // the pinned runtime, managed env, and local LLM proxy are shared by all.
     let child_env = config.agent.child_env(
         proxy.port(),
         &claude_config_dir,
@@ -70,29 +72,24 @@ pub async fn run(config: Config) -> anyhow::Result<()> {
         .to_str()
         .ok_or_else(|| anyhow::anyhow!("adapter path not UTF-8"))?
         .to_string();
-    let acp = Arc::new(
-        acp::AcpProcess::spawn(runtime.node_bin.clone(), vec![adapter_entry], child_env).await?,
-    );
-    tracing::info!("ACP subprocess up (bundled node + adapter)");
+    let agent = agent::AgentLayer::new(agent::SpawnConfig {
+        program: runtime.node_bin.clone(),
+        args: vec![adapter_entry],
+        env: child_env,
+    });
+    tracing::info!("agent session layer ready (per-peer processes spawn on first contact)");
 
     // Keep the proxy alive for the life of the process.
     let _proxy = proxy;
 
     let _reactor = reactor::start(
         memory,
-        acp,
+        agent,
         seams.inbound_rx,
-        seams.thought_bus,
+        seams.out_tx,
         tts,
-        seams.audio_out.clone(),
-        seams.surface_out.clone(),
     );
     tracing::info!("reactor started");
-
-    // Hold clones of the broadcast senders so subscribers see Lagged not Closed
-    // even between turns (the reactor holds the producing clones).
-    let _audio_out = seams.audio_out;
-    let _surface_out = seams.surface_out;
 
     let addr = ("0.0.0.0", config.port);
     let listener = TcpListener::bind(addr).await?;

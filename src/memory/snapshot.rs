@@ -1,4 +1,4 @@
-//! Snapshot — the per-peer view passed into each routing ACP session.
+//! Snapshot — the per-peer view passed into a peer's reactor session.
 
 use chrono::{DateTime, Duration, Utc};
 
