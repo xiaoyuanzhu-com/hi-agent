@@ -1,8 +1,10 @@
-// Client for the human-interface /audio channel (inbound STT).
+// Client for the human-interface /audio channel.
 //
-// Capture + WAV encoding now live in `lib/micCapture` + `lib/wav` — continuous
-// VAD segmentation replaced the old push-to-talk recorder, so this module is
-// just the POST of a finished utterance.
+// Live mic input now streams continuously over the `/api/audio/in` WebSocket
+// (see `lib/audioStreamer`), with the upstream STT doing the endpointing.
+// `postAudio` below is the one-shot batch path for the `POST /api/audio`
+// endpoint — kept for non-streaming callers (e.g. uploading a finished clip);
+// it is not used by the live mic.
 
 export async function postAudio(opts: {
   from: string;

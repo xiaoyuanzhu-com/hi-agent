@@ -1,11 +1,11 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { subscribeThought, postThought } from "../channels/thought";
-import { subscribeAudioTurns, postAudio } from "../channels/audio";
+import { subscribeAudioTurns } from "../channels/audio";
 import { postVision } from "../channels/vision";
 import { subscribeSurface, type SurfaceEnvelope } from "../channels/surface";
 import { AudioBus } from "../lib/audioBus";
 import { ActivityMeter } from "../lib/activityMeter";
-import { MicCapture } from "../lib/micCapture";
+import { AudioStreamer } from "../lib/audioStreamer";
 import { VisionCapture } from "../lib/visionCapture";
 import { VoicePlayer } from "../lib/voicePlayer";
 import { SentenceBuffer } from "../lib/sentences";
@@ -144,7 +144,7 @@ export function useAgentSession(): AgentSession {
   const [surfaceHistory, setSurfaceHistory] = useState<SurfaceEnvelope[]>([]);
 
   const busRef = useRef<AudioBus | null>(null);
-  const micRef = useRef<MicCapture | null>(null);
+  const micRef = useRef<AudioStreamer | null>(null);
   const micStreamRef = useRef<MediaStream | null>(null);
   const voiceRef = useRef<VoicePlayer | null>(null);
   const visionRef = useRef<VisionCapture | null>(null);
@@ -297,7 +297,6 @@ export function useAgentSession(): AgentSession {
   const enableAudio = useCallback(async () => {
     const audioBus = busRef.current;
     if (!audioBus || micRef.current) return; // no session yet, or already live
-    const voice = voiceRef.current;
     try {
       const stream = await navigator.mediaDevices.getUserMedia({
         audio: { channelCount: 1, echoCancellation: true, noiseSuppression: true },
@@ -305,29 +304,29 @@ export function useAgentSession(): AgentSession {
       const micNode = audioBus.ctx.createMediaStreamSource(stream);
       audioBus.attachMic(micNode);
 
-      const mic = new MicCapture(audioBus.ctx, micNode, {
-        onSpeechStart: () => {
-          setUserSpeaking(true);
-          // Barge-in reflex: the moment our mic goes hot, mute the speaker so
-          // we never play over the human. This is the face's *only* output
-          // decision; whether/what to say next is the mind's call.
-          voice?.stop();
-        },
-        onSpeechEnd: ({ blob, mime }) => {
-          setUserSpeaking(false);
-          // Ship the utterance as one WAV; the backend transcribes and the
-          // mind decides if/when to reply. Show "thinking" immediately; if the
-          // clip held no speech (empty transcript) drop back to idle.
-          setAwaiting(true);
-          postAudio({ from: peer, blob, mime })
-            .then(({ transcript }) => {
-              if (!transcript.trim()) setAwaiting(false);
-            })
-            .catch(() => setAwaiting(false));
+      // Passthrough: stream every mic frame to the backend; the upstream STT
+      // segments and transcribes. No client-side VAD. Barge-in and UI state are
+      // driven by recognized text, not raw mic energy — so we never falsely
+      // mute the agent.
+      const streamer = new AudioStreamer(audioBus.ctx, micNode, {
+        peer,
+        onTranscript: ({ text, isFinal }) => {
+          const heard = text.trim().length > 0;
+          if (heard) {
+            // First real recognized speech ducks the speaker — the face's only
+            // output decision; whether/what to say next is the mind's call.
+            voiceRef.current?.stop();
+            setUserSpeaking(true);
+          }
+          if (isFinal && heard) {
+            // Utterance finalized and dispatched server-side; show "thinking".
+            setUserSpeaking(false);
+            setAwaiting(true);
+          }
         },
       });
       micStreamRef.current = stream;
-      micRef.current = mic;
+      micRef.current = streamer;
       setAudioError(null);
       setAudioInput(true);
     } catch (err) {

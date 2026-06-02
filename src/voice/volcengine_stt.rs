@@ -83,9 +83,17 @@ const DEFAULT_MODEL: &str = "bigmodel";
 const PCM_CHUNK_BYTES: usize = 3200;
 // Generous overall budget. Real recognitions complete in seconds.
 const TOTAL_TIMEOUT: Duration = Duration::from_secs(30);
-// Streaming spans the whole utterance (up to the 30 s mic cap) plus the trailing
-// finalization, so it gets a longer ceiling than the batch path.
-const STREAM_TIMEOUT: Duration = Duration::from_secs(90);
+// Streaming is a continuous, always-on session for the whole mic-open period —
+// many utterances, bounded only by how long the human keeps the channel open.
+// The ceiling is generous; the session ends when the client closes the audio
+// input, not on a timer.
+const STREAM_TIMEOUT: Duration = Duration::from_secs(60 * 30);
+// Trailing silence (ms) after which the upstream's server-side VAD finalizes an
+// utterance (`definite=true`) mid-stream. Empirically this is the lever that
+// makes continuous segmentation work; without it the upstream defers all
+// finalization to connection close. ~800 ms balances snappy turn handoff
+// against clipping a speaker who pauses mid-thought.
+const STREAM_END_WINDOW_MS: u32 = 800;
 
 const WAV_HEADER_BYTES: usize = 44;
 
@@ -169,9 +177,21 @@ impl VolcengineStt {
     }
 
     /// Build the FULL_CLIENT_REQUEST config frame. `show_utterances` exposes the
-    /// per-utterance `definite` flag the streaming path uses to tell the fast
-    /// preliminary text from the polished final.
+    /// per-utterance `definite` flag the streaming path uses for endpointing;
+    /// when set we also request server-side VAD segmentation via
+    /// `end_window_size` so utterances finalize mid-stream (after a short pause)
+    /// rather than only at connection close.
     fn config_frame(&self, show_utterances: bool) -> anyhow::Result<Vec<u8>> {
+        let mut request = json!({
+            "model_name": self.model,
+            "enable_itn": true,
+            "enable_punc": true,
+            "result_type": "single",
+            "show_utterances": show_utterances,
+        });
+        if show_utterances {
+            request["end_window_size"] = json!(STREAM_END_WINDOW_MS);
+        }
         let config = json!({
             "user": { "uid": "hi-agent" },
             "audio": {
@@ -181,13 +201,7 @@ impl VolcengineStt {
                 "bits": 16,
                 "channel": 1,
             },
-            "request": {
-                "model_name": self.model,
-                "enable_itn": true,
-                "enable_punc": true,
-                "result_type": "single",
-                "show_utterances": show_utterances,
-            },
+            "request": request,
         });
         Ok(frame(MSG_TYPE_FULL_CLIENT, 0, SER_JSON, &serde_json::to_vec(&config)?))
     }
@@ -234,15 +248,14 @@ impl VolcengineStt {
             let msg = msg.map_err(|e| anyhow::anyhow!("volcengine STT WS recv: {e}"))?;
             let bytes = match msg {
                 Message::Binary(b) => b,
-                Message::Close(frame) => {
-                    if !last_text.is_empty() && final_text.is_empty() {
-                        final_text = last_text.clone();
-                    }
+                Message::Close(_) => {
+                    // Normal end-of-stream. Promote the last rolling preliminary
+                    // if no frame was flagged `final`. An empty result here is a
+                    // benign "no speech recognized" — the upstream cannot tell
+                    // silence from un-transcribable sound, and neither path is an
+                    // error; the caller treats an empty transcript as a no-op.
                     if final_text.is_empty() {
-                        anyhow::bail!(
-                            "volcengine STT closed without final result: {:?}",
-                            frame
-                        );
+                        final_text = last_text.clone();
                     }
                     break;
                 }
@@ -253,15 +266,11 @@ impl VolcengineStt {
                 continue;
             }
             let msg_type = (bytes[1] >> 4) & 0x0F;
-            // Skip the 4-byte protocol header. The reference treats bytes
-            // 4..12 as opaque (size/seq fields we don't need) and reads JSON
-            // from byte 12 — but on some result frames the payload starts at
-            // byte 8. Find the first '{' to be tolerant of either.
             let tail = &bytes[4..];
 
             match msg_type {
                 MSG_TYPE_FULL_SERVER => {
-                    let Some(payload) = extract_json(tail) else {
+                    let Some(payload) = server_payload(&bytes) else {
                         continue;
                     };
                     let parsed: ServerResponse = match serde_json::from_slice(payload) {
@@ -303,11 +312,9 @@ impl VolcengineStt {
 
         let _ = tx.send(Message::Close(None)).await;
 
-        let text = final_text.trim().to_owned();
-        if text.is_empty() {
-            anyhow::bail!("volcengine STT returned empty transcript");
-        }
-        Ok(text)
+        // Empty is a valid result (no speech recognized), distinct from the
+        // errors above which `bail!` — those still propagate as failures.
+        Ok(final_text.trim().to_owned())
     }
 
     /// Full-duplex streaming: a sender task forwards incoming PCM as it arrives
@@ -345,10 +352,17 @@ impl VolcengineStt {
             anyhow::Ok(())
         });
 
-        // Reader: emit each new result; the upstream sends rolling preliminaries
-        // (definite=false) then a definite/final result per utterance.
-        let mut last_emitted = String::new();
-        let mut final_text = String::new();
+        // Reader: a continuous session over many utterances. The upstream sends
+        // rolling preliminaries (definite=false) then marks an utterance
+        // `definite=true` once its server-side VAD detects the endpoint. We emit
+        // every non-empty preliminary as a partial (the caller uses it for
+        // barge-in) and each finalized utterance as `is_final=true` (the caller
+        // dispatches those as discrete signals). The loop runs until the audio
+        // input closes and the upstream closes the socket — it does NOT stop at
+        // the first final.
+        let mut last_partial = String::new();
+        let mut last_final = String::new();
+        let mut last_returned = String::new();
         while let Some(msg) = rx.next().await {
             let msg = msg.map_err(|e| anyhow::anyhow!("volcengine STT WS recv: {e}"))?;
             let bytes = match msg {
@@ -363,7 +377,7 @@ impl VolcengineStt {
             let tail = &bytes[4..];
             match msg_type {
                 MSG_TYPE_FULL_SERVER => {
-                    let Some(payload) = extract_json(tail) else { continue };
+                    let Some(payload) = server_payload(&bytes) else { continue };
                     let parsed: ServerResponse = match serde_json::from_slice(payload) {
                         Ok(p) => p,
                         Err(err) => {
@@ -379,22 +393,29 @@ impl VolcengineStt {
                             );
                         }
                     }
-                    let is_final =
-                        parsed.kind.as_deref() == Some("final") || parsed.is_final == Some(true);
-                    if let Some(text) = parsed.result.as_ref().and_then(|r| r.first_text()) {
-                        if !text.is_empty() {
-                            if is_final {
-                                final_text = text.clone();
-                            }
-                            // Dedupe identical rolling updates; always pass a final.
-                            if is_final || text != last_emitted {
-                                last_emitted = text.clone();
-                                let _ = out.send(Transcript { text, is_final }).await;
-                            }
+
+                    if parsed.is_definite() {
+                        // Utterance finalized. Dispatch its text once; a new
+                        // partial resets `last_final` so a later utterance with
+                        // identical text still dispatches.
+                        let text = parsed
+                            .result
+                            .as_ref()
+                            .and_then(|r| r.definite_text())
+                            .unwrap_or_default();
+                        if !text.is_empty() && text != last_final {
+                            last_final = text.clone();
+                            last_returned = text.clone();
+                            last_partial.clear();
+                            let _ = out.send(Transcript { text, is_final: true }).await;
                         }
-                    }
-                    if is_final {
-                        break;
+                    } else if let Some(text) = parsed.text() {
+                        // Rolling preliminary. Dedupe identical updates.
+                        if !text.is_empty() && text != last_partial {
+                            last_partial = text.clone();
+                            last_final.clear();
+                            let _ = out.send(Transcript { text, is_final: false }).await;
+                        }
                     }
                 }
                 MSG_TYPE_SERVER_ERROR => {
@@ -409,18 +430,10 @@ impl VolcengineStt {
         }
 
         send_task.abort();
-
-        let text = if final_text.trim().is_empty() {
-            last_emitted.trim().to_owned()
-        } else {
-            final_text.trim().to_owned()
-        };
-        // A final emit may not have been flagged (e.g. stream closed early); make
-        // sure the caller's last view matches what we return.
-        if !text.is_empty() && text != last_emitted {
-            let _ = out.send(Transcript { text: text.clone(), is_final: true }).await;
-        }
-        Ok(text)
+        // The return value is the last finalized utterance — a best-effort
+        // summary for callers that await the whole session; the live signal is
+        // the `out` stream above.
+        Ok(last_returned.trim().to_owned())
     }
 }
 
@@ -455,9 +468,36 @@ fn extract_pcm(audio: &Bytes, mime: &str) -> anyhow::Result<Vec<u8>> {
     }
 }
 
-/// Find the first JSON object in a byte slice. The server prepends some
-/// reserved/header bytes before the JSON body on some frames; the Python
-/// reference scans for the first `{`. We do the same.
+/// Extract the JSON payload of a server response frame by honoring the wire
+/// layout — *not* by scanning for a `{`. A naive brace-scan corrupts any frame
+/// whose 4-byte payload-size field ends in `0x7b`: a 123-byte payload writes a
+/// literal `{` byte into the size field that the scan locks onto before the
+/// real JSON (observed live as `key must be a string at line 1 column 2`).
+///
+/// Layout, where `flags` is the low nibble of byte 1:
+///
+///   ┌──────────────┬───────────────────────────┬──────────────┬──────────┐
+///   │ 4-byte header│ 4-byte sequence (iff 0x1) │ 4-byte size  │ payload… │
+///   └──────────────┴───────────────────────────┴──────────────┴──────────┘
+///
+/// Returns None on a frame too short to hold the declared payload.
+fn server_payload(bytes: &[u8]) -> Option<&[u8]> {
+    let flags = bytes.get(1).map(|b| b & 0x0F)?;
+    let mut off = 4;
+    if flags & 0x01 != 0 {
+        off += 4; // sequence number present
+    }
+    let size = bytes
+        .get(off..off + 4)
+        .map(|s| u32::from_be_bytes([s[0], s[1], s[2], s[3]]) as usize)?;
+    off += 4;
+    let end = off.checked_add(size)?.min(bytes.len());
+    bytes.get(off..end)
+}
+
+/// Best-effort scan for the first JSON object in a byte slice. Used only to
+/// stringify SERVER_ERROR frames for logging, where the exact framing differs
+/// (an `[code][size]` prefix) and a lossy result is acceptable.
 fn extract_json(bytes: &[u8]) -> Option<&[u8]> {
     let start = bytes.iter().position(|&b| b == b'{')?;
     Some(&bytes[start..])
@@ -478,6 +518,27 @@ struct ServerResponse {
     result: Option<ServerResult>,
 }
 
+impl ServerResponse {
+    /// Top-level recognized text for the current segment (empty if absent).
+    fn text(&self) -> Option<String> {
+        self.result.as_ref().and_then(|r| r.first_text())
+    }
+
+    /// True once the upstream's server-side VAD marks the current utterance as
+    /// finalized — the endpoint signal we use instead of client-side VAD. The
+    /// `type=="final"`/`is_final` flags only fire at stream close, so the
+    /// per-utterance `definite` flag is what drives continuous segmentation.
+    fn is_definite(&self) -> bool {
+        self.kind.as_deref() == Some("final")
+            || self.is_final == Some(true)
+            || self
+                .result
+                .as_ref()
+                .map(|r| r.has_definite_utterance())
+                .unwrap_or(false)
+    }
+}
+
 #[derive(Debug, Default, Deserialize, Serialize)]
 struct ServerHeader {
     #[serde(default)]
@@ -486,33 +547,113 @@ struct ServerHeader {
     message: Option<String>,
 }
 
-/// `result` is either an object with `text`, an array of such, or a string.
-/// We accept all three forms and return the longest text we can find.
-#[derive(Debug, Deserialize, Serialize)]
-#[serde(untagged)]
-enum ServerResult {
-    Object { text: Option<String> },
-    List(Vec<ResultItem>),
-    Text(String),
-}
-
-#[derive(Debug, Deserialize, Serialize)]
-struct ResultItem {
+/// The `result` object: a top-level `text` plus, when `show_utterances` is on,
+/// a per-utterance breakdown carrying the `definite` endpoint flag.
+#[derive(Debug, Default, Deserialize, Serialize)]
+struct ServerResult {
     #[serde(default)]
     text: Option<String>,
+    #[serde(default)]
+    utterances: Vec<Utterance>,
+}
+
+#[derive(Debug, Default, Deserialize, Serialize)]
+struct Utterance {
+    #[serde(default)]
+    text: Option<String>,
+    /// Set by the upstream's server-side VAD once this utterance is finalized
+    /// and will not change.
+    #[serde(default)]
+    definite: bool,
 }
 
 impl ServerResult {
     fn first_text(&self) -> Option<String> {
-        match self {
-            ServerResult::Object { text } => text.clone().map(|s| s.trim().to_owned()),
-            ServerResult::List(items) => items
-                .iter()
-                .filter_map(|i| i.text.as_deref())
-                .map(|s| s.trim().to_owned())
-                .filter(|s| !s.is_empty())
-                .max_by_key(|s| s.len()),
-            ServerResult::Text(s) => Some(s.trim().to_owned()),
+        self.text
+            .as_deref()
+            .map(|s| s.trim().to_owned())
+            .filter(|s| !s.is_empty())
+    }
+
+    fn has_definite_utterance(&self) -> bool {
+        self.utterances.iter().any(|u| u.definite)
+    }
+
+    /// Text of the finalized (definite) utterance, preferred over the top-level
+    /// `text` when dispatching a completed utterance.
+    fn definite_text(&self) -> Option<String> {
+        self.utterances
+            .iter()
+            .filter(|u| u.definite)
+            .filter_map(|u| u.text.as_deref())
+            .map(|s| s.trim().to_owned())
+            .filter(|s| !s.is_empty())
+            .next_back()
+            .or_else(|| self.first_text())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Build a JSON result frame the way the upstream does: header, optional
+    /// sequence, big-endian payload size, payload.
+    fn result_frame(with_seq: bool, json: &[u8]) -> Vec<u8> {
+        let flags = if with_seq { 0b0001 } else { 0 };
+        let mut f = vec![0x11, (MSG_TYPE_FULL_SERVER << 4) | flags, 0x10, 0x00];
+        if with_seq {
+            f.extend_from_slice(&1u32.to_be_bytes());
         }
+        f.extend_from_slice(&(json.len() as u32).to_be_bytes());
+        f.extend_from_slice(json);
+        f
+    }
+
+    // Regression: a 123-byte payload puts a literal `{` (0x7b) in the size
+    // field. The old brace-scan locked onto it and produced
+    // `key must be a string at line 1 column 2`, silently dropping the frame.
+    #[test]
+    fn payload_size_0x7b_does_not_corrupt_parse() {
+        // Pad a real result shape out to exactly 123 bytes.
+        let mut json = r#"{"result":{"text":"你好。"},"audio_info":{"duration":981}"#
+            .as_bytes()
+            .to_vec();
+        while json.len() < 122 {
+            json.push(b' ');
+        }
+        json.push(b'}');
+        assert_eq!(json.len(), 123, "fixture must hit the 0x7b size byte");
+
+        let frame = result_frame(true, &json);
+        // The size field's low byte really is `{`.
+        assert!(frame.iter().any(|&b| b == 0x7b));
+
+        let payload = server_payload(&frame).expect("payload extracted");
+        let parsed: ServerResponse = serde_json::from_slice(payload).expect("valid JSON");
+        assert_eq!(
+            parsed.result.as_ref().and_then(|r| r.first_text()).as_deref(),
+            Some("你好。")
+        );
+    }
+
+    #[test]
+    fn handles_frame_with_and_without_sequence() {
+        let json = br#"{"result":{"text":"hi"}}"#;
+        for with_seq in [false, true] {
+            let frame = result_frame(with_seq, json);
+            let payload = server_payload(&frame).expect("payload");
+            assert_eq!(payload, json, "with_seq={with_seq}");
+        }
+    }
+
+    #[test]
+    fn short_or_malformed_frame_returns_none() {
+        assert!(server_payload(&[0x11, 0x90]).is_none());
+        // Declares a 999-byte payload it doesn't carry: clamped, not panicking.
+        let mut frame = vec![0x11, 0x90, 0x10, 0x00];
+        frame.extend_from_slice(&999u32.to_be_bytes());
+        frame.extend_from_slice(b"{}");
+        assert_eq!(server_payload(&frame), Some(&b"{}"[..]));
     }
 }
