@@ -15,7 +15,10 @@ const proxy = Object.fromEntries(
     {
       target: "http://127.0.0.1:8080",
       changeOrigin: false,
-      ws: false,
+      // /api/audio/in is a WebSocket (continuous mic → STT). Without ws:true the
+      // proxy leaves the Upgrade handshake hanging and mic audio never reaches
+      // the backend. Regular long-poll HTTP proxying is unaffected by this flag.
+      ws: true,
       // Streaming-friendly: do not buffer, do not give up.
       proxyTimeout: 0,
       timeout: 0,
