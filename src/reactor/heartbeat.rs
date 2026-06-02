@@ -17,7 +17,7 @@ use crate::acp::{AcpSession, SessionOpts};
 use crate::memory::build_for_scene;
 use crate::types::Scene;
 
-use super::{REACTOR_SYSTEM_PROMPT, Reactor};
+use super::Reactor;
 
 /// Soft ceiling on a session's accumulated prompt+reply characters before the
 /// heartbeat swaps it. A coarse proxy for context pressure — we don't see the
@@ -89,9 +89,10 @@ pub(super) async fn swap(
         .unwrap_or_default();
 
     let seeded_system_prompt = format!(
-        "{REACTOR_SYSTEM_PROMPT}\n\n\
+        "{}\n\n\
          ## Briefing from your earlier conversation\n{}\n\n\
          {}",
+        reactor.inner.soul,
         briefing.trim(),
         tail.trim(),
     );

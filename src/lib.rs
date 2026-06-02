@@ -84,9 +84,11 @@ pub async fn run(config: Config) -> anyhow::Result<()> {
     // Keep the proxy alive for the life of the process.
     let _proxy = proxy;
 
+    let soul = reactor::load_soul(&config.data_dir);
     let _reactor = reactor::start(
         memory,
         agent,
+        soul,
         seams.inbound_rx,
         seams.out_tx,
         tts,

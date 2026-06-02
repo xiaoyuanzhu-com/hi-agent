@@ -40,6 +40,7 @@
 //! the next turn folds into what the mind says.
 
 use std::collections::HashMap;
+use std::path::Path;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
@@ -71,7 +72,11 @@ use bytes::Bytes;
 /// follows.
 const RESPONSE_SETTLE: Duration = Duration::from_millis(700);
 
-const REACTOR_SYSTEM_PROMPT: &str = "You are a human-interface agent. \
+/// Built-in fallback soul. The agent's identity — how it speaks, what it values,
+/// how it renders surfaces — is normally authored by the admin in
+/// `<data_dir>/SOUL.md` and loaded by [`load_soul`]. This constant is only the
+/// seed used when no SOUL.md is present, so a fresh install still has a voice.
+const DEFAULT_SOUL: &str = "You are a human-interface agent. \
 Someone is talking to you over /thought. Reply naturally with text — your reply \
 streams back to them and is spoken aloud, so keep it conversational. You have \
 file access, code execution, and the rest of your harness's tools; use them \
@@ -117,6 +122,30 @@ self. Alarm markers are never spoken. When an alarm fires you'll be woken with \
 its note under \"New signals\" as `(alarm) \"…\"`, even if nothing else has \
 happened — look at the situation as it is then and decide what to do. Waking up \
 is not a reason to talk: if nothing is actually needed, say nothing at all.";
+
+/// Load the agent's soul — its admin-authored identity (voice, values,
+/// guardrails, surface house-style) — used as the system prompt for every
+/// scene's persistent reactor session. Read from `<data_dir>/SOUL.md` so the
+/// admin can shape the agent's character without a rebuild; when the file is
+/// absent or empty the built-in [`DEFAULT_SOUL`] applies. Read once at startup,
+/// so edits to SOUL.md take effect on the next restart.
+pub fn load_soul(data_dir: &Path) -> String {
+    let path = data_dir.join("SOUL.md");
+    match std::fs::read_to_string(&path) {
+        Ok(text) if !text.trim().is_empty() => {
+            tracing::info!(path = %path.display(), "loaded soul from SOUL.md");
+            text
+        }
+        Ok(_) => {
+            tracing::warn!(path = %path.display(), "SOUL.md is empty; using built-in default soul");
+            DEFAULT_SOUL.to_string()
+        }
+        Err(_) => {
+            tracing::info!(path = %path.display(), "no SOUL.md; using built-in default soul");
+            DEFAULT_SOUL.to_string()
+        }
+    }
+}
 
 const SCENE_QUEUE_CAPACITY: usize = 64;
 
@@ -238,6 +267,11 @@ pub struct Reactor {
 struct ReactorInner {
     memory: Memory,
     agent: AgentLayer,
+    /// The admin-authored identity seeded into every scene's reactor session as
+    /// its system prompt (see [`load_soul`]). Loaded once at startup, shared
+    /// read-only across scenes; the heartbeat re-seeds replacement sessions with
+    /// it too, so a hot-swapped mind keeps the same character.
+    soul: String,
     /// Speech synthesis. `None` → the agent's replies are text-only (Phase 1
     /// behavior); when set, each sentence is synthesized and emitted as audio
     /// signals.
@@ -264,6 +298,7 @@ struct SceneHandle {
 pub fn start(
     memory: Memory,
     agent: AgentLayer,
+    soul: String,
     mut inbound_rx: mpsc::Receiver<Signal>,
     out: mpsc::Sender<OutboundSignal>,
     tts: Option<Arc<dyn Tts>>,
@@ -272,6 +307,7 @@ pub fn start(
         inner: Arc::new(ReactorInner {
             memory,
             agent,
+            soul,
             tts,
             out,
             turn_seq: AtomicU64::new(0),
@@ -514,7 +550,7 @@ async fn run_turn(
                     .session(
                         scene,
                         SessionOpts {
-                            system_prompt: Some(REACTOR_SYSTEM_PROMPT.to_string()),
+                            system_prompt: Some(reactor.inner.soul.clone()),
                             cwd: None,
                         },
                     )
@@ -904,7 +940,7 @@ const CLOSE: &str = "[[/surface]]";
 /// of the agent's text. Text outside the markers passes through (spoken +
 /// displayed); the inner HTML becomes a `SurfaceEnvelope`. A short tail that
 /// could be a partial opener is held back so a marker split across chunks is
-/// still recognized. Mirrors the convention taught in REACTOR_SYSTEM_PROMPT.
+/// still recognized. Mirrors the convention taught in the soul (see [`DEFAULT_SOUL`]).
 struct SurfaceExtractor {
     buf: String,
     inside: Option<SurfaceMode>,
