@@ -9,7 +9,7 @@ build: ## install web deps, build SPA, build release binary
 
 dev: ## run rust + vite dev servers (Ctrl-C stops both)
 	trap 'kill 0' INT TERM EXIT; \
-	cargo watch -x 'run -- --port 8080' & \
+	cargo watch -i 'src/appearance/web/**' -i 'data/**' -x 'run -- --port 8080' & \
 	(cd src/appearance/web && npm run dev) & \
 	wait
 
