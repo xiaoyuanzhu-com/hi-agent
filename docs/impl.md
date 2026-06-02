@@ -263,12 +263,13 @@ neutral signal types at the reactor↔adapter seam (E).
 ## Build, dev, deploy (unchanged)
 
 - **Dev:** `cargo run -- --port 8080` for the Rust side; the SPA dev server proxies channel
-  routes. Cognition runtime installs on first run into the OS cache dir.
+  routes. Cognition runtime resolves on startup (system PATH, else first-run install into
+  the OS cache dir).
 - **Release:** SPA built into `appearance/web/dist/`, embedded via `rust-embed`; single
   static binary.
-- **Dependency:** the binary installs/uses Node + the ACP adapter + the `claude` CLI at
-  runtime (`runtime/mod.rs`); the `HI_AGENT_DEV_*` env vars point at an external runtime for
-  local debugging without a download.
+- **Dependency:** the binary uses Node + the ACP adapter + the `claude` CLI at runtime
+  (`runtime/mod.rs`); it prefers them from `PATH` (`node` / `claude-agent-acp` / `claude`)
+  and only downloads a pinned set when the system doesn't offer all three.
 
 ---
 

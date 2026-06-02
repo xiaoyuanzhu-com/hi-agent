@@ -1,33 +1,34 @@
-//! Node + ACP adapter + claude CLI runtime, installed into an OS cache dir on
-//! first run and reused thereafter (keyed by the build-stamped `bundle_id`).
+//! Node + ACP adapter + claude CLI runtime resolution.
 //!
-//! Rather than embedding a ~200 MB archive in the hi-agent binary, the only
-//! things baked in are the two small *pin* files (`src/runtime/package.json` +
-//! `src/runtime/package-lock.json`) and the manifest version stamps. On first run
-//! we download the pinned Node release and `npm ci` the adapter into
-//! `<cache>/hi-agent/<bundle_id>/`, then resolve the node/adapter/claude paths.
-//! Subsequent runs reuse that directory via a `.complete` marker, so the cost is
-//! paid once per pinned version.
+//! We **prefer what the system already offers**: if `node`, the ACP adapter
+//! (`claude-agent-acp`), and the `claude` CLI are all on `PATH`, we use them
+//! directly and download nothing. Having those tools on `PATH` is also how you
+//! point hi-agent at your own runtime for local development.
 //!
-//! The pins still come from `src/runtime/manifest.toml` + the committed lockfile, so
-//! cognition stays reproducible — we just fetch at first run instead of at build
-//! time. Bumping any pin changes `bundle_id`, which transparently triggers a
-//! fresh install into a new cache dir.
+//! Only when the system *doesn't* offer the full set do we fall back to a
+//! self-contained install: download the pinned Node release and `npm ci` the
+//! adapter (which carries the `claude` binary as a platform dep) into a single
+//! fixed directory ([`runtime_dir`]), then resolve the node/adapter/claude paths.
+//! Subsequent runs reuse that directory via a `.complete` marker, so the install
+//! cost is paid once.
 //!
-//! Prototype scope: macOS + Linux on x86_64/aarch64, extraction via the system
-//! `tar`, and no SHA-256 verification of the Node download yet. The
-//! `HI_AGENT_DEV_*` env vars point at an external runtime for local debugging
-//! without any download.
+//! The pins come from `src/runtime/manifest.toml` + the committed lockfile, so a
+//! managed install stays reproducible — we just fetch at first run instead of at
+//! build time. The install dir is fixed (not version-keyed): bumping a pin does
+//! *not* auto-reinstall today; delete the dir to force a fresh install. Deliberate
+//! version management (auto-update) is a later concern.
+//!
+//! Detection is all-or-nothing: a partial system set (e.g. `node` but no
+//! `claude`) falls back to the managed install so we never mix a system tool with
+//! a managed one. Prototype scope for the install path: macOS + Linux on
+//! x86_64/aarch64, extraction via the system `tar`, and no SHA-256 verification of
+//! the Node download yet.
 
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use anyhow::{Context, anyhow, bail};
 use tokio::process::Command;
-
-/// Build-stamped identity of the pinned runtime (`bundle_version` + node +
-/// adapter). Doubles as the cache subdirectory name and the `--version` tag.
-pub const BUNDLE_ID: &str = env!("HI_AGENT_BUNDLE_ID");
 
 /// Pinned Node version (no leading `v`), stamped from `src/runtime/manifest.toml`.
 const NODE_VERSION: &str = env!("HI_AGENT_NODE_VERSION");
@@ -42,12 +43,15 @@ const PACKAGE_LOCK: &str =
 /// Path of the adapter entry relative to the install dir, after `npm ci`.
 const ADAPTER_REL: &str = "adapter/node_modules/@agentclientprotocol/claude-agent-acp/dist/index.js";
 
-/// Absolute paths to the installed runtime components.
+/// Absolute paths to the resolved runtime components.
 #[derive(Debug, Clone)]
 pub struct ResolvedRuntime {
     pub node_bin: PathBuf,
     pub adapter_entry: PathBuf,
     pub claude_bin: PathBuf,
+    /// Where these came from — `"system"` (found on `PATH`) or `"managed"`
+    /// (downloaded/installed into the cache). For logging only.
+    pub origin: &'static str,
 }
 
 impl ResolvedRuntime {
@@ -57,27 +61,29 @@ impl ResolvedRuntime {
     }
 }
 
-/// Resolve the runtime: install on first run, reuse thereafter.
+/// Resolve the runtime: use the system tools if all are present, otherwise
+/// install on first run and reuse thereafter.
 pub async fn ensure() -> anyhow::Result<ResolvedRuntime> {
-    if let Some(dev) = resolve_dev_override() {
-        tracing::warn!("using HI_AGENT_DEV_* runtime override (unsupported, debug only)");
-        return Ok(dev);
+    // Prefer what the system already offers — no download when the user has
+    // node + the ACP adapter + claude on PATH.
+    if let Some(system) = resolve_system() {
+        return Ok(system);
     }
 
-    let cache_root = cache_root()?;
-    let target = cache_root.join(BUNDLE_ID);
+    let target = runtime_dir()?;
 
     // Reuse a complete install from a previous run.
     if target.join(".complete").exists() {
-        tracing::debug!(bundle_id = BUNDLE_ID, "runtime already installed");
+        tracing::debug!(path = %target.display(), "runtime already installed");
         return resolve(&target);
     }
 
-    install(&cache_root, &target).await
+    install(&target).await
 }
 
-/// Base cache dir, overridable by `HI_AGENT_RUNTIME_DIR`.
-fn cache_root() -> anyhow::Result<PathBuf> {
+/// The single directory the managed runtime installs into. Override with
+/// `HI_AGENT_RUNTIME_DIR`; otherwise a fixed spot in the OS cache dir.
+fn runtime_dir() -> anyhow::Result<PathBuf> {
     if let Ok(dir) = std::env::var("HI_AGENT_RUNTIME_DIR") {
         return Ok(PathBuf::from(dir));
     }
@@ -86,15 +92,18 @@ fn cache_root() -> anyhow::Result<PathBuf> {
     Ok(dirs.cache_dir().join("runtime"))
 }
 
-/// Install the pinned Node + adapter into `<cache_root>/<BUNDLE_ID>`. Builds in a
-/// unique temp dir and atomically renames into place, so concurrent or
-/// interrupted starts never observe a half-installed runtime.
-async fn install(cache_root: &Path, target: &Path) -> anyhow::Result<ResolvedRuntime> {
-    tokio::fs::create_dir_all(cache_root)
+/// Install the pinned Node + adapter into `target`. Builds in a sibling temp dir
+/// and atomically renames into place, so concurrent or interrupted starts never
+/// observe a half-installed runtime.
+async fn install(target: &Path) -> anyhow::Result<ResolvedRuntime> {
+    let parent = target
+        .parent()
+        .ok_or_else(|| anyhow!("runtime dir {} has no parent", target.display()))?;
+    tokio::fs::create_dir_all(parent)
         .await
-        .with_context(|| format!("creating cache root {}", cache_root.display()))?;
+        .with_context(|| format!("creating {}", parent.display()))?;
 
-    let tmp = cache_root.join(format!(".{BUNDLE_ID}.tmp.{}", std::process::id()));
+    let tmp = parent.join(format!(".runtime.tmp.{}", std::process::id()));
     let _ = tokio::fs::remove_dir_all(&tmp).await;
     tokio::fs::create_dir_all(&tmp)
         .await
@@ -126,7 +135,10 @@ async fn install(cache_root: &Path, target: &Path) -> anyhow::Result<ResolvedRun
         .await
         .context("writing the completion marker")?;
 
-    // Atomic publish. If another process won the race, drop ours and reuse.
+    // Clear any leftover partial install at the fixed path, then atomically
+    // rename ours into place. If another process won the race (a complete
+    // install already sits there), drop ours and reuse it.
+    let _ = tokio::fs::remove_dir_all(target).await;
     match tokio::fs::rename(&tmp, target).await {
         Ok(()) => {}
         Err(_) if target.join(".complete").exists() => {
@@ -138,7 +150,6 @@ async fn install(cache_root: &Path, target: &Path) -> anyhow::Result<ResolvedRun
         }
     }
 
-    gc_stale(cache_root);
     hint("runtime ready.");
     resolve(target)
 }
@@ -156,6 +167,7 @@ fn resolve(target: &Path) -> anyhow::Result<ResolvedRuntime> {
         node_bin: target.join("node").join("bin").join("node"),
         adapter_entry: target.join(ADAPTER_REL),
         claude_bin: target.join(claude_rel),
+        origin: "managed",
     })
 }
 
@@ -272,19 +284,6 @@ async fn run_with_heartbeat(
     }
 }
 
-/// GC sibling cache dirs whose name ≠ the current `bundle_id` (best effort).
-fn gc_stale(cache_root: &Path) {
-    if let Ok(entries) = std::fs::read_dir(cache_root) {
-        for entry in entries.flatten() {
-            let name = entry.file_name();
-            let name = name.to_string_lossy();
-            if name != BUNDLE_ID && !name.starts_with('.') {
-                let _ = std::fs::remove_dir_all(entry.path());
-            }
-        }
-    }
-}
-
 /// Map the host to Node's release naming. `Err` on platforms we don't auto-install.
 fn node_target() -> anyhow::Result<(&'static str, &'static str)> {
     let os = match std::env::consts::OS {
@@ -292,8 +291,8 @@ fn node_target() -> anyhow::Result<(&'static str, &'static str)> {
         "linux" => "linux",
         other => bail!(
             "runtime auto-install supports macOS and Linux only (OS `{other}`). \
-             Set HI_AGENT_DEV_NODE / HI_AGENT_DEV_ADAPTER / HI_AGENT_DEV_CLAUDE to \
-             point at an external runtime."
+             Install node, claude-agent-acp, and claude on your PATH to use the \
+             system runtime instead."
         ),
     };
     let arch = match std::env::consts::ARCH {
@@ -301,7 +300,8 @@ fn node_target() -> anyhow::Result<(&'static str, &'static str)> {
         "aarch64" => "arm64",
         other => bail!(
             "runtime auto-install supports x86_64 and aarch64 only (arch `{other}`). \
-             Set HI_AGENT_DEV_NODE / HI_AGENT_DEV_ADAPTER / HI_AGENT_DEV_CLAUDE."
+             Install node, claude-agent-acp, and claude on your PATH to use the \
+             system runtime instead."
         ),
     };
     Ok((os, arch))
@@ -316,18 +316,35 @@ fn is_executable(p: &Path) -> bool {
     }
 }
 
-/// Dev escape hatch (debug only): point at an external runtime via env so
-/// `cargo run` works without any download. Returns `Some` only if all three
-/// vars are set.
-fn resolve_dev_override() -> Option<ResolvedRuntime> {
-    let node = std::env::var("HI_AGENT_DEV_NODE").ok()?;
-    let adapter = std::env::var("HI_AGENT_DEV_ADAPTER").ok()?;
-    let claude = std::env::var("HI_AGENT_DEV_CLAUDE").ok()?;
+/// Use the system's tools when it offers the full set: `node`, the ACP adapter
+/// (`claude-agent-acp`), and the `claude` CLI all on `PATH`. All-or-nothing —
+/// returns `None` if any is missing, so we never pair a system tool with a
+/// managed one. The adapter bin is a JS entry (it has a `node` shebang), so we
+/// keep running it as `node <entry>` exactly like the managed adapter.
+fn resolve_system() -> Option<ResolvedRuntime> {
+    let node_bin = find_on_path("node")?;
+    let adapter_entry = find_on_path("claude-agent-acp")?;
+    let claude_bin = find_on_path("claude")?;
+    tracing::debug!(
+        node = %node_bin.display(),
+        adapter = %adapter_entry.display(),
+        claude = %claude_bin.display(),
+        "using system runtime from PATH",
+    );
     Some(ResolvedRuntime {
-        node_bin: PathBuf::from(node),
-        adapter_entry: PathBuf::from(adapter),
-        claude_bin: PathBuf::from(claude),
+        node_bin,
+        adapter_entry,
+        claude_bin,
+        origin: "system",
     })
+}
+
+/// Find an executable named `name` on `PATH`, returning the first match.
+fn find_on_path(name: &str) -> Option<PathBuf> {
+    let path = std::env::var_os("PATH")?;
+    std::env::split_paths(&path)
+        .map(|dir| dir.join(name))
+        .find(|candidate| is_executable(candidate))
 }
 
 /// First-run user-facing hint. Goes straight to stderr (not `tracing`) so it is
@@ -350,8 +367,8 @@ mod tests {
 
     #[test]
     fn resolve_builds_expected_paths() {
-        let r = resolve(Path::new("/cache/bundleX")).unwrap();
-        assert_eq!(r.node_bin, Path::new("/cache/bundleX/node/bin/node"));
+        let r = resolve(Path::new("/cache/runtimeX")).unwrap();
+        assert_eq!(r.node_bin, Path::new("/cache/runtimeX/node/bin/node"));
         assert!(r.adapter_entry.ends_with("claude-agent-acp/dist/index.js"));
         assert!(r.claude_bin.ends_with("claude"));
         assert!(
@@ -361,15 +378,15 @@ mod tests {
             "claude path should point at a platform package: {}",
             r.claude_bin.display()
         );
-        assert_eq!(r.node_bin_dir(), Path::new("/cache/bundleX/node/bin"));
+        assert_eq!(r.node_bin_dir(), Path::new("/cache/runtimeX/node/bin"));
+        assert_eq!(r.origin, "managed");
     }
 
     #[test]
-    fn dev_override_needs_all_three() {
-        // Not asserting env mutation here (process-global); just the shape: with
-        // none set, the override is absent.
-        if std::env::var_os("HI_AGENT_DEV_NODE").is_none() {
-            assert!(resolve_dev_override().is_none());
-        }
+    fn find_on_path_locates_a_known_executable() {
+        // `tar` is required by the install path, so it's a safe always-present
+        // executable to probe for on any supported host.
+        assert!(find_on_path("tar").is_some());
+        assert!(find_on_path("definitely-not-a-real-binary-xyz").is_none());
     }
 }

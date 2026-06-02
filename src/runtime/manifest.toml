@@ -1,11 +1,10 @@
-# Pinned runtime versions. Bump bundle_version whenever any pin changes — it
-# keys the per-version install cache dir (see src/runtime/mod.rs).
+# Pinned runtime versions, read at build time by build.rs and stamped into the
+# binary as the HI_AGENT_* env vars (surfaced by `--version`). The Node download
+# URL is derived from node_version in src/runtime/mod.rs; the adapter/claude tree
+# is pinned by the committed package.json + package-lock.json alongside this file.
 #
-# These four values are read at build time by build.rs and stamped into the
-# binary as the HI_AGENT_* env vars. The Node download URL is derived from
-# node_version in src/runtime/mod.rs; the adapter/claude tree is pinned by the
-# committed package.json + package-lock.json alongside this file.
-bundle_version  = "1"
+# The managed install lives at a fixed path (not version-keyed), so bumping a pin
+# does not auto-reinstall — delete the runtime dir to force a fresh install.
 node_version    = "22.14.0"
 adapter_version = "0.36.1"
 # claude_version is resolved by `npm ci` from the lockfile; recorded here for

@@ -62,5 +62,11 @@ export default defineConfig({
     outDir: "dist",
     emptyOutDir: true,
     sourcemap: true,
+    // The AudioWorklet module (imported via `?url`) must be a real, statically
+    // served same-origin file: `AudioWorklet.addModule()` cannot load a `data:`
+    // URL. Vite inlines assets under `assetsInlineLimit` (default 4096 B) as
+    // base64 data URLs — and the worklet is small enough to be inlined, which
+    // silently breaks mic capture. Force it to be emitted as a hashed file.
+    assetsInlineLimit: (filePath) => (filePath.endsWith("pcmWorklet.js") ? false : undefined),
   },
 });

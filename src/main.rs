@@ -16,12 +16,11 @@ struct Cli {
     data_dir: PathBuf,
 }
 
-/// Version line including bundled component versions.
+/// Version line including the pinned runtime component versions.
 fn version_string() -> &'static str {
     concat!(
         env!("CARGO_PKG_VERSION"),
-        " (bundle ", env!("HI_AGENT_BUNDLE_ID"),
-        "; node ", env!("HI_AGENT_NODE_VERSION"),
+        " (node ", env!("HI_AGENT_NODE_VERSION"),
         "; adapter ", env!("HI_AGENT_ADAPTER_VERSION"),
         "; claude ", env!("HI_AGENT_CLAUDE_VERSION"), ")"
     )

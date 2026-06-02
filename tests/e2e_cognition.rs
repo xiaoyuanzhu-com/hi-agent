@@ -1,14 +1,15 @@
-//! Full-stack smoke: real bundled adapter ↔ local proxy ↔ stub upstream.
+//! Full-stack smoke: real ACP adapter ↔ local proxy ↔ stub upstream.
 //! Opt-in: `RUN_E2E=1 cargo test --test e2e_cognition -- --nocapture`.
 
 #[tokio::test]
-async fn thought_round_trips_through_bundle() {
+async fn thought_round_trips_through_runtime() {
     if std::env::var("RUN_E2E").ok().as_deref() != Some("1") {
         eprintln!("skipping e2e (set RUN_E2E=1 to run)");
         return;
     }
     // A real run requires:
-    //   - a built bundle (`make bundle`) OR HI_AGENT_DEV_NODE/ADAPTER/CLAUDE set,
+    //   - node + claude-agent-acp + claude on PATH, or a populated runtime cache
+    //     (first run installs the pinned set automatically),
     //   - AI_API_KEY set,
     //   - AI_API_BASE pointing at a reachable Anthropic-compatible endpoint
     //     (or a local stub that returns a canned Messages SSE stream).

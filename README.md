@@ -11,13 +11,16 @@ design v0.1 · 2026-05-28 · v0 implementation complete · not load-tested.
 ### Prerequisites
 
 - Rust toolchain (2024 edition — `rustc` 1.85 or newer)
-- A running binary needs no separate runtime preinstalled — on first run hi-agent
-  downloads the pinned Node and `npm ci`s the ACP adapter + `claude` CLI into an
-  OS cache dir, then reuses that install on every subsequent start. First run
-  therefore needs network access and the system `tar`; later runs are offline.
-- macOS and Linux on x86_64/aarch64 are supported for auto-install. To use your
-  own runtime instead (or to develop offline), set `HI_AGENT_DEV_NODE` /
-  `HI_AGENT_DEV_ADAPTER` / `HI_AGENT_DEV_CLAUDE`.
+- hi-agent prefers the runtime your system already offers: if `node`, the ACP
+  adapter (`claude-agent-acp`), and the `claude` CLI are all on your `PATH`, it
+  uses them directly and downloads nothing. Installing those tools globally is
+  also how you point hi-agent at your own runtime (e.g. to develop offline).
+- If the system doesn't offer the full set, hi-agent falls back to a
+  self-contained install: on first run it downloads the pinned Node and `npm ci`s
+  the ACP adapter + `claude` CLI into an OS cache dir, then reuses that install on
+  every subsequent start. That first run needs network access and the system
+  `tar`; later runs are offline. macOS and Linux on x86_64/aarch64 are supported
+  for auto-install.
 
 ### Build and run
 
@@ -145,10 +148,9 @@ Env vars consulted at startup:
 
 Managed cognition parameters (model, effort, permission mode) live in
 [`config.toml`](config.toml), not in env vars; the upstream credential and base
-URL come from `AI_API_KEY` / `AI_API_BASE`. The dev-only `HI_AGENT_DEV_NODE` /
-`HI_AGENT_DEV_ADAPTER` /
-`HI_AGENT_DEV_CLAUDE` overrides let you point at an external runtime when
-developing offline or skipping the first-run download (debug use only).
+URL come from `AI_API_KEY` / `AI_API_BASE`. To use your own runtime (or to skip
+the first-run download), put `node`, `claude-agent-acp`, and `claude` on your
+`PATH` — hi-agent detects and uses them automatically.
 
 ### Runtime install & versioning
 

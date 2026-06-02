@@ -121,7 +121,7 @@ impl AgentConfig {
     ///
     /// `proxy_port` is the local proxy's bound port; `config_dir` is the managed
     /// `CLAUDE_CONFIG_DIR`; `node_bin_dir` is the directory containing the
-    /// bundled `node`; `claude_bin` is the bundled claude executable.
+    /// resolved `node`; `claude_bin` is the resolved claude executable.
     pub fn child_env(
         &self,
         proxy_port: u16,
@@ -147,7 +147,7 @@ impl AgentConfig {
         if let Some(model) = &self.model {
             env.push(("ANTHROPIC_MODEL".to_string(), model.clone()));
         }
-        // Prepend the bundled node dir to PATH so the adapter resolves `node`.
+        // Prepend the resolved node dir to PATH so the adapter resolves `node`.
         let sep = if cfg!(windows) { ';' } else { ':' };
         let existing = std::env::var("PATH").unwrap_or_default();
         env.push((
