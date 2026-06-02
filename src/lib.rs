@@ -14,6 +14,7 @@ pub mod llm_proxy;
 pub mod memory;
 pub mod runtime;
 pub mod reactor;
+pub mod segment;
 pub mod server;
 pub mod types;
 pub mod vendors;

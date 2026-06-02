@@ -60,6 +60,7 @@ use crate::acp::{AcpSession, SessionOpts, SessionUpdate};
 use crate::agent::AgentLayer;
 use crate::capabilities::tts::{self, TtsStream};
 use crate::memory::{Memory, build_for_scene};
+use crate::segment::{Segmenter, Terminator};
 use crate::types::{Channel, JournalEntry, Scene, Signal, SurfaceEnvelope, SurfaceMode, SurfaceOp};
 use bytes::Bytes;
 
@@ -544,7 +545,7 @@ async fn run_turn(
         // to push text (for prosody/request size), not playback boundaries; the
         // session stays open across sentences. All of this exists only when TTS
         // is configured.
-        let mut splitter = SentenceSplitter::new();
+        let mut splitter = Segmenter::new(Terminator, std::time::Instant::now());
         let mut extractor = SurfaceExtractor::new();
         // Pulls `[[delegate]] … [[/delegate]]` task blocks out of the reply: the
         // reactor delegates heavy work by naming a task inline, which spawns a
@@ -607,7 +608,7 @@ async fn run_turn(
                     if !spoken.is_empty() {
                         full_reply.push_str(&spoken);
                         if let Some(tx) = &synth_tx {
-                            for sentence in splitter.push(&spoken) {
+                            for sentence in splitter.commit(&spoken, std::time::Instant::now()) {
                                 let _ = tx.send(sentence).await;
                             }
                         }
@@ -647,7 +648,7 @@ async fn run_turn(
         if !spoken_tail.is_empty() {
             full_reply.push_str(&spoken_tail);
             if let Some(tx) = &synth_tx {
-                for sentence in splitter.push(&spoken_tail) {
+                for sentence in splitter.commit(&spoken_tail, std::time::Instant::now()) {
                     let _ = tx.send(sentence).await;
                 }
             }
@@ -821,59 +822,6 @@ async fn forward_frames(
         bytes = total,
         "channel out (tts stream)",
     );
-}
-
-/// Minimal incremental sentence splitter for per-sentence TTS, mirroring the
-/// frontend `sentences.ts`: CJK terminators (。！？) split immediately; Latin
-/// terminators (.!?…) split only when followed by whitespace, so decimals and
-/// abbreviations aren't broken. The trailing partial waits for `flush()`.
-struct SentenceSplitter {
-    buf: String,
-}
-
-impl SentenceSplitter {
-    fn new() -> Self {
-        Self { buf: String::new() }
-    }
-
-    fn push(&mut self, chunk: &str) -> Vec<String> {
-        self.buf.push_str(chunk);
-        let mut out = Vec::new();
-        while let Some(idx) = find_boundary(&self.buf) {
-            let sentence = self.buf[..idx].trim().to_string();
-            self.buf = self.buf[idx..].trim_start().to_string();
-            if !sentence.is_empty() {
-                out.push(sentence);
-            }
-        }
-        out
-    }
-
-    fn flush(&mut self) -> Option<String> {
-        let s = self.buf.trim().to_string();
-        self.buf.clear();
-        if s.is_empty() { None } else { Some(s) }
-    }
-}
-
-/// Byte index just past the first sentence terminator that qualifies as a
-/// boundary, or `None` if the buffer holds no complete sentence yet.
-fn find_boundary(s: &str) -> Option<usize> {
-    let mut chars = s.char_indices().peekable();
-    while let Some((off, c)) = chars.next() {
-        let end = off + c.len_utf8();
-        if matches!(c, '。' | '！' | '？') {
-            return Some(end);
-        }
-        if matches!(c, '.' | '!' | '?' | '…') {
-            if let Some(&(_, next)) = chars.peek() {
-                if next.is_whitespace() {
-                    return Some(end);
-                }
-            }
-        }
-    }
-    None
 }
 
 /// Emit one rich-content envelope on the /surface channel for this scene.
@@ -1131,34 +1079,6 @@ mod surface_tests {
         assert_eq!(s2[0].mode, Some(SurfaceMode::Full));
         assert_eq!(s2[0].html.as_deref(), Some("<p>x</p>"));
         assert_eq!(t2, "");
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::SentenceSplitter;
-
-    #[test]
-    fn splits_latin_on_terminator_plus_space() {
-        let mut s = SentenceSplitter::new();
-        assert_eq!(s.push("Hello world"), Vec::<String>::new());
-        assert_eq!(s.push(". How are"), vec!["Hello world.".to_string()]);
-        assert_eq!(s.flush(), Some("How are".to_string()));
-    }
-
-    #[test]
-    fn does_not_split_decimals() {
-        let mut s = SentenceSplitter::new();
-        assert_eq!(s.push("pi is 3.14 today"), Vec::<String>::new());
-    }
-
-    #[test]
-    fn splits_cjk_immediately() {
-        let mut s = SentenceSplitter::new();
-        assert_eq!(
-            s.push("你好。最近怎么样？"),
-            vec!["你好。".to_string(), "最近怎么样？".to_string()]
-        );
     }
 }
 

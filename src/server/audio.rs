@@ -39,7 +39,7 @@ use crate::capabilities::stt::{self, Transcript};
 use crate::memory::media::{self, Direction};
 use crate::server::{AppState, AudioEvent};
 use crate::server::headers::{AuthBearer, RequiredScene, SceneHeader};
-use crate::server::segmenter::{Segmenter, SegmenterConfig};
+use crate::segment::{Segmenter, Speech};
 use crate::types::{Channel, JournalEntry, Scene, Signal};
 
 const DEFAULT_MIME: &str = "audio/wav";
@@ -206,7 +206,7 @@ async fn stream_audio_in(
     let relay_state = state.clone();
     let relay_scene = scene.clone();
     let out_task = tokio::spawn(async move {
-        let mut seg = Segmenter::new(SegmenterConfig::default(), Instant::now());
+        let mut seg = Segmenter::new(Speech::default(), Instant::now());
         let mut ticker = tokio::time::interval(Duration::from_millis(150));
         ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         'relay: loop {

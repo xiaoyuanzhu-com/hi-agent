@@ -1,17 +1,24 @@
-//! Utterance segmentation — the explicit cut from a continuous STT word-stream
-//! into discrete sentences for the agent (ACP accepts sentences, not a forever
-//! stream of words).
+//! Segmentation — aggregating a continuous signal into the coarser grain a
+//! downstream consumer accepts. One mechanism, swappable cut policy.
 //!
-//! # Why we own the cut
+//! # One aggregator, two policies
 //!
-//! We deliberately do NOT cut on the upstream's silence/`definite` signal: it is
-//! laggy and erratic. The cut policy lives here instead, so it is explicit and
-//! tunable ([`SegmenterConfig`]). The upstream's `definite` flag is still read,
-//! but ONLY to *commit stable text* — it never, by itself, ends a sentence.
+//! Both places we segment are the *same* operation: take a fine, continuous
+//! stream and cut it into the coarser units the next stage wants. They differ
+//! only in *where to cut* and in how the input behaves:
+//!
+//! - **[`Speech`]** — STT word-stream → sentences for the agent. The upstream
+//!   revises its tail (a rolling partial), so the cut must balance punctuation,
+//!   size, and time, and must not guillotine a partial before its period lands.
+//! - **[`Terminator`]** — the agent's reply stream → sentences for TTS. The
+//!   source is append-only (an LLM never un-says a token), so the cut is purely
+//!   structural: a sentence terminator, mirroring the frontend `sentences.ts`.
+//!
+//! The buffer machinery is shared; the [`CutPolicy`] supplies the boundary rule.
 //!
 //! # The buffer model
 //!
-//! The session transcript is held in two parts and one pointer:
+//! The stream is held in two parts and one pointer:
 //!
 //! ```text
 //!   locked            partial
@@ -24,45 +31,78 @@
 //! ```
 //!
 //! - `observe(text, is_final=false)` replaces `partial` with the latest rolling
-//!   text (the upstream may revise the tail of an utterance).
-//! - `observe(text, is_final=true)` is the upstream's `definite`: it appends the
-//!   finalized text to `locked` and clears `partial`. Locked text is stable.
+//!   text (a revisable source may rewrite the tail of an utterance).
+//! - `observe(text, is_final=true)` — also reachable as [`Segmenter::commit`] —
+//!   appends finalized text to `locked` and clears `partial`. Locked text is
+//!   stable. Append-only sources only ever commit, so `partial` stays empty and
+//!   the time-based rules never fire.
 //! - A cut advances `dispatched` past the emitted prefix; whatever follows stays
-//!   in the buffer for the next segment. We never flush incomplete trailing
-//!   words just because an earlier part of the buffer was emitted.
+//!   buffered for the next segment. Incomplete trailing words are never flushed
+//!   just because an earlier part of the buffer was emitted.
 //!
-//! # The cut rules (checked in priority order over the tail)
-//!
-//! 1. **Punctuation** — cut just after the first sentence-ending mark
-//!    (`。！？!?.…`), once it is *settled*: it sits in committed text, OR more
-//!    text already follows it, OR the tail has been unchanged for `punct_stable`.
-//!    This is the common, low-latency boundary. The settle check is what stops us
-//!    splitting "你好。" into "你好" + "。" when the upstream appends the period a
-//!    beat after the words.
-//! 2. **Size** (guard) — once the tail reaches `max_chars`, force a cut, but
-//!    `snap_back` to the last punctuation/clause mark so we emit a clean clause
-//!    and keep the remainder buffered (only chop mid-word if there is no
-//!    punctuation at all).
-//! 3. **Stability** (guard) — a *committed* fragment with no terminal punctuation
-//!    (e.g. a bare "嗯") that has been unchanged for `stable` is flushed whole.
-//!    Restricted to fully-locked text so it can never guillotine a revisable
-//!    partial that is still awaiting its period.
-//! 4. **Max-segment age** (guard) — a segment older than `max_segment` is
-//!    force-cut even mid-sentence (snapping like rule 2). Restores the monologue
-//!    cap the old client-side VAD used to enforce.
-//!
-//! Rule 1 carries normal speech; rules 2–4 are guards for the run-on, bare
-//! fragment, and non-stop-monologue cases. `cut` loops, so a backlog holding
-//! several complete sentences is emitted one sentence per call iteration.
-//!
-//! Time is injected into every method so the whole policy is deterministically
-//! unit-testable with a synthetic clock.
+//! Time is injected into every method so a policy that uses it is
+//! deterministically unit-testable with a synthetic clock. Policies that ignore
+//! time (e.g. [`Terminator`]) are unaffected by the clock entirely.
 
 use std::time::{Duration, Instant};
 
-/// Tunable thresholds for the three cut levers. Defaults target conversational
-/// Mandarin/English speech: punctuation carries most cuts; size and time are
-/// guards for the run-on / monologue / trailing-fragment cases.
+// -----------------------------------------------------------------------------
+// CutPolicy — where to cut the tail
+// -----------------------------------------------------------------------------
+
+/// The undispatched tail and the facts a policy needs to judge a cut. `tail` is
+/// already split into chars (all boundaries are char-aligned); a policy returns
+/// the char count to emit, or `None` to keep waiting.
+pub struct Cut<'a> {
+    /// The undispatched suffix, char-aligned.
+    pub tail: &'a [char],
+    /// How many leading chars of `tail` are committed (definite) text, which can
+    /// never be revised — punctuation there is settled the instant it is seen.
+    pub committed: usize,
+    /// How long the tail has been unchanged.
+    pub since_change: Duration,
+    /// How long the current undispatched segment has been accumulating.
+    pub since_start: Duration,
+}
+
+/// Decides where (if anywhere) to cut the current tail into a finished unit.
+pub trait CutPolicy {
+    fn boundary(&self, cut: &Cut) -> Option<usize>;
+}
+
+// -----------------------------------------------------------------------------
+// Shared punctuation helpers
+// -----------------------------------------------------------------------------
+
+fn is_sentence_end(c: char) -> bool {
+    matches!(c, '。' | '！' | '？' | '!' | '?' | '.' | '…')
+}
+
+/// Clause-level marks — not sentence ends, but safe places to break a run-on so
+/// a forced cut lands on a phrase boundary instead of mid-word.
+fn is_clause_boundary(c: char) -> bool {
+    matches!(c, '，' | '、' | '；' | '：' | ',' | ';' | ':')
+}
+
+/// When a size/time guard forces a cut, snap back to the last punctuation
+/// (sentence end or clause mark) before `hard`, emitting up to there and leaving
+/// the incomplete remainder buffered. Falls back to `hard` only when the tail
+/// has no punctuation at all to break on.
+fn snap_back(chars: &[char], hard: usize) -> usize {
+    (0..hard)
+        .rev()
+        .find(|&i| is_sentence_end(chars[i]) || is_clause_boundary(chars[i]))
+        .map(|i| i + 1)
+        .unwrap_or(hard)
+}
+
+// -----------------------------------------------------------------------------
+// Speech — STT word-stream → sentences (revisable source, time-aware)
+// -----------------------------------------------------------------------------
+
+/// Tunable thresholds for the [`Speech`] cut levers. Defaults target
+/// conversational Mandarin/English speech: punctuation carries most cuts; size
+/// and time are guards for the run-on / monologue / trailing-fragment cases.
 #[derive(Debug, Clone, Copy)]
 pub struct SegmenterConfig {
     /// Hard cap on undispatched chars before a forced cut (run-on guard).
@@ -91,37 +131,132 @@ impl Default for SegmenterConfig {
     }
 }
 
-fn is_sentence_end(c: char) -> bool {
-    matches!(c, '。' | '！' | '？' | '!' | '?' | '.' | '…')
-}
-
-/// Clause-level marks — not sentence ends, but safe places to break a run-on so
-/// a forced cut lands on a phrase boundary instead of mid-word.
-fn is_clause_boundary(c: char) -> bool {
-    matches!(c, '，' | '、' | '；' | '：' | ',' | ';' | ':')
-}
-
-/// When a size/time guard forces a cut, snap back to the last punctuation
-/// (sentence end or clause mark) before `hard`, emitting up to there and leaving
-/// the incomplete remainder buffered. Falls back to `hard` only when the tail
-/// has no punctuation at all to break on.
-fn snap_back(chars: &[char], hard: usize) -> usize {
-    (0..hard)
-        .rev()
-        .find(|&i| is_sentence_end(chars[i]) || is_clause_boundary(chars[i]))
-        .map(|i| i + 1)
-        .unwrap_or(hard)
-}
-
-/// Stateful segmenter. Feed it rolling transcript updates; it returns completed
-/// sentences to dispatch. Time is injected so it is deterministically testable.
-pub struct Segmenter {
+/// Cut policy for a revisable speech transcript. We deliberately do NOT cut on
+/// the upstream's silence/`definite` signal: it is laggy and erratic. The cut
+/// policy lives here instead, explicit and tunable. The upstream's `definite`
+/// flag is still read (it commits stable text), but never by itself ends a
+/// sentence.
+///
+/// The rules, in priority order over the tail:
+///
+/// 1. **Punctuation** — cut just after the first sentence-ending mark
+///    (`。！？!?.…`), once it is *settled*: it sits in committed text, OR more
+///    text already follows it, OR the tail has been unchanged for `punct_stable`.
+///    The low-latency common case. The settle check stops us splitting "你好。"
+///    into "你好" + "。" when the upstream appends the period a beat after the words.
+/// 2. **Size** (guard) — once the tail reaches `max_chars`, force a cut, but
+///    `snap_back` to the last punctuation/clause mark so we emit a clean clause
+///    and keep the remainder buffered (only chop mid-word with no punctuation).
+/// 3. **Stability** (guard) — a *committed* fragment with no terminal punctuation
+///    (e.g. a bare "嗯") unchanged for `stable` is flushed whole. Restricted to
+///    fully-locked text so it can never guillotine a still-revisable partial.
+/// 4. **Max-segment age** (guard) — a segment older than `max_segment` is
+///    force-cut even mid-sentence (snapping like rule 2).
+#[derive(Debug, Clone, Copy, Default)]
+pub struct Speech {
     cfg: SegmenterConfig,
+}
+
+impl Speech {
+    pub fn new(cfg: SegmenterConfig) -> Self {
+        Self { cfg }
+    }
+}
+
+impl CutPolicy for Speech {
+    fn boundary(&self, cut: &Cut) -> Option<usize> {
+        let chars = cut.tail;
+        let n = chars.len();
+        let committed = cut.committed;
+
+        // 1. Punctuation — cut just after the first sentence-ending mark, once
+        //    it's settled: it sits in committed text, OR more text already
+        //    follows it, OR the (revisable) tail has been stable long enough
+        //    that the mark won't move.
+        if let Some(i) = chars.iter().position(|&c| is_sentence_end(c)) {
+            let settled = i < committed
+                || chars[i + 1..].iter().any(|c| !c.is_whitespace())
+                || cut.since_change >= self.cfg.punct_stable;
+            if settled {
+                return Some(i + 1);
+            }
+        }
+
+        // 2. Size — run-on guard. Snap back to the last phrase boundary so we
+        //    emit a clean clause and keep the rest buffered, e.g.
+        //    "…明天的天气。来决定" → emit "…明天的天气。", buffer "来决定".
+        if n >= self.cfg.max_chars {
+            return Some(snap_back(chars, n));
+        }
+
+        // 3. Stability — a *committed* fragment with no terminal punctuation that
+        //    has gone quiet (e.g. "嗯", "对"). We require the whole tail to be
+        //    locked: a still-revisable partial must NOT be flushed here, or we'd
+        //    guillotine a sentence's words a beat before the upstream appends its
+        //    period — splitting "你好。" into "你好" + "。". A committed fragment is a
+        //    finished unit, so we emit it whole rather than snapping.
+        if committed >= n && cut.since_change >= self.cfg.stable {
+            return Some(n);
+        }
+
+        // 4. Max segment age — force-cut a non-stop monologue, snapping to the
+        //    last phrase boundary and buffering the remainder.
+        if cut.since_start >= self.cfg.max_segment {
+            return Some(snap_back(chars, n));
+        }
+
+        None
+    }
+}
+
+// -----------------------------------------------------------------------------
+// Terminator — append-only reply stream → sentences (structural, time-free)
+// -----------------------------------------------------------------------------
+
+/// Cut policy for an append-only token stream (the agent's reply → TTS),
+/// mirroring the frontend `sentences.ts`: CJK terminators (。！？) cut
+/// immediately; Latin terminators (.!?…) cut only when followed by whitespace,
+/// so decimals and abbreviations aren't broken. A terminator at the very end of
+/// the tail waits for more text (or [`Segmenter::flush`]). Time is ignored.
+///
+/// This MUST stay in agreement with the frontend splitter: the spec requires the
+/// text-fade and the TTS to cut at the same places.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct Terminator;
+
+impl CutPolicy for Terminator {
+    fn boundary(&self, cut: &Cut) -> Option<usize> {
+        let chars = cut.tail;
+        for (i, &c) in chars.iter().enumerate() {
+            if matches!(c, '。' | '！' | '？') {
+                return Some(i + 1);
+            }
+            if matches!(c, '.' | '!' | '?' | '…') {
+                if let Some(&next) = chars.get(i + 1) {
+                    if next.is_whitespace() {
+                        return Some(i + 1);
+                    }
+                }
+            }
+        }
+        None
+    }
+}
+
+// -----------------------------------------------------------------------------
+// Segmenter — the shared buffer machinery
+// -----------------------------------------------------------------------------
+
+/// Stateful segmenter. Feed it rolling stream updates; it returns completed
+/// units to dispatch, cut by its [`CutPolicy`]. Time is injected so a
+/// time-aware policy is deterministically testable.
+pub struct Segmenter<P> {
+    policy: P,
     /// Finalized (definite) text — stable, never revised.
     locked: String,
-    /// Current in-progress utterance text — may still be revised by the upstream.
+    /// Current in-progress text — may still be revised by the source.
     partial: String,
-    /// Chars of `locked + partial` already emitted as sentences.
+    /// Chars of `locked + partial` already emitted.
     dispatched: usize,
     /// When the current undispatched segment started accumulating.
     seg_start: Instant,
@@ -131,10 +266,10 @@ pub struct Segmenter {
     last_tail: String,
 }
 
-impl Segmenter {
-    pub fn new(cfg: SegmenterConfig, now: Instant) -> Self {
+impl<P: CutPolicy> Segmenter<P> {
+    pub fn new(policy: P, now: Instant) -> Self {
         Self {
-            cfg,
+            policy,
             locked: String::new(),
             partial: String::new(),
             dispatched: 0,
@@ -144,9 +279,8 @@ impl Segmenter {
         }
     }
 
-    /// Apply a transcript update. `is_final` (the upstream's `definite`) commits
-    /// the text into the stable prefix; it does not itself cause a cut. Returns
-    /// any sentences completed by this update.
+    /// Apply a stream update. `is_final` commits the text into the stable prefix;
+    /// it does not itself cause a cut. Returns any units completed by this update.
     pub fn observe(&mut self, text: &str, is_final: bool, now: Instant) -> Vec<String> {
         if is_final {
             self.locked.push_str(text);
@@ -157,13 +291,19 @@ impl Segmenter {
         self.cut(now)
     }
 
+    /// Append finalized text — for sources that never revise their tail (e.g. an
+    /// LLM token stream). Sugar for `observe(text, is_final = true, now)`.
+    pub fn commit(&mut self, text: &str, now: Instant) -> Vec<String> {
+        self.observe(text, true, now)
+    }
+
     /// Time-driven check with no new text — drives the stability and max-segment
-    /// cuts when the speaker has gone quiet. Call on a periodic tick.
+    /// cuts when the source has gone quiet. Call on a periodic tick.
     pub fn tick(&mut self, now: Instant) -> Vec<String> {
         self.cut(now)
     }
 
-    /// Flush whatever undispatched text remains as a final sentence (session end).
+    /// Flush whatever undispatched text remains as a final unit (stream end).
     pub fn flush(&mut self) -> Option<String> {
         let tail = self.tail();
         let seg = tail.trim().to_string();
@@ -188,8 +328,8 @@ impl Segmenter {
         loop {
             let tail = self.tail();
             if tail.trim().is_empty() {
-                // Nothing pending; reset the segment clock so the next sentence
-                // is timed from when it actually begins.
+                // Nothing pending; reset the segment clock so the next unit is
+                // timed from when it actually begins.
                 if tail != self.last_tail {
                     self.last_tail = tail;
                     self.seg_start = now;
@@ -205,9 +345,16 @@ impl Segmenter {
                 self.last_change = now;
             }
 
-            match self.boundary(&tail, now) {
+            let chars: Vec<char> = tail.chars().collect();
+            let ctx = Cut {
+                committed: self.locked.chars().count().saturating_sub(self.dispatched),
+                since_change: now.duration_since(self.last_change),
+                since_start: now.duration_since(self.seg_start),
+                tail: &chars,
+            };
+            match self.policy.boundary(&ctx) {
                 Some(b) if b > 0 => {
-                    let seg: String = tail.chars().take(b).collect();
+                    let seg: String = chars.iter().take(b).collect();
                     let seg = seg.trim().to_string();
                     self.dispatched += b;
                     self.seg_start = now;
@@ -216,69 +363,26 @@ impl Segmenter {
                     if !seg.is_empty() {
                         out.push(seg);
                     }
-                    // Loop again: a backlog may hold more than one sentence.
+                    // Loop again: a backlog may hold more than one unit.
                 }
                 _ => break,
             }
         }
         out
     }
-
-    /// Decide the cut point (char count into `tail`), or None to keep waiting.
-    fn boundary(&self, tail: &str, now: Instant) -> Option<usize> {
-        let chars: Vec<char> = tail.chars().collect();
-        let n = chars.len();
-        // How much of the tail is committed (definite) text, which can't be
-        // revised — punctuation there is settled the instant we see it.
-        let locked_in_tail = self.locked.chars().count().saturating_sub(self.dispatched);
-
-        // 1. Punctuation — cut just after the first sentence-ending mark, once
-        //    it's settled: it sits in committed text, OR more text already
-        //    follows it, OR the (revisable) tail has been stable long enough
-        //    that the mark won't move.
-        if let Some(i) = chars.iter().position(|&c| is_sentence_end(c)) {
-            let settled = i < locked_in_tail
-                || chars[i + 1..].iter().any(|c| !c.is_whitespace())
-                || now.duration_since(self.last_change) >= self.cfg.punct_stable;
-            if settled {
-                return Some(i + 1);
-            }
-        }
-
-        // 2. Size — run-on guard. Snap back to the last phrase boundary so we
-        //    emit a clean clause and keep the rest buffered, e.g.
-        //    "…明天的天气。来决定" → emit "…明天的天气。", buffer "来决定".
-        if n >= self.cfg.max_chars {
-            return Some(snap_back(&chars, n));
-        }
-
-        // 3. Stability — a *committed* fragment with no terminal punctuation that
-        //    has gone quiet (e.g. "嗯", "对"). We require the whole tail to be
-        //    locked: a still-revisable partial must NOT be flushed here, or we'd
-        //    guillotine a sentence's words a beat before the upstream appends its
-        //    period — splitting "你好。" into "你好" + "。". A committed fragment is a
-        //    finished unit, so we emit it whole rather than snapping.
-        if locked_in_tail >= n && now.duration_since(self.last_change) >= self.cfg.stable {
-            return Some(n);
-        }
-
-        // 4. Max segment age — force-cut a non-stop monologue, snapping to the
-        //    last phrase boundary and buffering the remainder.
-        if now.duration_since(self.seg_start) >= self.cfg.max_segment {
-            return Some(snap_back(&chars, n));
-        }
-
-        None
-    }
 }
 
+// -----------------------------------------------------------------------------
+// Tests
+// -----------------------------------------------------------------------------
+
 #[cfg(test)]
-mod tests {
+mod speech_tests {
     use super::*;
 
-    fn seg() -> (Segmenter, Instant) {
+    fn seg() -> (Segmenter<Speech>, Instant) {
         let t0 = Instant::now();
-        (Segmenter::new(SegmenterConfig::default(), t0), t0)
+        (Segmenter::new(Speech::default(), t0), t0)
     }
 
     #[test]
@@ -492,5 +596,38 @@ mod tests {
     fn flush_is_none_when_empty() {
         let (mut s, _t0) = seg();
         assert_eq!(s.flush(), None);
+    }
+}
+
+#[cfg(test)]
+mod terminator_tests {
+    use super::*;
+
+    fn seg() -> (Segmenter<Terminator>, Instant) {
+        let t0 = Instant::now();
+        (Segmenter::new(Terminator, t0), t0)
+    }
+
+    #[test]
+    fn splits_latin_on_terminator_plus_space() {
+        let (mut s, t0) = seg();
+        assert_eq!(s.commit("Hello world", t0), Vec::<String>::new());
+        assert_eq!(s.commit(". How are", t0), vec!["Hello world.".to_string()]);
+        assert_eq!(s.flush(), Some("How are".to_string()));
+    }
+
+    #[test]
+    fn does_not_split_decimals() {
+        let (mut s, t0) = seg();
+        assert_eq!(s.commit("pi is 3.14 today", t0), Vec::<String>::new());
+    }
+
+    #[test]
+    fn splits_cjk_immediately() {
+        let (mut s, t0) = seg();
+        assert_eq!(
+            s.commit("你好。最近怎么样？", t0),
+            vec!["你好。".to_string(), "最近怎么样？".to_string()]
+        );
     }
 }

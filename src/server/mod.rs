@@ -18,7 +18,6 @@ use crate::types::{Scene, Signal, SurfaceEnvelope};
 pub mod audio;
 pub mod binder;
 pub mod headers;
-pub mod segmenter;
 pub mod stubs;
 pub mod surface;
 pub mod thought;

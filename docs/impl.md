@@ -188,7 +188,7 @@ cleanup.
   (`ROUTER_SYSTEM_PROMPT` → reactor, "routing turn" → "turn", router → reactor session) are
   local and safe.
 - **Seam.** `reactor.rs` identifiers; a small `tools` module for the reactor session's
-  tool-call carrier; `SurfaceExtractor`/`SentenceSplitter` stay (they are carrier rendering).
+  tool-call carrier; `SurfaceExtractor`/`Segmenter` stay (they are carrier rendering).
 
 ---
 
