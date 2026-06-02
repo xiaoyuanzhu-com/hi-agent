@@ -51,6 +51,12 @@ mod workers;
 
 pub use outbound::OutboundSignal;
 
+/// The heartbeat's soft context-budget ceiling, surfaced so the observatory can
+/// render each scene's budget as a fraction of where a hot-swap kicks in.
+pub fn swap_budget_chars() -> usize {
+    heartbeat::SWAP_AFTER_CHARS
+}
+
 use chrono::{DateTime, Utc};
 use tokio::sync::{Mutex, mpsc};
 use tokio::time::{Instant, sleep_until, timeout};
@@ -60,6 +66,7 @@ use crate::acp::{AcpSession, SessionOpts, SessionUpdate};
 use crate::agent::AgentLayer;
 use crate::capabilities::tts::{self, TtsStream};
 use crate::memory::{Memory, build_for_scene};
+use crate::observatory::{EventKind, Observatory, SessionKind};
 use crate::segment::{Segmenter, Terminator};
 use crate::types::{Channel, JournalEntry, Scene, Signal, SurfaceEnvelope, SurfaceMode, SurfaceOp};
 use bytes::Bytes;
@@ -217,7 +224,7 @@ fn parse_delay(tok: &str) -> Option<Duration> {
 /// Parse one `[[alarm]]` block body — `"<delay> <note>"` — and register it: the
 /// first whitespace-delimited token is the delay, the rest is the note. A block
 /// whose delay won't parse is logged and dropped.
-fn schedule_alarm(alarms: &mut Alarms, scene: &Scene, block: &str) {
+async fn schedule_alarm(reactor: &Reactor, alarms: &mut Alarms, scene: &Scene, block: &str) {
     let (delay_tok, note) = match block.split_once(char::is_whitespace) {
         Some((d, rest)) => (d, rest.trim()),
         None => (block, ""),
@@ -225,6 +232,14 @@ fn schedule_alarm(alarms: &mut Alarms, scene: &Scene, block: &str) {
     match parse_delay(delay_tok) {
         Some(delay) => {
             alarms.schedule(delay, note.to_owned(), Instant::now());
+            reactor
+                .inner
+                .observatory
+                .record(
+                    scene,
+                    EventKind::AlarmScheduled { note: note.to_owned(), delay_s: delay.as_secs() },
+                )
+                .await;
             tracing::info!(scene = %scene, delay_s = delay.as_secs(), note = %note, "alarm scheduled");
         }
         None => {
@@ -251,6 +266,9 @@ struct ReactorInner {
     /// (see [`outbound`]). A transport adapter binds these to a wire. The reactor
     /// has no knowledge of HTTP, `Content-Type`, or response framing.
     out: mpsc::Sender<OutboundSignal>,
+    /// Structured visibility into the session lifecycle. Turn, session, swap,
+    /// barge-in, worker and alarm events feed it; the HTTP front serves it.
+    observatory: Observatory,
     /// Monotonic cognition-turn counter. Each turn claims the next id;
     /// it tags audio spans and the channel logs so a reply is traceable end to
     /// end. (The client no longer needs it — turns are internal to the mind.)
@@ -271,6 +289,7 @@ pub fn start(
     soul: String,
     mut inbound_rx: mpsc::Receiver<Signal>,
     out: mpsc::Sender<OutboundSignal>,
+    observatory: Observatory,
 ) -> Reactor {
     let reactor = Reactor {
         inner: Arc::new(ReactorInner {
@@ -278,6 +297,7 @@ pub fn start(
             agent,
             soul,
             out,
+            observatory,
             turn_seq: AtomicU64::new(0),
             scenes: Mutex::new(HashMap::new()),
         }),
@@ -307,6 +327,7 @@ impl Reactor {
             if let Err(err) = session.cancel().await {
                 tracing::warn!(scene = %scene, error = %err, "session/cancel failed during interruption");
             } else {
+                self.inner.observatory.record(&scene, EventKind::BargeIn).await;
                 tracing::debug!(scene = %scene, "interrupting in-flight turn");
             }
         }
@@ -390,6 +411,11 @@ async fn per_scene_loop(
                     },
                     _ = sleep_until(deadline) => {
                         for fired in alarms.take_due(Instant::now()) {
+                            reactor
+                                .inner
+                                .observatory
+                                .record(&scene, EventKind::AlarmFired { note: fired.note.clone() })
+                                .await;
                             batch.push(LoopInput::Alarm(fired));
                         }
                     }
@@ -459,8 +485,21 @@ async fn per_scene_loop(
                 }
                 // Discard the possibly-wedged session; the next turn cold-opens a
                 // fresh one and rebuilds context from the journal snapshot.
-                reactor_session = None;
+                if let Some(dead) = reactor_session.take() {
+                    reactor
+                        .inner
+                        .observatory
+                        .record(
+                            &scene,
+                            EventKind::SessionClosed {
+                                kind: SessionKind::Reactor,
+                                id: dead.id().0.to_string(),
+                            },
+                        )
+                        .await;
+                }
                 budget.reset();
+                reactor.inner.observatory.set_budget(&scene, 0).await;
             }
         }
     }
@@ -485,6 +524,11 @@ async fn run_turn(
     alarms: &mut Alarms,
 ) -> anyhow::Result<()> {
     let turn_id = reactor.inner.turn_seq.fetch_add(1, Ordering::Relaxed);
+    reactor
+        .inner
+        .observatory
+        .record(scene, EventKind::TurnStarted { turn: turn_id })
+        .await;
 
     // What the delegated workers are doing right now, so the live session can
     // nudge one, wait, or fold a finished result into its reply. Empty when
@@ -524,6 +568,17 @@ async fn run_turn(
                     )
                     .await?,
             );
+            reactor
+                .inner
+                .observatory
+                .record(
+                    scene,
+                    EventKind::SessionOpened {
+                        kind: SessionKind::Reactor,
+                        id: opened.id().0.to_string(),
+                    },
+                )
+                .await;
             *reactor_session = Some(opened.clone());
             opened
         }
@@ -603,7 +658,7 @@ async fn run_turn(
                     // also never spoken.
                     let (spoken, alarm_blocks) = alarm_extractor.push(&spoken);
                     for block in alarm_blocks {
-                        schedule_alarm(alarms, scene, &block);
+                        schedule_alarm(reactor, alarms, scene, &block).await;
                     }
                     if !spoken.is_empty() {
                         full_reply.push_str(&spoken);
@@ -643,7 +698,7 @@ async fn run_turn(
         let (mut spoken_tail, tail_alarms) = alarm_extractor.push(&spoken_tail);
         spoken_tail.push_str(&alarm_extractor.flush());
         for block in tail_alarms {
-            schedule_alarm(alarms, scene, &block);
+            schedule_alarm(reactor, alarms, scene, &block).await;
         }
         if !spoken_tail.is_empty() {
             full_reply.push_str(&spoken_tail);
@@ -664,15 +719,29 @@ async fn run_turn(
         }
 
         let mut cancelled = false;
-        match run.wait().await {
+        let stop_reason = match run.wait().await {
             Ok(result) => {
                 tracing::debug!(scene = %scene, stop = ?result.stop_reason, "turn finished");
+                Some(format!("{:?}", result.stop_reason))
             }
             Err(err) => {
                 cancelled = true;
                 tracing::debug!(scene = %scene, error = %err, "turn run ended with error (likely cancel)");
+                None
             }
-        }
+        };
+        reactor
+            .inner
+            .observatory
+            .record(
+                scene,
+                EventKind::TurnFinished {
+                    turn: turn_id,
+                    stop_reason,
+                    reply_chars: full_reply.chars().count(),
+                },
+            )
+            .await;
 
         // Dropping the text sender signals end-of-input: the TTS session sends
         // FinishSession, the drain task forwards trailing frames, then emits the
@@ -714,6 +783,7 @@ async fn run_turn(
     // discarded along with its (possibly wedged) session.
     let reply_chars = outcome?;
     budget.record_turn(prompt_chars, reply_chars);
+    reactor.inner.observatory.set_budget(scene, budget.chars()).await;
     Ok(())
 }
 

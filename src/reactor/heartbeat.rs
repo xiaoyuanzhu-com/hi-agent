@@ -15,6 +15,7 @@ use std::sync::Arc;
 
 use crate::acp::{AcpSession, SessionOpts};
 use crate::memory::build_for_scene;
+use crate::observatory::EventKind;
 use crate::types::Scene;
 
 use super::Reactor;
@@ -24,7 +25,7 @@ use super::Reactor;
 /// model's token count, and an over-estimate just swaps a little early, which
 /// is harmless (the replacement is seeded). Kept well below a typical model
 /// window so the briefing-plus-tail seed always fits with room to grow.
-const SWAP_AFTER_CHARS: usize = 48_000;
+pub(crate) const SWAP_AFTER_CHARS: usize = 48_000;
 
 /// Tracks how much the live session has accumulated since it was opened, so the
 /// per-scene loop can decide when to hot-swap. Cheap; lives in that loop.
@@ -47,6 +48,11 @@ impl ContextBudget {
 
     pub(super) fn should_swap(&self) -> bool {
         self.chars >= SWAP_AFTER_CHARS
+    }
+
+    /// Current accumulated chars, mirrored into the observatory for display.
+    pub(super) fn chars(&self) -> usize {
+        self.chars
     }
 
     /// Reset after a swap (or after the session is discarded on error).
@@ -79,6 +85,7 @@ pub(super) async fn swap(
         let run = current.prompt(SUMMARIZE_PROMPT.to_string()).await?;
         run.wait().await?.text
     };
+    let briefing_chars = briefing.chars().count();
 
     // The verbatim recent tail from the journal — the immediate thread the
     // briefing might compress away. Together they seed the replacement so it
@@ -108,5 +115,19 @@ pub(super) async fn swap(
             },
         )
         .await?;
+
+    reactor
+        .inner
+        .observatory
+        .record(
+            scene,
+            EventKind::HotSwap {
+                old_id: current.id().0.to_string(),
+                new_id: fresh.id().0.to_string(),
+                briefing_chars,
+            },
+        )
+        .await;
+
     Ok(Arc::new(fresh))
 }

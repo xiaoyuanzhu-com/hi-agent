@@ -12,6 +12,7 @@ use tokio::sync::{broadcast, mpsc};
 use tower_http::trace::TraceLayer;
 
 use crate::memory::Memory;
+use crate::observatory::Observatory;
 use crate::reactor::OutboundSignal;
 use crate::types::{Scene, Signal, SurfaceEnvelope};
 
@@ -19,6 +20,7 @@ pub mod audio;
 pub mod binder;
 pub mod headers;
 pub mod overlay;
+pub mod sessions;
 pub mod stubs;
 pub mod surface;
 pub mod thought;
@@ -134,12 +136,16 @@ pub struct AppState {
     /// Memory substrate — journal. Cloneable handle.
     pub memory: Memory,
 
+    /// Structured visibility into the ACP session lifecycle. Served read-only by
+    /// the `/api/sessions` endpoints and the `/debug/sessions` dashboard.
+    pub observatory: Observatory,
+
     /// Where blob media lives. POST /api/audio and POST /api/vision write
     /// incoming bytes here before journaling the reference.
     pub data_dir: PathBuf,
 }
 
-pub fn build(memory: Memory, data_dir: PathBuf) -> (Router, ServerSeams) {
+pub fn build(memory: Memory, data_dir: PathBuf, observatory: Observatory) -> (Router, ServerSeams) {
     let (inbound_tx, inbound_rx) = mpsc::channel::<Signal>(1024);
     let thought_bus = ThoughtBus::new();
     let (audio_tx, _) = broadcast::channel::<AudioEvent>(64);
@@ -167,6 +173,7 @@ pub fn build(memory: Memory, data_dir: PathBuf) -> (Router, ServerSeams) {
         vision_out: vision_tx.clone(),
         overlay_out: overlay_tx.clone(),
         memory,
+        observatory,
         data_dir,
     });
 
@@ -182,6 +189,8 @@ pub fn build(memory: Memory, data_dir: PathBuf) -> (Router, ServerSeams) {
         .route("/api/touch", post(stubs::post_touch))
         .route("/api/smell", post(stubs::post_smell))
         .route("/api/taste", post(stubs::post_taste))
+        .route("/api/sessions", get(sessions::get_sessions))
+        .route("/api/sessions/events", get(sessions::get_sessions_events))
         .with_state(state)
         .merge(crate::appearance::router())
         .fallback(not_found)

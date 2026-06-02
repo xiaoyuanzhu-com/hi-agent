@@ -38,6 +38,7 @@ use tokio::sync::{Mutex, mpsc};
 use tokio::task::JoinHandle;
 
 use crate::acp::{AcpSession, SessionOpts, SessionUpdate};
+use crate::observatory::{EventKind, Observatory, WorkerState};
 use crate::types::Scene;
 
 use super::{LoopInput, MarkerExtractor, Reactor};
@@ -170,6 +171,11 @@ impl WorkerRegistry {
                 .await?,
         );
 
+        let observatory = reactor.inner.observatory.clone();
+        observatory
+            .record(&self.scene, EventKind::WorkerSpawned { id, task: task.clone() })
+            .await;
+
         let transcript = Arc::new(Mutex::new(String::new()));
         let drive = tokio::spawn(drive_worker(
             id,
@@ -177,6 +183,8 @@ impl WorkerRegistry {
             session,
             transcript.clone(),
             self.inbound.clone(),
+            observatory,
+            self.scene.clone(),
         ));
 
         self.workers.insert(
@@ -256,11 +264,25 @@ async fn drive_worker(
     session: Arc<AcpSession>,
     transcript: Arc<Mutex<String>>,
     inbound: mpsc::Sender<LoopInput>,
+    observatory: Observatory,
+    scene: Scene,
 ) {
-    let kind = match run_worker(id, &task, &session, &transcript, &inbound).await {
+    let kind = match run_worker(id, &task, &session, &transcript, &inbound, &observatory, &scene)
+        .await
+    {
         Ok(answer) => WorkerReportKind::Done(answer),
         Err(err) => WorkerReportKind::Failed(err.to_string()),
     };
+    let (state, summary_chars) = match &kind {
+        WorkerReportKind::Done(answer) => (WorkerState::Done, answer.chars().count()),
+        WorkerReportKind::Failed(err) => (WorkerState::Failed, err.chars().count()),
+        // Questions are interim, never terminal — drive_worker only ever ends in
+        // Done or Failed, so this arm is unreachable, but keep it total.
+        WorkerReportKind::Question(_) => (WorkerState::Running, 0),
+    };
+    observatory
+        .record(&scene, EventKind::WorkerFinished { id, state, summary_chars })
+        .await;
     let report = WorkerReport { id, task, kind };
     if let Err(err) = inbound.send(LoopInput::Worker(report)).await {
         tracing::warn!(worker = id, error = %err, "worker report dropped; scene loop gone");
@@ -276,6 +298,8 @@ async fn run_worker(
     session: &AcpSession,
     transcript: &Arc<Mutex<String>>,
     inbound: &mpsc::Sender<LoopInput>,
+    observatory: &Observatory,
+    scene: &Scene,
 ) -> anyhow::Result<String> {
     let mut run = session.prompt(task.to_string()).await?;
     let mut asks = MarkerExtractor::new(OPEN_ASK, CLOSE_ASK);
@@ -288,8 +312,14 @@ async fn run_worker(
                 if !clean.is_empty() {
                     full.push_str(&clean);
                     transcript.lock().await.push_str(&clean);
+                    // Mirror the live tail so the dashboard shows what the worker
+                    // is doing right now.
+                    observatory.worker_progress(scene, id, &full).await;
                 }
                 for q in questions {
+                    observatory
+                        .record(scene, EventKind::WorkerQuestion { id, question: q.clone() })
+                        .await;
                     let report = WorkerReport {
                         id,
                         task: task.to_string(),

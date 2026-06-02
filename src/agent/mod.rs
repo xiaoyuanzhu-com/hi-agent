@@ -18,6 +18,7 @@ use std::sync::Arc;
 use tokio::sync::{Mutex, OnceCell};
 
 use crate::acp::{AcpProcess, AcpSession, SessionOpts};
+use crate::observatory::{EventKind, Observatory};
 use crate::types::Scene;
 
 /// How to spawn one ACP subprocess. Cloned per scene: the same pinned runtime and
@@ -38,6 +39,8 @@ pub struct AgentLayer {
 
 struct Inner {
     spawn: SpawnConfig,
+    /// Structured visibility — process spawn/restart events feed it.
+    observatory: Observatory,
     /// One lazily-initialised process per scene. The `OnceCell` makes concurrent
     /// first-contacts for the *same* scene wait on a single spawn, while leaving
     /// other scenes free to proceed (the map lock is held only to fetch the cell,
@@ -46,10 +49,11 @@ struct Inner {
 }
 
 impl AgentLayer {
-    pub fn new(spawn: SpawnConfig) -> Self {
+    pub fn new(spawn: SpawnConfig, observatory: Observatory) -> Self {
         Self {
             inner: Arc::new(Inner {
                 spawn,
+                observatory,
                 scenes: Mutex::new(HashMap::new()),
             }),
         }
@@ -80,6 +84,10 @@ impl AgentLayer {
         // Dropping the cell drops its `Arc<AcpProcess>`; the process tears down
         // once the last handle is gone (its `Drop` signals shutdown).
         drop(removed);
+        self.inner
+            .observatory
+            .record(scene, EventKind::ProcessRestarted)
+            .await;
         tracing::info!(scene = %scene, "scene ACP subprocess dropped; will cold-start on next session");
     }
 
@@ -93,6 +101,7 @@ impl AgentLayer {
         };
 
         let spawn = &self.inner.spawn;
+        let observatory = &self.inner.observatory;
         let process = cell
             .get_or_try_init(|| async {
                 tracing::info!(scene = %scene, "spawning ACP subprocess for scene");
@@ -102,6 +111,7 @@ impl AgentLayer {
                     spawn.env.clone(),
                 )
                 .await?;
+                observatory.record(scene, EventKind::ProcessSpawned).await;
                 Ok::<_, anyhow::Error>(Arc::new(proc))
             })
             .await?;

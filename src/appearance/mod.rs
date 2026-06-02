@@ -76,6 +76,11 @@ where
 {
     Router::new()
         .route("/", get(index))
+        // The admin console is a client-routed SPA section. Serve the same SPA
+        // shell for `/admin` and any nested path so a deep link or refresh on
+        // e.g. `/admin/acp` boots the app, which then renders the right view.
+        .route("/admin", get(index))
+        .route("/admin/{*path}", get(index))
         .route("/favicon.ico", get(favicon))
         .route("/vite.svg", get(vite_svg))
         .route("/assets/{*path}", get(asset))

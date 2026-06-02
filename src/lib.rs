@@ -12,6 +12,7 @@ pub mod channel_log;
 pub mod config;
 pub mod llm_proxy;
 pub mod memory;
+pub mod observatory;
 pub mod runtime;
 pub mod reactor;
 pub mod segment;
@@ -34,6 +35,14 @@ pub async fn run(config: Config) -> anyhow::Result<()> {
     let memory = memory::Memory::open(&config.data_dir).await?;
     tracing::info!(data_dir = %config.data_dir.display(), "memory opened");
 
+    // Structured visibility into the ACP session lifecycle. The agent layer,
+    // reactor, workers and heartbeat feed it; `GET /api/sessions` reads the live
+    // mirror and `GET /api/sessions/events` streams the history over SSE.
+    let observatory = observatory::Observatory::new(
+        Some(config.data_dir.join("sessions.jsonl")),
+        reactor::swap_budget_chars(),
+    );
+
     // Resolve all capabilities from the environment. Unconfigured capabilities
     // are fine; gates affect /audio (STT) and the speak path (TTS) only.
     capabilities::init_from_env()?;
@@ -43,7 +52,8 @@ pub async fn run(config: Config) -> anyhow::Result<()> {
         "capabilities resolved"
     );
 
-    let (router, seams) = server::build(memory.clone(), config.data_dir.clone());
+    let (router, seams) =
+        server::build(memory.clone(), config.data_dir.clone(), observatory.clone());
 
     // Resolve the runtime: prefer system tools on PATH, else install on first run.
     let runtime = runtime::ensure().await?;
@@ -75,11 +85,14 @@ pub async fn run(config: Config) -> anyhow::Result<()> {
         .to_str()
         .ok_or_else(|| anyhow::anyhow!("adapter path not UTF-8"))?
         .to_string();
-    let agent = agent::AgentLayer::new(agent::SpawnConfig {
-        program: runtime.node_bin.clone(),
-        args: vec![adapter_entry],
-        env: child_env,
-    });
+    let agent = agent::AgentLayer::new(
+        agent::SpawnConfig {
+            program: runtime.node_bin.clone(),
+            args: vec![adapter_entry],
+            env: child_env,
+        },
+        observatory.clone(),
+    );
     tracing::info!("agent session layer ready (per-scene processes spawn on first contact)");
 
     // Keep the proxy alive for the life of the process.
@@ -92,6 +105,7 @@ pub async fn run(config: Config) -> anyhow::Result<()> {
         soul,
         seams.inbound_rx,
         seams.out_tx,
+        observatory,
     );
     tracing::info!("reactor started");
 
