@@ -72,65 +72,38 @@ use bytes::Bytes;
 /// follows.
 const RESPONSE_SETTLE: Duration = Duration::from_millis(700);
 
-/// Built-in fallback soul. The agent's identity — how it speaks, what it values,
-/// how it renders surfaces — is normally authored by the admin in
-/// `<data_dir>/SOUL.md` and loaded by [`load_soul`]. This constant is only the
-/// seed used when no SOUL.md is present, so a fresh install still has a voice.
-const DEFAULT_SOUL: &str = "You are a human-interface agent. \
-Someone is talking to you over /thought. Reply naturally with text — your reply \
-streams back to them and is spoken aloud, so keep it conversational. You have \
-file access, code execution, and the rest of your harness's tools; use them \
-freely when helpful.\n\
-\n\
-They often speak in several short bursts with pauses between them, so by \
-the time you reply you may be seeing the whole thing at once under \"New \
-signals\". Respond the way a person who was listening the whole time would: \
-take in everything they said and answer it as one. When it feels natural, open \
-with a brief acknowledgement of what you've understood before your considered \
-answer (\"got it — for the flights…\"); if you're still missing something, keep \
-it short rather than guessing. Don't pad: a little to say means a short reply. \
-What you say is for when they've finished a thought — never talk over them.\n\
-\n\
-To show rich visual content (an image, a chart, a web page, a table, a \
-preview), emit a self-contained HTML block wrapped in surface markers: \
-`[[surface:card]]` … `[[/surface]]` for a focused card, or `[[surface:full]]` \
-… `[[/surface]]` for a full-screen view. The HTML renders in a sandboxed \
-frame: inline all CSS/JS, reference no external resources, and assume a dark \
-background. Everything OUTSIDE the markers is what you say aloud — keep the \
-spoken part natural and let the surface carry the visuals. Use surfaces \
-sparingly, only when a visual genuinely helps.\n\
-\n\
-When a request needs heavy or long-running work — research, multi-step tool \
-use, writing and running code, anything that would otherwise leave you silent \
-for a while — hand it to a working session instead of grinding through it \
-inline. Name the task between delegate markers: `[[delegate]] a self-contained \
-description of the work, with everything the worker needs to start [[/delegate]]`. \
-The worker runs in the background with your same tools and memory but no voice \
-of its own; it reports back when it's done (or if it gets stuck), and you'll \
-see its result under \"New signals\" to fold into what you say next. Delegate \
-markers are never spoken — keep talking to them naturally around them \
-(\"let me dig into that, give me a moment\"). Do quick, simple things yourself; \
-delegate only what genuinely needs the time. A \"Working sessions\" section, \
-when present, shows what your delegated workers are doing right now.\n\
-\n\
-You can also wake yourself up later. When something should be revisited after a \
-delay — a reminder you promised, checking back if they've gone quiet, any \
-time-based follow-up — schedule it between alarm markers: `[[alarm]] 20m see if \
-they actually got up [[/alarm]]`. The delay comes first (seconds, or a number \
-with an s/m/h suffix like `30s`, `20m`, `1h`), then a short note to your future \
-self. Alarm markers are never spoken. When an alarm fires you'll be woken with \
-its note under \"New signals\" as `(alarm) \"…\"`, even if nothing else has \
-happened — look at the situation as it is then and decide what to do. Waking up \
-is not a reason to talk: if nothing is actually needed, say nothing at all.";
+/// Built-in default soul, embedded at compile time from `default_soul.md`. The
+/// agent's identity — how it speaks, what it values, how it renders surfaces — is
+/// authored here as a tracked asset so a fresh install ships fully characterful.
+/// On first run [`load_soul`] seeds `<data_dir>/SOUL.md` from this, after which
+/// the admin can shape the agent's character by editing that file.
+const DEFAULT_SOUL: &str = include_str!("default_soul.md");
 
-/// Load the agent's soul — its admin-authored identity (voice, values,
-/// guardrails, surface house-style) — used as the system prompt for every
-/// scene's persistent reactor session. Read from `<data_dir>/SOUL.md` so the
-/// admin can shape the agent's character without a rebuild; when the file is
-/// absent or empty the built-in [`DEFAULT_SOUL`] applies. Read once at startup,
-/// so edits to SOUL.md take effect on the next restart.
+/// Load the agent's soul — its identity (voice, values, guardrails, surface
+/// house-style) — used as the system prompt for every scene's persistent reactor
+/// session. On first run this seeds `<data_dir>/SOUL.md` from the built-in
+/// [`DEFAULT_SOUL`], so a fresh install is immediately characterful and leaves an
+/// editable file on disk; thereafter the admin can shape the agent's character by
+/// editing SOUL.md without a rebuild. Read once at startup, so edits take effect
+/// on the next restart. If seeding or reading fails for any reason, the in-memory
+/// [`DEFAULT_SOUL`] still applies, so the agent always has a voice.
 pub fn load_soul(data_dir: &Path) -> String {
     let path = data_dir.join("SOUL.md");
+
+    // Seed the file from the built-in default on first run, so the admin has
+    // something concrete to edit and the on-disk soul matches what's running.
+    if !path.exists() {
+        match std::fs::create_dir_all(data_dir).and_then(|()| std::fs::write(&path, DEFAULT_SOUL)) {
+            Ok(()) => {
+                tracing::info!(path = %path.display(), "seeded SOUL.md from built-in default soul");
+            }
+            Err(err) => {
+                tracing::warn!(path = %path.display(), %err, "could not seed SOUL.md; using built-in default soul");
+                return DEFAULT_SOUL.to_string();
+            }
+        }
+    }
+
     match std::fs::read_to_string(&path) {
         Ok(text) if !text.trim().is_empty() => {
             tracing::info!(path = %path.display(), "loaded soul from SOUL.md");
@@ -140,8 +113,8 @@ pub fn load_soul(data_dir: &Path) -> String {
             tracing::warn!(path = %path.display(), "SOUL.md is empty; using built-in default soul");
             DEFAULT_SOUL.to_string()
         }
-        Err(_) => {
-            tracing::info!(path = %path.display(), "no SOUL.md; using built-in default soul");
+        Err(err) => {
+            tracing::warn!(path = %path.display(), %err, "could not read SOUL.md; using built-in default soul");
             DEFAULT_SOUL.to_string()
         }
     }
