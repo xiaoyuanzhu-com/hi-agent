@@ -54,7 +54,7 @@ curl -N -H 'X-HI-To: alice@phone' http://127.0.0.1:8080/thought
 
 ## Curl recipes
 
-The full set lives in [`scripts/curl-recipes.sh`](scripts/curl-recipes.sh). The most useful four:
+The most useful four:
 
 ```sh
 # Open a long-poll on /thought as alice@phone (Ctrl-C to close)
@@ -153,11 +153,10 @@ developing offline or skipping the first-run download (debug use only).
 ### Runtime install & versioning
 
 The Node and ACP adapter versions are pinned in
-[`runtime/manifest.toml`](runtime/manifest.toml) (which also records the
-per-target Node download URLs + checksums for reference); the adapter +
+[`src/runtime/manifest.toml`](src/runtime/manifest.toml); the adapter +
 `claude` CLI dependency tree is pinned by the committed
-[`runtime/package.json`](runtime/package.json) /
-[`runtime/package-lock.json`](runtime/package-lock.json). On first run hi-agent
+[`src/runtime/package.json`](src/runtime/package.json) /
+[`src/runtime/package-lock.json`](src/runtime/package-lock.json). On first run hi-agent
 downloads the pinned Node release from nodejs.org (extracted with the system
 `tar`) and runs `npm ci --omit=dev` against the committed lockfile into an OS
 cache dir, marks the install complete, and reuses it on every later start.
@@ -204,10 +203,6 @@ hi-agent/
 ├── docs/
 │   ├── impl.md                             # architecture and step plan
 │   └── risks.md                            # unverified-things register (Step 0 spike output)
-├── examples/
-│   └── acp_spike.rs                        # concurrency probe (run before trusting the architecture)
-├── scripts/
-│   └── curl-recipes.sh                     # demo curls for every channel
 ├── src/
 │   ├── main.rs                             # CLI; re-exec branch for the MCP shim
 │   ├── lib.rs                              # `run(Config)` — wires everything
@@ -218,6 +213,7 @@ hi-agent/
 │   ├── mcp.rs                              # in-process MCP hub + the seven tools
 │   ├── memory/                             # journal, intents, snapshot builder
 │   ├── heartbeat.rs                        # 1 Hz tick; absolute-intent firing
+│   ├── runtime/                            # first-run node+adapter install; pinned manifest + package files
 │   └── appearance/                         # web surface (Rust handlers + embedded Vite SPA)
 └── tests/
     ├── http_smoke.rs                       # route surface + header rejection + journaling
@@ -251,7 +247,7 @@ runtime for cognition to work.
 
 ## Risks and known unverified things
 
-See [`docs/risks.md`](docs/risks.md). The headline item: concurrent ACP sessions in the Claude Code runtime have not been measured under load. Run `cargo run --example acp_spike` after first build to validate the concurrency assumption before trusting the architecture in production.
+See [`docs/risks.md`](docs/risks.md). The headline item: concurrent ACP sessions in the Claude Code runtime have not been measured under load. Validate the concurrency assumption (drive concurrent thoughts from several peers and compare wall-clock) before trusting the architecture in production.
 
 ## License
 

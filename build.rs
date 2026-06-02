@@ -1,9 +1,9 @@
 fn main() {
     println!("cargo:rerun-if-changed=src/appearance/web/dist");
-    println!("cargo:rerun-if-changed=runtime/manifest.toml");
+    println!("cargo:rerun-if-changed=src/runtime/manifest.toml");
     // The pin files are embedded by src/runtime (include_str!); rebuild on change.
-    println!("cargo:rerun-if-changed=runtime/package.json");
-    println!("cargo:rerun-if-changed=runtime/package-lock.json");
+    println!("cargo:rerun-if-changed=src/runtime/package.json");
+    println!("cargo:rerun-if-changed=src/runtime/package-lock.json");
 
     // Version stamps surfaced by `--version` and used as the install cache key.
     // The runtime itself is fetched on first run (see src/runtime), not embedded.
@@ -24,7 +24,7 @@ struct ManifestVersions {
 /// Minimal manifest read. Avoids extra build-deps by scanning for keys; falls
 /// back to "dev" placeholders when the manifest is absent.
 fn read_manifest_versions() -> ManifestVersions {
-    let text = std::fs::read_to_string("runtime/manifest.toml").unwrap_or_default();
+    let text = std::fs::read_to_string("src/runtime/manifest.toml").unwrap_or_default();
     // Match `key = "value"` tolerating arbitrary whitespace around `=` (the
     // manifest column-aligns its keys, so a fixed-space prefix would miss them).
     let get = |key: &str| -> Option<String> {

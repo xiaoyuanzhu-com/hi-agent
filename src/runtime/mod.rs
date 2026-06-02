@@ -2,22 +2,22 @@
 //! first run and reused thereafter (keyed by the build-stamped `bundle_id`).
 //!
 //! Rather than embedding a ~200 MB archive in the hi-agent binary, the only
-//! things baked in are the two small *pin* files (`runtime/package.json` +
-//! `runtime/package-lock.json`) and the manifest version stamps. On first run
+//! things baked in are the two small *pin* files (`src/runtime/package.json` +
+//! `src/runtime/package-lock.json`) and the manifest version stamps. On first run
 //! we download the pinned Node release and `npm ci` the adapter into
 //! `<cache>/hi-agent/<bundle_id>/`, then resolve the node/adapter/claude paths.
 //! Subsequent runs reuse that directory via a `.complete` marker, so the cost is
 //! paid once per pinned version.
 //!
-//! The pins still come from `runtime/manifest.toml` + the committed lockfile, so
+//! The pins still come from `src/runtime/manifest.toml` + the committed lockfile, so
 //! cognition stays reproducible — we just fetch at first run instead of at build
 //! time. Bumping any pin changes `bundle_id`, which transparently triggers a
 //! fresh install into a new cache dir.
 //!
 //! Prototype scope: macOS + Linux on x86_64/aarch64, extraction via the system
-//! `tar`, and no SHA-256 verification of the Node download yet (the manifest's
-//! checksums are placeholders). The `HI_AGENT_DEV_*` env vars point at an
-//! external runtime for local debugging without any download.
+//! `tar`, and no SHA-256 verification of the Node download yet. The
+//! `HI_AGENT_DEV_*` env vars point at an external runtime for local debugging
+//! without any download.
 
 use std::path::{Path, PathBuf};
 use std::time::Duration;
@@ -29,15 +29,15 @@ use tokio::process::Command;
 /// adapter). Doubles as the cache subdirectory name and the `--version` tag.
 pub const BUNDLE_ID: &str = env!("HI_AGENT_BUNDLE_ID");
 
-/// Pinned Node version (no leading `v`), stamped from `runtime/manifest.toml`.
+/// Pinned Node version (no leading `v`), stamped from `src/runtime/manifest.toml`.
 const NODE_VERSION: &str = env!("HI_AGENT_NODE_VERSION");
 
 /// The committed pin files, embedded so `npm ci` reproduces the exact tree
 /// without needing the repo on disk. Tiny (text), unlike the runtime itself.
 const PACKAGE_JSON: &str =
-    include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/runtime/package.json"));
+    include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/src/runtime/package.json"));
 const PACKAGE_LOCK: &str =
-    include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/runtime/package-lock.json"));
+    include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/src/runtime/package-lock.json"));
 
 /// Path of the adapter entry relative to the install dir, after `npm ci`.
 const ADAPTER_REL: &str = "adapter/node_modules/@agentclientprotocol/claude-agent-acp/dist/index.js";

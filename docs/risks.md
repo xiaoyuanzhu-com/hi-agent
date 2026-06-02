@@ -18,13 +18,13 @@ worker, all multiplexed over the same stdio pair. The
 opens sessions independently, but `claude-code`'s behavior under sustained
 concurrent prompts is not observed.
 
-**Verify with:**
-```
-cargo run --example acp_spike
-```
-The example opens 3 sessions in parallel, prompts each, and waits. If the
-wall-clock latency is roughly max-of-three (not sum-of-three), concurrency
-works. If it's sum-of-three, claude-code is serializing — see the fallback.
+**Verify with:** drive concurrent load through the running agent — POST
+thoughts from three distinct peers (`X-HI-From: a@x`, `b@x`, `c@x`) at the
+same instant and compare wall-clock. If total latency is roughly
+max-of-three (not sum-of-three), concurrency works. If it's sum-of-three,
+claude-code is serializing — see the fallback. (An earlier standalone
+`acp_spike` probe did this against `src/acp/` directly; it was removed once
+the per-peer reactor made the same check reachable through the live routes.)
 
 **Fallback if no concurrency:** wrap routing-session creation in a
 `tokio::sync::Semaphore` with permits = 1 (or small N). Workers can keep
@@ -78,8 +78,7 @@ per-peer task observes the cancel via `SessionRun::next_update` returning a
 
 **Verify by:** issuing two POSTs in rapid succession with
 `X-HI-From: alice@phone` and observing the second prompt's snapshot
-includes both signals. The shell recipe is in `scripts/curl-recipes.sh`
-under "interruption demo".
+includes both signals.
 
 **Tests:** `tests/interruption.rs` is `#[ignore]`-d — exercising it would
 require a mock ACP backend, which is a v1-grade refactor not undertaken
@@ -121,8 +120,9 @@ issue is implementation-side, not docs-side.
 - [ ] `cargo check` passes
 - [ ] `cargo build --release` produces `./target/release/hi-agent`
 - [ ] `cargo test` passes (the `#[ignore]`-d tests stay ignored)
-- [ ] `cargo run --example acp_spike` succeeds with parallel timing roughly
-      equal to single-session timing (concurrency works)
+- [ ] concurrent thoughts from three distinct peers route with parallel
+      timing roughly equal to single-session timing (concurrency works —
+      see "Concurrent ACP sessions" above)
 - [ ] `cd src/appearance/web && pnpm install && pnpm build` succeeds
 - [ ] `./target/release/hi-agent` starts; `curl http://127.0.0.1:8080/`
       returns the embedded SPA HTML (200, `text/html`)
