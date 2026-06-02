@@ -1,7 +1,7 @@
-//! Per-scene outbound buffer for `/thought`, replacing a lossy broadcast.
+//! Per-scene outbound buffer for `/out/text`, replacing a lossy broadcast.
 //!
-//! POST `/thought` is fire-and-forget (`202`); the agent's reply streams back
-//! out on GET `/thought`. The previous design broadcast each chunk over a
+//! POST `/in/text` is fire-and-forget (`202`); the agent's reply streams back
+//! out on GET `/out/text`. The previous design broadcast each chunk over a
 //! `tokio::broadcast`, which only delivers to receivers that already exist at
 //! `send()` time. So a reply produced before the first GET — or in the
 //! reconnect gap between two utterances — was dropped on the floor. The field
@@ -29,10 +29,10 @@ use crate::types::Scene;
 /// undelivered utterances means nobody has polled in a long while.
 const MAX_BUFFERED_PER_SCENE: usize = 32;
 
-/// Outbound `/thought` buffer, keyed by recipient scene. Cloneable handle over
+/// Outbound `/out/text` buffer, keyed by recipient scene. Cloneable handle over
 /// shared state.
 #[derive(Clone, Default)]
-pub struct ThoughtBus {
+pub struct TextBus {
     inner: Arc<Mutex<HashMap<Scene, SceneOut>>>,
 }
 
@@ -61,7 +61,7 @@ struct Utterance {
     complete: bool,
 }
 
-impl ThoughtBus {
+impl TextBus {
     pub fn new() -> Self {
         Self::default()
     }

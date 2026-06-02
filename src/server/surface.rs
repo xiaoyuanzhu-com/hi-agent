@@ -1,7 +1,7 @@
-//! GET /surface — long-poll for outbound rich-content envelopes.
+//! GET /api/out/surface — long-poll for outbound rich-content envelopes.
 //!
-//! Mirrors GET /audio: subscribe to the reactor's `surface_out` broadcast and
-//! return one envelope per request as JSON; the browser re-subscribes for the
+//! Mirrors GET /api/out/audio: subscribe to the reactor's `surface_out` broadcast
+//! and return one envelope per request as JSON; the browser re-subscribes for the
 //! next. The reactor produces these when the agent emits a `[[surface:…]]`
 //! block in its reply.
 
@@ -15,14 +15,14 @@ use tokio::sync::broadcast::error::RecvError;
 use crate::server::AppState;
 use crate::server::headers::{AuthBearer, RequiredScene};
 
-pub async fn get_surface(
+pub async fn get_out_surface(
     State(state): State<Arc<AppState>>,
     RequiredScene(scene): RequiredScene,
     AuthBearer(auth): AuthBearer,
 ) -> impl IntoResponse {
     let mut rx = state.surface_out.subscribe();
 
-    tracing::info!(scene = %scene, auth = ?auth, "GET /surface long-poll opened");
+    tracing::info!(scene = %scene, auth = ?auth, "GET /api/out/surface long-poll opened");
 
     loop {
         match rx.recv().await {

@@ -1,5 +1,5 @@
 import { useState } from "react";
-import type { SurfaceEnvelope } from "../channels/surface";
+import type { SurfaceEnvelope } from "../channels/out/surface";
 
 interface HistoryDrawerProps {
   /** Past surfaces, oldest first. */

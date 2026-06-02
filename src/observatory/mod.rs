@@ -4,7 +4,7 @@
 //! reactor session, ephemeral worker sessions, in-flight prompts, heartbeat
 //! hot-swaps, barge-ins and self-alarms all live only as scattered `tracing`
 //! lines. The observatory is an additive, cloneable handle (like [`Memory`] or
-//! [`ThoughtBus`]) that the agent layer, reactor, workers and heartbeat feed as
+//! [`TextBus`]) that the agent layer, reactor, workers and heartbeat feed as
 //! those things happen. It keeps two things:
 //!
 //! - a **live mirror** — the current state per scene (process, reactor session,
@@ -18,7 +18,7 @@
 //! snapshots-then-subscribes can neither miss an event nor see a duplicate.
 //!
 //! [`Memory`]: crate::memory::Memory
-//! [`ThoughtBus`]: crate::server::ThoughtBus
+//! [`TextBus`]: crate::server::TextBus
 
 use std::collections::{HashMap, VecDeque};
 use std::convert::Infallible;

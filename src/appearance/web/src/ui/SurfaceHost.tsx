@@ -1,5 +1,5 @@
 import { useEffect, useState } from "react";
-import type { SurfaceEnvelope } from "../channels/surface";
+import type { SurfaceEnvelope } from "../channels/out/surface";
 
 interface SurfaceHostProps {
   /** The surface to display, or null. New surfaces replace the current one. */

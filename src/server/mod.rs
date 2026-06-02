@@ -14,20 +14,21 @@ use tower_http::trace::TraceLayer;
 use crate::memory::Memory;
 use crate::observatory::Observatory;
 use crate::reactor::OutboundSignal;
-use crate::types::{Scene, Signal, SurfaceEnvelope};
+use crate::types::{Channel, Scene, Signal, SurfaceEnvelope};
 
 pub mod audio;
 pub mod binder;
 pub mod headers;
+pub mod observe;
 pub mod overlay;
 pub mod sessions;
 pub mod stubs;
 pub mod surface;
-pub mod thought;
-pub mod thought_bus;
+pub mod text;
+pub mod text_bus;
 pub mod vision;
 
-pub use thought_bus::ThoughtBus;
+pub use text_bus::TextBus;
 
 /// Outbound synthesized-audio event. One turn's speech is a continuous stream:
 /// a `Start` (carrying the mime so GET /audio can set `Content-Type` before the
@@ -66,7 +67,7 @@ impl AudioEvent {
 }
 
 /// Outbound rich-content event. Carries the envelope plus the routing target
-/// that the GET /surface long-poll filters on.
+/// that the GET /out/surface long-poll filters on.
 #[derive(Debug, Clone)]
 pub struct SurfaceEvent {
     pub scene: Option<Scene>,
@@ -75,8 +76,8 @@ pub struct SurfaceEvent {
 }
 
 /// A vision frame, broadcast so any local party can *read* the input channel —
-/// not just the reactor. `POST /api/vision` keeps persisting and additionally
-/// publishes the frame here; `GET /api/vision` subscribers (e.g. a detector
+/// not just the reactor. `POST /api/in/vision` keeps persisting and additionally
+/// publishes the frame here; `GET /api/in/vision` subscribers (e.g. a detector
 /// working session) receive it. The bytes are `Bytes` (refcounted), so a frame
 /// with no subscriber is a cheap drop. This rides *outside* the cognition turn
 /// loop — it never enters the journal or a prompt; perceiving raw frames is the
@@ -90,16 +91,37 @@ pub struct VisionFrameEvent {
 }
 
 /// A non-voice overlay frame: a continuous, worker-writable output channel that
-/// sits *outside* the reactor turn loop. `POST /api/overlay` broadcasts directly
-/// here (not via the reactor's `OutboundSignal` binder), which is precisely what
-/// keeps single-voice coherence intact — speech still funnels through the one
-/// reactor voice, while a worker driving an animated overlay (face rects, …) is
-/// a deliberate continuous-data exception. `GET /api/overlay` streams these as
-/// NDJSON. The payload is opaque bytes (a JSON line by convention).
+/// sits *outside* the reactor turn loop. `POST /api/out/overlay` broadcasts
+/// directly here (not via the reactor's `OutboundSignal` binder), which is
+/// precisely what keeps single-voice coherence intact — speech still funnels
+/// through the one reactor voice, while a worker driving an animated overlay
+/// (face rects, …) is a deliberate continuous-data exception. `GET
+/// /api/out/overlay` streams these as NDJSON. The payload is opaque bytes (a JSON
+/// line by convention).
 #[derive(Debug, Clone)]
 pub struct OverlayEvent {
     pub scene: Option<Scene>,
     pub payload: Bytes,
+    pub ts: DateTime<Utc>,
+}
+
+/// One recognized input, echoed to scene observers on `GET /api/in/<channel>`.
+///
+/// Inputs (typed text, recognized speech) cross the world→agent boundary on a
+/// single POST/WS held by one client, but every client in the scene should see
+/// them — the same identical-UI guarantee the outbound channels give. So each
+/// input is published here and fanned out live. This is a *presence* signal, not
+/// a log: it is broadcast (lossy ring, no replay), matching `audio_out` /
+/// `surface_out`. A late joiner sees inputs from the moment it connects.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct InputEcho {
+    pub scene: Scene,
+    pub channel: Channel,
+    pub text: String,
+    /// `false` for a rolling partial (e.g. live STT), `true` once the utterance
+    /// is settled. Serialized as `final` for the client.
+    #[serde(rename = "final")]
+    pub is_final: bool,
     pub ts: DateTime<Utc>,
 }
 
@@ -108,50 +130,71 @@ pub struct AppState {
     /// Inbound signals from every channel POST. The reactor consumes these.
     pub inbound: mpsc::Sender<Signal>,
 
-    /// Outbound thought buffer. GET /thought readers drain it per scene. Unlike
-    /// a broadcast, a reply produced while no reader is connected is retained
-    /// for the next GET instead of being dropped.
-    pub thought_bus: ThoughtBus,
+    /// Outbound text buffer. GET /api/out/text readers drain it per scene.
+    /// Unlike a broadcast, a reply produced while no reader is connected is
+    /// retained for the next GET instead of being dropped.
+    pub text_bus: TextBus,
 
-    /// Outbound audio broadcast. GET /audio subscribers receive from this; the
-    /// reactor produces TTS clips here when a TTS provider is configured.
+    /// Outbound audio broadcast. GET /api/out/audio subscribers receive from
+    /// this; the reactor produces TTS clips here when a TTS provider is set.
     pub audio_out: broadcast::Sender<AudioEvent>,
 
-    /// Outbound rich-content broadcast. GET /surface subscribers receive from
-    /// this; the reactor produces envelopes when the agent emits a surface block.
+    /// Outbound rich-content broadcast. GET /api/out/surface subscribers receive
+    /// from this; the reactor produces envelopes when the agent emits a surface.
     pub surface_out: broadcast::Sender<SurfaceEvent>,
 
     /// Vision-frame broadcast — the read side of the vision *input* channel.
-    /// POST /api/vision publishes each frame here; GET /api/vision subscribers
-    /// (a detector working session, …) consume it. Written directly by the POST
-    /// handler, not the binder — it is input data, not the reactor's voice.
+    /// POST /api/in/vision publishes each frame here; GET /api/in/vision
+    /// subscribers (a detector working session, …) consume it. Written directly by
+    /// the POST handler, not the binder — it is input data, not the reactor's voice.
     pub vision_out: broadcast::Sender<VisionFrameEvent>,
 
     /// Overlay broadcast — a non-voice, worker-writable *output* channel. Any
-    /// local party POSTs frames to /api/overlay and they fan out to GET
-    /// /api/overlay subscribers. Deliberately bypasses the reactor turn loop so
+    /// local party POSTs frames to /api/out/overlay and they fan out to GET
+    /// /api/out/overlay subscribers. Deliberately bypasses the reactor turn loop so
     /// continuous overlay data never contends with the single reactor voice.
     pub overlay_out: broadcast::Sender<OverlayEvent>,
+
+    /// Inbound echo broadcast. GET /api/in/<channel> observers receive recognized
+    /// inputs (typed text, recognized speech) from this — live, no replay.
+    pub input_echo: broadcast::Sender<InputEcho>,
 
     /// Memory substrate — journal. Cloneable handle.
     pub memory: Memory,
 
     /// Structured visibility into the ACP session lifecycle. Served read-only by
-    /// the `/api/sessions` endpoints and the `/debug/sessions` dashboard.
+    /// the `/api/sessions` endpoints.
     pub observatory: Observatory,
 
-    /// Where blob media lives. POST /api/audio and POST /api/vision write
+    /// Where blob media lives. POST /api/in/audio and POST /api/in/vision write
     /// incoming bytes here before journaling the reference.
     pub data_dir: PathBuf,
 }
 
+impl AppState {
+    /// Publish one recognized input to the scene's observers. Best-effort and
+    /// non-blocking: with no live observer the send is simply dropped (no replay),
+    /// matching the live-presence semantics of the outbound broadcasts.
+    pub fn echo_input(&self, scene: &Scene, channel: Channel, text: &str, is_final: bool) {
+        let _ = self.input_echo.send(InputEcho {
+            scene: scene.clone(),
+            channel,
+            text: text.to_owned(),
+            is_final,
+            ts: Utc::now(),
+        });
+    }
+}
+
 pub fn build(memory: Memory, data_dir: PathBuf, observatory: Observatory) -> (Router, ServerSeams) {
     let (inbound_tx, inbound_rx) = mpsc::channel::<Signal>(1024);
-    let thought_bus = ThoughtBus::new();
+    let text_bus = TextBus::new();
     let (audio_tx, _) = broadcast::channel::<AudioEvent>(64);
     let (surface_tx, _) = broadcast::channel::<SurfaceEvent>(64);
     let (vision_tx, _) = broadcast::channel::<VisionFrameEvent>(64);
     let (overlay_tx, _) = broadcast::channel::<OverlayEvent>(64);
+    // Input echo: live broadcast, lossy ring, no replay (see `InputEcho`).
+    let (input_echo_tx, _) = broadcast::channel::<InputEcho>(64);
 
     // The reactor's single transport-free outbound seam. A binder task fans each
     // `OutboundSignal` out to the HTTP-shaped carriers above — assigning
@@ -160,35 +203,45 @@ pub fn build(memory: Memory, data_dir: PathBuf, observatory: Observatory) -> (Ro
     let (out_tx, out_rx) = mpsc::channel::<OutboundSignal>(1024);
     tokio::spawn(binder::bind_outbound(
         out_rx,
-        thought_bus.clone(),
+        text_bus.clone(),
         audio_tx.clone(),
         surface_tx.clone(),
     ));
 
     let state = Arc::new(AppState {
         inbound: inbound_tx,
-        thought_bus: thought_bus.clone(),
+        text_bus: text_bus.clone(),
         audio_out: audio_tx.clone(),
         surface_out: surface_tx.clone(),
         vision_out: vision_tx.clone(),
         overlay_out: overlay_tx.clone(),
+        input_echo: input_echo_tx.clone(),
         memory,
         observatory,
         data_dir,
     });
 
-    // Every channel lives under `/api/*`; the appearance router owns the rest
-    // (SPA shell + static assets).
+    // Channels are namespaced by boundary: `/api/in/*` is the world→agent side
+    // (perception), `/api/out/*` is the agent→world side (expression). Each side
+    // is observable via GET so every client in a scene renders identical UI.
+    // `/api/sessions` is observability, not a channel.
     let router = Router::new()
-        .route("/api/thought", post(thought::post_thought).get(thought::get_thought))
-        .route("/api/audio", post(audio::post_audio).get(audio::get_audio))
-        .route("/api/audio/in", get(audio::get_audio_in))
-        .route("/api/surface", get(surface::get_surface))
-        .route("/api/vision", post(vision::post_vision).get(vision::get_vision))
-        .route("/api/overlay", post(overlay::post_overlay).get(overlay::get_overlay))
-        .route("/api/touch", post(stubs::post_touch))
-        .route("/api/smell", post(stubs::post_smell))
-        .route("/api/taste", post(stubs::post_taste))
+        .route("/api/in/text", post(text::post_text).get(text::get_in_text))
+        .route("/api/out/text", get(text::get_out_text))
+        .route("/api/in/audio", post(audio::post_audio).get(audio::get_in_audio))
+        .route("/api/in/audio/stream", get(audio::get_audio_stream))
+        .route("/api/out/audio", get(audio::get_out_audio))
+        .route("/api/out/surface", get(surface::get_out_surface))
+        // Vision is an input channel that is also observable: POST a frame,
+        // GET the live frame stream (a worker session reads it).
+        .route("/api/in/vision", post(vision::post_vision).get(vision::get_vision))
+        // Overlay is a non-voice *output* channel any local party may write —
+        // the first concrete `POST /api/out/*` (worker-driven, bypasses the
+        // reactor voice); GET observes it.
+        .route("/api/out/overlay", post(overlay::post_overlay).get(overlay::get_overlay))
+        .route("/api/in/touch", post(stubs::post_touch))
+        .route("/api/in/smell", post(stubs::post_smell))
+        .route("/api/in/taste", post(stubs::post_taste))
         .route("/api/sessions", get(sessions::get_sessions))
         .route("/api/sessions/events", get(sessions::get_sessions_events))
         .with_state(state)
@@ -198,7 +251,7 @@ pub fn build(memory: Memory, data_dir: PathBuf, observatory: Observatory) -> (Ro
 
     let seams = ServerSeams {
         inbound_rx,
-        thought_bus,
+        text_bus,
         out_tx,
     };
 
@@ -208,11 +261,11 @@ pub fn build(memory: Memory, data_dir: PathBuf, observatory: Observatory) -> (Ro
 /// What `build` hands back to wire the reactor to the HTTP front. `inbound_rx`
 /// is the channel POSTs feed; `out_tx` is the reactor's single transport-free
 /// outbound seam (the binder spawned in `build` carries it to the wire). The
-/// `thought_bus` is exposed only so integration tests can drive utterances
+/// `text_bus` is exposed only so integration tests can drive utterances
 /// directly without standing up a reactor.
 pub struct ServerSeams {
     pub inbound_rx: mpsc::Receiver<Signal>,
-    pub thought_bus: ThoughtBus,
+    pub text_bus: TextBus,
     pub out_tx: mpsc::Sender<OutboundSignal>,
 }
 

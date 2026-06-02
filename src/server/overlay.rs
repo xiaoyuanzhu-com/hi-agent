@@ -1,4 +1,4 @@
-//! POST /api/overlay and GET /api/overlay — the non-voice overlay channel.
+//! POST /api/out/overlay and GET /api/out/overlay — the non-voice overlay channel.
 //!
 //! The overlay is a continuous *output* channel that any local party can write,
 //! not just the reactor. Its whole reason to exist is to carry worker-driven
@@ -10,14 +10,14 @@
 //! straight onto `overlay_out`; it never touches the reactor's `OutboundSignal`
 //! binder and never enters a cognition turn. So a worker writing 15 frames a
 //! second cannot contend with — or fragment — the one serialized voice that
-//! `/api/thought`, `/api/audio`, and `/api/surface` carry. Speech stays the
-//! reactor's; continuous data rides here.
+//! `/api/out/text`, `/api/out/audio`, and `/api/out/surface` carry. Speech stays
+//! the reactor's; continuous data rides here.
 //!
-//! Inbound (`POST /api/overlay`): raw body bytes → one `OverlayEvent`, scene
+//! Inbound (`POST /api/out/overlay`): raw body bytes → one `OverlayEvent`, scene
 //! from `X-HI-Scene`. Returns 202. The payload is opaque (a JSON line by
 //! convention, e.g. `{"rects":[...]}`); the host does not parse it.
 //!
-//! Outbound (`GET /api/overlay`): unlike surface's one-shot long-poll, an
+//! Outbound (`GET /api/out/overlay`): unlike surface's one-shot long-poll, an
 //! overlay is animated, so this is a *continuous* chunked NDJSON stream — it
 //! stays open and emits one `payload + "\n"` per matching event. The browser
 //! reads it line by line and repaints. Scene-filtered; a mismatched scene
@@ -48,7 +48,7 @@ pub async fn post_overlay(
         return (StatusCode::BAD_REQUEST, "overlay body is empty\n").into_response();
     }
 
-    tracing::debug!(scene = %scene, bytes = body.len(), "POST /api/overlay");
+    tracing::debug!(scene = %scene, bytes = body.len(), "POST /api/out/overlay");
 
     // Broadcast directly — outside the reactor turn loop (see module docs). A
     // send error just means no subscriber is connected, which is fine.
@@ -70,10 +70,10 @@ fn routed(target: &Option<Scene>, scene: &Scene) -> bool {
     }
 }
 
-/// `GET /api/overlay` — continuous NDJSON stream of overlay frames for a scene.
+/// `GET /api/out/overlay` — continuous NDJSON stream of overlay frames for a scene.
 ///
 /// Stays open and emits one JSON line per matching event. Mirrors the chunked
-/// `Body::from_stream` shape of [`crate::server::audio::get_audio`], minus the
+/// `Body::from_stream` shape of [`crate::server::audio::get_out_audio`], minus the
 /// per-turn binding — an overlay stream is not turn-scoped.
 pub async fn get_overlay(
     State(state): State<Arc<AppState>>,
@@ -82,7 +82,7 @@ pub async fn get_overlay(
 ) -> impl IntoResponse {
     let rx = state.overlay_out.subscribe();
 
-    tracing::info!(scene = %scene, auth = ?auth, "GET /overlay stream opened");
+    tracing::info!(scene = %scene, auth = ?auth, "GET /api/out/overlay stream opened");
 
     let stream = futures::stream::unfold((rx, scene), |(mut rx, scene)| async move {
         loop {

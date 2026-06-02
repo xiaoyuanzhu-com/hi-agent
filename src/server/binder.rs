@@ -4,8 +4,8 @@
 //! The reactor is the mind; it emits [`OutboundSignal`]s in human-channel terms
 //! ("said this text", "this span of speech", "show this surface") and knows
 //! nothing about HTTP. Everything HTTP-shaped lives on this side of the seam:
-//! the utterance→response framing of /thought, the `Content-Type` and turn
-//! binding of /audio, the broadcast of /surface. This binder is the one place
+//! the utterance→response framing of /out/text, the `Content-Type` and turn
+//! binding of /out/audio, the broadcast of /out/surface. This binder is the one place
 //! that translates between the two, so swapping HTTP for another wire touches
 //! only this file — the reactor and its vocabulary are untouched.
 //!
@@ -16,27 +16,27 @@ use chrono::Utc;
 use tokio::sync::{broadcast, mpsc};
 
 use crate::reactor::OutboundSignal;
-use crate::server::{AudioEvent, SurfaceEvent, ThoughtBus};
+use crate::server::{AudioEvent, SurfaceEvent, TextBus};
 
 /// Drain the reactor's outbound seam and bind each signal to its HTTP carrier.
 /// Owns the producing halves of the wire-side broadcasts; runs until the reactor
 /// drops `out_tx` (process teardown).
 pub(crate) async fn bind_outbound(
     mut rx: mpsc::Receiver<OutboundSignal>,
-    thought_bus: ThoughtBus,
+    text_bus: TextBus,
     audio_out: broadcast::Sender<AudioEvent>,
     surface_out: broadcast::Sender<SurfaceEvent>,
 ) {
     while let Some(signal) = rx.recv().await {
         match signal {
-            // /thought is buffered per scene (a reply produced with no reader
+            // /out/text is buffered per scene (a reply produced with no reader
             // connected is retained, not dropped); end-of-utterance is what
-            // closes one streaming GET /thought response.
+            // closes one streaming GET /out/text response.
             OutboundSignal::Text { scene, chunk } => {
-                thought_bus.push_chunk(&scene, chunk).await;
+                text_bus.push_chunk(&scene, chunk).await;
             }
             OutboundSignal::TextEnd { scene } => {
-                thought_bus.end_utterance(&scene).await;
+                text_bus.end_utterance(&scene).await;
             }
             // /audio: one utterance's span is one chunked response. The codec
             // becomes the response's Content-Type, set before the first byte;

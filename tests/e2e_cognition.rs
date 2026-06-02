@@ -14,7 +14,7 @@ async fn thought_round_trips_through_runtime() {
     //   - AI_API_BASE pointing at a reachable Anthropic-compatible endpoint
     //     (or a local stub that returns a canned Messages SSE stream).
     // Build a Config, call hi_agent::run on a random port in a task, POST a
-    // /thought, and assert a journal line / thought-bus emission appears.
+    // /thought, and assert a journal line / thought-bus emission appears. (HTTP path: POST /api/in/text)
     // (Left as the single heavy integration check; keep it deterministic by
     //  pointing upstream at a local stub rather than the real API.)
     eprintln!("e2e harness placeholder — implement against a local SSE stub");

@@ -1,9 +1,9 @@
-// Client for the human-interface /surface channel (outbound rich content).
+// Client for the outbound surface channel (rich content).
 //
-// GET /surface is a long-poll that returns one envelope per response (like
-// /audio); we re-subscribe after each. The agent produces these by wrapping
-// HTML in `[[surface:…]] … [[/surface]]`; the reactor strips them from the
-// spoken text and routes them here.
+// GET /api/out/surface is a long-poll that returns one envelope per response
+// (like /api/out/audio); we re-subscribe after each. The agent produces these by
+// wrapping HTML in `[[surface:…]] … [[/surface]]`; the reactor strips them from
+// the spoken text and routes them here.
 
 export type SurfaceMode = "card" | "full";
 
@@ -25,14 +25,14 @@ export async function* subscribeSurface(
   opts: SubscribeSurfaceOpts,
 ): AsyncGenerator<SurfaceEnvelope, void, void> {
   while (!opts.signal.aborted) {
-    const res = await fetch("/api/surface", {
+    const res = await fetch("/api/out/surface", {
       method: "GET",
       headers: { "X-HI-Scene": opts.scene, Accept: "application/json" },
       signal: opts.signal,
       cache: "no-store",
     });
     if (!res.ok) {
-      throw new Error(`/surface subscribe failed: ${res.status} ${res.statusText}`);
+      throw new Error(`/api/out/surface subscribe failed: ${res.status} ${res.statusText}`);
     }
     const env = (await res.json()) as SurfaceEnvelope;
     if (env && env.id) yield env;

@@ -10,8 +10,8 @@
 //!
 //! It is *not*, however, channel-blind. Over hi-agent's own HTTP surface
 //! (`HI_AGENT_BASE_URL` in its env) a worker may **perceive input channels**
-//! (e.g. `GET /api/vision` for live frames) and **drive the non-voice `overlay`
-//! channel** (`POST /api/overlay`) — the deliberate continuous-data exception
+//! (e.g. `GET /api/in/vision` for live frames) and **drive the non-voice `overlay`
+//! channel** (`POST /api/out/overlay`) — the deliberate continuous-data exception
 //! that lets a worker, say, run face detection and push rects to the UI without
 //! ever holding the voice. Both ride *outside* the turn loop, so they never
 //! contend with the reactor's serialized speech.
@@ -71,11 +71,11 @@ non-voice output, the overlay. The server's base URL is in the \
 `HI_AGENT_BASE_URL` environment variable, and your scene is `{scene}` — send it \
 as the `X-HI-Scene` header on every request. Specifically:\n\
 - Perceive input channels, e.g. live camera frames:\n\
-    `GET $HI_AGENT_BASE_URL/api/vision` with header `X-HI-Scene: {scene}`\n\
+    `GET $HI_AGENT_BASE_URL/api/in/vision` with header `X-HI-Scene: {scene}`\n\
   (one frame per response; re-request for the next). Process the raw bytes \
 however the task needs — detection, CV, etc. is your job.\n\
 - Drive the overlay (a continuous, non-voice visual channel — e.g. face rects):\n\
-    `POST $HI_AGENT_BASE_URL/api/overlay` with header `X-HI-Scene: {scene}` and \
+    `POST $HI_AGENT_BASE_URL/api/out/overlay` with header `X-HI-Scene: {scene}` and \
 a JSON body (one frame per POST; the UI repaints each line).\n\
 The overlay is the ONLY thing you may write to the person's screen, and it is \
 not speech — never use it to talk. Speaking stays the agent's job.\n\

@@ -1,7 +1,7 @@
-//! POST /api/vision — inbound vision channel; GET /api/vision — its read side.
+//! POST /api/in/vision — inbound vision channel; GET /api/in/vision — its read side.
 //!
 //! Vision is a *continuous* input channel: the client captures frames from the
-//! camera and POSTs them here, the same way the mic feeds /api/audio. There is
+//! camera and POSTs them here, the same way the mic feeds /api/in/audio. There is
 //! no commit on the client — it just streams the signal; what (if anything) to
 //! do with it is the mind's call.
 //!
@@ -15,7 +15,7 @@
 //!    read yet. When a perception path exists (captioning or a multimodal
 //!    prompt), this is where it slots in.
 //! 2. **Broadcast** on `vision_out` so the channel is readable by any local
-//!    party, not just the reactor. `GET /api/vision` mirrors `GET /api/surface`:
+//!    party, not just the reactor. `GET /api/in/vision` mirrors `GET /api/out/surface`:
 //!    one frame per scene-filtered long-poll response. A detector working
 //!    session polls it, runs CV on the raw bytes, and drives the overlay channel
 //!    — the perception is *its* job, not the host's.
@@ -53,7 +53,7 @@ pub async fn post_vision(
         .unwrap_or_else(|| DEFAULT_MIME.to_string());
     let ext = mime_to_ext(&mime);
 
-    tracing::debug!(scene = %scene, mime = %mime, bytes = body.len(), "POST /api/vision");
+    tracing::debug!(scene = %scene, mime = %mime, bytes = body.len(), "POST /api/in/vision");
 
     // Publish the live frame to any subscriber (the read side of the channel).
     // A send error just means nobody is watching — fine, mirrors audio out.
@@ -74,9 +74,9 @@ pub async fn post_vision(
     }
 }
 
-/// `GET /api/vision` — long-poll for the next live frame in this scene.
+/// `GET /api/in/vision` — long-poll for the next live frame in this scene.
 ///
-/// Mirrors [`crate::server::surface::get_surface`]: subscribe to `vision_out`,
+/// Mirrors [`crate::server::surface::get_out_surface`]: subscribe to `vision_out`,
 /// skip frames routed to other scenes, and return the next matching frame's
 /// bytes with its `Content-Type`. The subscriber re-GETs for the frame after.
 pub async fn get_vision(
@@ -86,7 +86,7 @@ pub async fn get_vision(
 ) -> impl IntoResponse {
     let mut rx = state.vision_out.subscribe();
 
-    tracing::info!(scene = %scene, auth = ?auth, "GET /vision long-poll opened");
+    tracing::info!(scene = %scene, auth = ?auth, "GET /api/in/vision long-poll opened");
 
     loop {
         match rx.recv().await {

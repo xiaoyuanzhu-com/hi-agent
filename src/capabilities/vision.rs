@@ -9,7 +9,7 @@
 //! [`available`] reports whether a provider is configured, and [`understand`]
 //! dispatches to it. The config never appears in a signature.
 //!
-//! **No caller wires this in yet.** `POST /api/vision` still only persists
+//! **No caller wires this in yet.** `POST /api/in/vision` still only persists
 //! frames. This module is the capability a future, deliberately-triggered
 //! perception path will call; wiring it in later is purely additive.
 

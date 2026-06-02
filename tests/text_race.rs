@@ -1,17 +1,17 @@
-//! Regression: the /thought delivery race that dropped an utterance when the
+//! Regression: the /out/text delivery race that dropped an utterance when the
 //! subscriber was not connected at send time.
 //!
 //! The field symptom (journal-confirmed): the reactor produced a reply
 //! ("Hey! What's up?") and emitted its chunks, but the web client's GET
-//! /thought re-subscribed ~150ms too late. The old `tokio::broadcast` delivered
+//! GET /out/text re-subscribed ~150ms too late. The old `tokio::broadcast` delivered
 //! nothing to a receiver created after the send, so "send hi, nothing
-//! responds". The per-scene `ThoughtBus` buffers utterances, so a late GET still
+//! responds". The per-scene `TextBus` buffers utterances, so a late GET still
 //! drains the pending one.
 
 use std::time::Duration;
 
 use hi_agent::memory::Memory;
-use hi_agent::server::{self, ServerSeams, ThoughtBus};
+use hi_agent::server::{self, ServerSeams, TextBus};
 use hi_agent::types::Scene;
 use tempfile::tempdir;
 use tokio::net::TcpListener;
@@ -31,7 +31,7 @@ async fn spawn_server() -> (String, tempfile::TempDir, ServerSeams) {
     (format!("http://{addr}"), dir, seams)
 }
 
-async fn emit_utterance(bus: &ThoughtBus, scene: &str, chunks: &[&str]) {
+async fn emit_utterance(bus: &TextBus, scene: &str, chunks: &[&str]) {
     let scene = Scene(scene.to_string());
     for c in chunks {
         bus.push_chunk(&scene, c.to_string()).await;
@@ -39,11 +39,11 @@ async fn emit_utterance(bus: &ThoughtBus, scene: &str, chunks: &[&str]) {
     bus.end_utterance(&scene).await;
 }
 
-async fn get_thought(base: &str, scene: &str, budget: Duration) -> Result<String, ()> {
+async fn get_out_text(base: &str, scene: &str, budget: Duration) -> Result<String, ()> {
     let client = reqwest::Client::new();
     tokio::time::timeout(budget, async {
         client
-            .get(format!("{base}/api/thought"))
+            .get(format!("{base}/api/out/text"))
             .header("X-HI-Scene", scene)
             .send()
             .await
@@ -62,10 +62,10 @@ async fn get_thought(base: &str, scene: &str, budget: Duration) -> Result<String
 async fn late_subscriber_still_gets_the_utterance() {
     let (base, _dir, seams) = spawn_server().await;
 
-    emit_utterance(&seams.thought_bus, "web@local", &["Hey! What", "'s up?"]).await;
+    emit_utterance(&seams.text_bus, "web@local", &["Hey! What", "'s up?"]).await;
     tokio::time::sleep(Duration::from_millis(50)).await;
 
-    let body = get_thought(&base, "web@local", Duration::from_millis(500))
+    let body = get_out_text(&base, "web@local", Duration::from_millis(500))
         .await
         .expect("late GET should receive the buffered utterance, not hang");
     assert_eq!(body, "Hey! What's up?");
@@ -76,10 +76,10 @@ async fn late_subscriber_still_gets_the_utterance() {
 async fn connected_subscriber_streams_live() {
     let (base, _dir, seams) = spawn_server().await;
 
-    let bus = seams.thought_bus.clone();
+    let bus = seams.text_bus.clone();
     let base2 = base.clone();
     let reader = tokio::spawn(async move {
-        get_thought(&base2, "web@local", Duration::from_millis(800)).await
+        get_out_text(&base2, "web@local", Duration::from_millis(800)).await
     });
 
     // Let the GET subscribe, then emit.
@@ -96,15 +96,15 @@ async fn connected_subscriber_streams_live() {
 async fn sequential_gets_drain_fifo() {
     let (base, _dir, seams) = spawn_server().await;
 
-    emit_utterance(&seams.thought_bus, "web@local", &["first"]).await;
-    emit_utterance(&seams.thought_bus, "web@local", &["second"]).await;
+    emit_utterance(&seams.text_bus, "web@local", &["first"]).await;
+    emit_utterance(&seams.text_bus, "web@local", &["second"]).await;
 
-    let a = get_thought(&base, "web@local", Duration::from_millis(500))
+    let a = get_out_text(&base, "web@local", Duration::from_millis(500))
         .await
         .expect("first GET");
     assert_eq!(a, "first");
 
-    let b = get_thought(&base, "web@local", Duration::from_millis(500))
+    let b = get_out_text(&base, "web@local", Duration::from_millis(500))
         .await
         .expect("second GET");
     assert_eq!(b, "second");
@@ -115,14 +115,14 @@ async fn sequential_gets_drain_fifo() {
 async fn utterances_are_per_scene() {
     let (base, _dir, seams) = spawn_server().await;
 
-    emit_utterance(&seams.thought_bus, "alice@phone", &["for alice"]).await;
+    emit_utterance(&seams.text_bus, "alice@phone", &["for alice"]).await;
     tokio::time::sleep(Duration::from_millis(30)).await;
 
     // Bob has nothing buffered → his GET must time out, not steal alice's.
-    let bob = get_thought(&base, "bob@desktop", Duration::from_millis(250)).await;
+    let bob = get_out_text(&base, "bob@desktop", Duration::from_millis(250)).await;
     assert!(bob.is_err(), "bob should get nothing; got {bob:?}");
 
-    let alice = get_thought(&base, "alice@phone", Duration::from_millis(500))
+    let alice = get_out_text(&base, "alice@phone", Duration::from_millis(500))
         .await
         .expect("alice GET");
     assert_eq!(alice, "for alice");
@@ -135,7 +135,7 @@ async fn get_without_scene_is_bad_request() {
     let client = reqwest::Client::new();
 
     let resp = client
-        .get(format!("{base}/api/thought"))
+        .get(format!("{base}/api/out/text"))
         .send()
         .await
         .expect("send");

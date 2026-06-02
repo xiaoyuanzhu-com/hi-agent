@@ -25,10 +25,10 @@
 //! BASE=http://127.0.0.1:8080
 //! ME=alice@phone
 //! curl -X POST -H "X-HI-Scene: $ME" \
-//!     --data-binary 'first thought, take your time' "$BASE/thought" &
+//!     --data-binary 'first thought, take your time' "$BASE/api/in/text" &
 //! sleep 0.2
 //! curl -X POST -H "X-HI-Scene: $ME" \
-//!     --data-binary 'actually never mind, what time is it' "$BASE/thought"
+//!     --data-binary 'actually never mind, what time is it' "$BASE/api/in/text"
 //! ```
 //!
 //! Expected: tracing logs show "session/cancel" on the first ACP session;

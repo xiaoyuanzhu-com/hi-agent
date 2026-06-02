@@ -48,7 +48,10 @@ impl FromStr for Scene {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Channel {
-    Thought,
+    /// The text channel — typed input and the agent's worded replies. `alias`
+    /// keeps journals written before the thought→text rename loadable.
+    #[serde(alias = "thought")]
+    Text,
     Vision,
     Audio,
     Touch,
@@ -59,7 +62,7 @@ pub enum Channel {
 impl Channel {
     pub fn as_str(self) -> &'static str {
         match self {
-            Channel::Thought => "thought",
+            Channel::Text => "text",
             Channel::Vision => "vision",
             Channel::Audio => "audio",
             Channel::Touch => "touch",
@@ -84,7 +87,7 @@ impl FromStr for Channel {
 
     fn from_str(s: &str) -> Result<Self, Self::Err> {
         match s {
-            "thought" => Ok(Channel::Thought),
+            "text" | "thought" => Ok(Channel::Text),
             "vision" => Ok(Channel::Vision),
             "audio" => Ok(Channel::Audio),
             "touch" => Ok(Channel::Touch),

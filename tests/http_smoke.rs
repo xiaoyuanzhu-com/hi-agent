@@ -3,7 +3,7 @@
 //! Builds the axum router via [`hi_agent::server::build`] directly. The
 //! reactor seams are returned alongside so the test holds them past the
 //! handlers' send into `inbound` — otherwise the receiver drops and
-//! POST /thought returns 503.
+//! POST /api/in/text returns 503.
 
 use std::time::Duration;
 
@@ -52,7 +52,7 @@ async fn post_thought_accepts_and_journals() {
     let client = reqwest::Client::new();
 
     let resp = client
-        .post(format!("{base}/api/thought"))
+        .post(format!("{base}/api/in/text"))
         .header("X-HI-Scene", "alice@phone")
         .body("hi")
         .send()
@@ -80,7 +80,7 @@ async fn post_thought_without_scene_header_is_anonymous() {
     let client = reqwest::Client::new();
 
     let resp = client
-        .post(format!("{base}/api/thought"))
+        .post(format!("{base}/api/in/text"))
         .body("hi")
         .send()
         .await
@@ -106,7 +106,7 @@ async fn post_vision_accepts_and_persists_without_journaling() {
     let client = reqwest::Client::new();
 
     let resp = client
-        .post(format!("{base}/api/vision"))
+        .post(format!("{base}/api/in/vision"))
         .header("X-HI-Scene", "alice@phone")
         .header("Content-Type", "image/jpeg")
         .body(vec![0xFFu8, 0xD8, 0xFF, 0xD9]) // minimal JPEG-ish bytes
@@ -138,7 +138,7 @@ async fn all_sensory_stubs_return_501() {
 
     for ch in ["touch", "smell", "taste"] {
         let resp = client
-            .post(format!("{base}/api/{ch}"))
+            .post(format!("{base}/api/in/{ch}"))
             .header("X-HI-Scene", "alice@phone")
             .body("...")
             .send()
@@ -147,14 +147,14 @@ async fn all_sensory_stubs_return_501() {
         assert_eq!(
             resp.status(),
             reqwest::StatusCode::NOT_IMPLEMENTED,
-            "POST /api/{ch} should be 501"
+            "POST /api/in/{ch} should be 501"
         );
     }
 
-    // POST /api/audio with no STT configured: 501 with the new (capability-gated)
+    // POST /api/in/audio with no STT configured: 501 with the new (capability-gated)
     // body.
     let resp = client
-        .post(format!("{base}/api/audio"))
+        .post(format!("{base}/api/in/audio"))
         .header("X-HI-Scene", "alice@phone")
         .header("Content-Type", "audio/wav")
         .body(vec![0u8; 16])
@@ -199,7 +199,7 @@ async fn overlay_round_trips_post_to_get() {
 
     // Open the stream first so the subscriber exists before we POST.
     let mut resp = client
-        .get(format!("{base}/api/overlay"))
+        .get(format!("{base}/api/out/overlay"))
         .header("X-HI-Scene", "alice@phone")
         .send()
         .await
@@ -215,7 +215,7 @@ async fn overlay_round_trips_post_to_get() {
     tokio::time::sleep(Duration::from_millis(30)).await;
     let payload = r#"{"rects":[{"x":1,"y":2,"w":3,"h":4}]}"#;
     let post = client
-        .post(format!("{base}/api/overlay"))
+        .post(format!("{base}/api/out/overlay"))
         .header("X-HI-Scene", "alice@phone")
         .header("Content-Type", "application/json")
         .body(payload)
@@ -239,7 +239,7 @@ async fn overlay_scene_mismatch_receives_nothing() {
     let client = reqwest::Client::new();
 
     let mut resp = client
-        .get(format!("{base}/api/overlay"))
+        .get(format!("{base}/api/out/overlay"))
         .header("X-HI-Scene", "alice@phone")
         .send()
         .await
@@ -248,7 +248,7 @@ async fn overlay_scene_mismatch_receives_nothing() {
 
     tokio::time::sleep(Duration::from_millis(30)).await;
     let post = client
-        .post(format!("{base}/api/overlay"))
+        .post(format!("{base}/api/out/overlay"))
         .header("X-HI-Scene", "bob@tv") // different scene
         .body("{}")
         .send()
@@ -266,7 +266,7 @@ async fn overlay_scene_mismatch_receives_nothing() {
 
 #[tokio::test]
 async fn vision_get_receives_posted_frame() {
-    // GET /api/vision is the read side of the input channel: one frame per
+    // GET /api/in/vision is the read side of the input channel: one frame per
     // scene-filtered long-poll response, carrying the frame's Content-Type.
     let (base, _dir, _seams) = spawn_server().await;
     let client = reqwest::Client::new();
@@ -277,7 +277,7 @@ async fn vision_get_receives_posted_frame() {
     let getter = tokio::spawn(async move {
         let c = reqwest::Client::new();
         let resp = c
-            .get(format!("{get_base}/api/vision"))
+            .get(format!("{get_base}/api/in/vision"))
             .header("X-HI-Scene", "alice@phone")
             .send()
             .await
@@ -295,7 +295,7 @@ async fn vision_get_receives_posted_frame() {
     tokio::time::sleep(Duration::from_millis(80)).await;
     let frame = vec![0xFFu8, 0xD8, 0xFF, 0xD9];
     let post = client
-        .post(format!("{base}/api/vision"))
+        .post(format!("{base}/api/in/vision"))
         .header("X-HI-Scene", "alice@phone")
         .header("Content-Type", "image/jpeg")
         .body(frame.clone())

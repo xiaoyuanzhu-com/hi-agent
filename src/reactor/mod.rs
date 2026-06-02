@@ -13,7 +13,7 @@
 //!
 //! 1. **Commit-after-quiet.** A finalized utterance does not immediately make
 //!    the agent reply. The human often speaks in bursts; each burst arrives as
-//!    its own inbound signal (one VAD-segmented `POST /api/audio`), and the mind
+//!    its own inbound signal (one segmented utterance over `/api/in/audio`), and the mind
 //!    waits until no new signal has landed for a short settle before it
 //!    responds, absorbing every burst in the meantime into one consolidated
 //!    prompt. The cost is a little latency; the win is that the agent doesn't
@@ -713,7 +713,7 @@ async fn run_turn(
             emit_thought_chunk(reactor, scene, spoken_tail).await;
         }
         if !full_reply.trim().is_empty() {
-            crate::channel_log::outbound(Channel::Thought, scene, full_reply.trim());
+            crate::channel_log::outbound(Channel::Text, scene, full_reply.trim());
         }
         if let Some(tx) = &synth_tx {
             if let Some(tail) = splitter.flush() {
@@ -795,7 +795,7 @@ async fn emit_thought_chunk(reactor: &Reactor, scene: &Scene, text: String) {
     let ts = Utc::now();
     let entry = JournalEntry::SignalOut {
         ts,
-        channel: Channel::Thought,
+        channel: Channel::Text,
         scene: scene.clone(),
         body: text.clone(),
         media_path: None,

@@ -5,19 +5,19 @@ import react from "@vitejs/plugin-react";
 // human-interface channel route — all under `/api/*` — to the Rust server on
 // :8080.
 //
-// The proxy MUST NOT buffer: /api/thought is a long-poll endpoint where the
-// response body trickles in and body-close ends the utterance. http-proxy
-// streams by default (selfHandleResponse stays false). We disable timeouts so a
-// quiet long-poll is not killed mid-flight.
+// The proxy MUST NOT buffer: /api/out/text (and the /api/in/* observe streams)
+// are long-poll/streaming endpoints where the body trickles in and body-close
+// ends the utterance. http-proxy streams by default (selfHandleResponse stays
+// false). We disable timeouts so a quiet long-poll is not killed mid-flight.
 const proxy = Object.fromEntries(
   ["/api"].map((path) => [
     path,
     {
       target: "http://127.0.0.1:8080",
       changeOrigin: false,
-      // /api/audio/in is a WebSocket (continuous mic → STT). Without ws:true the
-      // proxy leaves the Upgrade handshake hanging and mic audio never reaches
-      // the backend. Regular long-poll HTTP proxying is unaffected by this flag.
+      // /api/in/audio/stream is a WebSocket (continuous mic → STT). Without
+      // ws:true the proxy leaves the Upgrade handshake hanging and mic audio
+      // never reaches the backend. Regular HTTP proxying is unaffected by this.
       ws: true,
       // Streaming-friendly: do not buffer, do not give up.
       proxyTimeout: 0,

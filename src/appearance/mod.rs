@@ -13,7 +13,7 @@
 //!
 //! Step 1's server module is expected to mount this router at `/` after
 //! attaching all channel routes; axum matches more specific routes first, so
-//! `/thought` and friends keep working.
+//! `/api/in/*` and `/api/out/*` and friends keep working.
 //!
 //! ## Coordination with Step 1
 //!

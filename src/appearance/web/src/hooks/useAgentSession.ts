@@ -1,8 +1,10 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
-import { subscribeThought, postThought } from "../channels/thought";
-import { subscribeAudioTurns } from "../channels/audio";
-import { postVision } from "../channels/vision";
-import { subscribeSurface, type SurfaceEnvelope } from "../channels/surface";
+import { subscribeOutText } from "../channels/out/text";
+import { subscribeAudioTurns } from "../channels/out/audio";
+import { subscribeSurface, type SurfaceEnvelope } from "../channels/out/surface";
+import { postInText, subscribeInText } from "../channels/in/text";
+import { subscribeInAudio } from "../channels/in/audio";
+import { postVision } from "../channels/in/vision";
 import { AudioBus } from "../lib/audioBus";
 import { ActivityMeter } from "../lib/activityMeter";
 import { AudioStreamer } from "../lib/audioStreamer";
@@ -15,6 +17,9 @@ import type { SpeechItem } from "../ui/SpeechText";
 
 // How many recent sentences stay on screen (calm, 1–2 at a time).
 const SENTENCE_WINDOW = 2;
+// Reserved id marking the user's live, in-progress line so React updates it in
+// place across partials. Real lines use positive ids from sentenceIdRef.
+const LIVE_USER_LINE_ID = -1;
 
 // ---- Channel preferences (persisted client-side) -------------------------
 // The user's chosen on/off state for each channel, remembered across visits in
@@ -97,17 +102,20 @@ export interface AgentSession {
 
 /**
  * The coordinator — deliberately a *dumb face*. After the wake gesture it owns
- * the input channels (mic → /api/audio, one VAD-segmented WAV per utterance;
- * camera → /api/vision, a frame every couple seconds) and subscribes to the
- * output channels, rendering whatever arrives: /api/audio clips play on arrival,
- * /api/thought chunks fade in as whole sentences.
+ * the input channels (mic → /api/in/audio/stream, continuous PCM; camera →
+ * /api/in/vision, a frame every couple seconds) and subscribes to every channel
+ * on both boundaries, rendering whatever arrives: /api/out/audio plays on
+ * arrival, /api/out/text chunks fade in as whole sentences, and the user's own
+ * recognized words (/api/in/audio) and typed lines (/api/in/text) render the
+ * same way — sourced from the observe streams so every client in the scene shows
+ * identical UI, whether or not it holds the mic.
  *
  * Crucially it does NOT decide turns. Turn-taking — when the agent speaks, which
  * drafts to suppress — lives in the mind (the reactor), which commits after the
  * inbound signal stream goes quiet. The face contributes exactly one output-side
- * behavior: a local **barge-in reflex**, muting the speaker the instant its own
- * mic goes hot (don't talk over the human, don't play into a hot mic).
- * Everything else is pass-through: the input channels just stream the signal.
+ * behavior: a **barge-in reflex**, muting the speaker the instant any mic in the
+ * scene goes hot (don't talk over the human). It is now scene-wide — driven by
+ * the /api/in/audio observe stream — so every client ducks together.
  */
 export function useAgentSession(): AgentSession {
   const scene = useMemo(() => getScene(), []);
@@ -136,6 +144,9 @@ export function useAgentSession(): AgentSession {
   const [audioOutput, setAudioOutput] = useState(prefsRef.current.audioOutput);
   const [textInput, setTextInput] = useState(prefsRef.current.textInput);
   const [userSpeaking, setUserSpeaking] = useState(false);
+  // The user's in-progress utterance: a rolling partial transcript shown live,
+  // null when nothing is being recognized. Folded into `sentences` on final.
+  const [userLive, setUserLive] = useState<string | null>(null);
   const [agentStreaming, setAgentStreaming] = useState(false);
   const [awaiting, setAwaiting] = useState(false);
   const [ttsPlaying, setTtsPlaying] = useState(false);
@@ -155,7 +166,24 @@ export function useAgentSession(): AgentSession {
   // the Presence pulses with the agent's real output rate (not a canned loop).
   const activityRef = useRef(new ActivityMeter());
 
-  // ---- GET /thought subscription loop (after wake) -----------------------
+  // Fold a settled user line (recognized speech or a typed line) into the
+  // timeline, clearing any live rolling line and marking the agent as thinking
+  // until its reply streams in. Both input-observe loops below funnel here, so
+  // user speech and user text render identically.
+  const finalizeUser = useCallback((text: string) => {
+    const trimmed = text.trim();
+    setUserLive(null);
+    if (!trimmed) return;
+    sentenceIdRef.current += 1;
+    const item: SpeechItem = { id: sentenceIdRef.current, text: trimmed, speaker: "user" };
+    setSentences((prev) => {
+      const next = [...prev, item];
+      return next.length > SENTENCE_WINDOW ? next.slice(next.length - SENTENCE_WINDOW) : next;
+    });
+    setAwaiting(true);
+  }, []);
+
+  // ---- GET /out/text subscription loop (after wake) ----------------------
   useEffect(() => {
     if (!woken) return;
     const ctrl = new AbortController();
@@ -183,7 +211,7 @@ export function useAgentSession(): AgentSession {
           // Render the agent's words as they arrive. The mind only streams a
           // reply once it has committed to speaking (the human yielded the
           // floor), so there are no superseded drafts to untangle here.
-          for await (const chunk of subscribeThought({ scene, signal: ctrl.signal })) {
+          for await (const chunk of subscribeOutText({ scene, signal: ctrl.signal })) {
             if (cancelled) break;
             setOffline(false);
             if (!gotChunk) {
@@ -213,7 +241,7 @@ export function useAgentSession(): AgentSession {
     };
   }, [woken, scene]);
 
-  // ---- GET /audio subscription loop (Phase 2: TTS playback) --------------
+  // ---- GET /out/audio subscription loop (TTS playback) -------------------
   // Pure render: each response is one turn's continuous audio. Stream its body
   // straight into the player as it arrives — no clip queue. The mind only puts
   // speech on the wire once it has committed to it, so there's nothing to gate
@@ -290,6 +318,73 @@ export function useAgentSession(): AgentSession {
     };
   }, [woken, scene]);
 
+  // ---- GET /in/audio observe loop: the user's recognized speech ----------
+  // Sourced from the scene's observe stream, not the local mic socket, so a
+  // reader with no mic sees the speaker's words too. Partials roll the live
+  // line; finals settle it. Any recognized speech ducks the agent's voice
+  // (scene-wide barge-in) and lifts the presence to "listening".
+  useEffect(() => {
+    if (!woken) return;
+    const ctrl = new AbortController();
+    let cancelled = false;
+    void (async () => {
+      while (!cancelled) {
+        try {
+          for await (const ev of subscribeInAudio({ scene, signal: ctrl.signal })) {
+            if (cancelled) break;
+            setOffline(false);
+            const heard = ev.text.trim().length > 0;
+            if (heard) {
+              voiceRef.current?.stop();
+              setUserSpeaking(true);
+            }
+            if (ev.final) {
+              setUserSpeaking(false);
+              if (heard) finalizeUser(ev.text);
+              else setUserLive(null);
+            } else if (heard) {
+              setUserLive(ev.text);
+            }
+          }
+        } catch {
+          if (cancelled || ctrl.signal.aborted) break;
+          await new Promise((r) => setTimeout(r, 1500));
+        }
+      }
+    })();
+    return () => {
+      cancelled = true;
+      ctrl.abort();
+    };
+  }, [woken, scene, finalizeUser]);
+
+  // ---- GET /in/text observe loop: typed lines (this client or another) ---
+  // Typed input is echoed by the server and rendered here, the same as speech,
+  // so the conversation reads uniformly across every client in the scene.
+  useEffect(() => {
+    if (!woken) return;
+    const ctrl = new AbortController();
+    let cancelled = false;
+    void (async () => {
+      while (!cancelled) {
+        try {
+          for await (const ev of subscribeInText({ scene, signal: ctrl.signal })) {
+            if (cancelled) break;
+            setOffline(false);
+            if (ev.final && ev.text.trim().length > 0) finalizeUser(ev.text);
+          }
+        } catch {
+          if (cancelled || ctrl.signal.aborted) break;
+          await new Promise((r) => setTimeout(r, 1500));
+        }
+      }
+    })();
+    return () => {
+      cancelled = true;
+      ctrl.abort();
+    };
+  }, [woken, scene, finalizeUser]);
+
   // ---- audio-input channel: acquire/release the mic (and vision) ---------
   // Independent of the session itself — text and audio are coequal input
   // channels, each freely toggled on or off. Enabling needs the session's
@@ -305,26 +400,10 @@ export function useAgentSession(): AgentSession {
       audioBus.attachMic(micNode);
 
       // Passthrough: stream every mic frame to the backend; the upstream STT
-      // segments and transcribes. No client-side VAD. Barge-in and UI state are
-      // driven by recognized text, not raw mic energy — so we never falsely
-      // mute the agent.
-      const streamer = await AudioStreamer.create(audioBus.ctx, micNode, {
-        scene,
-        onTranscript: ({ text, isFinal }) => {
-          const heard = text.trim().length > 0;
-          if (heard) {
-            // First real recognized speech ducks the speaker — the face's only
-            // output decision; whether/what to say next is the mind's call.
-            voiceRef.current?.stop();
-            setUserSpeaking(true);
-          }
-          if (isFinal && heard) {
-            // Utterance finalized and dispatched server-side; show "thinking".
-            setUserSpeaking(false);
-            setAwaiting(true);
-          }
-        },
-      });
+      // segments and transcribes. No client-side VAD. The socket is upload-only
+      // — recognized speech (display + barge-in) arrives on the /in/audio observe
+      // loop above, so even this client reads its own words from there.
+      const streamer = await AudioStreamer.create(audioBus.ctx, micNode, { scene });
       micStreamRef.current = stream;
       micRef.current = streamer;
       setAudioError(null);
@@ -346,6 +425,7 @@ export function useAgentSession(): AgentSession {
     micStreamRef.current?.getTracks().forEach((t) => t.stop());
     micStreamRef.current = null;
     setUserSpeaking(false);
+    setUserLive(null);
     setAudioInput(false);
   }, []);
 
@@ -402,7 +482,7 @@ export function useAgentSession(): AgentSession {
 
   // ---- voice output channel: mute/unmute the agent's TTS -----------------
   // Independent of everything else — silencing the voice leaves the agent's
-  // words flowing as text on /thought.
+  // words flowing as text on /out/text.
   const toggleAudioOutput = useCallback(() => {
     setAudioOutput((on) => {
       const next = !on;
@@ -526,9 +606,10 @@ export function useAgentSession(): AgentSession {
     (text: string) => {
       const trimmed = text.trim();
       if (!trimmed) return;
-      // SpeechText shows the agent's words only; the typed line isn't echoed there.
+      // The server echoes the line back on /in/text, where the observe loop folds
+      // it into the timeline as a user line — so we don't add it locally.
       setAwaiting(true);
-      postThought({ scene, body: trimmed }).catch(() => setAwaiting(false));
+      postInText({ scene, body: trimmed }).catch(() => setAwaiting(false));
     },
     [scene],
   );
@@ -561,13 +642,15 @@ export function useAgentSession(): AgentSession {
   // The content overlay dims/demotes the presence — more for full-screen.
   const demote = activeSurface ? (activeSurface.mode === "full" ? 1 : 0.72) : 0;
 
-  // Render the agent's recent words, windowed to keep the display calm. (User
-  // speech isn't shown as text for now — that feature is deferred.)
+  // Render the settled timeline plus the user's in-progress line (if any),
+  // windowed to keep the display calm.
   const displaySentences = useMemo<SpeechItem[]>(() => {
-    return sentences.length > SENTENCE_WINDOW
-      ? sentences.slice(sentences.length - SENTENCE_WINDOW)
-      : sentences;
-  }, [sentences]);
+    const base =
+      userLive !== null
+        ? [...sentences, { id: LIVE_USER_LINE_ID, text: userLive, speaker: "user" as const, pending: true }]
+        : sentences;
+    return base.length > SENTENCE_WINDOW ? base.slice(base.length - SENTENCE_WINDOW) : base;
+  }, [sentences, userLive]);
 
   return {
     state,

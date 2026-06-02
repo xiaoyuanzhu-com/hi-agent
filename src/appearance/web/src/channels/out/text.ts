@@ -1,7 +1,7 @@
-// Subscriber for the human-interface /thought channel.
+// Subscriber for the outbound text channel — the agent's worded reply.
 //
 // Spec rules we obey here:
-//   * GET /thought is a long-poll. The server holds the response open and
+//   * GET /api/out/text is a long-poll. The server holds the response open and
 //     streams body bytes as the agent emits. Body-close ends the utterance.
 //   * X-HI-Scene names the scene we want to receive on (i.e. "stream me this
 //     scene's output"). Without it the server can't key the right mailbox.
@@ -10,7 +10,7 @@
 // The function is an async generator: each yielded string is a UTF-8 chunk
 // of one in-flight utterance. The generator returns when the body closes.
 
-export interface ThoughtChunk {
+export interface TextChunk {
   /** The chunk of text the server just emitted. */
   text: string;
 }
@@ -23,15 +23,15 @@ export interface SubscribeOpts {
 }
 
 /**
- * Open one long-poll against /thought. Yields each chunk of text as it arrives.
- * Resolves (returns) when the server closes the body — i.e. the utterance ended.
- * Throws if the request fails or is aborted; callers should treat AbortError
- * as a normal shutdown.
+ * Open one long-poll against /api/out/text. Yields each chunk of text as it
+ * arrives. Resolves (returns) when the server closes the body — i.e. the
+ * utterance ended. Throws if the request fails or is aborted; callers should
+ * treat AbortError as a normal shutdown.
  */
-export async function* subscribeThought(
+export async function* subscribeOutText(
   opts: SubscribeOpts,
-): AsyncGenerator<ThoughtChunk, void, void> {
-  const res = await fetch("/api/thought", {
+): AsyncGenerator<TextChunk, void, void> {
+  const res = await fetch("/api/out/text", {
     method: "GET",
     headers: {
       "X-HI-Scene": opts.scene,
@@ -43,7 +43,7 @@ export async function* subscribeThought(
   });
 
   if (!res.ok) {
-    throw new Error(`/thought subscribe failed: ${res.status} ${res.statusText}`);
+    throw new Error(`/api/out/text subscribe failed: ${res.status} ${res.statusText}`);
   }
 
   // Some servers (or proxies) may return a non-streaming body. fall through:
@@ -70,32 +70,5 @@ export async function* subscribeThought(
     } catch {
       // ignore
     }
-  }
-}
-
-/**
- * Send a /thought signal to the agent.
- * Returns when the server has accepted the body (202).
- */
-export async function postThought(opts: {
-  scene: string;
-  body: string;
-  signal?: AbortSignal;
-}): Promise<void> {
-  const res = await fetch("/api/thought", {
-    method: "POST",
-    headers: {
-      "Content-Type": "text/plain; charset=utf-8",
-      "X-HI-Scene": opts.scene,
-    },
-    body: opts.body,
-    signal: opts.signal,
-  });
-
-  if (!res.ok) {
-    const detail = await res.text().catch(() => "");
-    throw new Error(
-      `/thought POST failed: ${res.status} ${res.statusText}${detail ? ` — ${detail}` : ""}`,
-    );
   }
 }
