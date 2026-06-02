@@ -33,9 +33,11 @@ function eventDetail(d: SessionEvent): string {
     case "session_closed":
       return `${s("kind")} ${s("id").slice(0, 12)} closed`;
     case "turn_started":
-      return `turn ${s("turn")}`;
-    case "turn_finished":
-      return `turn ${s("turn")} → ${s("stop_reason") || "?"} (${s("reply_chars")} chars)`;
+      return s("input") ? `turn ${s("turn")} ◂ ${s("input")}` : `turn ${s("turn")}`;
+    case "turn_finished": {
+      const head = `turn ${s("turn")} → ${s("stop_reason") || "?"} (${s("reply_chars")} chars)`;
+      return s("reply") ? `${head}\n▸ ${s("reply")}` : head;
+    }
     case "hot_swap":
       return `${s("old_id").slice(0, 8)} → ${s("new_id").slice(0, 8)} · brief ${s("briefing_chars")}`;
     case "worker_spawned":

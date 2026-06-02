@@ -527,7 +527,10 @@ async fn run_turn(
     reactor
         .inner
         .observatory
-        .record(scene, EventKind::TurnStarted { turn: turn_id })
+        .record(
+            scene,
+            EventKind::TurnStarted { turn: turn_id, input: preview(&render_batch(batch)) },
+        )
         .await;
 
     // What the delegated workers are doing right now, so the live session can
@@ -739,6 +742,7 @@ async fn run_turn(
                     turn: turn_id,
                     stop_reason,
                     reply_chars: full_reply.chars().count(),
+                    reply: preview(&full_reply),
                 },
             )
             .await;
@@ -827,6 +831,19 @@ fn join_sections(sections: &[&str]) -> String {
         .filter(|s| !s.is_empty())
         .collect::<Vec<_>>()
         .join("\n\n")
+}
+
+/// Cap a message at a sane length for an observatory event. The session log is
+/// a developer view, not a transcript store; a long reply is truncated with an
+/// ellipsis rather than streaming kilobytes through the SSE feed and the ring.
+fn preview(s: &str) -> String {
+    const MAX: usize = 2000;
+    let s = s.trim();
+    if s.chars().count() <= MAX {
+        return s.to_string();
+    }
+    let head: String = s.chars().take(MAX).collect();
+    format!("{head}…")
 }
 
 fn render_batch(batch: &[LoopInput]) -> String {

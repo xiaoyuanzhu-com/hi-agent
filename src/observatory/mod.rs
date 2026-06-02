@@ -155,8 +155,12 @@ pub enum EventKind {
     ProcessRestarted,
     SessionOpened { kind: SessionKind, id: String },
     SessionClosed { kind: SessionKind, id: String },
-    TurnStarted { turn: u64 },
-    TurnFinished { turn: u64, stop_reason: Option<String>, reply_chars: usize },
+    /// `input` is the human-readable incoming message(s) for this turn — the new
+    /// signals batch (human utterances, worker reports, fired alarms), not the
+    /// full seeded prompt.
+    TurnStarted { turn: u64, input: String },
+    /// `reply` is the agent's spoken text for this turn (markers stripped).
+    TurnFinished { turn: u64, stop_reason: Option<String>, reply_chars: usize, reply: String },
     BargeIn,
     HotSwap { old_id: String, new_id: String, briefing_chars: usize },
     WorkerSpawned { id: u64, task: String },
@@ -308,7 +312,7 @@ impl Observatory {
                 // Reactor close is rare (only error teardown); workers are removed
                 // on WorkerFinished. Nothing to do for the summarizer.
             }
-            EventKind::TurnStarted { turn } => {
+            EventKind::TurnStarted { turn, .. } => {
                 if let Some(s) = view.reactor_session.as_mut() {
                     s.in_flight = true;
                 }
@@ -320,7 +324,7 @@ impl Observatory {
                     reply_chars: None,
                 });
             }
-            EventKind::TurnFinished { turn, stop_reason, reply_chars } => {
+            EventKind::TurnFinished { turn, stop_reason, reply_chars, .. } => {
                 if let Some(s) = view.reactor_session.as_mut() {
                     s.in_flight = false;
                     s.turns += 1;
@@ -468,7 +472,7 @@ mod tests {
             EventKind::SessionOpened { kind: SessionKind::Reactor, id: "sess-1".into() },
         )
         .await;
-        obs.record(&s, EventKind::TurnStarted { turn: 0 }).await;
+        obs.record(&s, EventKind::TurnStarted { turn: 0, input: "hi".into() }).await;
 
         let snap = obs.snapshot().await;
         assert_eq!(snap.len(), 1);
@@ -480,7 +484,12 @@ mod tests {
 
         obs.record(
             &s,
-            EventKind::TurnFinished { turn: 0, stop_reason: Some("end_turn".into()), reply_chars: 42 },
+            EventKind::TurnFinished {
+                turn: 0,
+                stop_reason: Some("end_turn".into()),
+                reply_chars: 42,
+                reply: "hello there".into(),
+            },
         )
         .await;
         let v = &obs.snapshot().await[0];
