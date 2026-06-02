@@ -50,9 +50,9 @@ mod workers;
 
 pub use outbound::OutboundSignal;
 
-use chrono::Utc;
+use chrono::{DateTime, Utc};
 use tokio::sync::{Mutex, mpsc};
-use tokio::time::timeout;
+use tokio::time::{Instant, sleep_until, timeout};
 use uuid::Uuid;
 
 use crate::acp::{AcpSession, SessionOpts, SessionUpdate};
@@ -106,7 +106,17 @@ see its result under \"New signals\" to fold into what you say next. Delegate \
 markers are never spoken — keep talking to them naturally around them \
 (\"let me dig into that, give me a moment\"). Do quick, simple things yourself; \
 delegate only what genuinely needs the time. A \"Working sessions\" section, \
-when present, shows what your delegated workers are doing right now.";
+when present, shows what your delegated workers are doing right now.\n\
+\n\
+You can also wake yourself up later. When something should be revisited after a \
+delay — a reminder you promised, checking back if they've gone quiet, any \
+time-based follow-up — schedule it between alarm markers: `[[alarm]] 20m see if \
+they actually got up [[/alarm]]`. The delay comes first (seconds, or a number \
+with an s/m/h suffix like `30s`, `20m`, `1h`), then a short note to your future \
+self. Alarm markers are never spoken. When an alarm fires you'll be woken with \
+its note under \"New signals\" as `(alarm) \"…\"`, even if nothing else has \
+happened — look at the situation as it is then and decide what to do. Waking up \
+is not a reason to talk: if nothing is actually needed, say nothing at all.";
 
 const SCENE_QUEUE_CAPACITY: usize = 64;
 
@@ -119,6 +129,105 @@ const SCENE_QUEUE_CAPACITY: usize = 64;
 enum LoopInput {
     Human(Signal),
     Worker(workers::WorkerReport),
+    /// A self-scheduled wake firing. The mind asked for it earlier with an
+    /// `[[alarm]]` marker; when its deadline passes the loop injects this so a
+    /// turn runs even though no new signal arrived.
+    Alarm(AlarmFired),
+}
+
+/// One fired self-alarm, handed to the mind under "New signals".
+struct AlarmFired {
+    /// Wall-clock time it fired, for rendering alongside other batch entries.
+    at: DateTime<Utc>,
+    /// The note the mind left its future self ("check if they're still asleep").
+    note: String,
+}
+
+/// A scene loop's pending self-alarms. The scene wakes for one of two reasons —
+/// a new signal, or the soonest of these firing. Only the mind schedules them,
+/// by emitting `[[alarm]]` markers. A flat Vec is plenty: a scene has at most a
+/// handful pending at once.
+struct Alarms {
+    pending: Vec<PendingAlarm>,
+}
+
+struct PendingAlarm {
+    fire_at: Instant,
+    note: String,
+}
+
+impl Alarms {
+    fn new() -> Self {
+        Self { pending: Vec::new() }
+    }
+
+    /// Register a wake `delay` from `now` carrying `note`.
+    fn schedule(&mut self, delay: Duration, note: String, now: Instant) {
+        self.pending.push(PendingAlarm { fire_at: now + delay, note });
+    }
+
+    /// The soonest pending deadline, or `None` if nothing is scheduled — the
+    /// loop then blocks on the inbound queue with no timer arm at all.
+    fn next_deadline(&self) -> Option<Instant> {
+        self.pending.iter().map(|a| a.fire_at).min()
+    }
+
+    /// Remove and return every alarm whose deadline has passed by `now`.
+    fn take_due(&mut self, now: Instant) -> Vec<AlarmFired> {
+        let at = Utc::now();
+        let mut fired = Vec::new();
+        let mut i = 0;
+        while i < self.pending.len() {
+            if self.pending[i].fire_at <= now {
+                let a = self.pending.swap_remove(i);
+                fired.push(AlarmFired { at, note: a.note });
+            } else {
+                i += 1;
+            }
+        }
+        fired
+    }
+}
+
+const OPEN_ALARM: &str = "[[alarm]]";
+const CLOSE_ALARM: &str = "[[/alarm]]";
+
+/// Parse an `[[alarm]]` delay token: a bare integer is seconds, or an integer
+/// with an `s`/`m`/`h` suffix (`30s`, `20m`, `1h`). `None` for anything
+/// unparseable, so a malformed alarm is dropped rather than firing at a wrong
+/// time.
+fn parse_delay(tok: &str) -> Option<Duration> {
+    let tok = tok.trim();
+    let (digits, mult) = if let Some(n) = tok.strip_suffix(|c| c == 's' || c == 'S') {
+        (n, 1)
+    } else if let Some(n) = tok.strip_suffix(|c| c == 'm' || c == 'M') {
+        (n, 60)
+    } else if let Some(n) = tok.strip_suffix(|c| c == 'h' || c == 'H') {
+        (n, 3600)
+    } else {
+        (tok, 1)
+    };
+    let n: u64 = digits.trim().parse().ok()?;
+    Some(Duration::from_secs(n.saturating_mul(mult)))
+}
+
+/// Parse one `[[alarm]]` block body — `"<delay> <note>"` — and register it: the
+/// first whitespace-delimited token is the delay, the rest is the note. A block
+/// whose delay won't parse is logged and dropped.
+fn schedule_alarm(alarms: &mut Alarms, scene: &Scene, block: &str) {
+    let (delay_tok, note) = match block.split_once(char::is_whitespace) {
+        Some((d, rest)) => (d, rest.trim()),
+        None => (block, ""),
+    };
+    match parse_delay(delay_tok) {
+        Some(delay) => {
+            alarms.schedule(delay, note.to_owned(), Instant::now());
+            tracing::info!(scene = %scene, delay_s = delay.as_secs(), note = %note, "alarm scheduled");
+        }
+        None => {
+            tracing::warn!(scene = %scene, token = %delay_tok, "ignoring [[alarm]] with unparseable delay");
+        }
+    }
 }
 
 #[derive(Clone)]
@@ -256,15 +365,45 @@ async fn per_scene_loop(
     // delegates runs here; workers post progress and results back through
     // `worker_inbound` into this same loop.
     let mut workers = workers::WorkerRegistry::new(scene.clone(), worker_inbound);
+    // Self-alarms the mind has scheduled. They give the loop a second reason to
+    // wake — time passing — on top of an incoming signal; see the `select!` below.
+    let mut alarms = Alarms::new();
     loop {
-        let first = match inbound.recv().await {
-            Some(s) => s,
-            None => {
-                tracing::info!(scene = %scene, "per-scene inbound closed; exiting loop");
-                return;
+        // Wait for the first reason to wake: a new signal, or — when the mind has
+        // set alarms — the soonest firing. An alarm wake injects synthetic batch
+        // items so a turn runs even with no new signal; the mind then looks at the
+        // situation and decides what to do (including nothing).
+        let mut batch: Vec<LoopInput> = Vec::new();
+        match alarms.next_deadline() {
+            Some(deadline) => {
+                tokio::select! {
+                    recvd = inbound.recv() => match recvd {
+                        Some(s) => batch.push(s),
+                        None => {
+                            tracing::info!(scene = %scene, "per-scene inbound closed; exiting loop");
+                            return;
+                        }
+                    },
+                    _ = sleep_until(deadline) => {
+                        for fired in alarms.take_due(Instant::now()) {
+                            batch.push(LoopInput::Alarm(fired));
+                        }
+                    }
+                }
             }
-        };
-        let mut batch: Vec<LoopInput> = vec![first];
+            None => match inbound.recv().await {
+                Some(s) => batch.push(s),
+                None => {
+                    tracing::info!(scene = %scene, "per-scene inbound closed; exiting loop");
+                    return;
+                }
+            },
+        }
+
+        // A timer can resolve with nothing actually due; don't run an empty turn.
+        if batch.is_empty() {
+            continue;
+        }
 
         // Commit-after-quiet: wait for things to settle before replying. Keep
         // absorbing utterances; each one that lands resets the wait. When the
@@ -287,7 +426,7 @@ async fn per_scene_loop(
         // Forget any workers that have finished, so the registry doesn't grow.
         workers.reap();
 
-        match run_turn(&reactor, &scene, &batch, &in_flight, &mut reactor_session, &mut budget, &mut workers).await {
+        match run_turn(&reactor, &scene, &batch, &in_flight, &mut reactor_session, &mut budget, &mut workers, &mut alarms).await {
             Ok(()) => {
                 // Between turns: if the live session has grown past budget, hot-swap
                 // it now. The human is consuming the reply just delivered, so the
@@ -339,6 +478,7 @@ async fn run_turn(
     reactor_session: &mut Option<Arc<AcpSession>>,
     budget: &mut heartbeat::ContextBudget,
     workers: &mut workers::WorkerRegistry,
+    alarms: &mut Alarms,
 ) -> anyhow::Result<()> {
     let turn_id = reactor.inner.turn_seq.fetch_add(1, Ordering::Relaxed);
 
@@ -409,6 +549,9 @@ async fn run_turn(
         // reactor delegates heavy work by naming a task inline, which spawns a
         // channel-mute working session and is NOT spoken to the scene.
         let mut delegate_extractor = MarkerExtractor::new(OPEN_DELEGATE, CLOSE_DELEGATE);
+        // Pulls `[[alarm]] <delay> <note> [[/alarm]]` blocks out of the reply: the
+        // mind scheduling its own future wake. Like delegate markers, never spoken.
+        let mut alarm_extractor = MarkerExtractor::new(OPEN_ALARM, CLOSE_ALARM);
         // Accumulate the spoken text so the whole reply is logged once at end of
         // turn on the `channel` stream, rather than per-chunk (which is noisy).
         let mut full_reply = String::new();
@@ -453,6 +596,12 @@ async fn run_turn(
                             tracing::warn!(scene = %scene, error = %err, "failed to spawn working session");
                         }
                     }
+                    // Then pull any `[[alarm]]` blocks — self-scheduled wakes,
+                    // also never spoken.
+                    let (spoken, alarm_blocks) = alarm_extractor.push(&spoken);
+                    for block in alarm_blocks {
+                        schedule_alarm(alarms, scene, &block);
+                    }
                     if !spoken.is_empty() {
                         full_reply.push_str(&spoken);
                         if let Some(tx) = &synth_tx {
@@ -485,6 +634,13 @@ async fn run_turn(
             if let Err(err) = workers.spawn(reactor, task).await {
                 tracing::warn!(scene = %scene, error = %err, "failed to spawn working session");
             }
+        }
+        // Drain the alarm extractor too, so an `[[alarm]]` that ended the reply
+        // still schedules.
+        let (mut spoken_tail, tail_alarms) = alarm_extractor.push(&spoken_tail);
+        spoken_tail.push_str(&alarm_extractor.flush());
+        for block in tail_alarms {
+            schedule_alarm(alarms, scene, &block);
         }
         if !spoken_tail.is_empty() {
             full_reply.push_str(&spoken_tail);
@@ -615,6 +771,10 @@ fn render_batch(batch: &[LoopInput]) -> String {
             }
             LoopInput::Worker(report) => {
                 let _ = writeln!(s, "{}", workers::render_report(report));
+            }
+            LoopInput::Alarm(a) => {
+                let ts = a.at.format("%H:%M:%S");
+                let _ = writeln!(s, "[{}] (alarm) \"{}\"", ts, a.note);
             }
         }
     }
@@ -997,5 +1157,54 @@ mod tests {
             s.push("你好。最近怎么样？"),
             vec!["你好。".to_string(), "最近怎么样？".to_string()]
         );
+    }
+}
+
+#[cfg(test)]
+mod alarm_tests {
+    use super::{Alarms, parse_delay};
+    use std::time::Duration;
+    use tokio::time::Instant;
+
+    #[test]
+    fn parse_delay_reads_units() {
+        assert_eq!(parse_delay("1200"), Some(Duration::from_secs(1200)));
+        assert_eq!(parse_delay("30s"), Some(Duration::from_secs(30)));
+        assert_eq!(parse_delay("20m"), Some(Duration::from_secs(1200)));
+        assert_eq!(parse_delay("1h"), Some(Duration::from_secs(3600)));
+        assert_eq!(parse_delay("  45  "), Some(Duration::from_secs(45)));
+    }
+
+    #[test]
+    fn parse_delay_rejects_garbage() {
+        assert_eq!(parse_delay("soon"), None);
+        assert_eq!(parse_delay(""), None);
+        assert_eq!(parse_delay("m"), None);
+    }
+
+    #[test]
+    fn fires_in_deadline_order_and_keeps_the_rest() {
+        let t0 = Instant::now();
+        let mut alarms = Alarms::new();
+        assert_eq!(alarms.next_deadline(), None);
+
+        alarms.schedule(Duration::from_secs(60), "later".into(), t0);
+        alarms.schedule(Duration::from_secs(10), "sooner".into(), t0);
+        assert_eq!(alarms.next_deadline(), Some(t0 + Duration::from_secs(10)));
+
+        // Nothing due before the soonest deadline.
+        assert!(alarms.take_due(t0 + Duration::from_secs(5)).is_empty());
+
+        // At 10s only "sooner" fires; the 60s one stays pending.
+        let fired = alarms.take_due(t0 + Duration::from_secs(10));
+        assert_eq!(fired.len(), 1);
+        assert_eq!(fired[0].note, "sooner");
+        assert_eq!(alarms.next_deadline(), Some(t0 + Duration::from_secs(60)));
+
+        // Past the last deadline the remaining one fires and the queue empties.
+        let fired = alarms.take_due(t0 + Duration::from_secs(120));
+        assert_eq!(fired.len(), 1);
+        assert_eq!(fired[0].note, "later");
+        assert_eq!(alarms.next_deadline(), None);
     }
 }
