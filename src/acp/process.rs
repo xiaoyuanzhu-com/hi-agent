@@ -71,6 +71,17 @@ impl AcpProcess {
             match direction {
                 acp::LineDirection::Stdin => tracing::trace!(target: "acp::send", "{line}"),
                 acp::LineDirection::Stdout => tracing::trace!(target: "acp::recv", "{line}"),
+                // The ACP adapter logs `Unexpected case: {...}` to stderr (via its
+                // `unreachable` fallback) for any stream message subtype it lacks an
+                // explicit case for. We capture every adapter stderr line and surface
+                // it as a WARN — but `thinking_tokens` is a benign, informational token
+                // estimate from a newer CLI than the adapter; treating it as "known,
+                // no-op" here keeps the warning channel meaningful for real issues.
+                acp::LineDirection::Stderr
+                    if line.contains("Unexpected case") && line.contains("thinking_tokens") =>
+                {
+                    tracing::trace!(target: "acp::stderr", "{line}")
+                }
                 acp::LineDirection::Stderr => tracing::warn!(target: "acp::stderr", "{line}"),
             }
         });
