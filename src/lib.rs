@@ -9,6 +9,7 @@ pub mod agent;
 pub mod appearance;
 pub mod channel_log;
 pub mod config;
+pub mod imagery;
 pub mod llm_proxy;
 pub mod memory;
 pub mod runtime;
