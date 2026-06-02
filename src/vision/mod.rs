@@ -13,7 +13,7 @@
 //! **No caller wires this in yet.** `POST /api/vision`
 //! ([`crate::server::vision`]) still only persists frames — it does not call a
 //! `Vision` provider, because journaling an understanding of every streamed
-//! frame would flood the per-peer snapshot. This module is the capability that a
+//! frame would flood the per-scene snapshot. This module is the capability that a
 //! future, deliberately-triggered perception path will call; it is built and
 //! tested standalone so that wiring it in later is purely additive.
 

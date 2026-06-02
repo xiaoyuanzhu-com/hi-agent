@@ -1,12 +1,12 @@
 //! POST /thought and GET /thought.
 //!
 //! GET /thought is a long-poll. The handler binds to the next buffered
-//! utterance for the subscriber's peer, holds the connection open, and streams
+//! utterance for the subscriber's scene, holds the connection open, and streams
 //! each chunk into the response body until the utterance completes. Closing the
 //! body is the spec's "end of utterance".
 //!
 //! Per the spec, a fresh GET re-subscribes for the next utterance. Because the
-//! [`ThoughtBus`](crate::server::ThoughtBus) buffers per peer, a reply produced
+//! [`ThoughtBus`](crate::server::ThoughtBus) buffers per scene, a reply produced
 //! between polls (or before the first poll) is retained for the next GET rather
 //! than lost — see that module for the race this fixes.
 
@@ -19,13 +19,12 @@ use axum::response::{IntoResponse, Response};
 use chrono::Utc;
 
 use crate::server::AppState;
-use crate::server::headers::{AuthBearer, PeerHeader, ToHeader};
+use crate::server::headers::{AuthBearer, RequiredScene, SceneHeader};
 use crate::types::{Channel, JournalEntry, Signal};
 
 pub async fn post_thought(
     State(state): State<Arc<AppState>>,
-    PeerHeader(from): PeerHeader,
-    ToHeader(to): ToHeader,
+    SceneHeader(scene): SceneHeader,
     AuthBearer(auth): AuthBearer,
     body: Bytes,
 ) -> impl IntoResponse {
@@ -38,25 +37,23 @@ pub async fn post_thought(
 
     let signal = Signal {
         channel: Channel::Thought,
-        from: from.clone(),
-        to: to.clone(),
+        scene: scene.clone(),
         body: body_str,
         ts: Utc::now(),
     };
 
     tracing::info!(
-        from = %from,
-        to = ?to,
+        scene = %scene,
         auth = ?auth,
         len = signal.body.len(),
         "POST /thought"
     );
-    crate::channel_log::inbound(Channel::Thought, &from, &signal.body);
+    crate::channel_log::inbound(Channel::Thought, &scene, &signal.body);
 
     let entry = JournalEntry::SignalIn {
         ts: signal.ts,
         channel: signal.channel,
-        from: signal.from.clone(),
+        scene: signal.scene.clone(),
         body: signal.body.clone(),
         media_path: None,
     };
@@ -74,23 +71,12 @@ pub async fn post_thought(
 
 pub async fn get_thought(
     State(state): State<Arc<AppState>>,
-    ToHeader(subscriber): ToHeader,
+    RequiredScene(scene): RequiredScene,
     AuthBearer(auth): AuthBearer,
 ) -> Response {
-    // A reader drains one peer's mailbox, so it must say who it is. The spec
-    // has the subscriber identify themselves via X-HI-To; without it we can't
-    // route the buffered reply.
-    let Some(peer) = subscriber else {
-        return (
-            StatusCode::BAD_REQUEST,
-            "GET /thought requires X-HI-To to name the subscribing peer\n",
-        )
-            .into_response();
-    };
+    tracing::info!(scene = %scene, auth = ?auth, "GET /thought long-poll opened");
 
-    tracing::info!(subscriber = %peer, auth = ?auth, "GET /thought long-poll opened");
-
-    let stream = state.thought_bus.subscribe(peer);
+    let stream = state.thought_bus.subscribe(scene);
 
     Response::builder()
         .status(StatusCode::OK)

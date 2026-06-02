@@ -10,7 +10,7 @@ pub mod media;
 pub mod snapshot;
 
 pub use journal::Journal;
-pub use snapshot::{Snapshot, build_for_peer};
+pub use snapshot::{Snapshot, build_for_scene};
 
 const JOURNAL_FILE: &str = "journal.jsonl";
 

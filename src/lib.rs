@@ -61,7 +61,7 @@ pub async fn run(config: Config) -> anyhow::Result<()> {
     config.agent.render_settings_json(&claude_config_dir)?;
 
     // Spawn config for the agent session layer. The subprocess itself is spawned
-    // lazily, one per peer, on that peer's first session (Chrome-style isolation);
+    // lazily, one per scene, on that scene's first session (Chrome-style isolation);
     // the pinned runtime, managed env, and local LLM proxy are shared by all.
     let child_env = config.agent.child_env(
         proxy.port(),
@@ -79,7 +79,7 @@ pub async fn run(config: Config) -> anyhow::Result<()> {
         args: vec![adapter_entry],
         env: child_env,
     });
-    tracing::info!("agent session layer ready (per-peer processes spawn on first contact)");
+    tracing::info!("agent session layer ready (per-scene processes spawn on first contact)");
 
     // Keep the proxy alive for the life of the process.
     let _proxy = proxy;

@@ -1,7 +1,7 @@
 //! Interruption semantics — placeholder, requires `claude-code`.
 //!
 //! Per impl.md § Aliveness — Cognition contract: when a new POST arrives for
-//! a peer whose queue is already running a routing turn, the reactor cancels
+//! a scene whose queue is already running a routing turn, the reactor cancels
 //! the in-flight ACP session and re-prompts with the merged batch. The
 //! reactor implementation already does this (`reactor.rs` § "Interruption
 //! policy") — what we lack is a hermetic way to drive it from a test.
@@ -21,13 +21,13 @@
 //! # in one terminal, watch journal.jsonl
 //! tail -F data/journal.jsonl
 //!
-//! # in another, fire two POSTs in rapid succession to the same peer
+//! # in another, fire two POSTs in rapid succession to the same scene
 //! BASE=http://127.0.0.1:8080
 //! ME=alice@phone
-//! curl -X POST -H "X-HI-From: $ME" \
+//! curl -X POST -H "X-HI-Scene: $ME" \
 //!     --data-binary 'first thought, take your time' "$BASE/thought" &
 //! sleep 0.2
-//! curl -X POST -H "X-HI-From: $ME" \
+//! curl -X POST -H "X-HI-Scene: $ME" \
 //!     --data-binary 'actually never mind, what time is it' "$BASE/thought"
 //! ```
 //!

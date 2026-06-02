@@ -12,24 +12,24 @@ first build.
 **Status:** unverified.
 
 The architecture assumes one `claude-code` subprocess hosts N concurrent ACP
-sessions: one ephemeral router per active peer and one long-lived session per
+sessions: one ephemeral router per active scene and one long-lived session per
 worker, all multiplexed over the same stdio pair. The
 `agent-client-protocol` 0.12 crate documents this support and `src/acp/`
 opens sessions independently, but `claude-code`'s behavior under sustained
 concurrent prompts is not observed.
 
 **Verify with:** drive concurrent load through the running agent — POST
-thoughts from three distinct peers (`X-HI-From: a@x`, `b@x`, `c@x`) at the
+thoughts from three distinct scenes (`X-HI-Scene: a@x`, `b@x`, `c@x`) at the
 same instant and compare wall-clock. If total latency is roughly
 max-of-three (not sum-of-three), concurrency works. If it's sum-of-three,
 claude-code is serializing — see the fallback. (An earlier standalone
 `acp_spike` probe did this against `src/acp/` directly; it was removed once
-the per-peer reactor made the same check reachable through the live routes.)
+the per-scene reactor made the same check reachable through the live routes.)
 
 **Fallback if no concurrency:** wrap routing-session creation in a
 `tokio::sync::Semaphore` with permits = 1 (or small N). Workers can keep
 their own permit pool. The reactor's dispatch model already serializes one
-turn per peer; adding a global cap is a localized change in `reactor.rs`
+turn per scene; adding a global cap is a localized change in `reactor.rs`
 (wrap the `AcpSession::new_prompt(...)` call in `acquire().await`).
 
 ## MCP attachment per ephemeral session
@@ -48,7 +48,7 @@ tools within a reasonable budget (target: < 500 ms per attach).
 
 **Fallback:** investigate session-template / shared-MCP-server reuse if
 `claude-code` exposes one. Otherwise pre-spawn shims in a small pool keyed
-by peer.
+by scene.
 
 ## Journal-as-context coherence
 
@@ -56,11 +56,11 @@ by peer.
 
 Routers depend on memory snapshots being faithful. The reactor writes to
 `journal.jsonl` **before** spawning the routing session — `server::thought::post_thought`
-journals the inbound, then sends to the reactor's mpsc, then the per-peer
+journals the inbound, then sends to the reactor's mpsc, then the per-scene
 task builds the snapshot. The snapshot read sees the just-written entry by
 construction.
 
-**Verify by:** sending a burst of POSTs to `/thought` for the same peer
+**Verify by:** sending a burst of POSTs to `/thought` for the same scene
 under load, then inspecting `journal.jsonl` and the prompts emitted to the
 ACP session (trace logs show snapshot contents). Each subsequent prompt's
 `recent_journal` must contain every earlier signal in this batch.
@@ -70,14 +70,14 @@ ACP session (trace logs show snapshot contents). Each subsequent prompt's
 **Status:** implemented; manual verification only.
 
 Per impl.md § Aliveness — Cognition contract, a new POST arriving for a
-peer while their queue is running a routing turn must cancel the in-flight
+scene while its queue is running a routing turn must cancel the in-flight
 router and re-prompt with both signals merged. The reactor's `dispatch_signal`
-checks the peer's `in_flight` slot, calls `session.cancel()`, and the
-per-peer task observes the cancel via `SessionRun::next_update` returning a
+checks the scene's `in_flight` slot, calls `session.cancel()`, and the
+per-scene task observes the cancel via `SessionRun::next_update` returning a
 `Cancelled` variant, then re-prompts with the merged batch.
 
 **Verify by:** issuing two POSTs in rapid succession with
-`X-HI-From: alice@phone` and observing the second prompt's snapshot
+`X-HI-Scene: alice@phone` and observing the second prompt's snapshot
 includes both signals.
 
 **Tests:** `tests/interruption.rs` is `#[ignore]`-d — exercising it would
@@ -120,27 +120,27 @@ issue is implementation-side, not docs-side.
 - [ ] `cargo check` passes
 - [ ] `cargo build --release` produces `./target/release/hi-agent`
 - [ ] `cargo test` passes (the `#[ignore]`-d tests stay ignored)
-- [ ] concurrent thoughts from three distinct peers route with parallel
+- [ ] concurrent thoughts from three distinct scenes route with parallel
       timing roughly equal to single-session timing (concurrency works —
       see "Concurrent ACP sessions" above)
 - [ ] `cd src/appearance/web && pnpm install && pnpm build` succeeds
 - [ ] `./target/release/hi-agent` starts; `curl http://127.0.0.1:8080/`
       returns the embedded SPA HTML (200, `text/html`)
-- [ ] `curl -X POST -H 'X-HI-From: alice@phone' --data-binary 'hi'
+- [ ] `curl -X POST -H 'X-HI-Scene: alice@phone' --data-binary 'hi'
       http://127.0.0.1:8080/thought` returns 202 and writes a `SignalIn`
       line to `data/journal.jsonl`
 - [ ] A `GET /thought` long-poll opened beforehand receives the router's
-      reply on the same peer
+      reply on the same scene
 - [ ] `set_intent` (via a router decision, e.g. "remind me in 2 minutes")
       followed by waiting two minutes fires the intent — observable as an
       `IntentFired` line in `journal.jsonl` and an outbound signal on the
       long-poll
 - [ ] `POST /vision` returns 501 with a body explaining "not implemented in v0"
-- [ ] `POST /thought` without `X-HI-From` returns 400
+- [ ] `GET /thought` without `X-HI-Scene` returns 400
 
 ## Items not in this register
 
 Items deferred per impl.md § Scope (no risk to flag, they were never in
-v0): cron / relative intents, forgetting curve / journal compaction, multi-peer
+v0): cron / relative intents, forgetting curve / journal compaction, multi-scene
 shared workspaces, authorization validation, handle discovery, federation,
 end-to-end encryption beyond TLS, OS sleep/wake bridge for battery devices.

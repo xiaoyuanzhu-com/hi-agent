@@ -13,8 +13,8 @@ concrete code seams. Where the two disagree, `architecture.md` wins.
 
 Move the codebase from the current shape — a single shared ACP subprocess, a per-turn
 **ephemeral** session, and a reactor that is wired straight to HTTP types — to the target
-topology: an **agent session layer** (per-peer process pool, independent handles), a
-**persistent reactor session** per peer (hot-swapped, never per-turn), **working sessions**
+topology: an **agent session layer** (per-scene process pool, independent handles), a
+**persistent reactor session** per scene (hot-swapped, never per-turn), **working sessions**
 reached over an async collaboration bus, and a **transport-agnostic reactor**.
 
 Nothing about the design is re-argued here; read `architecture.md` first. This is ordering,
@@ -26,9 +26,9 @@ gap analysis, and file-level seams.
 
 | Concern | Today (in code) | Target (`architecture.md`) |
 |---|---|---|
-| Process model | one shared `AcpProcess` (`lib.rs:73`), passed to `reactor::start` | per-peer pool behind an **agent session layer** (§6) |
-| Session lifetime | **ephemeral per turn** — `run_routing_turn` calls `acp.new_session()`, drops it at turn end (`reactor.rs:255,402`) | **one persistent reactor session per peer**, used forever (§5) |
-| Context hygiene | journal rebuilt fresh each turn (`build_for_peer`) — session is stateless | warm session + **heartbeat hot-swap** (compact → pre-warm → atomic swap) (§5) |
+| Process model | one shared `AcpProcess` (`lib.rs:73`), passed to `reactor::start` | per-scene pool behind an **agent session layer** (§6) |
+| Session lifetime | **ephemeral per turn** — `run_routing_turn` calls `acp.new_session()`, drops it at turn end (`reactor.rs:255,402`) | **one persistent reactor session per scene**, used forever (§5) |
+| Context hygiene | journal rebuilt fresh each turn (`build_for_scene`) — session is stateless | warm session + **heartbeat hot-swap** (compact → pre-warm → atomic swap) (§5) |
 | Heavy work | done inline in the one session | **working sessions**, capability peers, channel-mute, async bus (§7) |
 | Cancel | `session/cancel` on the per-turn session (`reactor.rs:154`) | **fix-forward**; barge-in lands on the always-free reactor session (§5) |
 | Transport coupling | reactor imports `server::{AudioEvent, SurfaceEvent, ThoughtBus}`, owns `mime`, `turn`, per-turn frame binding (`reactor.rs:41,271–389`) | reactor speaks **continuous channel signals only**; HTTP artifacts live in the adapter (§2,§3) |
@@ -42,7 +42,7 @@ What is **already true** and should not be rebuilt:
   pool* over what exists, not a rewrite.
 - Commit-after-quiet settle and barge-in are implemented (`reactor.rs:197–237`). Persistence
   changes *what* gets cancelled/reused, not the turn-taking rules.
-- The journal is already the durable backstop (`memory/`, `build_for_peer`).
+- The journal is already the durable backstop (`memory/`, `build_for_scene`).
 
 ---
 
@@ -64,45 +64,45 @@ cleanup.
 - **Seam.** `src/voice/volcengine_tts.rs` only. No reactor change. Can land before or after
   any other phase.
 
-### Phase A — Agent session layer (per-peer process pool)
+### Phase A — Agent session layer (per-scene process pool)
 
 - **Goal.** The reactor stops holding an `AcpProcess`; it talks to a layer that hands out
   **independent session handles** and hides subprocesses, the routing table, and `session_id`
   demux entirely.
-- **Decision.** One subprocess **per peer** (Chrome-style isolation). All of a peer's
-  sessions — its reactor session and its workers — multiplex inside that peer's process.
-- **Why.** Contain blast radius to one peer; keep intra-peer `session/new` cheap (shared
+- **Decision.** One subprocess **per scene** (Chrome-style isolation). All of a scene's
+  sessions — its reactor session and its workers — multiplex inside that scene's process.
+- **Why.** Contain blast radius to one scene; keep intra-scene `session/new` cheap (shared
   runtime/MCP). See §6.
-- **Facts/limits.** Within-peer shared fate is accepted: a worker OOM can take that peer's
-  brain down — recovered by killing the peer's process and rebuilding the reactor session
-  from the journal. Cross-peer isolation is hard. Process count = peer count (bounded;
+- **Facts/limits.** Within-scene shared fate is accepted: a worker OOM can take that scene's
+  brain down — recovered by killing the scene's process and rebuilding the reactor session
+  from the journal. Cross-scene isolation is hard. Process count = scene count (bounded;
   multi-tenant LRU/idle eviction is later, not now).
 - **Seam.**
-  - New `src/agent/mod.rs` (working name) — a façade owning `HashMap<PeerId, AcpProcess>`,
-    lazy-spawn on a peer's first session, plus `session(peer, opts) -> AcpSession`,
-    `restart(peer)`. Spawn logic moves out of `lib.rs:62–76`.
+  - New `src/agent/mod.rs` (working name) — a façade owning `HashMap<Scene, AcpProcess>`,
+    lazy-spawn on a scene's first session, plus `session(scene, opts) -> AcpSession`,
+    `restart(scene)`. Spawn logic moves out of `lib.rs:62–76`.
   - `reactor::start` takes the agent layer instead of `Arc<AcpProcess>` (`reactor.rs:111`,
     `ReactorInner.acp` at `:88`).
   - `run_routing_turn`'s `acp.new_session(...)` (`reactor.rs:258`) becomes
-    `agent.session(peer, …)`.
+    `agent.session(scene, …)`.
   - No change to `process.rs`/`session.rs` internals — the handle already exists.
 
-### Phase B — Persistent reactor session per peer
+### Phase B — Persistent reactor session per scene
 
-- **Goal.** Replace the per-turn ephemeral session with **one session per peer, reused
+- **Goal.** Replace the per-turn ephemeral session with **one session per scene, reused
   forever** as the brain.
-- **Decision.** The peer's reactor session is opened once (lazily) and held in `PeerHandle`;
+- **Decision.** The scene's reactor session is opened once (lazily) and held in `SceneHandle`;
   each turn `prompt()`s it again instead of `new_session` + drop.
 - **Why.** A warm, continuous mind, not a cold per-turn rebuild. Continuity moves *into* the
   session; the journal stays the durable backstop. See §5.
 - **Facts/limits.** ACP's one-in-flight-prompt-per-session still holds — turns are serial per
-  peer, which the per-peer loop already guarantees. Barge-in now `cancel()`s the *current
+  scene, which the per-scene loop already guarantees. Barge-in now `cancel()`s the *current
   prompt* on the persistent session (`reactor.rs:154` already calls `session.cancel()`); the
   session is **not** dropped. The session will grow — that's what Phase C addresses, so B
   alone is safe only for short-lived runs.
 - **Seam.**
-  - `PeerHandle` (`reactor.rs:104`) gains `reactor_session: Arc<AcpSession>`, opened in
-    `get_or_create_peer` (`:166`).
+  - `SceneHandle` (`reactor.rs:104`) gains `reactor_session: Arc<AcpSession>`, opened in
+    `get_or_create_scene` (`:166`).
   - `run_routing_turn` (`reactor.rs:241`) stops calling `new_session` / `drop(session)`
     (`:255,402`); it prompts the held session. The `in_flight` slot becomes "is the reactor
     session mid-prompt," used for barge-in cancel — most of `:149–159,266–269,398–401` stays,
@@ -115,16 +115,16 @@ cleanup.
 - **Decision.** A heartbeat asynchronously (1) summarizes the live session, (2) pre-warms a
   replacement seeded with that summary + a verbatim recent tail, (3) **atomically swaps** it
   in between turns. A hard context-limit hit forces the same swap (hard-stop).
-- **Why.** A warm mind without unbounded growth; the peer never sees a cold restart. See §5.
+- **Why.** A warm mind without unbounded growth; the conversation never sees a cold restart. See §5.
 - **Facts/limits.** The swap happens only between turns (never mid-prompt). The journal stays
   authoritative for durability/recovery/cold-start — if a swap fails, rebuild from snapshot.
 - **Seam.**
   - New `src/reactor/heartbeat.rs` (or a `swap` submodule): owns the summarize +
     pre-warm + swap. Reuses the agent layer (Phase A) to open the replacement session.
-  - `PeerHandle.reactor_session` becomes swappable (`Arc<Mutex<Arc<AcpSession>>>` or an
+  - `SceneHandle.reactor_session` becomes swappable (`Arc<Mutex<Arc<AcpSession>>>` or an
     `arc-swap`); `run_routing_turn` reads the current handle at turn start.
   - Summarization is itself an ACP prompt (a working-style session, or a dedicated
-    summarizer prompt against a throwaway session in the peer's process).
+    summarizer prompt against a throwaway session in the scene's process).
 
 ### Phase D — Working sessions + collaboration bus
 
@@ -143,9 +143,9 @@ cleanup.
   worker's transcript on demand), so **worker transcripts must be inspectable**.
 - **Seam.**
   - A `delegate` path the reactor session can invoke — a reactor-side tool (carrier #3,
-    Phase F) that does `agent.session(peer, …)` (worker, in the same per-peer process) +
+    Phase F) that does `agent.session(scene, …)` (worker, in the same per-scene process) +
     prompt + register.
-  - New `src/reactor/workers.rs`: worker registry per peer, the async bus (worker→reactor
+  - New `src/reactor/workers.rs`: worker registry per scene, the async bus (worker→reactor
     intents, reactor→worker injects), the social-timeout policy. The reactor session reads a
     worker's transcript to answer "how's it going."
   - Workers get the shared substrate (memory/skills/tools) but **no channel emit/perceive** —
@@ -232,7 +232,7 @@ submodules noted above.
 src/
 ├── main.rs                  # CLI parse → Config → run
 ├── lib.rs                   # run(): open memory, spawn ACP, start reactor, serve
-├── types.rs                 # Signal, PeerId, Channel, Journal/Surface types
+├── types.rs                 # Signal, Scene, Channel, Journal/Surface types
 ├── config/mod.rs            # AgentConfig: upstream, settings.json, child env
 ├── runtime/mod.rs           # first-run install of node + ACP adapter + claude CLI
 ├── llm_proxy/mod.rs         # local proxy the adapter talks to instead of upstream
@@ -240,9 +240,9 @@ src/
 │   ├── mod.rs               # re-exports
 │   ├── process.rs           # AcpProcess: child + connection + RoutingTable (demux)
 │   └── session.rs           # AcpSession: independent handle, prompt/cancel/close
-├── reactor.rs               # per-peer loop, ephemeral turn, carriers   ← biggest change
+├── reactor.rs               # per-scene loop, ephemeral turn, carriers   ← biggest change
 ├── memory/
-│   ├── mod.rs · journal.rs · media.rs · snapshot.rs   # journal + build_for_peer
+│   ├── mod.rs · journal.rs · media.rs · snapshot.rs   # journal + build_for_scene
 ├── server/                  # HTTP front (the transport adapter, today fused to reactor)
 │   ├── mod.rs               # axum router, AppState, AudioEvent/SurfaceEvent
 │   ├── thought.rs · thought_bus.rs   # text channel in/out (the /thought wire path)

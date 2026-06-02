@@ -9,31 +9,31 @@
 
 use std::borrow::Cow;
 
-use crate::types::{Channel, PeerId};
+use crate::types::{Channel, Scene};
 
 /// Longest body logged inline; longer text is clipped so a big reply or a
 /// surface's HTML doesn't flood one line. Clipped on a char boundary.
 const MAX_BODY: usize = 2000;
 
-/// A signal arriving from a peer on `channel` (user → agent).
-pub fn inbound(channel: Channel, peer: &PeerId, body: &str) {
+/// A signal arriving in a scene on `channel` (user → agent).
+pub fn inbound(channel: Channel, scene: &Scene, body: &str) {
     tracing::info!(
         target: "channel",
         dir = "in",
         channel = %channel,
-        peer = %peer,
+        scene = %scene,
         body = %clip(body),
         "channel in",
     );
 }
 
-/// A signal the agent emits to a peer on `channel` (agent → user).
-pub fn outbound(channel: Channel, peer: &PeerId, body: &str) {
+/// A signal the agent emits into a scene on `channel` (agent → user).
+pub fn outbound(channel: Channel, scene: &Scene, body: &str) {
     tracing::info!(
         target: "channel",
         dir = "out",
         channel = %channel,
-        peer = %peer,
+        scene = %scene,
         body = %clip(body),
         "channel out",
     );

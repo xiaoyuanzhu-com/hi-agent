@@ -3,8 +3,8 @@
 // Spec rules we obey here:
 //   * GET /thought is a long-poll. The server holds the response open and
 //     streams body bytes as the agent emits. Body-close ends the utterance.
-//   * X-HI-To names the peer we want to receive on (i.e. "I am the recipient
-//     identified as <peer>"). Without it the server has no idea who we are.
+//   * X-HI-Scene names the scene we want to receive on (i.e. "stream me this
+//     scene's output"). Without it the server can't key the right mailbox.
 //   * After body-close we re-subscribe. Each subscription is one utterance.
 //
 // The function is an async generator: each yielded string is a UTF-8 chunk
@@ -13,13 +13,11 @@
 export interface ThoughtChunk {
   /** The chunk of text the server just emitted. */
   text: string;
-  /** Sender identity reported by the server, if any. */
-  from?: string;
 }
 
 export interface SubscribeOpts {
-  /** Peer identity we want to receive on. Sent as X-HI-To. */
-  peer: string;
+  /** Scene we want to receive on. Sent as X-HI-Scene. */
+  scene: string;
   /** Abort signal so the caller can cancel cleanly on unmount. */
   signal: AbortSignal;
 }
@@ -36,7 +34,7 @@ export async function* subscribeThought(
   const res = await fetch("/api/thought", {
     method: "GET",
     headers: {
-      "X-HI-To": opts.peer,
+      "X-HI-Scene": opts.scene,
       Accept: "text/plain, application/octet-stream",
     },
     signal: opts.signal,
@@ -48,12 +46,10 @@ export async function* subscribeThought(
     throw new Error(`/thought subscribe failed: ${res.status} ${res.statusText}`);
   }
 
-  const from = res.headers.get("X-HI-From") ?? undefined;
-
   // Some servers (or proxies) may return a non-streaming body. fall through:
   if (!res.body) {
     const text = await res.text();
-    if (text.length > 0) yield { text, from };
+    if (text.length > 0) yield { text };
     return;
   }
 
@@ -66,18 +62,9 @@ export async function* subscribeThought(
       if (done) return;
       if (!value || value.byteLength === 0) continue;
       const text = decoder.decode(value, { stream: true });
-      if (text.length > 0) yield { text, from };
+      if (text.length > 0) yield { text };
     }
   } finally {
-    // Flush any trailing bytes.
-    const tail = decoder.decode();
-    if (tail.length > 0) {
-      // Intentional: a final chunk after body-close is still part of the
-      // utterance. We hand it off via the generator return path by yielding
-      // outside the loop is not possible after `return` — so emit before
-      // releasing the reader.
-      // (No-op if empty.)
-    }
     try {
       reader.releaseLock();
     } catch {
@@ -91,20 +78,16 @@ export async function* subscribeThought(
  * Returns when the server has accepted the body (202).
  */
 export async function postThought(opts: {
-  from: string;
+  scene: string;
   body: string;
-  to?: string;
   signal?: AbortSignal;
 }): Promise<void> {
-  const headers: Record<string, string> = {
-    "Content-Type": "text/plain; charset=utf-8",
-    "X-HI-From": opts.from,
-  };
-  if (opts.to) headers["X-HI-To"] = opts.to;
-
   const res = await fetch("/api/thought", {
     method: "POST",
-    headers,
+    headers: {
+      "Content-Type": "text/plain; charset=utf-8",
+      "X-HI-Scene": opts.scene,
+    },
     body: opts.body,
     signal: opts.signal,
   });

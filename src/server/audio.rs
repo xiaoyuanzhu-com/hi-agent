@@ -3,7 +3,7 @@
 //! Inbound (`POST /audio`): the body bytes are audio; we save them under
 //! `data/media/audio/in/<uuid>.<ext>`, transcribe via the configured
 //! [`Stt`](crate::voice::Stt), and feed the transcript into the same
-//! per-peer path that `POST /thought` uses. The journal records a
+//! per-scene path that `POST /thought` uses. The journal records a
 //! `SignalIn { channel: Audio, body: <transcript>, media_path: Some(path) }`
 //! so the reactor's snapshot can show that this signal arrived as speech
 //! while the body remains text-searchable.
@@ -37,9 +37,9 @@ use tokio::sync::mpsc;
 
 use crate::memory::media::{self, Direction};
 use crate::server::{AppState, AudioEvent};
-use crate::server::headers::{AuthBearer, PeerHeader, ToHeader};
+use crate::server::headers::{AuthBearer, RequiredScene, SceneHeader};
 use crate::server::segmenter::{Segmenter, SegmenterConfig};
-use crate::types::{Channel, JournalEntry, PeerId, Signal};
+use crate::types::{Channel, JournalEntry, Scene, Signal};
 use crate::voice::stt::Transcript;
 
 const DEFAULT_MIME: &str = "audio/wav";
@@ -52,8 +52,7 @@ struct PostAudioAck {
 
 pub async fn post_audio(
     State(state): State<Arc<AppState>>,
-    PeerHeader(from): PeerHeader,
-    ToHeader(to): ToHeader,
+    SceneHeader(scene): SceneHeader,
     AuthBearer(auth): AuthBearer,
     headers: HeaderMap,
     body: Bytes,
@@ -81,8 +80,7 @@ pub async fn post_audio(
     let ext = mime_to_ext(&mime);
 
     tracing::info!(
-        from = %from,
-        to = ?to,
+        scene = %scene,
         auth = ?auth,
         mime = %mime,
         bytes = body.len(),
@@ -119,7 +117,7 @@ pub async fn post_audio(
     // audio is already persisted for audit) — the SPA reads the empty
     // transcript and drops back to idle rather than treating it as a failure.
     if transcript.trim().is_empty() {
-        tracing::info!(from = %from, media_path = %media_path, "audio clip held no speech");
+        tracing::info!(scene = %scene, media_path = %media_path, "audio clip held no speech");
         let ack = PostAudioAck { transcript: String::new(), media_path };
         return (StatusCode::ACCEPTED, axum::Json(ack)).into_response();
     }
@@ -129,16 +127,15 @@ pub async fn post_audio(
     let ts = Utc::now();
     let signal = Signal {
         channel: Channel::Audio,
-        from: from.clone(),
-        to: to.clone(),
+        scene: scene.clone(),
         body: transcript.clone(),
         ts,
     };
-    crate::channel_log::inbound(Channel::Audio, &from, &transcript);
+    crate::channel_log::inbound(Channel::Audio, &scene, &transcript);
     let entry = JournalEntry::SignalIn {
         ts,
         channel: Channel::Audio,
-        from: from.clone(),
+        scene: scene.clone(),
         body: transcript.clone(),
         media_path: Some(media_path.clone()),
     };
@@ -156,9 +153,9 @@ pub async fn post_audio(
 
 #[derive(Debug, Deserialize)]
 pub struct StreamParams {
-    /// Identity of the streaming peer. Browsers can't set `X-HI-From` on a
-    /// WebSocket handshake, so the peer rides in the query string instead.
-    peer: Option<String>,
+    /// The streaming scene. Browsers can't set `X-HI-Scene` on a WebSocket
+    /// handshake, so the scene rides in the query string instead.
+    scene: Option<String>,
 }
 
 /// `GET /api/audio/in` — continuous inbound speech over a WebSocket.
@@ -185,20 +182,20 @@ pub async fn get_audio_in(
                 .into_response();
         }
     };
-    let peer = PeerId(
+    let scene = Scene(
         params
-            .peer
+            .scene
             .filter(|s| !s.is_empty())
             .unwrap_or_else(|| "anonymous".to_string()),
     );
-    tracing::info!(peer = %peer, "WS /audio/in opened");
-    ws.on_upgrade(move |socket| stream_audio_in(state, stt, peer, socket))
+    tracing::info!(scene = %scene, "WS /audio/in opened");
+    ws.on_upgrade(move |socket| stream_audio_in(state, stt, scene, socket))
 }
 
 async fn stream_audio_in(
     state: Arc<AppState>,
     stt: Arc<dyn crate::voice::Stt>,
-    peer: PeerId,
+    scene: Scene,
     socket: axum::extract::ws::WebSocket,
 ) {
     let (mut sink, mut source) = socket.split();
@@ -214,7 +211,7 @@ async fn stream_audio_in(
     // continuous word-stream is cut into sentences for the agent. A periodic
     // tick drives the time-based cut rules when the speaker has gone quiet.
     let relay_state = state.clone();
-    let relay_peer = peer.clone();
+    let relay_scene = scene.clone();
     let out_task = tokio::spawn(async move {
         let mut seg = Segmenter::new(SegmenterConfig::default(), Instant::now());
         let mut ticker = tokio::time::interval(Duration::from_millis(150));
@@ -244,14 +241,14 @@ async fn stream_audio_in(
                 if sink.send(WsMessage::Text(frame.into())).await.is_err() {
                     break 'relay;
                 }
-                dispatch_utterance(&relay_state, &relay_peer, &sentence).await;
+                dispatch_utterance(&relay_state, &relay_scene, &sentence).await;
             }
         }
         // Flush any trailing words as a final sentence when the session ends.
         if let Some(sentence) = seg.flush() {
             let frame = serde_json::json!({ "text": sentence, "final": true }).to_string();
             let _ = sink.send(WsMessage::Text(frame.into())).await;
-            dispatch_utterance(&relay_state, &relay_peer, &sentence).await;
+            dispatch_utterance(&relay_state, &relay_scene, &sentence).await;
         }
     });
 
@@ -272,32 +269,31 @@ async fn stream_audio_in(
     // Closing the audio side lets the STT session flush its last utterance.
     drop(audio_tx);
     match tokio::time::timeout(Duration::from_secs(5), stt_task).await {
-        Ok(Ok(Err(err))) => tracing::warn!(peer = %peer, error = %err, "audio stream STT ended"),
-        Err(_) => tracing::warn!(peer = %peer, "audio stream STT did not finalize in time"),
+        Ok(Ok(Err(err))) => tracing::warn!(scene = %scene, error = %err, "audio stream STT ended"),
+        Err(_) => tracing::warn!(scene = %scene, "audio stream STT did not finalize in time"),
         _ => {}
     }
     out_task.abort();
-    tracing::info!(peer = %peer, "WS /audio/in closed");
+    tracing::info!(scene = %scene, "WS /audio/in closed");
 }
 
 /// Journal + dispatch one finalized utterance — the streaming counterpart of the
 /// tail of `post_audio`. Streaming utterances aren't persisted as discrete media
 /// files (no per-clip blob); the journal records the transcript with no
 /// `media_path`.
-async fn dispatch_utterance(state: &AppState, peer: &PeerId, text: &str) {
+async fn dispatch_utterance(state: &AppState, scene: &Scene, text: &str) {
     let ts = Utc::now();
     let signal = Signal {
         channel: Channel::Audio,
-        from: peer.clone(),
-        to: None,
+        scene: scene.clone(),
         body: text.to_owned(),
         ts,
     };
-    crate::channel_log::inbound(Channel::Audio, peer, text);
+    crate::channel_log::inbound(Channel::Audio, scene, text);
     let entry = JournalEntry::SignalIn {
         ts,
         channel: Channel::Audio,
-        from: peer.clone(),
+        scene: scene.clone(),
         body: text.to_owned(),
         media_path: None,
     };
@@ -309,23 +305,22 @@ async fn dispatch_utterance(state: &AppState, peer: &PeerId, text: &str) {
     }
 }
 
-/// Whether an event routed to `target` should reach this `subscriber`.
-fn routed(target: &Option<PeerId>, subscriber: &Option<PeerId>) -> bool {
-    match (target, subscriber) {
-        (None, _) => true,
-        (Some(t), Some(s)) => t == s,
-        (Some(_), None) => true,
+/// Whether an event routed to `target` should reach this `scene` subscriber.
+fn routed(target: &Option<Scene>, scene: &Scene) -> bool {
+    match target {
+        None => true,
+        Some(t) => t == scene,
     }
 }
 
 pub async fn get_audio(
     State(state): State<Arc<AppState>>,
-    ToHeader(subscriber): ToHeader,
+    RequiredScene(scene): RequiredScene,
     AuthBearer(auth): AuthBearer,
 ) -> impl IntoResponse {
     let mut rx = state.audio_out.subscribe();
 
-    tracing::info!(subscriber = ?subscriber, auth = ?auth, "GET /audio long-poll opened");
+    tracing::info!(scene = %scene, auth = ?auth, "GET /audio long-poll opened");
 
     // Block until a turn for this subscriber starts. `Start` carries the mime,
     // which must be set before any body byte; Frame/End seen before a Start
@@ -334,7 +329,7 @@ pub async fn get_audio(
     let (turn, mime) = loop {
         match rx.recv().await {
             Ok(event) => {
-                if !routed(event.to(), &subscriber) {
+                if !routed(event.scene(), &scene) {
                     continue;
                 }
                 if let AudioEvent::Start { turn, mime, .. } = event {
@@ -352,25 +347,25 @@ pub async fn get_audio(
     };
 
     // Stream this turn's frames as a chunked body until its `End`. Frames from
-    // any other turn or peer are filtered out, so a response stays bound to the
+    // any other turn or scene are filtered out, so a response stays bound to the
     // single turn it opened on.
     let stream = futures::stream::unfold(
-        (rx, subscriber, turn, false),
-        |(mut rx, subscriber, turn, done)| async move {
+        (rx, scene, turn, false),
+        |(mut rx, scene, turn, done)| async move {
             if done {
                 return None;
             }
             loop {
                 match rx.recv().await {
                     Ok(event) => {
-                        if !routed(event.to(), &subscriber) || event.turn() != turn {
+                        if !routed(event.scene(), &scene) || event.turn() != turn {
                             continue;
                         }
                         match event {
                             AudioEvent::Frame { bytes, .. } => {
                                 return Some((
                                     Ok::<Bytes, std::convert::Infallible>(bytes),
-                                    (rx, subscriber, turn, false),
+                                    (rx, scene, turn, false),
                                 ));
                             }
                             AudioEvent::End { .. } => return None,

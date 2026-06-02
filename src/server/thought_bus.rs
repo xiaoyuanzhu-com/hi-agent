@@ -1,4 +1,4 @@
-//! Per-peer outbound buffer for `/thought`, replacing a lossy broadcast.
+//! Per-scene outbound buffer for `/thought`, replacing a lossy broadcast.
 //!
 //! POST `/thought` is fire-and-forget (`202`); the agent's reply streams back
 //! out on GET `/thought`. The previous design broadcast each chunk over a
@@ -8,7 +8,7 @@
 //! symptom was "send hi, nothing responds": the reply was produced and
 //! journalled, but the client's GET re-subscribed milliseconds too late.
 //!
-//! This bus buffers utterances per peer. A GET that opens late still receives
+//! This bus buffers utterances per scene. A GET that opens late still receives
 //! the pending utterance; one that opens mid-utterance streams it from its
 //! first chunk. Delivery is FIFO and an utterance is removed once a reader has
 //! drained it to completion, so the next GET picks up the next utterance.
@@ -21,31 +21,31 @@ use axum::body::Bytes;
 use futures::stream::{Stream, unfold};
 use tokio::sync::{Mutex, Notify};
 
-use crate::types::PeerId;
+use crate::types::Scene;
 
-/// Cap on buffered utterances per peer. Bounds growth when a peer produces
+/// Cap on buffered utterances per scene. Bounds growth when a scene produces
 /// output that no client ever connects to consume; the oldest utterances are
-/// evicted first. Per-peer turns are serial, so reaching this many
+/// evicted first. Per-scene turns are serial, so reaching this many
 /// undelivered utterances means nobody has polled in a long while.
-const MAX_BUFFERED_PER_PEER: usize = 32;
+const MAX_BUFFERED_PER_SCENE: usize = 32;
 
-/// Outbound `/thought` buffer, keyed by recipient peer. Cloneable handle over
+/// Outbound `/thought` buffer, keyed by recipient scene. Cloneable handle over
 /// shared state.
 #[derive(Clone, Default)]
 pub struct ThoughtBus {
-    inner: Arc<Mutex<HashMap<PeerId, PeerOut>>>,
+    inner: Arc<Mutex<HashMap<Scene, SceneOut>>>,
 }
 
-struct PeerOut {
+struct SceneOut {
     queue: VecDeque<Utterance>,
     /// Pulsed whenever `queue` changes (new chunk, new utterance, completion)
     /// so a parked reader re-checks.
     notify: Arc<Notify>,
-    /// Monotonic utterance id, unique within this peer.
+    /// Monotonic utterance id, unique within this scene.
     next_id: u64,
 }
 
-impl PeerOut {
+impl SceneOut {
     fn new() -> Self {
         Self {
             queue: VecDeque::new(),
@@ -66,22 +66,22 @@ impl ThoughtBus {
         Self::default()
     }
 
-    /// Append a chunk of agent text destined for `peer`. Starts a new utterance
+    /// Append a chunk of agent text destined for `scene`. Starts a new utterance
     /// when the previous one has completed (or none exists). Empty chunks are
     /// dropped so they neither open an utterance nor emit empty body frames.
-    pub async fn push_chunk(&self, peer: &PeerId, text: String) {
+    pub async fn push_chunk(&self, scene: &Scene, text: String) {
         if text.is_empty() {
             return;
         }
         let mut map = self.inner.lock().await;
-        let entry = map.entry(peer.clone()).or_insert_with(PeerOut::new);
+        let entry = map.entry(scene.clone()).or_insert_with(SceneOut::new);
 
         let need_new = match entry.queue.back() {
             Some(u) => u.complete,
             None => true,
         };
         if need_new {
-            while entry.queue.len() >= MAX_BUFFERED_PER_PEER {
+            while entry.queue.len() >= MAX_BUFFERED_PER_SCENE {
                 entry.queue.pop_front();
             }
             let id = entry.next_id;
@@ -98,12 +98,12 @@ impl ThoughtBus {
         entry.notify.notify_waiters();
     }
 
-    /// Mark the peer's open utterance complete. A reader streaming it will close
+    /// Mark the scene's open utterance complete. A reader streaming it will close
     /// its HTTP body once it has drained the buffered chunks — the spec's
     /// body-close = end-of-utterance contract.
-    pub async fn end_utterance(&self, peer: &PeerId) {
+    pub async fn end_utterance(&self, scene: &Scene) {
         let mut map = self.inner.lock().await;
-        if let Some(entry) = map.get_mut(peer) {
+        if let Some(entry) = map.get_mut(scene) {
             if let Some(u) = entry.queue.back_mut() {
                 u.complete = true;
             }
@@ -117,18 +117,18 @@ impl ThoughtBus {
     /// they arrive, and removes it once fully drained.
     pub fn subscribe(
         &self,
-        subscriber: PeerId,
+        subscriber: Scene,
     ) -> impl Stream<Item = Result<Bytes, Infallible>> + use<> {
         struct Reader {
-            inner: Arc<Mutex<HashMap<PeerId, PeerOut>>>,
-            peer: PeerId,
+            inner: Arc<Mutex<HashMap<Scene, SceneOut>>>,
+            scene: Scene,
             bound: Option<u64>,
             cursor: usize,
         }
 
         let state = Reader {
             inner: self.inner.clone(),
-            peer: subscriber,
+            scene: subscriber,
             bound: None,
             cursor: 0,
         };
@@ -139,7 +139,7 @@ impl ThoughtBus {
             let inner = s.inner.clone();
             loop {
                 let mut map = inner.lock().await;
-                let entry = map.entry(s.peer.clone()).or_insert_with(PeerOut::new);
+                let entry = map.entry(s.scene.clone()).or_insert_with(SceneOut::new);
 
                 if s.bound.is_none()
                     && let Some(front) = entry.queue.front()

@@ -8,32 +8,35 @@ use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
 // -----------------------------------------------------------------------------
-// PeerId
+// Scene
 // -----------------------------------------------------------------------------
 
-/// A peer identifier carried by `X-HI-From` / `X-HI-To`, e.g. `alice@phone`.
+/// The situation a signal belongs to, carried by `X-HI-Scene` — a 1:1, a group,
+/// or being alone doing something, e.g. `alice@phone`. It is the unit of context
+/// isolation (one reactor session / journal slice / subprocess per scene); the
+/// human who spoke is soft, inferred content, not part of this key.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(transparent)]
-pub struct PeerId(pub String);
+pub struct Scene(pub String);
 
-impl fmt::Display for PeerId {
+impl fmt::Display for Scene {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str(&self.0)
     }
 }
 
 #[derive(Debug, Error)]
-#[error("peer id may not be empty")]
-pub struct PeerIdParseError;
+#[error("scene id may not be empty")]
+pub struct SceneParseError;
 
-impl FromStr for PeerId {
-    type Err = PeerIdParseError;
+impl FromStr for Scene {
+    type Err = SceneParseError;
 
     fn from_str(s: &str) -> Result<Self, Self::Err> {
         if s.is_empty() {
-            Err(PeerIdParseError)
+            Err(SceneParseError)
         } else {
-            Ok(PeerId(s.to_owned()))
+            Ok(Scene(s.to_owned()))
         }
     }
 }
@@ -99,8 +102,7 @@ impl FromStr for Channel {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Signal {
     pub channel: Channel,
-    pub from: PeerId,
-    pub to: Option<PeerId>,
+    pub scene: Scene,
     pub body: String,
     pub ts: DateTime<Utc>,
 }
@@ -115,7 +117,10 @@ pub enum JournalEntry {
     SignalIn {
         ts: DateTime<Utc>,
         channel: Channel,
-        from: PeerId,
+        // `alias = "from"` keeps journals written before the X-HI-Scene rename
+        // (which stored the sender as `from`) loadable on cold start.
+        #[serde(alias = "from")]
+        scene: Scene,
         body: String,
         /// Stable file reference for non-text bodies (audio bytes, future
         /// images). `body` stays the text representation (e.g. STT transcript).
@@ -125,7 +130,10 @@ pub enum JournalEntry {
     SignalOut {
         ts: DateTime<Utc>,
         channel: Channel,
-        to: PeerId,
+        // `alias = "to"` keeps pre-rename journals (which stored the recipient
+        // as `to`) loadable.
+        #[serde(alias = "to")]
+        scene: Scene,
         body: String,
         /// For outbound audio: where the rendered bytes live.
         #[serde(default)]

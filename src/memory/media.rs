@@ -13,9 +13,9 @@ use std::path::{Path, PathBuf};
 use tokio::io::AsyncWriteExt;
 use uuid::Uuid;
 
-/// Whether the blob arrived from a peer (`In`) or was rendered by the agent
+/// Whether the blob arrived inbound (`In`) or was rendered by the agent
 /// (`Out`). The two go in sibling folders so a `du -sh data/media/audio/in`
-/// answers "how much voice has the peer sent us" without globbing.
+/// answers "how much voice have we received" without globbing.
 #[derive(Debug, Clone, Copy)]
 pub enum Direction {
     In,

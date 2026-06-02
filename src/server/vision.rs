@@ -9,7 +9,7 @@
 //! audio works because STT turns it into text). So we deliberately do the
 //! minimum that makes the channel real: persist the frame to disk and ack. We
 //! do **not** journal or dispatch it — journaling a frame every few seconds
-//! would flood the per-peer snapshot ([`crate::memory::snapshot`], a 30-min /
+//! would flood the per-scene snapshot ([`crate::memory::snapshot`], a 30-min /
 //! 200-entry window) and crowd out the actual conversation, all for bytes the
 //! agent can't read yet. When a perception path exists (captioning or a
 //! multimodal prompt), this is where it slots in.
@@ -24,14 +24,13 @@ use axum::response::IntoResponse;
 
 use crate::memory::media::{self, Direction};
 use crate::server::AppState;
-use crate::server::headers::{PeerHeader, ToHeader};
+use crate::server::headers::SceneHeader;
 
 const DEFAULT_MIME: &str = "image/jpeg";
 
 pub async fn post_vision(
     State(state): State<Arc<AppState>>,
-    PeerHeader(from): PeerHeader,
-    ToHeader(to): ToHeader,
+    SceneHeader(scene): SceneHeader,
     headers: HeaderMap,
     body: Bytes,
 ) -> impl IntoResponse {
@@ -46,7 +45,7 @@ pub async fn post_vision(
         .unwrap_or_else(|| DEFAULT_MIME.to_string());
     let ext = mime_to_ext(&mime);
 
-    tracing::debug!(from = %from, to = ?to, mime = %mime, bytes = body.len(), "POST /api/vision");
+    tracing::debug!(scene = %scene, mime = %mime, bytes = body.len(), "POST /api/vision");
 
     // Persist only — no journal, no dispatch (see module docs).
     match media::store_image(&state.data_dir, Direction::In, ext, &body).await {

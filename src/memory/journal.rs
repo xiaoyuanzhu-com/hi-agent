@@ -11,7 +11,7 @@ use tokio::fs::{File, OpenOptions};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::sync::Mutex;
 
-use crate::types::{JournalEntry, PeerId};
+use crate::types::{JournalEntry, Scene};
 
 #[derive(Clone)]
 pub struct Journal {
@@ -77,7 +77,7 @@ impl Journal {
 
     pub async fn recent(
         &self,
-        peer: Option<&PeerId>,
+        scene: Option<&Scene>,
         since: DateTime<Utc>,
         limit: usize,
     ) -> anyhow::Result<Vec<JournalEntry>> {
@@ -85,8 +85,8 @@ impl Journal {
         let mut filtered: Vec<JournalEntry> = all
             .into_iter()
             .filter(|e| entry_ts(e) >= since)
-            .filter(|e| match peer {
-                Some(p) => entry_involves_peer(e, p),
+            .filter(|e| match scene {
+                Some(s) => entry_involves_scene(e, s),
                 None => true,
             })
             .collect();
@@ -104,9 +104,9 @@ pub fn entry_ts(entry: &JournalEntry) -> DateTime<Utc> {
     }
 }
 
-fn entry_involves_peer(entry: &JournalEntry, peer: &PeerId) -> bool {
+fn entry_involves_scene(entry: &JournalEntry, scene: &Scene) -> bool {
     match entry {
-        JournalEntry::SignalIn { from, .. } => from == peer,
-        JournalEntry::SignalOut { to, .. } => to == peer,
+        JournalEntry::SignalIn { scene: s, .. } => s == scene,
+        JournalEntry::SignalOut { scene: s, .. } => s == scene,
     }
 }

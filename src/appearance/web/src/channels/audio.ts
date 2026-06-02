@@ -7,7 +7,7 @@
 // it is not used by the live mic.
 
 export async function postAudio(opts: {
-  from: string;
+  scene: string;
   blob: Blob;
   mime: string;
   signal?: AbortSignal;
@@ -16,7 +16,7 @@ export async function postAudio(opts: {
     method: "POST",
     headers: {
       "Content-Type": opts.mime,
-      "X-HI-From": opts.from,
+      "X-HI-Scene": opts.scene,
     },
     body: opts.blob,
     signal: opts.signal,
@@ -31,8 +31,8 @@ export async function postAudio(opts: {
 }
 
 export interface SubscribeAudioOpts {
-  /** Peer identity we receive on (sent as X-HI-To). */
-  peer: string;
+  /** Scene we receive on (sent as X-HI-Scene). */
+  scene: string;
   signal: AbortSignal;
 }
 
@@ -60,7 +60,7 @@ export async function* subscribeAudioTurns(
   while (!opts.signal.aborted) {
     const res = await fetch("/api/audio", {
       method: "GET",
-      headers: { "X-HI-To": opts.peer, Accept: "audio/*" },
+      headers: { "X-HI-Scene": opts.scene, Accept: "audio/*" },
       signal: opts.signal,
       cache: "no-store",
     });

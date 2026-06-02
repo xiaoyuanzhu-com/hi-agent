@@ -7,7 +7,7 @@
 // fire-and-forget; we don't read the response body.
 
 export async function postVision(opts: {
-  from: string;
+  scene: string;
   blob: Blob;
   mime: string;
   signal?: AbortSignal;
@@ -16,7 +16,7 @@ export async function postVision(opts: {
     method: "POST",
     headers: {
       "Content-Type": opts.mime,
-      "X-HI-From": opts.from,
+      "X-HI-Scene": opts.scene,
     },
     body: opts.blob,
     signal: opts.signal,

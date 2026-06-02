@@ -17,8 +17,8 @@ The critical decisions, each with its reasoning, in roughly descending importanc
 | Cognition is delegated to an ACP subprocess; hi-agent is the human-interface layer around it | Keep presence, channels, and continuity separate from the LLM; the mind stays swappable |
 | **Channels live in the reactor, not in cognition** | An ACP session is a single text duplex with no channel concept; the reactor is what gives it multi-channel reach |
 | **Transport lives in the owner, not the reactor** | Keep the mind aligned to the continuous human model; HTTP is just one batch transport, swappable for WebSocket or local audio |
-| **One persistent reactor session per peer, hot-swapped** | A warm, continuous mind rather than a cold per-turn rebuild; the journal is the durable backstop that makes persistence safe |
-| **One subprocess per peer** (Chrome-style isolation) | Contain blast radius to a single peer; keep intra-peer session spawn cheap |
+| **One persistent reactor session per scene, hot-swapped** | A warm, continuous mind rather than a cold per-turn rebuild; the journal is the durable backstop that makes persistence safe |
+| **One subprocess per scene** (Chrome-style isolation) | Contain blast radius to a single scene; keep intra-scene session spawn cheap |
 | **Working sessions are capability peers, but channel-mute** | Single-voice coherence — many sub-minds may think, but one mouth speaks |
 | **Fix-forward, no real cancel** | More human than a hard cancel; fits ACP's one-in-flight-prompt-per-session constraint |
 | **Emission via natural language; action/perception via tools** | "Think, then organize words"; humans don't speak JSON, but do take deliberate, answerable actions |
@@ -50,7 +50,7 @@ This single rule recurs at every layer below, including the wire: **HTTP is a ba
 Five layers, each with a single responsibility and a clean contract to the layer below.
 
 ```
-   peer (human / device)
+   participant (human / device)
         ▲ │
    wire │ ▼   HTTP / WebSocket / local audio …
  ┌──────┴───────────────────────────────────────────────┐
@@ -59,7 +59,7 @@ Five layers, each with a single responsibility and a clean contract to the layer
  └──────┬───────────────────────────────────────────────┘
         ▲ │   continuous channel signals (human-model vocabulary, no transport)
  ┌──────┴───────────────────────────────────────────────┐
- │ Reactor module  (per peer)                            │  connects all channels,
+ │ Reactor module  (per scene)                           │  connects all channels,
  │   fan-in N input channels → one prompt                │  decides & articulates,
  │   fan-out one output stream → N channels              │  always responsive
  │   ┌─────────────────────────────────────────────┐    │
@@ -71,8 +71,8 @@ Five layers, each with a single responsibility and a clean contract to the layer
  └──────┬───────────────────────────────────────────────┘
         ▲ │   independent session handles (no demux at this boundary)
  ┌──────┴───────────────────────────────────────────────┐
- │ Agent session layer                                   │  one subprocess per peer
- │   per-peer process pool; hides session_id demux       │  (Chrome-style isolation)
+ │ Agent session layer                                   │  one subprocess per scene
+ │   per-scene process pool; hides session_id demux      │  (Chrome-style isolation)
  └──────┬───────────────────────────────────────────────┘
         ▲ │   ACP JSON-RPC over stdio
  ┌──────┴───────────────────────────────────────────────┐
@@ -84,10 +84,10 @@ Each boundary is a clean contract:
 
 | Boundary | What crosses it | What is hidden |
 |---|---|---|
-| peer ⇄ adapter | a concrete wire protocol (HTTP today) | everything above |
+| participant ⇄ adapter | a concrete wire protocol (HTTP today) | everything above |
 | adapter ⇄ reactor | **continuous channel signals**, human-model vocabulary | transport, framing, mime, long-poll |
 | reactor ⇄ session layer | **independent session handles** (prompt / read updates / drop) | subprocesses, the routing table, `session_id` demux |
-| session layer ⇄ subprocess | ACP JSON-RPC | process pooling, per-peer isolation |
+| session layer ⇄ subprocess | ACP JSON-RPC | process pooling, per-scene isolation |
 
 The two rules that place responsibility:
 
@@ -155,9 +155,9 @@ The convention: **emission stays markers/natural-language; anything that needs a
 
 ## 5. Session lifecycle
 
-### One persistent reactor session per peer
+### One persistent reactor session per scene
 
-Each peer has exactly one reactor session, used **forever** as the brain — not re-created per turn. Its context is kept clean, lightweight, and responsive. Continuity is *in the session*, with the journal as the durable backstop (below).
+Each scene has exactly one reactor session, used **forever** as the brain — not re-created per turn. Its context is kept clean, lightweight, and responsive. Continuity is *in the session*, with the journal as the durable backstop (below).
 
 ### Heartbeat hot-swap (asynchronous auto-compaction)
 
@@ -165,9 +165,9 @@ A long-lived session would eventually rot or overflow. Instead of letting it, a 
 
 1. summarizes the live reactor session,
 2. pre-warms a replacement session seeded with that summary plus a verbatim recent tail,
-3. atomically **swaps** the replacement in between turns — invisible to the peer.
+3. atomically **swaps** the replacement in between turns — invisible to the conversation.
 
-On a hard context-limit hit, the same mechanism runs as a forced **hard-stop swap**. The swap is a runtime concern; the peer never sees it.
+On a hard context-limit hit, the same mechanism runs as a forced **hard-stop swap**. The swap is a runtime concern; the conversation never sees it.
 
 ### The journal is the durable backstop
 
@@ -183,16 +183,16 @@ There is no true interruption or cancel. New input — including a correction or
 
 The reactor never sees subprocesses or the routing table. It talks to an **agent session layer** that exposes each ACP session as an **independent handle** — prompt it, read its updates, drop it to close. The `session_id` demux that lets many logical sessions share one stdio pipe is an internal detail of this layer.
 
-**Pool granularity: one subprocess per peer** (Chrome-style site-isolation, where the *peer* is the isolation unit). All of a peer's sessions — its persistent reactor session and its ephemeral working sessions — multiplex inside that peer's single subprocess. Different peers get different subprocesses.
+**Pool granularity: one subprocess per scene** (Chrome-style site-isolation, where the *scene* is the isolation unit). All of a scene's sessions — its persistent reactor session and its ephemeral working sessions — multiplex inside that scene's single subprocess. Different scenes get different subprocesses.
 
 Consequences, all deliberate:
 
-- **Cross-peer isolation.** One peer's crash or OOM cannot touch another.
-- **Within-peer shared fate (accepted).** A worker OOM can take that peer's brain down — recovered by killing and cold-restarting the peer's process and rebuilding the reactor session from the journal. A recoverable hiccup, not data loss.
-- **Intra-peer cancel is cooperative.** You cannot `kill -9` one worker without killing the brain it shares a process with — which is consistent with fix-forward/no-cancel (§5). Hard-cancel exists only at peer granularity (restart the peer's process).
-- The process is spawned lazily on a peer's first session and kept warm; intra-peer session creation is cheap. Process count is bounded by peer count; multi-tenant scale would later add idle/LRU eviction or a bounded pool.
+- **Cross-scene isolation.** One scene's crash or OOM cannot touch another.
+- **Within-scene shared fate (accepted).** A worker OOM can take that scene's brain down — recovered by killing and cold-restarting the scene's process and rebuilding the reactor session from the journal. A recoverable hiccup, not data loss.
+- **Intra-scene cancel is cooperative.** You cannot `kill -9` one worker without killing the brain it shares a process with — which is consistent with fix-forward/no-cancel (§5). Hard-cancel exists only at scene granularity (restart the scene's process).
+- The process is spawned lazily on a scene's first session and kept warm; intra-scene session creation is cheap. Process count is bounded by scene count; multi-tenant scale would later add idle/LRU eviction or a bounded pool.
 
-ACP permits both one-connection-many-sessions and one-process-per-session; this layer chooses per-peer pooling and keeps the choice swappable behind the handle interface.
+ACP permits both one-connection-many-sessions and one-process-per-session; this layer chooses per-scene pooling and keeps the choice swappable behind the handle interface.
 
 ---
 
@@ -208,7 +208,7 @@ The reactor session keeps a clean, fast context and spins off heavy or tool-usin
 
 A working session and the reactor session are **peers in capability**. Both reach the full inner substrate — user memory, learned skills, tools, the right to spawn further workers. The reactor is the *lifecycle* parent (it spawns and can tear down a worker) but does **not** gate a live worker's capabilities.
 
-The one asymmetry: **channels are exclusive to the reactor session.** A worker cannot emit on or perceive a channel — it cannot directly speak or show. The reason is **single-voice coherence**: reading memory or skills never conflicts, so it is shared; but many sub-minds emitting to the peer at once is chaos, so the channel funnels through a single serializing articulator. A worker that wants to reach the peer produces an *intent*; the reactor articulates it.
+The one asymmetry: **channels are exclusive to the reactor session.** A worker cannot emit on or perceive a channel — it cannot directly speak or show. The reason is **single-voice coherence**: reading memory or skills never conflicts, so it is shared; but many sub-minds emitting to the person at once is chaos, so the channel funnels through a single serializing articulator. A worker that wants to reach the person produces an *intent*; the reactor articulates it.
 
 ### The bus is bidirectional and async
 
@@ -219,10 +219,10 @@ Delegation is not "call a worker, get a summary." During a run:
 
 Asks are **non-blocking intents**, not blocking calls. The worker proceeds with a placeholder and reconciles later — **fix-forward on missing input**, the same spirit as fix-forward/no-cancel. The reactor decides *when, whether, and how* to voice an ask on its own social timing:
 
-- the peer said "don't bother me for an hour" → hold the ask, keep building with placeholders;
-- the peer said nothing and no answer arrives in a few minutes → the reactor's **social timeout** fires and it tells the worker to proceed with a placeholder.
+- the person said "don't bother me for an hour" → hold the ask, keep building with placeholders;
+- the person said nothing and no answer arrives in a few minutes → the reactor's **social timeout** fires and it tells the worker to proceed with a placeholder.
 
-That wait is a reactor *policy*, never a worker block. Progress-checking is therefore **emergent**, not a native feature: when the peer asks "how's it going," the reactor decides to check — e.g. by consulting a worker's transcript — and articulates a clean answer. (This requires worker transcripts to be inspectable, so one worker can be seeded with another's history.)
+That wait is a reactor *policy*, never a worker block. Progress-checking is therefore **emergent**, not a native feature: when the person asks "how's it going," the reactor decides to check — e.g. by consulting a worker's transcript — and articulates a clean answer. (This requires worker transcripts to be inspectable, so one worker can be seeded with another's history.)
 
 ---
 
@@ -238,11 +238,11 @@ Other load-bearing terms:
 
 - **channel** — one sense or expression stream (text, audio, vision, surface, …).
 - **reactor module** — the transport-agnostic Rust mux/demux and presence loop.
-- **reactor session** — the persistent per-peer brain.
+- **reactor session** — the persistent per-scene brain.
 - **working session** — an ephemeral, channel-mute, delegated cognition unit.
 - **transport adapter** (a.k.a. the reactor *owner* / host) — binds continuous channel signals to a concrete wire.
-- **agent session layer** — the per-peer process pool exposing independent session handles.
-- **peer** — a counterpart (human or device) the agent converses with.
+- **agent session layer** — the per-scene process pool exposing independent session handles.
+- **scene** — the situation a signal belongs to (with a person, a group, or alone); the context-isolation unit. One reactor session and one subprocess per scene. Participants — the humans or devices in a scene — are soft, inferred from content, not a structural key.
 
 ---
 

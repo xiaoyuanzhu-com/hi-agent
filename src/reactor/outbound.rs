@@ -16,25 +16,25 @@
 
 use bytes::Bytes;
 
-use crate::types::{PeerId, SurfaceEnvelope};
+use crate::types::{Scene, SurfaceEnvelope};
 
-/// One continuous outbound signal on a channel, addressed to a peer. The
+/// One continuous outbound signal on a channel, addressed to a scene. The
 /// reactor's entire output surface in human-channel terms.
 #[derive(Debug, Clone)]
 pub enum OutboundSignal {
-    /// A chunk of agent text on the /thought channel. Concatenate a peer's
+    /// A chunk of agent text on the /thought channel. Concatenate a scene's
     /// chunks between [`TextEnd`](OutboundSignal::TextEnd)s to get one utterance.
-    Text { peer: PeerId, chunk: String },
+    Text { scene: Scene, chunk: String },
     /// The boundary that ends one continuous /thought utterance.
-    TextEnd { peer: PeerId },
+    TextEnd { scene: Scene },
     /// A span of synthesized speech begins; `codec` names the audio format
     /// (e.g. `audio/mpeg`). `turn` correlates this span's frames so the adapter
     /// can hold one response open for exactly one utterance.
-    AudioBegin { peer: PeerId, turn: u64, codec: String },
+    AudioBegin { scene: Scene, turn: u64, codec: String },
     /// One frame of synthesized speech within the open span.
-    AudioFrame { peer: PeerId, turn: u64, bytes: Bytes },
+    AudioFrame { scene: Scene, turn: u64, bytes: Bytes },
     /// The span of speech ends (synthesis finished, or the turn was cut short).
-    AudioEnd { peer: PeerId, turn: u64 },
+    AudioEnd { scene: Scene, turn: u64 },
     /// A rich-content surface to show on the /surface channel.
-    Surface { peer: PeerId, envelope: SurfaceEnvelope },
+    Surface { scene: Scene, envelope: SurfaceEnvelope },
 }

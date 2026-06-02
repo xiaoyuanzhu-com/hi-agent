@@ -1,30 +1,30 @@
-//! Snapshot — the per-peer view passed into a peer's reactor session.
+//! Snapshot — the per-scene view passed into a scene's reactor session.
 
 use chrono::{DateTime, Duration, Utc};
 
 use crate::memory::Memory;
 use crate::memory::journal::entry_ts;
-use crate::types::{JournalEntry, PeerId};
+use crate::types::{JournalEntry, Scene};
 
 pub const RECENT_WINDOW_MIN: i64 = 30;
 pub const RECENT_ENTRY_LIMIT: usize = 200;
 
 #[derive(Debug, Clone)]
 pub struct Snapshot {
-    pub peer: PeerId,
+    pub scene: Scene,
     pub recent_entries: Vec<JournalEntry>,
     pub now: DateTime<Utc>,
 }
 
-pub async fn build_for_peer(memory: &Memory, peer: &PeerId) -> anyhow::Result<Snapshot> {
+pub async fn build_for_scene(memory: &Memory, scene: &Scene) -> anyhow::Result<Snapshot> {
     let now = Utc::now();
     let since = now - Duration::minutes(RECENT_WINDOW_MIN);
     let recent_entries = memory
         .journal
-        .recent(Some(peer), since, RECENT_ENTRY_LIMIT)
+        .recent(Some(scene), since, RECENT_ENTRY_LIMIT)
         .await?;
     Ok(Snapshot {
-        peer: peer.clone(),
+        scene: scene.clone(),
         recent_entries,
         now,
     })
@@ -49,11 +49,11 @@ impl Snapshot {
 fn render_entry(e: &JournalEntry) -> String {
     let ts = entry_ts(e).format("%H:%M:%S");
     match e {
-        JournalEntry::SignalIn { channel, from, body, .. } => {
-            format!("[{}] {}\u{2192}agent on /{}: \"{}\"", ts, from, channel, truncate(body, 200))
+        JournalEntry::SignalIn { channel, scene, body, .. } => {
+            format!("[{}] {}\u{2192}agent on /{}: \"{}\"", ts, scene, channel, truncate(body, 200))
         }
-        JournalEntry::SignalOut { channel, to, body, .. } => {
-            format!("[{}] agent\u{2192}{} on /{}: \"{}\"", ts, to, channel, truncate(body, 200))
+        JournalEntry::SignalOut { channel, scene, body, .. } => {
+            format!("[{}] agent\u{2192}{} on /{}: \"{}\"", ts, scene, channel, truncate(body, 200))
         }
     }
 }

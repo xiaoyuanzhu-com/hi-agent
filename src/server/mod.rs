@@ -13,7 +13,7 @@ use tower_http::trace::TraceLayer;
 
 use crate::memory::Memory;
 use crate::reactor::OutboundSignal;
-use crate::types::{PeerId, Signal, SurfaceEnvelope};
+use crate::types::{Scene, Signal, SurfaceEnvelope};
 use crate::voice::Stt;
 
 pub mod audio;
@@ -34,23 +34,23 @@ pub use thought_bus::ThoughtBus;
 /// `End`. The GET /audio handler turns one such run into one chunked HTTP
 /// response — the client just appends bytes and plays, no per-clip reassembly.
 ///
-/// `to` routes to a peer (or broadcast when `None`); `turn` is the monotonic
+/// `scene` routes to a scene (or broadcast when `None`); `turn` is the monotonic
 /// cognition turn, used to keep a handler's response bound to a single turn so
 /// frames from a later turn never bleed into an earlier response.
 #[derive(Debug, Clone)]
 pub enum AudioEvent {
-    Start { to: Option<PeerId>, turn: u64, mime: String },
-    Frame { to: Option<PeerId>, turn: u64, bytes: Bytes },
-    End { to: Option<PeerId>, turn: u64 },
+    Start { scene: Option<Scene>, turn: u64, mime: String },
+    Frame { scene: Option<Scene>, turn: u64, bytes: Bytes },
+    End { scene: Option<Scene>, turn: u64 },
 }
 
 impl AudioEvent {
     /// The routing target, common to every variant.
-    pub fn to(&self) -> &Option<PeerId> {
+    pub fn scene(&self) -> &Option<Scene> {
         match self {
-            AudioEvent::Start { to, .. }
-            | AudioEvent::Frame { to, .. }
-            | AudioEvent::End { to, .. } => to,
+            AudioEvent::Start { scene, .. }
+            | AudioEvent::Frame { scene, .. }
+            | AudioEvent::End { scene, .. } => scene,
         }
     }
 
@@ -68,7 +68,7 @@ impl AudioEvent {
 /// that the GET /surface long-poll filters on.
 #[derive(Debug, Clone)]
 pub struct SurfaceEvent {
-    pub to: Option<PeerId>,
+    pub scene: Option<Scene>,
     pub envelope: SurfaceEnvelope,
     pub ts: DateTime<Utc>,
 }
@@ -78,7 +78,7 @@ pub struct AppState {
     /// Inbound signals from every channel POST. The reactor consumes these.
     pub inbound: mpsc::Sender<Signal>,
 
-    /// Outbound thought buffer. GET /thought readers drain it per peer. Unlike
+    /// Outbound thought buffer. GET /thought readers drain it per scene. Unlike
     /// a broadcast, a reply produced while no reader is connected is retained
     /// for the next GET instead of being dropped.
     pub thought_bus: ThoughtBus,

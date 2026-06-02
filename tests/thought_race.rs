@@ -5,14 +5,14 @@
 //! ("Hey! What's up?") and emitted its chunks, but the web client's GET
 //! /thought re-subscribed ~150ms too late. The old `tokio::broadcast` delivered
 //! nothing to a receiver created after the send, so "send hi, nothing
-//! responds". The per-peer `ThoughtBus` buffers utterances, so a late GET still
+//! responds". The per-scene `ThoughtBus` buffers utterances, so a late GET still
 //! drains the pending one.
 
 use std::time::Duration;
 
 use hi_agent::memory::Memory;
 use hi_agent::server::{self, ServerSeams, ThoughtBus};
-use hi_agent::types::PeerId;
+use hi_agent::types::Scene;
 use tempfile::tempdir;
 use tokio::net::TcpListener;
 
@@ -30,20 +30,20 @@ async fn spawn_server() -> (String, tempfile::TempDir, ServerSeams) {
     (format!("http://{addr}"), dir, seams)
 }
 
-async fn emit_utterance(bus: &ThoughtBus, peer: &str, chunks: &[&str]) {
-    let peer = PeerId(peer.to_string());
+async fn emit_utterance(bus: &ThoughtBus, scene: &str, chunks: &[&str]) {
+    let scene = Scene(scene.to_string());
     for c in chunks {
-        bus.push_chunk(&peer, c.to_string()).await;
+        bus.push_chunk(&scene, c.to_string()).await;
     }
-    bus.end_utterance(&peer).await;
+    bus.end_utterance(&scene).await;
 }
 
-async fn get_thought(base: &str, peer: &str, budget: Duration) -> Result<String, ()> {
+async fn get_thought(base: &str, scene: &str, budget: Duration) -> Result<String, ()> {
     let client = reqwest::Client::new();
     tokio::time::timeout(budget, async {
         client
             .get(format!("{base}/api/thought"))
-            .header("X-HI-To", peer)
+            .header("X-HI-Scene", scene)
             .send()
             .await
             .expect("send")
@@ -109,9 +109,9 @@ async fn sequential_gets_drain_fifo() {
     assert_eq!(b, "second");
 }
 
-/// Utterances are keyed by peer: one peer's reply never leaks to another.
+/// Utterances are keyed by scene: one scene's reply never leaks to another.
 #[tokio::test]
-async fn utterances_are_per_peer() {
+async fn utterances_are_per_scene() {
     let (base, _dir, seams) = spawn_server().await;
 
     emit_utterance(&seams.thought_bus, "alice@phone", &["for alice"]).await;
@@ -127,9 +127,9 @@ async fn utterances_are_per_peer() {
     assert_eq!(alice, "for alice");
 }
 
-/// GET without X-HI-To has no peer to drain → 400, not a silent hang.
+/// GET without X-HI-Scene has no scene to drain → 400, not a silent hang.
 #[tokio::test]
-async fn get_without_peer_is_bad_request() {
+async fn get_without_scene_is_bad_request() {
     let (base, _dir, _seams) = spawn_server().await;
     let client = reqwest::Client::new();
 

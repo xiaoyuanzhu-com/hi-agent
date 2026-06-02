@@ -13,24 +13,23 @@ use axum::response::IntoResponse;
 use tokio::sync::broadcast::error::RecvError;
 
 use crate::server::AppState;
-use crate::server::headers::{AuthBearer, ToHeader};
+use crate::server::headers::{AuthBearer, RequiredScene};
 
 pub async fn get_surface(
     State(state): State<Arc<AppState>>,
-    ToHeader(subscriber): ToHeader,
+    RequiredScene(scene): RequiredScene,
     AuthBearer(auth): AuthBearer,
 ) -> impl IntoResponse {
     let mut rx = state.surface_out.subscribe();
 
-    tracing::info!(subscriber = ?subscriber, auth = ?auth, "GET /surface long-poll opened");
+    tracing::info!(scene = %scene, auth = ?auth, "GET /surface long-poll opened");
 
     loop {
         match rx.recv().await {
             Ok(event) => {
-                let deliver = match (&event.to, &subscriber) {
-                    (None, _) => true,
-                    (Some(target), Some(sub)) => target == sub,
-                    (Some(_), None) => true,
+                let deliver = match &event.scene {
+                    None => true,
+                    Some(target) => target == &scene,
                 };
                 if !deliver {
                     continue;

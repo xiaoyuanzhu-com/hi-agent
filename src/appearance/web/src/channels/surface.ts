@@ -17,7 +17,7 @@ export interface SurfaceEnvelope {
 }
 
 export interface SubscribeSurfaceOpts {
-  peer: string;
+  scene: string;
   signal: AbortSignal;
 }
 
@@ -27,7 +27,7 @@ export async function* subscribeSurface(
   while (!opts.signal.aborted) {
     const res = await fetch("/api/surface", {
       method: "GET",
-      headers: { "X-HI-To": opts.peer, Accept: "application/json" },
+      headers: { "X-HI-Scene": opts.scene, Accept: "application/json" },
       signal: opts.signal,
       cache: "no-store",
     });

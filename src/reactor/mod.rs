@@ -1,8 +1,8 @@
-//! Reactor — the *mind*. Per-peer queues + one persistent session per peer.
+//! Reactor — the *mind*. Per-scene queues + one persistent session per scene.
 //!
-//! One mpsc per peer, one task per peer; turns run serially against a single
-//! ACP session that is opened on the peer's first turn and reused forever as
-//! the peer's continuous mind. Cognition is delegated to that session; the
+//! One mpsc per scene, one task per scene; turns run serially against a single
+//! ACP session that is opened on the scene's first turn and reused forever as
+//! the scene's continuous mind. Cognition is delegated to that session; the
 //! reactor never blocks on it.
 //!
 //! ## Turn-taking lives here, not in the client
@@ -36,7 +36,7 @@
 //! markers; the reactor spawns a channel-mute [`workers`] session for it and
 //! keeps talking. The worker runs with the same substrate (memory, tools) but
 //! no voice of its own, and posts its result — or a question, if it gets
-//! stuck — back into this peer's queue, where it lands as just another input
+//! stuck — back into this scene's queue, where it lands as just another input
 //! the next turn folds into what the mind says.
 
 use std::collections::HashMap;
@@ -57,8 +57,8 @@ use uuid::Uuid;
 
 use crate::acp::{AcpSession, SessionOpts, SessionUpdate};
 use crate::agent::AgentLayer;
-use crate::memory::{Memory, build_for_peer};
-use crate::types::{Channel, JournalEntry, PeerId, Signal, SurfaceEnvelope, SurfaceMode, SurfaceOp};
+use crate::memory::{Memory, build_for_scene};
+use crate::types::{Channel, JournalEntry, Scene, Signal, SurfaceEnvelope, SurfaceMode, SurfaceOp};
 use crate::voice::{Tts, TtsStream};
 use bytes::Bytes;
 
@@ -72,12 +72,12 @@ use bytes::Bytes;
 const RESPONSE_SETTLE: Duration = Duration::from_millis(700);
 
 const REACTOR_SYSTEM_PROMPT: &str = "You are a human-interface agent. \
-A peer is talking to you over /thought. Reply naturally with text — your reply \
+Someone is talking to you over /thought. Reply naturally with text — your reply \
 streams back to them and is spoken aloud, so keep it conversational. You have \
 file access, code execution, and the rest of your harness's tools; use them \
 freely when helpful.\n\
 \n\
-The peer often speaks in several short bursts with pauses between them, so by \
+They often speak in several short bursts with pauses between them, so by \
 the time you reply you may be seeing the whole thing at once under \"New \
 signals\". Respond the way a person who was listening the whole time would: \
 take in everything they said and answer it as one. When it feels natural, open \
@@ -103,16 +103,16 @@ description of the work, with everything the worker needs to start [[/delegate]]
 The worker runs in the background with your same tools and memory but no voice \
 of its own; it reports back when it's done (or if it gets stuck), and you'll \
 see its result under \"New signals\" to fold into what you say next. Delegate \
-markers are never spoken — keep talking to the peer naturally around them \
+markers are never spoken — keep talking to them naturally around them \
 (\"let me dig into that, give me a moment\"). Do quick, simple things yourself; \
 delegate only what genuinely needs the time. A \"Working sessions\" section, \
 when present, shows what your delegated workers are doing right now.";
 
-const PEER_QUEUE_CAPACITY: usize = 64;
+const SCENE_QUEUE_CAPACITY: usize = 64;
 
-/// One item in a peer's turn queue. Both a human utterance and a worker's
+/// One item in a scene's turn queue. Both a human utterance and a worker's
 /// report drive a reactor turn, but they enter differently: a human signal
-/// comes through [`Reactor::deliver_to_peer`] and triggers barge-in (it cancels
+/// comes through [`Reactor::deliver_to_scene`] and triggers barge-in (it cancels
 /// the in-flight prompt); a worker report is posted straight into the queue by
 /// the worker's drive task, so it waits its turn and never interrupts live
 /// speech. Both land here and are settled into one batch.
@@ -142,13 +142,13 @@ struct ReactorInner {
     /// it tags audio spans and the channel logs so a reply is traceable end to
     /// end. (The client no longer needs it — turns are internal to the mind.)
     turn_seq: AtomicU64,
-    peers: Mutex<HashMap<PeerId, PeerHandle>>,
+    scenes: Mutex<HashMap<Scene, SceneHandle>>,
 }
 
-struct PeerHandle {
+struct SceneHandle {
     inbound: mpsc::Sender<LoopInput>,
     /// `None` when idle. Set to the in-flight session so the dispatcher can
-    /// cancel it when a new signal arrives for this peer.
+    /// cancel it when a new signal arrives for this scene.
     in_flight: Arc<Mutex<Option<Arc<AcpSession>>>>,
 }
 
@@ -166,15 +166,15 @@ pub fn start(
             tts,
             out,
             turn_seq: AtomicU64::new(0),
-            peers: Mutex::new(HashMap::new()),
+            scenes: Mutex::new(HashMap::new()),
         }),
     };
     let dispatch_reactor = reactor.clone();
 
     tokio::spawn(async move {
         while let Some(signal) = inbound_rx.recv().await {
-            let peer = signal.from.clone();
-            dispatch_reactor.deliver_to_peer(peer, signal).await;
+            let scene = signal.scene.clone();
+            dispatch_reactor.deliver_to_scene(scene, signal).await;
         }
         tracing::warn!("reactor inbound channel closed; dispatch loop exiting");
     });
@@ -183,8 +183,8 @@ pub fn start(
 }
 
 impl Reactor {
-    async fn deliver_to_peer(&self, peer: PeerId, signal: Signal) {
-        let (sender, in_flight) = self.get_or_create_peer(peer.clone()).await;
+    async fn deliver_to_scene(&self, scene: Scene, signal: Signal) {
+        let (sender, in_flight) = self.get_or_create_scene(scene.clone()).await;
 
         let in_flight_session: Option<Arc<AcpSession>> = {
             let guard = in_flight.lock().await;
@@ -192,75 +192,75 @@ impl Reactor {
         };
         if let Some(session) = in_flight_session {
             if let Err(err) = session.cancel().await {
-                tracing::warn!(peer = %peer, error = %err, "session/cancel failed during interruption");
+                tracing::warn!(scene = %scene, error = %err, "session/cancel failed during interruption");
             } else {
-                tracing::debug!(peer = %peer, "interrupting in-flight turn");
+                tracing::debug!(scene = %scene, "interrupting in-flight turn");
             }
         }
 
         if let Err(err) = sender.send(LoopInput::Human(signal)).await {
-            tracing::error!(peer = %peer, error = %err, "peer inbound channel closed; dropping signal");
+            tracing::error!(scene = %scene, error = %err, "scene inbound channel closed; dropping signal");
         }
     }
 
-    async fn get_or_create_peer(
+    async fn get_or_create_scene(
         &self,
-        peer: PeerId,
+        scene: Scene,
     ) -> (mpsc::Sender<LoopInput>, Arc<Mutex<Option<Arc<AcpSession>>>>) {
-        let mut peers = self.inner.peers.lock().await;
-        if let Some(handle) = peers.get(&peer) {
+        let mut scenes = self.inner.scenes.lock().await;
+        if let Some(handle) = scenes.get(&scene) {
             return (handle.inbound.clone(), handle.in_flight.clone());
         }
 
-        let (tx, rx) = mpsc::channel::<LoopInput>(PEER_QUEUE_CAPACITY);
+        let (tx, rx) = mpsc::channel::<LoopInput>(SCENE_QUEUE_CAPACITY);
         let in_flight: Arc<Mutex<Option<Arc<AcpSession>>>> = Arc::new(Mutex::new(None));
-        peers.insert(
-            peer.clone(),
-            PeerHandle {
+        scenes.insert(
+            scene.clone(),
+            SceneHandle {
                 inbound: tx.clone(),
                 in_flight: in_flight.clone(),
             },
         );
-        drop(peers);
+        drop(scenes);
 
         let task_reactor = self.clone();
-        let task_peer = peer.clone();
+        let task_scene = scene.clone();
         let task_in_flight = in_flight.clone();
         // The worker registry posts its reports back into this same queue, so
         // hand the loop a sender clone to seed it.
         let task_worker_inbound = tx.clone();
         tokio::spawn(async move {
-            per_peer_loop(task_reactor, task_peer, rx, task_in_flight, task_worker_inbound).await;
+            per_scene_loop(task_reactor, task_scene, rx, task_in_flight, task_worker_inbound).await;
         });
 
         (tx, in_flight)
     }
 }
 
-async fn per_peer_loop(
+async fn per_scene_loop(
     reactor: Reactor,
-    peer: PeerId,
+    scene: Scene,
     mut inbound: mpsc::Receiver<LoopInput>,
     in_flight: Arc<Mutex<Option<Arc<AcpSession>>>>,
     worker_inbound: mpsc::Sender<LoopInput>,
 ) {
-    // The peer's persistent reactor session: opened lazily on the first turn,
-    // then reused for every later turn as the peer's continuous mind. Only this
+    // The scene's persistent reactor session: opened lazily on the first turn,
+    // then reused for every later turn as the scene's continuous mind. Only this
     // loop touches it, so a plain local `Option` suffices; the heartbeat swap
     // below replaces it in place, between turns.
     let mut reactor_session: Option<Arc<AcpSession>> = None;
     // Tracks how much the live session has accumulated, so we know when to
     // hot-swap it before it rots or overflows.
     let mut budget = heartbeat::ContextBudget::new();
-    // The peer's live working sessions. Heavy/tool-using work the reactor
+    // The scene's live working sessions. Heavy/tool-using work the reactor
     // delegates runs here; workers post progress and results back through
     // `worker_inbound` into this same loop.
-    let mut workers = workers::WorkerRegistry::new(peer.clone(), worker_inbound);
+    let mut workers = workers::WorkerRegistry::new(scene.clone(), worker_inbound);
     loop {
         let first = match inbound.recv().await {
             Some(s) => s,
             None => {
-                tracing::info!(peer = %peer, "per-peer inbound closed; exiting loop");
+                tracing::info!(scene = %scene, "per-scene inbound closed; exiting loop");
                 return;
             }
         };
@@ -280,14 +280,14 @@ async fn per_peer_loop(
             }
         };
         if closed {
-            tracing::info!(peer = %peer, "per-peer inbound closed; exiting loop");
+            tracing::info!(scene = %scene, "per-scene inbound closed; exiting loop");
             return;
         }
 
         // Forget any workers that have finished, so the registry doesn't grow.
         workers.reap();
 
-        match run_turn(&reactor, &peer, &batch, &in_flight, &mut reactor_session, &mut budget, &mut workers).await {
+        match run_turn(&reactor, &scene, &batch, &in_flight, &mut reactor_session, &mut budget, &mut workers).await {
             Ok(()) => {
                 // Between turns: if the live session has grown past budget, hot-swap
                 // it now. The human is consuming the reply just delivered, so the
@@ -295,21 +295,21 @@ async fn per_peer_loop(
                 // a cold restart. A swap failure leaves the warm session in place.
                 if budget.should_swap() {
                     if let Some(current) = reactor_session.clone() {
-                        match heartbeat::swap(&reactor, &peer, &current).await {
+                        match heartbeat::swap(&reactor, &scene, &current).await {
                             Ok(fresh) => {
                                 reactor_session = Some(fresh);
                                 budget.reset();
-                                tracing::info!(peer = %peer, "reactor session hot-swapped");
+                                tracing::info!(scene = %scene, "reactor session hot-swapped");
                             }
                             Err(err) => {
-                                tracing::warn!(peer = %peer, error = %err, "hot-swap failed; keeping warm session");
+                                tracing::warn!(scene = %scene, error = %err, "hot-swap failed; keeping warm session");
                             }
                         }
                     }
                 }
             }
             Err(err) => {
-                tracing::warn!(peer = %peer, error = %err, "turn failed");
+                tracing::warn!(scene = %scene, error = %err, "turn failed");
                 {
                     let mut guard = in_flight.lock().await;
                     *guard = None;
@@ -323,7 +323,7 @@ async fn per_peer_loop(
     }
 }
 
-/// One turn: prompt the peer's persistent reactor session (opening it on the
+/// One turn: prompt the scene's persistent reactor session (opening it on the
 /// first turn), stream text updates to `/thought`, and broadcast
 /// `EndOfUtterance` when the turn ends.
 ///
@@ -333,7 +333,7 @@ async fn per_peer_loop(
 /// the durable backstop, not per-turn context to re-send.
 async fn run_turn(
     reactor: &Reactor,
-    peer: &PeerId,
+    scene: &Scene,
     batch: &[LoopInput],
     in_flight: &Arc<Mutex<Option<Arc<AcpSession>>>>,
     reactor_session: &mut Option<Arc<AcpSession>>,
@@ -354,13 +354,13 @@ async fn run_turn(
     let prompt_text = match reactor_session.as_ref() {
         Some(_) => join_sections(&[&worker_status, &new_signals]),
         None => {
-            let snap = build_for_peer(&reactor.inner.memory, peer).await?;
+            let snap = build_for_scene(&reactor.inner.memory, scene).await?;
             join_sections(&[&snap.render_for_prompt(), &worker_status, &new_signals])
         }
     };
     let prompt_chars = prompt_text.chars().count();
 
-    // Get-or-open the peer's persistent reactor session. Opened once, carrying
+    // Get-or-open the scene's persistent reactor session. Opened once, carrying
     // the system prompt — which the session consumes on its first prompt and
     // never re-sends. Every later turn prompts this same warm session, so
     // continuity lives in the session, not in a per-turn rebuild.
@@ -372,7 +372,7 @@ async fn run_turn(
                     .inner
                     .agent
                     .session(
-                        peer,
+                        scene,
                         SessionOpts {
                             system_prompt: Some(REACTOR_SYSTEM_PROMPT.to_string()),
                             cwd: None,
@@ -407,7 +407,7 @@ async fn run_turn(
         let mut extractor = SurfaceExtractor::new();
         // Pulls `[[delegate]] … [[/delegate]]` task blocks out of the reply: the
         // reactor delegates heavy work by naming a task inline, which spawns a
-        // channel-mute working session and is NOT spoken to the peer.
+        // channel-mute working session and is NOT spoken to the scene.
         let mut delegate_extractor = MarkerExtractor::new(OPEN_DELEGATE, CLOSE_DELEGATE);
         // Accumulate the spoken text so the whole reply is logged once at end of
         // turn on the `channel` stream, rather than per-chunk (which is noisy).
@@ -420,17 +420,17 @@ async fn run_turn(
                     // with the right Content-Type before any frame arrives.
                     let _ = out
                         .send(OutboundSignal::AudioBegin {
-                            peer: peer.clone(),
+                            scene: scene.clone(),
                             turn: turn_id,
                             codec: mime,
                         })
                         .await;
                     let handle =
-                        tokio::spawn(forward_frames(frames, out, peer.clone(), turn_id));
+                        tokio::spawn(forward_frames(frames, out, scene.clone(), turn_id));
                     (Some(text), Some(handle))
                 }
                 Err(err) => {
-                    tracing::warn!(peer = %peer, error = %err, "TTS session start failed; turn is silent");
+                    tracing::warn!(scene = %scene, error = %err, "TTS session start failed; turn is silent");
                     (None, None)
                 }
             },
@@ -443,14 +443,14 @@ async fn run_turn(
                     // Split rich-content surface blocks out of the spoken text.
                     let (clean, surfaces) = extractor.push(&text);
                     for envelope in surfaces {
-                        emit_surface(reactor, peer, envelope).await;
+                        emit_surface(reactor, scene, envelope).await;
                     }
                     // Then pull any `[[delegate]]` task blocks out of what's
                     // left and spawn a worker per task — these are never spoken.
                     let (spoken, tasks) = delegate_extractor.push(&clean);
                     for task in tasks {
                         if let Err(err) = workers.spawn(reactor, task).await {
-                            tracing::warn!(peer = %peer, error = %err, "failed to spawn working session");
+                            tracing::warn!(scene = %scene, error = %err, "failed to spawn working session");
                         }
                     }
                     if !spoken.is_empty() {
@@ -460,17 +460,17 @@ async fn run_turn(
                                 let _ = tx.send(sentence).await;
                             }
                         }
-                        emit_thought_chunk(reactor, peer, spoken).await;
+                        emit_thought_chunk(reactor, scene, spoken).await;
                     }
                 }
                 Some(SessionUpdate::Thought(_)) => {
                     // Internal reasoning; do not surface.
                 }
                 Some(SessionUpdate::ToolCall(stub)) => {
-                    tracing::debug!(peer = %peer, variant = stub.raw_variant, "tool call");
+                    tracing::debug!(scene = %scene, variant = stub.raw_variant, "tool call");
                 }
                 Some(SessionUpdate::Other(name)) => {
-                    tracing::trace!(peer = %peer, variant = %name, "ignored ACP update");
+                    tracing::trace!(scene = %scene, variant = %name, "ignored ACP update");
                 }
                 None => break,
             }
@@ -483,7 +483,7 @@ async fn run_turn(
         spoken_tail.push_str(&delegate_extractor.flush());
         for task in tail_tasks {
             if let Err(err) = workers.spawn(reactor, task).await {
-                tracing::warn!(peer = %peer, error = %err, "failed to spawn working session");
+                tracing::warn!(scene = %scene, error = %err, "failed to spawn working session");
             }
         }
         if !spoken_tail.is_empty() {
@@ -493,10 +493,10 @@ async fn run_turn(
                     let _ = tx.send(sentence).await;
                 }
             }
-            emit_thought_chunk(reactor, peer, spoken_tail).await;
+            emit_thought_chunk(reactor, scene, spoken_tail).await;
         }
         if !full_reply.trim().is_empty() {
-            crate::channel_log::outbound(Channel::Thought, peer, full_reply.trim());
+            crate::channel_log::outbound(Channel::Thought, scene, full_reply.trim());
         }
         if let Some(tx) = &synth_tx {
             if let Some(tail) = splitter.flush() {
@@ -507,11 +507,11 @@ async fn run_turn(
         let mut cancelled = false;
         match run.wait().await {
             Ok(result) => {
-                tracing::debug!(peer = %peer, stop = ?result.stop_reason, "turn finished");
+                tracing::debug!(scene = %scene, stop = ?result.stop_reason, "turn finished");
             }
             Err(err) => {
                 cancelled = true;
-                tracing::debug!(peer = %peer, error = %err, "turn run ended with error (likely cancel)");
+                tracing::debug!(scene = %scene, error = %err, "turn run ended with error (likely cancel)");
             }
         }
 
@@ -528,7 +528,7 @@ async fn run_turn(
                     .inner
                     .out
                     .send(OutboundSignal::AudioEnd {
-                        peer: peer.clone(),
+                        scene: scene.clone(),
                         turn: turn_id,
                     })
                     .await;
@@ -540,7 +540,7 @@ async fn run_turn(
 
     // End of utterance — closes the GET /thought response that's been
     // streaming this turn's chunks.
-    emit_end_of_utterance(reactor, peer).await;
+    emit_end_of_utterance(reactor, scene).await;
 
     {
         let mut guard = in_flight.lock().await;
@@ -558,33 +558,33 @@ async fn run_turn(
     Ok(())
 }
 
-async fn emit_thought_chunk(reactor: &Reactor, peer: &PeerId, text: String) {
+async fn emit_thought_chunk(reactor: &Reactor, scene: &Scene, text: String) {
     let ts = Utc::now();
     let entry = JournalEntry::SignalOut {
         ts,
         channel: Channel::Thought,
-        to: peer.clone(),
+        scene: scene.clone(),
         body: text.clone(),
         media_path: None,
     };
     if let Err(err) = reactor.inner.memory.journal.append(entry).await {
-        tracing::error!(peer = %peer, error = %err, "journal append failed for outbound thought");
+        tracing::error!(scene = %scene, error = %err, "journal append failed for outbound thought");
     }
     let _ = reactor
         .inner
         .out
         .send(OutboundSignal::Text {
-            peer: peer.clone(),
+            scene: scene.clone(),
             chunk: text,
         })
         .await;
 }
 
-async fn emit_end_of_utterance(reactor: &Reactor, peer: &PeerId) {
+async fn emit_end_of_utterance(reactor: &Reactor, scene: &Scene) {
     let _ = reactor
         .inner
         .out
-        .send(OutboundSignal::TextEnd { peer: peer.clone() })
+        .send(OutboundSignal::TextEnd { scene: scene.clone() })
         .await;
 }
 
@@ -610,7 +610,7 @@ fn render_batch(batch: &[LoopInput]) -> String {
                 let _ = writeln!(
                     s,
                     "[{}] {} on /{}: \"{}\"",
-                    ts, sig.from, sig.channel, sig.body
+                    ts, sig.scene, sig.channel, sig.body
                 );
             }
             LoopInput::Worker(report) => {
@@ -630,7 +630,7 @@ fn render_batch(batch: &[LoopInput]) -> String {
 async fn forward_frames(
     mut frames: mpsc::Receiver<Bytes>,
     out: mpsc::Sender<OutboundSignal>,
-    peer: PeerId,
+    scene: Scene,
     turn: u64,
 ) {
     let mut total = 0usize;
@@ -638,7 +638,7 @@ async fn forward_frames(
         total += bytes.len();
         let _ = out
             .send(OutboundSignal::AudioFrame {
-                peer: peer.clone(),
+                scene: scene.clone(),
                 turn,
                 bytes,
             })
@@ -646,7 +646,7 @@ async fn forward_frames(
     }
     let _ = out
         .send(OutboundSignal::AudioEnd {
-            peer: peer.clone(),
+            scene: scene.clone(),
             turn,
         })
         .await;
@@ -654,7 +654,7 @@ async fn forward_frames(
         target: "channel",
         dir = "out",
         channel = "audio",
-        peer = %peer,
+        scene = %scene,
         turn = turn,
         bytes = total,
         "channel out (tts stream)",
@@ -714,13 +714,13 @@ fn find_boundary(s: &str) -> Option<usize> {
     None
 }
 
-/// Emit one rich-content envelope on the /surface channel for this peer.
-async fn emit_surface(reactor: &Reactor, peer: &PeerId, envelope: SurfaceEnvelope) {
+/// Emit one rich-content envelope on the /surface channel for this scene.
+async fn emit_surface(reactor: &Reactor, scene: &Scene, envelope: SurfaceEnvelope) {
     tracing::info!(
         target: "channel",
         dir = "out",
         channel = "surface",
-        peer = %peer,
+        scene = %scene,
         op = ?envelope.op,
         mode = ?envelope.mode,
         html_len = envelope.html.as_deref().map(str::len).unwrap_or(0),
@@ -730,7 +730,7 @@ async fn emit_surface(reactor: &Reactor, peer: &PeerId, envelope: SurfaceEnvelop
         .inner
         .out
         .send(OutboundSignal::Surface {
-            peer: peer.clone(),
+            scene: scene.clone(),
             envelope,
         })
         .await;

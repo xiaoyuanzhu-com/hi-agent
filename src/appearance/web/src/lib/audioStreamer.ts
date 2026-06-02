@@ -19,8 +19,8 @@ export interface TranscriptEvent {
 }
 
 export interface AudioStreamerOptions {
-  /** Peer identity; rides in the WS query string (browsers can't set headers). */
-  peer: string;
+  /** Scene identity; rides in the WS query string (browsers can't set headers). */
+  scene: string;
   onTranscript: (e: TranscriptEvent) => void;
   /** Fired when the socket closes (network drop or stop()). */
   onClose?: () => void;
@@ -48,7 +48,7 @@ export class AudioStreamer {
     this.sr = ctx.sampleRate;
 
     const proto = location.protocol === "https:" ? "wss" : "ws";
-    const url = `${proto}://${location.host}/api/audio/in?peer=${encodeURIComponent(opts.peer)}`;
+    const url = `${proto}://${location.host}/api/audio/in?scene=${encodeURIComponent(opts.scene)}`;
     this.ws = new WebSocket(url);
     this.ws.binaryType = "arraybuffer";
     this.ws.onopen = () => {

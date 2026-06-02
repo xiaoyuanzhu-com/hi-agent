@@ -9,7 +9,7 @@ import { AudioStreamer } from "../lib/audioStreamer";
 import { VisionCapture } from "../lib/visionCapture";
 import { VoicePlayer } from "../lib/voicePlayer";
 import { SentenceBuffer } from "../lib/sentences";
-import { getPeer } from "../lib/peer";
+import { getScene } from "../lib/scene";
 import type { PresenceState } from "../ui/Presence";
 import type { SpeechItem } from "../ui/SpeechText";
 
@@ -110,7 +110,7 @@ export interface AgentSession {
  * Everything else is pass-through: the input channels just stream the signal.
  */
 export function useAgentSession(): AgentSession {
-  const peer = useMemo(() => getPeer(), []);
+  const scene = useMemo(() => getScene(), []);
 
   // Saved channel intents. Held in a ref (read synchronously by startSession /
   // the toggles) and written through on every explicit user change.
@@ -183,7 +183,7 @@ export function useAgentSession(): AgentSession {
           // Render the agent's words as they arrive. The mind only streams a
           // reply once it has committed to speaking (the human yielded the
           // floor), so there are no superseded drafts to untangle here.
-          for await (const chunk of subscribeThought({ peer, signal: ctrl.signal })) {
+          for await (const chunk of subscribeThought({ scene, signal: ctrl.signal })) {
             if (cancelled) break;
             setOffline(false);
             if (!gotChunk) {
@@ -211,7 +211,7 @@ export function useAgentSession(): AgentSession {
       cancelled = true;
       ctrl.abort();
     };
-  }, [woken, peer]);
+  }, [woken, scene]);
 
   // ---- GET /audio subscription loop (Phase 2: TTS playback) --------------
   // Pure render: each response is one turn's continuous audio. Stream its body
@@ -226,7 +226,7 @@ export function useAgentSession(): AgentSession {
     void (async () => {
       while (!cancelled) {
         try {
-          for await (const turn of subscribeAudioTurns({ peer, signal: ctrl.signal })) {
+          for await (const turn of subscribeAudioTurns({ scene, signal: ctrl.signal })) {
             if (cancelled) break;
             const voice = voiceRef.current;
             if (!voice) continue;
@@ -253,7 +253,7 @@ export function useAgentSession(): AgentSession {
       cancelled = true;
       ctrl.abort();
     };
-  }, [woken, peer]);
+  }, [woken, scene]);
 
   // ---- GET /surface subscription loop (Phase 3: content overlays) --------
   useEffect(() => {
@@ -263,7 +263,7 @@ export function useAgentSession(): AgentSession {
     void (async () => {
       while (!cancelled) {
         try {
-          for await (const env of subscribeSurface({ peer, signal: ctrl.signal })) {
+          for await (const env of subscribeSurface({ scene, signal: ctrl.signal })) {
             if (cancelled) break;
             if (env.op === "dismiss") {
               setActiveSurface((cur) => (cur && cur.id === env.id ? null : cur));
@@ -288,7 +288,7 @@ export function useAgentSession(): AgentSession {
       cancelled = true;
       ctrl.abort();
     };
-  }, [woken, peer]);
+  }, [woken, scene]);
 
   // ---- audio-input channel: acquire/release the mic (and vision) ---------
   // Independent of the session itself — text and audio are coequal input
@@ -309,7 +309,7 @@ export function useAgentSession(): AgentSession {
       // driven by recognized text, not raw mic energy — so we never falsely
       // mute the agent.
       const streamer = new AudioStreamer(audioBus.ctx, micNode, {
-        peer,
+        scene,
         onTranscript: ({ text, isFinal }) => {
           const heard = text.trim().length > 0;
           if (heard) {
@@ -338,7 +338,7 @@ export function useAgentSession(): AgentSession {
       );
       setAudioInput(false);
     }
-  }, [peer]);
+  }, [scene]);
 
   const disableAudio = useCallback(() => {
     micRef.current?.stop();
@@ -368,7 +368,7 @@ export function useAgentSession(): AgentSession {
       visionStreamRef.current = videoStream;
       visionRef.current = new VisionCapture(videoStream, {
         onFrame: (frameBlob, frameMime) => {
-          postVision({ from: peer, blob: frameBlob, mime: frameMime }).catch(() => {});
+          postVision({ scene, blob: frameBlob, mime: frameMime }).catch(() => {});
         },
       });
       setVideoError(null);
@@ -382,7 +382,7 @@ export function useAgentSession(): AgentSession {
       );
       setVideoInput(false);
     }
-  }, [peer]);
+  }, [scene]);
 
   const disableVision = useCallback(() => {
     visionRef.current?.stop();
@@ -528,9 +528,9 @@ export function useAgentSession(): AgentSession {
       if (!trimmed) return;
       // SpeechText shows the agent's words only; the typed line isn't echoed there.
       setAwaiting(true);
-      postThought({ from: peer, body: trimmed }).catch(() => setAwaiting(false));
+      postThought({ scene, body: trimmed }).catch(() => setAwaiting(false));
     },
-    [peer],
+    [scene],
   );
 
   const dismissSurface = useCallback(() => {

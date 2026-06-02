@@ -2,14 +2,14 @@
 //!
 //! The reactor keeps a single voice and must never block the floor on slow
 //! work, so heavy or long-running tasks are delegated here. A worker is a
-//! *channel-mute capability peer*: it has the full substrate — the peer's
-//! memory, tools, code execution, the right to spawn further workers — but no
+//! *channel-mute capability within the scene*: it has the full substrate — the
+//! scene's memory, tools, code execution, the right to spawn further workers — but no
 //! voice of its own (it never perceives or emits on a channel). That mute-ness
 //! is what preserves single-voice coherence: only the reactor speaks.
 //!
 //! The collaboration bus is asynchronous and worker→reactor here: a worker runs
 //! to completion (or until it must ask something), then posts a [`WorkerReport`]
-//! back into the peer's queue as a `LoopInput::Worker`. It never interrupts live
+//! back into the scene's queue as a `LoopInput::Worker`. It never interrupts live
 //! speech — the report waits its turn like any other input, and the next turn
 //! folds it into what the mind says. Questions are *non-blocking*: a worker that
 //! hits ambiguity flags it via `[[ask]]` and then proceeds on its best
@@ -29,11 +29,11 @@ use tokio::sync::{Mutex, mpsc};
 use tokio::task::JoinHandle;
 
 use crate::acp::{AcpSession, SessionOpts, SessionUpdate};
-use crate::types::PeerId;
+use crate::types::Scene;
 
 use super::{LoopInput, MarkerExtractor, Reactor};
 
-/// Per-peer-unique handle for a working session. Small and `Copy`; it tags the
+/// Per-scene-unique handle for a working session. Small and `Copy`; it tags the
 /// worker in status lines and in the reports it posts back.
 pub(super) type WorkerId = u64;
 
@@ -61,7 +61,7 @@ correct course later. If you must surface a question, wrap it in `[[ask]] … \
 [[/ask]]` markers and then proceed on your best assumption anyway. Work to \
 completion.";
 
-/// A report a worker posts back to the reactor's per-peer loop. It enters the
+/// A report a worker posts back to the reactor's per-scene loop. It enters the
 /// queue as a `LoopInput::Worker`, so it waits its turn and never interrupts
 /// live speech.
 pub(super) struct WorkerReport {
@@ -90,12 +90,12 @@ struct Worker {
     drive: JoinHandle<()>,
 }
 
-/// The peer's live working sessions. Owned by the per-peer loop, so a plain
+/// The scene's live working sessions. Owned by the per-scene loop, so a plain
 /// map suffices — no locking. Survives reactor-session hot-swaps: workers are
-/// independent of the mind's own lifecycle within a peer.
+/// independent of the mind's own lifecycle within a scene.
 pub(super) struct WorkerRegistry {
-    peer: PeerId,
-    /// A clone of the peer's queue sender, handed to each worker's drive task so
+    scene: Scene,
+    /// A clone of the scene's queue sender, handed to each worker's drive task so
     /// its reports land back in the same loop.
     inbound: mpsc::Sender<LoopInput>,
     workers: HashMap<WorkerId, Worker>,
@@ -103,17 +103,17 @@ pub(super) struct WorkerRegistry {
 }
 
 impl WorkerRegistry {
-    pub(super) fn new(peer: PeerId, inbound: mpsc::Sender<LoopInput>) -> Self {
+    pub(super) fn new(scene: Scene, inbound: mpsc::Sender<LoopInput>) -> Self {
         Self {
-            peer,
+            scene,
             inbound,
             workers: HashMap::new(),
             next_id: 1,
         }
     }
 
-    /// Spawn a channel-mute working session for `task` on this peer's process
-    /// (workers multiplex inside the peer's single subprocess). Returns once the
+    /// Spawn a channel-mute working session for `task` on this scene's process
+    /// (workers multiplex inside the scene's single subprocess). Returns once the
     /// session is open and its drive task is running; the work proceeds in the
     /// background and reports back through the queue.
     pub(super) async fn spawn(
@@ -129,7 +129,7 @@ impl WorkerRegistry {
                 .inner
                 .agent
                 .session(
-                    &self.peer,
+                    &self.scene,
                     SessionOpts {
                         system_prompt: Some(WORKER_SYSTEM_PROMPT.to_string()),
                         cwd: None,
@@ -155,7 +155,7 @@ impl WorkerRegistry {
                 drive,
             },
         );
-        tracing::info!(peer = %self.peer, worker = id, "spawned working session");
+        tracing::info!(scene = %self.scene, worker = id, "spawned working session");
         Ok(id)
     }
 
@@ -231,7 +231,7 @@ async fn drive_worker(
     };
     let report = WorkerReport { id, task, kind };
     if let Err(err) = inbound.send(LoopInput::Worker(report)).await {
-        tracing::warn!(worker = id, error = %err, "worker report dropped; peer loop gone");
+        tracing::warn!(worker = id, error = %err, "worker report dropped; scene loop gone");
     }
 }
 

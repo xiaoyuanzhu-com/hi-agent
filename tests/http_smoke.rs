@@ -52,7 +52,7 @@ async fn post_thought_accepts_and_journals() {
 
     let resp = client
         .post(format!("{base}/api/thought"))
-        .header("X-HI-From", "alice@phone")
+        .header("X-HI-Scene", "alice@phone")
         .body("hi")
         .send()
         .await
@@ -63,8 +63,8 @@ async fn post_thought_accepts_and_journals() {
     let entries = read_journal(dir.path()).await;
     assert_eq!(entries.len(), 1, "expected one journal entry, got {entries:?}");
     match &entries[0] {
-        JournalEntry::SignalIn { from, body, .. } => {
-            assert_eq!(from.0, "alice@phone");
+        JournalEntry::SignalIn { scene, body, .. } => {
+            assert_eq!(scene.0, "alice@phone");
             assert_eq!(body, "hi");
         }
         other => panic!("expected SignalIn, got {other:?}"),
@@ -72,9 +72,9 @@ async fn post_thought_accepts_and_journals() {
 }
 
 #[tokio::test]
-async fn post_thought_without_peer_header_is_anonymous() {
-    // X-HI-From is "recommended" per spec; we default missing/empty to a
-    // stable anonymous peer id so per-peer routing still has a key.
+async fn post_thought_without_scene_header_is_anonymous() {
+    // X-HI-Scene is "recommended" per spec; we default missing/empty to a
+    // stable anonymous scene so per-scene routing still has a key.
     let (base, dir, _seams) = spawn_server().await;
     let client = reqwest::Client::new();
 
@@ -90,7 +90,7 @@ async fn post_thought_without_peer_header_is_anonymous() {
     let entries = read_journal(dir.path()).await;
     assert_eq!(entries.len(), 1);
     match &entries[0] {
-        JournalEntry::SignalIn { from, .. } => assert_eq!(from.0, "anonymous"),
+        JournalEntry::SignalIn { scene, .. } => assert_eq!(scene.0, "anonymous"),
         other => panic!("expected SignalIn, got {other:?}"),
     }
 }
@@ -106,7 +106,7 @@ async fn post_vision_accepts_and_persists_without_journaling() {
 
     let resp = client
         .post(format!("{base}/api/vision"))
-        .header("X-HI-From", "alice@phone")
+        .header("X-HI-Scene", "alice@phone")
         .header("Content-Type", "image/jpeg")
         .body(vec![0xFFu8, 0xD8, 0xFF, 0xD9]) // minimal JPEG-ish bytes
         .send()
@@ -136,7 +136,7 @@ async fn all_sensory_stubs_return_501() {
     for ch in ["touch", "smell", "taste"] {
         let resp = client
             .post(format!("{base}/api/{ch}"))
-            .header("X-HI-From", "alice@phone")
+            .header("X-HI-Scene", "alice@phone")
             .body("...")
             .send()
             .await
@@ -152,7 +152,7 @@ async fn all_sensory_stubs_return_501() {
     // body.
     let resp = client
         .post(format!("{base}/api/audio"))
-        .header("X-HI-From", "alice@phone")
+        .header("X-HI-Scene", "alice@phone")
         .header("Content-Type", "audio/wav")
         .body(vec![0u8; 16])
         .send()

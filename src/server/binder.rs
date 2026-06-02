@@ -10,7 +10,7 @@
 //! only this file — the reactor and its vocabulary are untouched.
 //!
 //! It runs as a single task draining the reactor's outbound channel in order,
-//! which keeps each peer's signals serialized exactly as the mind produced them.
+//! which keeps each scene's signals serialized exactly as the mind produced them.
 
 use chrono::Utc;
 use tokio::sync::{broadcast, mpsc};
@@ -29,44 +29,44 @@ pub(crate) async fn bind_outbound(
 ) {
     while let Some(signal) = rx.recv().await {
         match signal {
-            // /thought is buffered per peer (a reply produced with no reader
+            // /thought is buffered per scene (a reply produced with no reader
             // connected is retained, not dropped); end-of-utterance is what
             // closes one streaming GET /thought response.
-            OutboundSignal::Text { peer, chunk } => {
-                thought_bus.push_chunk(&peer, chunk).await;
+            OutboundSignal::Text { scene, chunk } => {
+                thought_bus.push_chunk(&scene, chunk).await;
             }
-            OutboundSignal::TextEnd { peer } => {
-                thought_bus.end_utterance(&peer).await;
+            OutboundSignal::TextEnd { scene } => {
+                thought_bus.end_utterance(&scene).await;
             }
             // /audio: one utterance's span is one chunked response. The codec
             // becomes the response's Content-Type, set before the first byte;
             // `turn` keeps a handler's response bound to a single utterance so a
             // later span's frames never bleed into an earlier response.
-            OutboundSignal::AudioBegin { peer, turn, codec } => {
+            OutboundSignal::AudioBegin { scene, turn, codec } => {
                 let _ = audio_out.send(AudioEvent::Start {
-                    to: Some(peer),
+                    scene: Some(scene),
                     turn,
                     mime: codec,
                 });
             }
-            OutboundSignal::AudioFrame { peer, turn, bytes } => {
+            OutboundSignal::AudioFrame { scene, turn, bytes } => {
                 let _ = audio_out.send(AudioEvent::Frame {
-                    to: Some(peer),
+                    scene: Some(scene),
                     turn,
                     bytes,
                 });
             }
-            OutboundSignal::AudioEnd { peer, turn } => {
+            OutboundSignal::AudioEnd { scene, turn } => {
                 let _ = audio_out.send(AudioEvent::End {
-                    to: Some(peer),
+                    scene: Some(scene),
                     turn,
                 });
             }
             // /surface: a single envelope broadcast the long-poll handler filters
-            // by peer.
-            OutboundSignal::Surface { peer, envelope } => {
+            // by scene.
+            OutboundSignal::Surface { scene, envelope } => {
                 let _ = surface_out.send(SurfaceEvent {
-                    to: Some(peer),
+                    scene: Some(scene),
                     envelope,
                     ts: Utc::now(),
                 });
