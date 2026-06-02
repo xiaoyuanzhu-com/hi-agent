@@ -2,10 +2,19 @@
 //!
 //! The reactor keeps a single voice and must never block the floor on slow
 //! work, so heavy or long-running tasks are delegated here. A worker is a
-//! *channel-mute capability within the scene*: it has the full substrate — the
-//! scene's memory, tools, code execution, the right to spawn further workers — but no
-//! voice of its own (it never perceives or emits on a channel). That mute-ness
-//! is what preserves single-voice coherence: only the reactor speaks.
+//! *voice-mute capability within the scene*: it has the full substrate — the
+//! scene's memory, tools, code execution, the right to spawn further workers —
+//! but no voice of its own. It never speaks: it cannot emit on the reactor's
+//! expression channels (thought / audio / surface). That voice-mute-ness is what
+//! preserves single-voice coherence: only the reactor speaks to the person.
+//!
+//! It is *not*, however, channel-blind. Over hi-agent's own HTTP surface
+//! (`HI_AGENT_BASE_URL` in its env) a worker may **perceive input channels**
+//! (e.g. `GET /api/vision` for live frames) and **drive the non-voice `overlay`
+//! channel** (`POST /api/overlay`) — the deliberate continuous-data exception
+//! that lets a worker, say, run face detection and push rects to the UI without
+//! ever holding the voice. Both ride *outside* the turn loop, so they never
+//! contend with the reactor's serialized speech.
 //!
 //! The collaboration bus is asynchronous and worker→reactor here: a worker runs
 //! to completion (or until it must ask something), then posts a [`WorkerReport`]
@@ -49,17 +58,40 @@ access to files, code execution, memory, and the rest of the harness's tools —
 use them freely to actually complete the work, not merely plan it.\n\
 \n\
 You have no voice of your own. You are not talking to the human, and nothing \
-you write is spoken aloud. Your job is to DO the task and then report the \
-result: finish with a clear, self-contained summary of what you did and what \
-came of it. That summary is handed back to the agent verbatim, so include \
-everything it needs to act on or to relay — don't assume it can see your \
-working notes.\n\
+you write is spoken aloud — never try to address the person. The agent owns the \
+voice: do NOT write to the thought, audio, or surface channels. Your job is to \
+DO the task and then report the result: finish with a clear, self-contained \
+summary of what you did and what came of it. That summary is handed back to the \
+agent verbatim, so include everything it needs to act on or to relay — don't \
+assume it can see your working notes.\n\
+\n\
+You ARE allowed to use hi-agent's own channels for perception and for the one \
+non-voice output, the overlay. The server's base URL is in the \
+`HI_AGENT_BASE_URL` environment variable, and your scene is `{scene}` — send it \
+as the `X-HI-Scene` header on every request. Specifically:\n\
+- Perceive input channels, e.g. live camera frames:\n\
+    `GET $HI_AGENT_BASE_URL/api/vision` with header `X-HI-Scene: {scene}`\n\
+  (one frame per response; re-request for the next). Process the raw bytes \
+however the task needs — detection, CV, etc. is your job.\n\
+- Drive the overlay (a continuous, non-voice visual channel — e.g. face rects):\n\
+    `POST $HI_AGENT_BASE_URL/api/overlay` with header `X-HI-Scene: {scene}` and \
+a JSON body (one frame per POST; the UI repaints each line).\n\
+The overlay is the ONLY thing you may write to the person's screen, and it is \
+not speech — never use it to talk. Speaking stays the agent's job.\n\
 \n\
 If you hit something genuinely ambiguous, do not stall waiting for an answer. \
 Make the most reasonable assumption, note it, and keep going — the agent can \
 correct course later. If you must surface a question, wrap it in `[[ask]] … \
 [[/ask]]` markers and then proceed on your best assumption anyway. Work to \
 completion.";
+
+/// The worker's system prompt, with its scene interpolated so it can tag every
+/// channel request with the right `X-HI-Scene`. The server base URL is delivered
+/// out-of-band in the subprocess env ([`crate::config::ENV_SERVER_BASE_URL`]),
+/// which the prompt references as `$HI_AGENT_BASE_URL`.
+fn worker_system_prompt(scene: &Scene) -> String {
+    WORKER_SYSTEM_PROMPT.replace("{scene}", &scene.0)
+}
 
 /// A report a worker posts back to the reactor's per-scene loop. It enters the
 /// queue as a `LoopInput::Worker`, so it waits its turn and never interrupts
@@ -131,7 +163,7 @@ impl WorkerRegistry {
                 .session(
                     &self.scene,
                     SessionOpts {
-                        system_prompt: Some(WORKER_SYSTEM_PROMPT.to_string()),
+                        system_prompt: Some(worker_system_prompt(&self.scene)),
                         cwd: None,
                     },
                 )

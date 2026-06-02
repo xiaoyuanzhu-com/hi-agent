@@ -14,6 +14,10 @@ pub const ENV_AI_API_BASE: &str = "AI_API_BASE";
 pub const DEFAULT_AI_API_BASE: &str = "https://api.anthropic.com";
 /// Env var overriding the config file path. Defaults to `./config.toml`.
 pub const ENV_CONFIG_PATH: &str = "HI_AGENT_CONFIG";
+/// Env var (set on the cognition subprocess) carrying hi-agent's own HTTP base
+/// URL, so sessions can read input channels and write the overlay over the same
+/// wire the browser uses. See [`AgentConfig::child_env`].
+pub const ENV_SERVER_BASE_URL: &str = "HI_AGENT_BASE_URL";
 
 /// Dev-managed cognition parameters. Non-secret managed fields come from
 /// `config.toml`; the upstream base URL and key are injected from the
@@ -119,12 +123,17 @@ impl AgentConfig {
 
     /// Build the env var pairs for the ACP child process.
     ///
-    /// `proxy_port` is the local proxy's bound port; `config_dir` is the managed
-    /// `CLAUDE_CONFIG_DIR`; `node_bin_dir` is the directory containing the
-    /// resolved `node`; `claude_bin` is the resolved claude executable.
+    /// Build the env var pairs for the ACP child process.
+    ///
+    /// `proxy_port` is the local proxy's bound port; `server_port` is hi-agent's
+    /// own HTTP port (handed to the child as `HI_AGENT_BASE_URL` so a session can
+    /// reach the channels); `config_dir` is the managed `CLAUDE_CONFIG_DIR`;
+    /// `node_bin_dir` is the directory containing the resolved `node`; `claude_bin`
+    /// is the resolved claude executable.
     pub fn child_env(
         &self,
         proxy_port: u16,
+        server_port: u16,
         config_dir: &Path,
         node_bin_dir: &Path,
         claude_bin: &Path,
@@ -135,6 +144,10 @@ impl AgentConfig {
                 format!("http://127.0.0.1:{proxy_port}"),
             ),
             ("ANTHROPIC_API_KEY".to_string(), Self::PLACEHOLDER_KEY.to_string()),
+            (
+                ENV_SERVER_BASE_URL.to_string(),
+                format!("http://127.0.0.1:{server_port}"),
+            ),
             (
                 "CLAUDE_CONFIG_DIR".to_string(),
                 config_dir.to_string_lossy().into_owned(),
@@ -262,6 +275,7 @@ mod tests {
         .unwrap();
         let env = cfg.child_env(
             7777,
+            8080,
             std::path::Path::new("/cache/config"),
             std::path::Path::new("/cache/runtime/node/bin"),
             std::path::Path::new("/cache/runtime/claude"),
@@ -269,6 +283,7 @@ mod tests {
         let map: std::collections::HashMap<_, _> = env.into_iter().collect();
         assert_eq!(map["ANTHROPIC_BASE_URL"], "http://127.0.0.1:7777");
         assert_eq!(map["ANTHROPIC_API_KEY"], "hi-agent-proxy");
+        assert_eq!(map["HI_AGENT_BASE_URL"], "http://127.0.0.1:8080");
         assert_eq!(map["ANTHROPIC_MODEL"], "claude-opus-4-8");
         assert!(!map.contains_key("MAX_THINKING_TOKENS"));
         assert_eq!(map["CLAUDE_CONFIG_DIR"], "/cache/config");

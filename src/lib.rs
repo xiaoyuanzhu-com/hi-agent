@@ -65,6 +65,7 @@ pub async fn run(config: Config) -> anyhow::Result<()> {
     // the pinned runtime, managed env, and local LLM proxy are shared by all.
     let child_env = config.agent.child_env(
         proxy.port(),
+        config.port,
         &claude_config_dir,
         runtime.node_bin_dir(),
         &runtime.claude_bin,
