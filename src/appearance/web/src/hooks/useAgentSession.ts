@@ -308,7 +308,7 @@ export function useAgentSession(): AgentSession {
       // segments and transcribes. No client-side VAD. Barge-in and UI state are
       // driven by recognized text, not raw mic energy — so we never falsely
       // mute the agent.
-      const streamer = new AudioStreamer(audioBus.ctx, micNode, {
+      const streamer = await AudioStreamer.create(audioBus.ctx, micNode, {
         scene,
         onTranscript: ({ text, isFinal }) => {
           const heard = text.trim().length > 0;

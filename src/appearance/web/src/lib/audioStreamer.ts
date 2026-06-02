@@ -10,8 +10,14 @@
 // This replaces the old MicCapture, whose homegrown RMS VAD segmented utterances
 // client-side. Moving segmentation to the upstream's ML VAD is both simpler and
 // more reliable; the only thing we do here is resample + frame the audio.
+//
+// The resampling/framing runs on the audio thread in `pcmWorklet.js` (an
+// AudioWorklet processor); this class just wires up the node, ships the finished
+// frames it posts back over the WebSocket, and reads transcripts off the socket.
 
-import { resample } from "./wav";
+// Vite resolves this to the (hashed, statically served) URL of the worklet
+// module, which `addModule` fetches and evaluates in the audio thread.
+import workletUrl from "./pcmWorklet.js?url";
 
 export interface TranscriptEvent {
   text: string;
@@ -26,27 +32,39 @@ export interface AudioStreamerOptions {
   onClose?: () => void;
 }
 
-const FRAME = 2048;
-const TARGET_SR = 16000;
-// 100 ms of 16 kHz mono 16-bit audio per WS frame (matches the upstream chunk).
-const SEND_SAMPLES = 1600;
+// Tracks which contexts already have the worklet module so we never call
+// addModule twice for the same one (a redundant network round-trip).
+const loaded = new WeakSet<BaseAudioContext>();
+
+async function ensureWorklet(ctx: BaseAudioContext): Promise<void> {
+  if (loaded.has(ctx)) return;
+  await ctx.audioWorklet.addModule(workletUrl);
+  loaded.add(ctx);
+}
 
 export class AudioStreamer {
-  private proc: ScriptProcessorNode;
+  private node: AudioWorkletNode;
   private sink: GainNode;
   private ws: WebSocket;
-  private readonly sr: number;
 
-  // Resampled int16 samples awaiting a full SEND_SAMPLES frame.
-  private pending: Int16Array[] = [];
-  private pendingLen = 0;
   // Frames captured before the socket finished opening.
   private backlog: ArrayBuffer[] = [];
   private stopped = false;
 
-  constructor(ctx: AudioContext, source: AudioNode, opts: AudioStreamerOptions) {
-    this.sr = ctx.sampleRate;
+  /**
+   * Start streaming `source`'s audio to the backend. Async because the worklet
+   * module is loaded lazily (`addModule` returns a promise).
+   */
+  static async create(
+    ctx: AudioContext,
+    source: AudioNode,
+    opts: AudioStreamerOptions,
+  ): Promise<AudioStreamer> {
+    await ensureWorklet(ctx);
+    return new AudioStreamer(ctx, source, opts);
+  }
 
+  private constructor(ctx: AudioContext, source: AudioNode, opts: AudioStreamerOptions) {
     const proto = location.protocol === "https:" ? "wss" : "ws";
     const url = `${proto}://${location.host}/api/audio/in?scene=${encodeURIComponent(opts.scene)}`;
     this.ws = new WebSocket(url);
@@ -66,51 +84,23 @@ export class AudioStreamer {
     };
     this.ws.onclose = () => opts.onClose?.();
 
-    this.proc = ctx.createScriptProcessor(FRAME, 1, 1);
-    this.proc.onaudioprocess = (e) => this.onFrame(e.inputBuffer.getChannelData(0));
-    source.connect(this.proc);
-    // ScriptProcessor only pulls when connected to the graph; route through a
-    // silent gain so nothing is audible.
+    this.node = new AudioWorkletNode(ctx, "pcm-stream", {
+      numberOfInputs: 1,
+      numberOfOutputs: 1,
+      channelCount: 1,
+    });
+    // The worklet posts back ready-to-send SEND_SAMPLES PCM frames (transferred).
+    this.node.port.onmessage = (ev) => {
+      if (!this.stopped) this.send(ev.data as ArrayBuffer);
+    };
+    source.connect(this.node);
+    // The node only renders (and thus pulls input) while it's wired to the
+    // destination; route its silent output through a zeroed gain so nothing is
+    // audible.
     this.sink = ctx.createGain();
     this.sink.gain.value = 0;
-    this.proc.connect(this.sink);
+    this.node.connect(this.sink);
     this.sink.connect(ctx.destination);
-  }
-
-  private onFrame(input: Float32Array): void {
-    if (this.stopped) return;
-
-    const frame = new Float32Array(input.length);
-    frame.set(input); // engine reuses the input buffer; copy it
-    const res = this.sr === TARGET_SR ? frame : resample(frame, this.sr, TARGET_SR);
-
-    const i16 = new Int16Array(res.length);
-    for (let i = 0; i < res.length; i++) {
-      const s = Math.max(-1, Math.min(1, res[i]!));
-      i16[i] = s < 0 ? s * 0x8000 : s * 0x7fff;
-    }
-    this.pending.push(i16);
-    this.pendingLen += i16.length;
-
-    while (this.pendingLen >= SEND_SAMPLES) {
-      const chunk = new Int16Array(SEND_SAMPLES);
-      let filled = 0;
-      while (filled < SEND_SAMPLES) {
-        const head = this.pending[0]!;
-        const need = SEND_SAMPLES - filled;
-        if (head.length <= need) {
-          chunk.set(head, filled);
-          filled += head.length;
-          this.pending.shift();
-        } else {
-          chunk.set(head.subarray(0, need), filled);
-          this.pending[0] = head.subarray(need);
-          filled += need;
-        }
-      }
-      this.pendingLen -= SEND_SAMPLES;
-      this.send(chunk.buffer);
-    }
   }
 
   private send(buf: ArrayBuffer): void {
@@ -121,8 +111,9 @@ export class AudioStreamer {
 
   stop(): void {
     this.stopped = true;
+    this.node.port.onmessage = null;
     try {
-      this.proc.disconnect();
+      this.node.disconnect();
     } catch {
       /* ignore */
     }
@@ -131,7 +122,6 @@ export class AudioStreamer {
     } catch {
       /* ignore */
     }
-    this.proc.onaudioprocess = null;
     try {
       this.ws.close();
     } catch {
