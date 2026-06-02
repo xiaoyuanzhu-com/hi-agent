@@ -187,3 +187,126 @@ async fn homepage_returns_html() {
     let body = resp.text().await.expect("body");
     assert!(body.contains("<html") || body.contains("<!doctype"));
 }
+
+#[tokio::test]
+async fn overlay_round_trips_post_to_get() {
+    // The overlay is a non-voice output channel any local party can write. A
+    // GET subscriber opens a continuous NDJSON stream; a POST frame to the same
+    // scene shows up as the next line.
+    let (base, _dir, _seams) = spawn_server().await;
+    let client = reqwest::Client::new();
+
+    // Open the stream first so the subscriber exists before we POST.
+    let mut resp = client
+        .get(format!("{base}/api/overlay"))
+        .header("X-HI-Scene", "alice@phone")
+        .send()
+        .await
+        .expect("send GET");
+    assert_eq!(resp.status(), reqwest::StatusCode::OK);
+    let ct = resp
+        .headers()
+        .get("content-type")
+        .map(|v| v.to_str().unwrap_or("").to_string())
+        .unwrap_or_default();
+    assert!(ct.starts_with("application/x-ndjson"), "got {ct:?}");
+
+    tokio::time::sleep(Duration::from_millis(30)).await;
+    let payload = r#"{"rects":[{"x":1,"y":2,"w":3,"h":4}]}"#;
+    let post = client
+        .post(format!("{base}/api/overlay"))
+        .header("X-HI-Scene", "alice@phone")
+        .header("Content-Type", "application/json")
+        .body(payload)
+        .send()
+        .await
+        .expect("send POST");
+    assert_eq!(post.status(), reqwest::StatusCode::ACCEPTED);
+
+    let chunk = tokio::time::timeout(Duration::from_secs(2), resp.chunk())
+        .await
+        .expect("overlay chunk within timeout")
+        .expect("chunk read")
+        .expect("a chunk present");
+    let line = String::from_utf8(chunk.to_vec()).expect("utf8");
+    assert_eq!(line.trim_end(), payload, "the NDJSON line is the posted payload");
+}
+
+#[tokio::test]
+async fn overlay_scene_mismatch_receives_nothing() {
+    let (base, _dir, _seams) = spawn_server().await;
+    let client = reqwest::Client::new();
+
+    let mut resp = client
+        .get(format!("{base}/api/overlay"))
+        .header("X-HI-Scene", "alice@phone")
+        .send()
+        .await
+        .expect("send GET");
+    assert_eq!(resp.status(), reqwest::StatusCode::OK);
+
+    tokio::time::sleep(Duration::from_millis(30)).await;
+    let post = client
+        .post(format!("{base}/api/overlay"))
+        .header("X-HI-Scene", "bob@tv") // different scene
+        .body("{}")
+        .send()
+        .await
+        .expect("send POST");
+    assert_eq!(post.status(), reqwest::StatusCode::ACCEPTED);
+
+    // Alice's stream must stay silent — reading a chunk times out.
+    let res = tokio::time::timeout(Duration::from_millis(300), resp.chunk()).await;
+    assert!(
+        res.is_err(),
+        "a frame for a different scene must not reach this subscriber"
+    );
+}
+
+#[tokio::test]
+async fn vision_get_receives_posted_frame() {
+    // GET /api/vision is the read side of the input channel: one frame per
+    // scene-filtered long-poll response, carrying the frame's Content-Type.
+    let (base, _dir, _seams) = spawn_server().await;
+    let client = reqwest::Client::new();
+
+    // The GET blocks until a frame arrives, so drive it from a task and POST
+    // after it has had time to subscribe.
+    let get_base = base.clone();
+    let getter = tokio::spawn(async move {
+        let c = reqwest::Client::new();
+        let resp = c
+            .get(format!("{get_base}/api/vision"))
+            .header("X-HI-Scene", "alice@phone")
+            .send()
+            .await
+            .expect("send GET");
+        assert_eq!(resp.status(), reqwest::StatusCode::OK);
+        let ct = resp
+            .headers()
+            .get("content-type")
+            .map(|v| v.to_str().unwrap_or("").to_string())
+            .unwrap_or_default();
+        let body = resp.bytes().await.expect("body");
+        (ct, body)
+    });
+
+    tokio::time::sleep(Duration::from_millis(80)).await;
+    let frame = vec![0xFFu8, 0xD8, 0xFF, 0xD9];
+    let post = client
+        .post(format!("{base}/api/vision"))
+        .header("X-HI-Scene", "alice@phone")
+        .header("Content-Type", "image/jpeg")
+        .body(frame.clone())
+        .send()
+        .await
+        .expect("send POST");
+    assert_eq!(post.status(), reqwest::StatusCode::ACCEPTED);
+
+    let (ct, body) = tokio::time::timeout(Duration::from_secs(2), getter)
+        .await
+        .expect("vision GET within timeout")
+        .expect("getter task");
+    assert!(ct.starts_with("image/jpeg"), "content-type echoes frame mime, got {ct:?}");
+    assert_eq!(body.as_ref(), frame.as_slice(), "frame bytes round-trip");
+}

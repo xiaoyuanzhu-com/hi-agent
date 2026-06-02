@@ -18,6 +18,7 @@ use crate::types::{Scene, Signal, SurfaceEnvelope};
 pub mod audio;
 pub mod binder;
 pub mod headers;
+pub mod overlay;
 pub mod stubs;
 pub mod surface;
 pub mod thought;
@@ -71,6 +72,35 @@ pub struct SurfaceEvent {
     pub ts: DateTime<Utc>,
 }
 
+/// A vision frame, broadcast so any local party can *read* the input channel —
+/// not just the reactor. `POST /api/vision` keeps persisting and additionally
+/// publishes the frame here; `GET /api/vision` subscribers (e.g. a detector
+/// working session) receive it. The bytes are `Bytes` (refcounted), so a frame
+/// with no subscriber is a cheap drop. This rides *outside* the cognition turn
+/// loop — it never enters the journal or a prompt; perceiving raw frames is the
+/// subscriber's job.
+#[derive(Debug, Clone)]
+pub struct VisionFrameEvent {
+    pub scene: Option<Scene>,
+    pub bytes: Bytes,
+    pub mime: String,
+    pub ts: DateTime<Utc>,
+}
+
+/// A non-voice overlay frame: a continuous, worker-writable output channel that
+/// sits *outside* the reactor turn loop. `POST /api/overlay` broadcasts directly
+/// here (not via the reactor's `OutboundSignal` binder), which is precisely what
+/// keeps single-voice coherence intact — speech still funnels through the one
+/// reactor voice, while a worker driving an animated overlay (face rects, …) is
+/// a deliberate continuous-data exception. `GET /api/overlay` streams these as
+/// NDJSON. The payload is opaque bytes (a JSON line by convention).
+#[derive(Debug, Clone)]
+pub struct OverlayEvent {
+    pub scene: Option<Scene>,
+    pub payload: Bytes,
+    pub ts: DateTime<Utc>,
+}
+
 /// Shared state passed to every handler via `axum::extract::State`.
 pub struct AppState {
     /// Inbound signals from every channel POST. The reactor consumes these.
@@ -89,6 +119,18 @@ pub struct AppState {
     /// this; the reactor produces envelopes when the agent emits a surface block.
     pub surface_out: broadcast::Sender<SurfaceEvent>,
 
+    /// Vision-frame broadcast — the read side of the vision *input* channel.
+    /// POST /api/vision publishes each frame here; GET /api/vision subscribers
+    /// (a detector working session, …) consume it. Written directly by the POST
+    /// handler, not the binder — it is input data, not the reactor's voice.
+    pub vision_out: broadcast::Sender<VisionFrameEvent>,
+
+    /// Overlay broadcast — a non-voice, worker-writable *output* channel. Any
+    /// local party POSTs frames to /api/overlay and they fan out to GET
+    /// /api/overlay subscribers. Deliberately bypasses the reactor turn loop so
+    /// continuous overlay data never contends with the single reactor voice.
+    pub overlay_out: broadcast::Sender<OverlayEvent>,
+
     /// Memory substrate — journal. Cloneable handle.
     pub memory: Memory,
 
@@ -102,6 +144,8 @@ pub fn build(memory: Memory, data_dir: PathBuf) -> (Router, ServerSeams) {
     let thought_bus = ThoughtBus::new();
     let (audio_tx, _) = broadcast::channel::<AudioEvent>(64);
     let (surface_tx, _) = broadcast::channel::<SurfaceEvent>(64);
+    let (vision_tx, _) = broadcast::channel::<VisionFrameEvent>(64);
+    let (overlay_tx, _) = broadcast::channel::<OverlayEvent>(64);
 
     // The reactor's single transport-free outbound seam. A binder task fans each
     // `OutboundSignal` out to the HTTP-shaped carriers above — assigning
@@ -120,6 +164,8 @@ pub fn build(memory: Memory, data_dir: PathBuf) -> (Router, ServerSeams) {
         thought_bus: thought_bus.clone(),
         audio_out: audio_tx.clone(),
         surface_out: surface_tx.clone(),
+        vision_out: vision_tx.clone(),
+        overlay_out: overlay_tx.clone(),
         memory,
         data_dir,
     });
@@ -131,7 +177,8 @@ pub fn build(memory: Memory, data_dir: PathBuf) -> (Router, ServerSeams) {
         .route("/api/audio", post(audio::post_audio).get(audio::get_audio))
         .route("/api/audio/in", get(audio::get_audio_in))
         .route("/api/surface", get(surface::get_surface))
-        .route("/api/vision", post(vision::post_vision))
+        .route("/api/vision", post(vision::post_vision).get(vision::get_vision))
+        .route("/api/overlay", post(overlay::post_overlay).get(overlay::get_overlay))
         .route("/api/touch", post(stubs::post_touch))
         .route("/api/smell", post(stubs::post_smell))
         .route("/api/taste", post(stubs::post_taste))
