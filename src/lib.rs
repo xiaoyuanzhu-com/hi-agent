@@ -15,6 +15,7 @@ pub mod runtime;
 pub mod reactor;
 pub mod server;
 pub mod types;
+pub mod vision;
 pub mod voice;
 
 #[derive(Debug, Clone)]
