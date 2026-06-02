@@ -15,11 +15,42 @@ import { getScene } from "../lib/scene";
 import type { PresenceState } from "../ui/Presence";
 import type { SpeechItem } from "../ui/SpeechText";
 
-// How many recent sentences stay on screen (calm, 1–2 at a time).
-const SENTENCE_WINDOW = 2;
+// How many of the agent's reply lines stay on screen at once. The reply rolls
+// as a calm caption (newest last), but it's windowed *on top of* the pinned
+// user line — never instead of it (see `visibleExchange`), so an answer of any
+// length can't scroll the prompt that prompted it off-screen.
+const AGENT_REPLY_WINDOW = 2;
 // Reserved id marking the user's live, in-progress line so React updates it in
 // place across partials. Real lines use positive ids from sentenceIdRef.
 const LIVE_USER_LINE_ID = -1;
+
+// Index of the last user line in a timeline, or -1 if the agent has spoken but
+// the user hasn't yet (e.g. an opening greeting). The user line anchors the
+// "current exchange": everything after it is the agent's reply to it.
+function lastUserIndex(items: SpeechItem[]): number {
+  for (let i = items.length - 1; i >= 0; i--) {
+    if (items[i]?.speaker === "user") return i;
+  }
+  return -1;
+}
+
+// State bound: drop turns before the user's current one. Earlier exchanges are
+// never shown, so they aren't retained — but the current user line and the full
+// reply accumulating after it are always kept. A new user line (the next turn)
+// is what clears the previous exchange.
+function dropPriorTurns(items: SpeechItem[]): SpeechItem[] {
+  const u = lastUserIndex(items);
+  return u <= 0 ? items : items.slice(u);
+}
+
+// Display window: the user's latest line pinned, followed by the most recent
+// `AGENT_REPLY_WINDOW` lines of the reply to it. With no user line yet, just the
+// rolling reply caption.
+function visibleExchange(items: SpeechItem[]): SpeechItem[] {
+  const u = lastUserIndex(items);
+  if (u === -1) return items.slice(-AGENT_REPLY_WINDOW);
+  return [...items.slice(u, u + 1), ...items.slice(u + 1).slice(-AGENT_REPLY_WINDOW)];
+}
 
 // ---- Channel preferences (persisted client-side) -------------------------
 // The user's chosen on/off state for each channel, remembered across visits in
@@ -176,10 +207,9 @@ export function useAgentSession(): AgentSession {
     if (!trimmed) return;
     sentenceIdRef.current += 1;
     const item: SpeechItem = { id: sentenceIdRef.current, text: trimmed, speaker: "user" };
-    setSentences((prev) => {
-      const next = [...prev, item];
-      return next.length > SENTENCE_WINDOW ? next.slice(next.length - SENTENCE_WINDOW) : next;
-    });
+    // A new user line opens a new exchange — drop the prior turn so this line
+    // (and the reply about to stream) is what stays on screen.
+    setSentences((prev) => dropPriorTurns([...prev, item]));
     setAwaiting(true);
   }, []);
 
@@ -198,9 +228,9 @@ export function useAgentSession(): AgentSession {
           sentenceIdRef.current += 1;
           next = [...next, { id: sentenceIdRef.current, text, speaker: "agent" }];
         }
-        return next.length > SENTENCE_WINDOW
-          ? next.slice(next.length - SENTENCE_WINDOW)
-          : next;
+        // Keep the whole reply in state (display windows it); just stay anchored
+        // to the current user turn so the prompt is never dropped.
+        return dropPriorTurns(next);
       });
     };
 
@@ -642,14 +672,15 @@ export function useAgentSession(): AgentSession {
   // The content overlay dims/demotes the presence — more for full-screen.
   const demote = activeSurface ? (activeSurface.mode === "full" ? 1 : 0.72) : 0;
 
-  // Render the settled timeline plus the user's in-progress line (if any),
-  // windowed to keep the display calm.
+  // Render the current exchange — the user's line pinned, the agent's reply
+  // rolling beneath it — plus the user's in-progress line (if any). A live line
+  // becomes the new anchor, so starting to speak/type clears the prior turn.
   const displaySentences = useMemo<SpeechItem[]>(() => {
     const base =
       userLive !== null
         ? [...sentences, { id: LIVE_USER_LINE_ID, text: userLive, speaker: "user" as const, pending: true }]
         : sentences;
-    return base.length > SENTENCE_WINDOW ? base.slice(base.length - SENTENCE_WINDOW) : base;
+    return visibleExchange(base);
   }, [sentences, userLive]);
 
   return {
