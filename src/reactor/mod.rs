@@ -58,9 +58,9 @@ use uuid::Uuid;
 
 use crate::acp::{AcpSession, SessionOpts, SessionUpdate};
 use crate::agent::AgentLayer;
+use crate::capabilities::tts::{self, TtsStream};
 use crate::memory::{Memory, build_for_scene};
 use crate::types::{Channel, JournalEntry, Scene, Signal, SurfaceEnvelope, SurfaceMode, SurfaceOp};
-use crate::voice::{Tts, TtsStream};
 use bytes::Bytes;
 
 /// How long the floor must stay quiet after the last finalized utterance before
@@ -245,10 +245,6 @@ struct ReactorInner {
     /// read-only across scenes; the heartbeat re-seeds replacement sessions with
     /// it too, so a hot-swapped mind keeps the same character.
     soul: String,
-    /// Speech synthesis. `None` → the agent's replies are text-only (Phase 1
-    /// behavior); when set, each sentence is synthesized and emitted as audio
-    /// signals.
-    tts: Option<Arc<dyn Tts>>,
     /// The reactor's single outbound seam: every channel signal it produces —
     /// text, synthesized speech, surfaces — goes out here in transport-free form
     /// (see [`outbound`]). A transport adapter binds these to a wire. The reactor
@@ -274,14 +270,12 @@ pub fn start(
     soul: String,
     mut inbound_rx: mpsc::Receiver<Signal>,
     out: mpsc::Sender<OutboundSignal>,
-    tts: Option<Arc<dyn Tts>>,
 ) -> Reactor {
     let reactor = Reactor {
         inner: Arc::new(ReactorInner {
             memory,
             agent,
             soul,
-            tts,
             out,
             turn_seq: AtomicU64::new(0),
             scenes: Mutex::new(HashMap::new()),
@@ -539,8 +533,6 @@ async fn run_turn(
         *guard = Some(session.clone());
     }
 
-    let tts = reactor.inner.tts.clone();
-
     let outcome: anyhow::Result<usize> = async {
         let mut run = session.prompt(prompt_text).await?;
 
@@ -564,8 +556,8 @@ async fn run_turn(
         // Accumulate the spoken text so the whole reply is logged once at end of
         // turn on the `channel` stream, rather than per-chunk (which is noisy).
         let mut full_reply = String::new();
-        let (synth_tx, synth_handle) = match &tts {
-            Some(tts) => match tts.start().await {
+        let (synth_tx, synth_handle) = if tts::available() {
+            match tts::start().await {
                 Ok(TtsStream { mime, text, frames }) => {
                     let out = reactor.inner.out.clone();
                     // Announce the span first so the adapter can open a response
@@ -585,8 +577,9 @@ async fn run_turn(
                     tracing::warn!(scene = %scene, error = %err, "TTS session start failed; turn is silent");
                     (None, None)
                 }
-            },
-            None => (None, None),
+            }
+        } else {
+            (None, None)
         };
 
         loop {

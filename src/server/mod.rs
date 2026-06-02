@@ -14,7 +14,6 @@ use tower_http::trace::TraceLayer;
 use crate::memory::Memory;
 use crate::reactor::OutboundSignal;
 use crate::types::{Scene, Signal, SurfaceEnvelope};
-use crate::voice::Stt;
 
 pub mod audio;
 pub mod binder;
@@ -97,16 +96,9 @@ pub struct AppState {
     /// Where blob media lives. POST /api/audio and POST /api/vision write
     /// incoming bytes here before journaling the reference.
     pub data_dir: PathBuf,
-
-    /// Speech-to-text capability. `None` → POST /api/audio returns 501.
-    pub stt: Option<Arc<dyn Stt>>,
 }
 
-pub fn build(
-    memory: Memory,
-    data_dir: PathBuf,
-    stt: Option<Arc<dyn Stt>>,
-) -> (Router, ServerSeams) {
+pub fn build(memory: Memory, data_dir: PathBuf) -> (Router, ServerSeams) {
     let (inbound_tx, inbound_rx) = mpsc::channel::<Signal>(1024);
     let thought_bus = ThoughtBus::new();
     let (audio_tx, _) = broadcast::channel::<AudioEvent>(64);
@@ -131,7 +123,6 @@ pub fn build(
         surface_out: surface_tx.clone(),
         memory,
         data_dir,
-        stt,
     });
 
     // Every channel lives under `/api/*`; the appearance router owns the rest

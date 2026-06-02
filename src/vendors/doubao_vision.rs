@@ -13,7 +13,7 @@
 //!   video: {"type":"video_url","video_url":{"url": <url|data-url>, "fps": 1}}
 //!
 //! Three **presets** pick the model + reasoning behaviour in one knob; each field
-//! is independently overridable by env (see [`DoubaoVision::from_env`]):
+//! is independently overridable by env (see [`Config::from_env`]):
 //!
 //!   preset    model                  thinking   effort
 //!   fast      doubao-seed-2.0-mini   disabled   minimal
@@ -28,12 +28,11 @@
 use std::time::Duration;
 
 use anyhow::Context;
-use async_trait::async_trait;
 use base64::Engine as _;
 use serde::Deserialize;
 use serde_json::{Value, json};
 
-use super::{MediaSource, Vision, VisualMedia};
+use crate::capabilities::vision::{MediaSource, VisualMedia};
 
 const DEFAULT_API_BASE: &str = "https://ark.cn-beijing.volces.com/api/v3";
 const DEFAULT_PRESET: &str = "balanced";
@@ -72,7 +71,7 @@ fn resolve_preset(name: &str) -> anyhow::Result<Preset> {
     })
 }
 
-pub struct DoubaoVision {
+pub struct Config {
     client: reqwest::Client,
     api_key: String,
     api_base: String,
@@ -81,7 +80,7 @@ pub struct DoubaoVision {
     effort: String,
 }
 
-impl DoubaoVision {
+impl Config {
     /// Resolve config from the environment: the selected preset provides the
     /// defaults for model/thinking/effort, and each is individually overridable.
     /// `DOUBAO_VISION_API_KEY` is required.
@@ -107,63 +106,60 @@ impl DoubaoVision {
 
         Ok(Self { client, api_key, api_base, model, thinking, effort })
     }
-
-    /// Build the Chat Completions request body. Pure (no I/O) so the wire shape
-    /// is unit-testable without a network call.
-    fn build_request(&self, media: VisualMedia, prompt: &str) -> anyhow::Result<Value> {
-        let media_part = match media {
-            VisualMedia::Image(src) => json!({
-                "type": "image_url",
-                "image_url": { "url": src.into_url()?, "detail": IMAGE_DETAIL },
-            }),
-            VisualMedia::Video(src) => json!({
-                "type": "video_url",
-                "video_url": { "url": src.into_url()?, "fps": VIDEO_FPS },
-            }),
-        };
-
-        Ok(json!({
-            "model": self.model,
-            "messages": [{
-                "role": "user",
-                "content": [
-                    media_part,
-                    { "type": "text", "text": prompt },
-                ],
-            }],
-            "thinking": { "type": self.thinking },
-            "reasoning_effort": self.effort,
-        }))
-    }
 }
 
-#[async_trait]
-impl Vision for DoubaoVision {
-    async fn understand(&self, media: VisualMedia, prompt: &str) -> anyhow::Result<String> {
-        let body = self.build_request(media, prompt)?;
-        let url = format!("{}/chat/completions", self.api_base.trim_end_matches('/'));
+/// Build the Chat Completions request body. Pure (no I/O) so the wire shape
+/// is unit-testable without a network call.
+fn build_request(cfg: &Config, media: VisualMedia, prompt: &str) -> anyhow::Result<Value> {
+    let media_part = match media {
+        VisualMedia::Image(src) => json!({
+            "type": "image_url",
+            "image_url": { "url": src.into_url()?, "detail": IMAGE_DETAIL },
+        }),
+        VisualMedia::Video(src) => json!({
+            "type": "video_url",
+            "video_url": { "url": src.into_url()?, "fps": VIDEO_FPS },
+        }),
+    };
 
-        let resp = self
-            .client
-            .post(&url)
-            .bearer_auth(&self.api_key)
-            .json(&body)
-            .send()
-            .await
-            .context("doubao vision request failed")?;
+    Ok(json!({
+        "model": cfg.model,
+        "messages": [{
+            "role": "user",
+            "content": [
+                media_part,
+                { "type": "text", "text": prompt },
+            ],
+        }],
+        "thinking": { "type": cfg.thinking },
+        "reasoning_effort": cfg.effort,
+    }))
+}
 
-        let status = resp.status();
-        let text = resp.text().await.context("reading doubao vision response")?;
-        if !status.is_success() {
-            anyhow::bail!("doubao vision HTTP {status}: {text}");
-        }
+pub async fn understand(cfg: &Config, media: VisualMedia, prompt: &str) -> anyhow::Result<String> {
+    let body = build_request(cfg, media, prompt)?;
+    let url = format!("{}/chat/completions", cfg.api_base.trim_end_matches('/'));
 
-        let parsed: ChatResponse = serde_json::from_str(&text)
-            .with_context(|| format!("parsing doubao vision response: {text}"))?;
-        parsed
-            .first_text()
-            .ok_or_else(|| anyhow::anyhow!("doubao vision returned no content"))
+    let resp = cfg
+        .client
+        .post(&url)
+        .bearer_auth(&cfg.api_key)
+        .json(&body)
+        .send()
+        .await
+        .context("doubao vision request failed")?;
+
+    let status = resp.status();
+    let text = resp.text().await.context("reading doubao vision response")?;
+    if !status.is_success() {
+        anyhow::bail!("doubao vision HTTP {status}: {text}");
     }
+
+    let parsed: ChatResponse = serde_json::from_str(&text)
+        .with_context(|| format!("parsing doubao vision response: {text}"))?;
+    parsed
+        .first_text()
+        .ok_or_else(|| anyhow::anyhow!("doubao vision returned no content"))
 }
 
 impl MediaSource {
@@ -215,9 +211,9 @@ mod tests {
     use super::*;
     use bytes::Bytes;
 
-    fn provider(preset: &str) -> DoubaoVision {
+    fn config(preset: &str) -> Config {
         let p = resolve_preset(preset).unwrap();
-        DoubaoVision {
+        Config {
             client: reqwest::Client::new(),
             api_key: "test-key".to_string(),
             api_base: DEFAULT_API_BASE.to_string(),
@@ -250,9 +246,9 @@ mod tests {
 
     #[test]
     fn image_bytes_become_a_base64_data_url_part() {
-        let p = provider("accurate");
+        let cfg = config("accurate");
         let media = VisualMedia::image_bytes(Bytes::from_static(b"\xff\xd8jpegbytes"), "image/jpeg");
-        let body = p.build_request(media, "What is this?").unwrap();
+        let body = build_request(&cfg, media, "What is this?").unwrap();
 
         assert_eq!(body["model"], "doubao-seed-2.0-pro");
         assert_eq!(body["thinking"]["type"], "enabled");
@@ -269,9 +265,9 @@ mod tests {
 
     #[test]
     fn video_url_passes_through_with_fps() {
-        let p = provider("balanced");
+        let cfg = config("balanced");
         let media = VisualMedia::video_url("https://example.com/clip.mp4");
-        let body = p.build_request(media, "Summarize the clip.").unwrap();
+        let body = build_request(&cfg, media, "Summarize the clip.").unwrap();
 
         let part = &body["messages"][0]["content"][0];
         assert_eq!(part["type"], "video_url");

@@ -1,9 +1,9 @@
 //! POST /audio and GET /audio — Step 11 voice channel.
 //!
 //! Inbound (`POST /audio`): the body bytes are audio; we save them under
-//! `data/media/audio/in/<uuid>.<ext>`, transcribe via the configured
-//! [`Stt`](crate::voice::Stt), and feed the transcript into the same
-//! per-scene path that `POST /thought` uses. The journal records a
+//! `data/media/audio/in/<uuid>.<ext>`, transcribe via the configured STT
+//! capability ([`crate::capabilities::stt`]), and feed the transcript into the
+//! same per-scene path that `POST /thought` uses. The journal records a
 //! `SignalIn { channel: Audio, body: <transcript>, media_path: Some(path) }`
 //! so the reactor's snapshot can show that this signal arrived as speech
 //! while the body remains text-searchable.
@@ -35,12 +35,12 @@ use serde::{Deserialize, Serialize};
 use tokio::sync::broadcast::error::RecvError;
 use tokio::sync::mpsc;
 
+use crate::capabilities::stt::{self, Transcript};
 use crate::memory::media::{self, Direction};
 use crate::server::{AppState, AudioEvent};
 use crate::server::headers::{AuthBearer, RequiredScene, SceneHeader};
 use crate::server::segmenter::{Segmenter, SegmenterConfig};
 use crate::types::{Channel, JournalEntry, Scene, Signal};
-use crate::voice::stt::Transcript;
 
 const DEFAULT_MIME: &str = "audio/wav";
 
@@ -57,16 +57,13 @@ pub async fn post_audio(
     headers: HeaderMap,
     body: Bytes,
 ) -> impl IntoResponse {
-    let stt = match state.stt.clone() {
-        Some(stt) => stt,
-        None => {
-            return (
-                StatusCode::NOT_IMPLEMENTED,
-                "audio capability not configured (set STT_PROVIDER)\n",
-            )
-                .into_response();
-        }
-    };
+    if !stt::available() {
+        return (
+            StatusCode::NOT_IMPLEMENTED,
+            "audio capability not configured (set STT_PROVIDER)\n",
+        )
+            .into_response();
+    }
 
     if body.is_empty() {
         return (StatusCode::BAD_REQUEST, "audio body is empty\n").into_response();
@@ -99,7 +96,7 @@ pub async fn post_audio(
     };
 
     // 2. Transcribe. Errors surface as 502 — the upstream provider failed.
-    let transcript = match stt.transcribe(body, &mime).await {
+    let transcript = match stt::transcribe(body, &mime).await {
         Ok(t) => t,
         Err(err) => {
             tracing::warn!(error = %err, media_path = %media_path, "STT transcribe failed");
@@ -172,16 +169,13 @@ pub async fn get_audio_in(
     Query(params): Query<StreamParams>,
     ws: WebSocketUpgrade,
 ) -> impl IntoResponse {
-    let stt = match state.stt.clone() {
-        Some(stt) => stt,
-        None => {
-            return (
-                StatusCode::NOT_IMPLEMENTED,
-                "audio capability not configured (set STT_PROVIDER)\n",
-            )
-                .into_response();
-        }
-    };
+    if !stt::available() {
+        return (
+            StatusCode::NOT_IMPLEMENTED,
+            "audio capability not configured (set STT_PROVIDER)\n",
+        )
+            .into_response();
+    }
     let scene = Scene(
         params
             .scene
@@ -189,12 +183,11 @@ pub async fn get_audio_in(
             .unwrap_or_else(|| "anonymous".to_string()),
     );
     tracing::info!(scene = %scene, "WS /audio/in opened");
-    ws.on_upgrade(move |socket| stream_audio_in(state, stt, scene, socket))
+    ws.on_upgrade(move |socket| stream_audio_in(state, scene, socket))
 }
 
 async fn stream_audio_in(
     state: Arc<AppState>,
-    stt: Arc<dyn crate::voice::Stt>,
     scene: Scene,
     socket: axum::extract::ws::WebSocket,
 ) {
@@ -204,7 +197,7 @@ async fn stream_audio_in(
     let (audio_tx, audio_rx) = mpsc::channel::<Bytes>(64);
     let (tr_tx, mut tr_rx) = mpsc::channel::<Transcript>(64);
 
-    let stt_task = tokio::spawn(async move { stt.transcribe_streaming(audio_rx, tr_tx).await });
+    let stt_task = tokio::spawn(async move { stt::transcribe_streaming(audio_rx, tr_tx).await });
 
     // Relay raw STT results to the client (for barge-in + live display) while an
     // explicit Segmenter — not the upstream's silence flag — decides where the

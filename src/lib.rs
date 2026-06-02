@@ -7,17 +7,16 @@ use tokio::net::TcpListener;
 pub mod acp;
 pub mod agent;
 pub mod appearance;
+pub mod capabilities;
 pub mod channel_log;
 pub mod config;
-pub mod imagery;
 pub mod llm_proxy;
 pub mod memory;
 pub mod runtime;
 pub mod reactor;
 pub mod server;
 pub mod types;
-pub mod vision;
-pub mod voice;
+pub mod vendors;
 
 #[derive(Debug, Clone)]
 pub struct Config {
@@ -34,16 +33,16 @@ pub async fn run(config: Config) -> anyhow::Result<()> {
     let memory = memory::Memory::open(&config.data_dir).await?;
     tracing::info!(data_dir = %config.data_dir.display(), "memory opened");
 
-    // Voice capabilities. `None` is fine; gates affect /audio only.
-    let stt = voice::build_stt()?;
-    let tts = voice::build_tts()?;
+    // Resolve all capabilities from the environment. Unconfigured capabilities
+    // are fine; gates affect /audio (STT) and the speak path (TTS) only.
+    capabilities::init_from_env()?;
     tracing::info!(
-        stt = stt.is_some(),
-        tts = tts.is_some(),
-        "voice capabilities resolved"
+        stt = capabilities::stt::available(),
+        tts = capabilities::tts::available(),
+        "capabilities resolved"
     );
 
-    let (router, seams) = server::build(memory.clone(), config.data_dir.clone(), stt);
+    let (router, seams) = server::build(memory.clone(), config.data_dir.clone());
 
     // Resolve the runtime (download + install on first run, reuse thereafter).
     let runtime = runtime::ensure().await?;
@@ -91,7 +90,6 @@ pub async fn run(config: Config) -> anyhow::Result<()> {
         soul,
         seams.inbound_rx,
         seams.out_tx,
-        tts,
     );
     tracing::info!("reactor started");
 

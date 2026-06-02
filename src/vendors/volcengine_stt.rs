@@ -49,7 +49,6 @@
 
 use std::time::Duration;
 
-use async_trait::async_trait;
 use bytes::Bytes;
 use futures::{SinkExt, StreamExt};
 use serde::{Deserialize, Serialize};
@@ -63,7 +62,7 @@ use tokio_tungstenite::tungstenite::Message;
 use tokio_tungstenite::{MaybeTlsStream, WebSocketStream};
 use uuid::Uuid;
 
-use super::stt::{Stt, Transcript};
+use crate::capabilities::stt::Transcript;
 
 // Defaults target the recommended async (optimized) endpoint + doubao 2.0
 // hour version. Override the resource id to point at concurrent variants or
@@ -106,14 +105,14 @@ const FLAG_LAST_CHUNK: u8 = 0b0010;
 const SER_JSON: u8 = 0b0001;
 const SER_RAW: u8 = 0b0000;
 
-pub struct VolcengineStt {
+pub struct Config {
     api_key: String,
     model: String,
     resource_id: String,
     endpoint: String,
 }
 
-impl VolcengineStt {
+impl Config {
     pub fn from_env() -> anyhow::Result<Self> {
         let api_key = std::env::var(ENV_API_KEY).map_err(|_| {
             anyhow::anyhow!("{ENV_API_KEY} is required when STT_PROVIDER=volcengine")
@@ -132,309 +131,304 @@ impl VolcengineStt {
     }
 }
 
-#[async_trait]
-impl Stt for VolcengineStt {
-    async fn transcribe(&self, audio: Bytes, mime: &str) -> anyhow::Result<String> {
-        timeout(TOTAL_TIMEOUT, self.transcribe_inner(audio, mime))
-            .await
-            .map_err(|_| anyhow::anyhow!("volcengine STT timed out after {TOTAL_TIMEOUT:?}"))?
-    }
-
-    async fn transcribe_streaming(
-        &self,
-        audio_rx: mpsc::Receiver<Bytes>,
-        out: mpsc::Sender<Transcript>,
-    ) -> anyhow::Result<String> {
-        timeout(STREAM_TIMEOUT, self.transcribe_streaming_inner(audio_rx, out))
-            .await
-            .map_err(|_| anyhow::anyhow!("volcengine STT stream timed out after {STREAM_TIMEOUT:?}"))?
-    }
+pub async fn transcribe(cfg: &Config, audio: Bytes, mime: &str) -> anyhow::Result<String> {
+    timeout(TOTAL_TIMEOUT, transcribe_inner(cfg, audio, mime))
+        .await
+        .map_err(|_| anyhow::anyhow!("volcengine STT timed out after {TOTAL_TIMEOUT:?}"))?
 }
 
-impl VolcengineStt {
-    /// Open the upstream WS with the custom auth headers shared by both the
-    /// batch and streaming paths.
-    async fn connect(&self) -> anyhow::Result<WebSocketStream<MaybeTlsStream<TcpStream>>> {
-        let connect_id = Uuid::now_v7().to_string();
-        let request_id = Uuid::now_v7().to_string();
-        let mut request = self.endpoint.as_str().into_client_request()?;
-        let headers = request.headers_mut();
-        headers.insert("X-Api-Key", HeaderValue::from_str(&self.api_key)?);
-        headers.insert("X-Api-Resource-Id", HeaderValue::from_str(&self.resource_id)?);
-        headers.insert("X-Api-Request-Id", HeaderValue::from_str(&request_id)?);
-        headers.insert("X-Api-Connect-Id", HeaderValue::from_str(&connect_id)?);
-        headers.insert("X-Api-Sequence", HeaderValue::from_static("-1"));
+pub async fn transcribe_streaming(
+    cfg: &Config,
+    audio_rx: mpsc::Receiver<Bytes>,
+    out: mpsc::Sender<Transcript>,
+) -> anyhow::Result<String> {
+    timeout(STREAM_TIMEOUT, transcribe_streaming_inner(cfg, audio_rx, out))
+        .await
+        .map_err(|_| anyhow::anyhow!("volcengine STT stream timed out after {STREAM_TIMEOUT:?}"))?
+}
 
-        let (ws, response) = tokio_tungstenite::connect_async(request)
-            .await
-            .map_err(|e| anyhow::anyhow!("volcengine STT WS connect failed: {e}"))?;
-        tracing::debug!(
-            status = %response.status(),
-            connect_id = %connect_id,
-            "volcengine STT WS connected"
-        );
-        Ok(ws)
+/// Open the upstream WS with the custom auth headers shared by both the
+/// batch and streaming paths.
+async fn connect(cfg: &Config) -> anyhow::Result<WebSocketStream<MaybeTlsStream<TcpStream>>> {
+    let connect_id = Uuid::now_v7().to_string();
+    let request_id = Uuid::now_v7().to_string();
+    let mut request = cfg.endpoint.as_str().into_client_request()?;
+    let headers = request.headers_mut();
+    headers.insert("X-Api-Key", HeaderValue::from_str(&cfg.api_key)?);
+    headers.insert("X-Api-Resource-Id", HeaderValue::from_str(&cfg.resource_id)?);
+    headers.insert("X-Api-Request-Id", HeaderValue::from_str(&request_id)?);
+    headers.insert("X-Api-Connect-Id", HeaderValue::from_str(&connect_id)?);
+    headers.insert("X-Api-Sequence", HeaderValue::from_static("-1"));
+
+    let (ws, response) = tokio_tungstenite::connect_async(request)
+        .await
+        .map_err(|e| anyhow::anyhow!("volcengine STT WS connect failed: {e}"))?;
+    tracing::debug!(
+        status = %response.status(),
+        connect_id = %connect_id,
+        "volcengine STT WS connected"
+    );
+    Ok(ws)
+}
+
+/// Build the FULL_CLIENT_REQUEST config frame. `show_utterances` exposes the
+/// per-utterance `definite` flag the streaming path uses for endpointing;
+/// when set we also request server-side VAD segmentation via
+/// `end_window_size` so utterances finalize mid-stream (after a short pause)
+/// rather than only at connection close.
+fn config_frame(cfg: &Config, show_utterances: bool) -> anyhow::Result<Vec<u8>> {
+    let mut request = json!({
+        "model_name": cfg.model,
+        "enable_itn": true,
+        "enable_punc": true,
+        "result_type": "single",
+        "show_utterances": show_utterances,
+    });
+    if show_utterances {
+        request["end_window_size"] = json!(STREAM_END_WINDOW_MS);
+    }
+    let config = json!({
+        "user": { "uid": "hi-agent" },
+        "audio": {
+            "format": "pcm",
+            "codec": "raw",
+            "rate": 16000,
+            "bits": 16,
+            "channel": 1,
+        },
+        "request": request,
+    });
+    Ok(frame(MSG_TYPE_FULL_CLIENT, 0, SER_JSON, &serde_json::to_vec(&config)?))
+}
+
+async fn transcribe_inner(cfg: &Config, audio: Bytes, mime: &str) -> anyhow::Result<String> {
+    let pcm = extract_pcm(&audio, mime)?;
+    let (mut tx, mut rx) = connect(cfg).await?.split();
+
+    // 1. FULL_CLIENT_REQUEST — JSON config.
+    tx.send(Message::Binary(config_frame(cfg, false)?)).await?;
+
+    // 2. Audio chunks.
+    let mut offset = 0;
+    while offset < pcm.len() {
+        let end = (offset + PCM_CHUNK_BYTES).min(pcm.len());
+        let is_last = end == pcm.len();
+        let flags = if is_last { FLAG_LAST_CHUNK } else { 0 };
+        tx.send(Message::Binary(frame(
+            MSG_TYPE_AUDIO_ONLY,
+            flags,
+            SER_RAW,
+            &pcm[offset..end],
+        )))
+        .await?;
+        offset = end;
+    }
+    // The reference impl also sends a zero-byte final marker when audio
+    // ends — done as part of the last chunk above if it had data, but if
+    // pcm was empty we still need to terminate.
+    if pcm.is_empty() {
+        tx.send(Message::Binary(frame(
+            MSG_TYPE_AUDIO_ONLY,
+            FLAG_LAST_CHUNK,
+            SER_RAW,
+            &[],
+        )))
+        .await?;
     }
 
-    /// Build the FULL_CLIENT_REQUEST config frame. `show_utterances` exposes the
-    /// per-utterance `definite` flag the streaming path uses for endpointing;
-    /// when set we also request server-side VAD segmentation via
-    /// `end_window_size` so utterances finalize mid-stream (after a short pause)
-    /// rather than only at connection close.
-    fn config_frame(&self, show_utterances: bool) -> anyhow::Result<Vec<u8>> {
-        let mut request = json!({
-            "model_name": self.model,
-            "enable_itn": true,
-            "enable_punc": true,
-            "result_type": "single",
-            "show_utterances": show_utterances,
-        });
-        if show_utterances {
-            request["end_window_size"] = json!(STREAM_END_WINDOW_MS);
+    // 3. Drain responses until we see a `final` result or an error.
+    let mut final_text = String::new();
+    let mut last_text = String::new();
+    while let Some(msg) = rx.next().await {
+        let msg = msg.map_err(|e| anyhow::anyhow!("volcengine STT WS recv: {e}"))?;
+        let bytes = match msg {
+            Message::Binary(b) => b,
+            Message::Close(_) => {
+                // Normal end-of-stream. Promote the last rolling preliminary
+                // if no frame was flagged `final`. An empty result here is a
+                // benign "no speech recognized" — the upstream cannot tell
+                // silence from un-transcribable sound, and neither path is an
+                // error; the caller treats an empty transcript as a no-op.
+                if final_text.is_empty() {
+                    final_text = last_text.clone();
+                }
+                break;
+            }
+            _ => continue,
+        };
+
+        if bytes.len() < 4 {
+            continue;
         }
-        let config = json!({
-            "user": { "uid": "hi-agent" },
-            "audio": {
-                "format": "pcm",
-                "codec": "raw",
-                "rate": 16000,
-                "bits": 16,
-                "channel": 1,
-            },
-            "request": request,
-        });
-        Ok(frame(MSG_TYPE_FULL_CLIENT, 0, SER_JSON, &serde_json::to_vec(&config)?))
-    }
+        let msg_type = (bytes[1] >> 4) & 0x0F;
+        let tail = &bytes[4..];
 
-    async fn transcribe_inner(&self, audio: Bytes, mime: &str) -> anyhow::Result<String> {
-        let pcm = extract_pcm(&audio, mime)?;
-        let (mut tx, mut rx) = self.connect().await?.split();
-
-        // 1. FULL_CLIENT_REQUEST — JSON config.
-        tx.send(Message::Binary(self.config_frame(false)?)).await?;
-
-        // 2. Audio chunks.
-        let mut offset = 0;
-        while offset < pcm.len() {
-            let end = (offset + PCM_CHUNK_BYTES).min(pcm.len());
-            let is_last = end == pcm.len();
-            let flags = if is_last { FLAG_LAST_CHUNK } else { 0 };
-            tx.send(Message::Binary(frame(
-                MSG_TYPE_AUDIO_ONLY,
-                flags,
-                SER_RAW,
-                &pcm[offset..end],
-            )))
-            .await?;
-            offset = end;
-        }
-        // The reference impl also sends a zero-byte final marker when audio
-        // ends — done as part of the last chunk above if it had data, but if
-        // pcm was empty we still need to terminate.
-        if pcm.is_empty() {
-            tx.send(Message::Binary(frame(
-                MSG_TYPE_AUDIO_ONLY,
-                FLAG_LAST_CHUNK,
-                SER_RAW,
-                &[],
-            )))
-            .await?;
-        }
-
-        // 3. Drain responses until we see a `final` result or an error.
-        let mut final_text = String::new();
-        let mut last_text = String::new();
-        while let Some(msg) = rx.next().await {
-            let msg = msg.map_err(|e| anyhow::anyhow!("volcengine STT WS recv: {e}"))?;
-            let bytes = match msg {
-                Message::Binary(b) => b,
-                Message::Close(_) => {
-                    // Normal end-of-stream. Promote the last rolling preliminary
-                    // if no frame was flagged `final`. An empty result here is a
-                    // benign "no speech recognized" — the upstream cannot tell
-                    // silence from un-transcribable sound, and neither path is an
-                    // error; the caller treats an empty transcript as a no-op.
-                    if final_text.is_empty() {
-                        final_text = last_text.clone();
+        match msg_type {
+            MSG_TYPE_FULL_SERVER => {
+                let Some(payload) = server_payload(&bytes) else {
+                    continue;
+                };
+                let parsed: ServerResponse = match serde_json::from_slice(payload) {
+                    Ok(p) => p,
+                    Err(err) => {
+                        tracing::warn!(error = %err, "volcengine STT JSON parse failed");
+                        continue;
                     }
+                };
+
+                if let Some(status) = parsed.header.as_ref().and_then(|h| h.status) {
+                    if status != SUCCESS_STATUS && status != 0 {
+                        anyhow::bail!(
+                            "volcengine STT error status={status} message={:?}",
+                            parsed.header.as_ref().and_then(|h| h.message.clone())
+                        );
+                    }
+                }
+
+                if let Some(text) = parsed.result.as_ref().and_then(|r| r.first_text()) {
+                    if !text.is_empty() {
+                        last_text = text;
+                    }
+                }
+
+                if parsed.kind.as_deref() == Some("final") {
+                    final_text = last_text.clone();
                     break;
                 }
-                _ => continue,
-            };
-
-            if bytes.len() < 4 {
-                continue;
             }
-            let msg_type = (bytes[1] >> 4) & 0x0F;
-            let tail = &bytes[4..];
-
-            match msg_type {
-                MSG_TYPE_FULL_SERVER => {
-                    let Some(payload) = server_payload(&bytes) else {
-                        continue;
-                    };
-                    let parsed: ServerResponse = match serde_json::from_slice(payload) {
-                        Ok(p) => p,
-                        Err(err) => {
-                            tracing::warn!(error = %err, "volcengine STT JSON parse failed");
-                            continue;
-                        }
-                    };
-
-                    if let Some(status) = parsed.header.as_ref().and_then(|h| h.status) {
-                        if status != SUCCESS_STATUS && status != 0 {
-                            anyhow::bail!(
-                                "volcengine STT error status={status} message={:?}",
-                                parsed.header.as_ref().and_then(|h| h.message.clone())
-                            );
-                        }
-                    }
-
-                    if let Some(text) = parsed.result.as_ref().and_then(|r| r.first_text()) {
-                        if !text.is_empty() {
-                            last_text = text;
-                        }
-                    }
-
-                    if parsed.kind.as_deref() == Some("final") {
-                        final_text = last_text.clone();
-                        break;
-                    }
-                }
-                MSG_TYPE_SERVER_ERROR => {
-                    let payload = extract_json(tail).unwrap_or(tail);
-                    let msg = String::from_utf8_lossy(payload).into_owned();
-                    anyhow::bail!("volcengine STT server error: {msg}");
-                }
-                _ => continue,
+            MSG_TYPE_SERVER_ERROR => {
+                let payload = extract_json(tail).unwrap_or(tail);
+                let msg = String::from_utf8_lossy(payload).into_owned();
+                anyhow::bail!("volcengine STT server error: {msg}");
             }
+            _ => continue,
         }
-
-        let _ = tx.send(Message::Close(None)).await;
-
-        // Empty is a valid result (no speech recognized), distinct from the
-        // errors above which `bail!` — those still propagate as failures.
-        Ok(final_text.trim().to_owned())
     }
 
-    /// Full-duplex streaming: a sender task forwards incoming PCM as it arrives
-    /// while this task reads incremental results. `audio_rx` carries raw 16 kHz
-    /// mono 16-bit PCM (no WAV header — the caller already stripped/never added
-    /// one). Each non-empty result is emitted on `out`; the polished final is
-    /// returned.
-    async fn transcribe_streaming_inner(
-        &self,
-        mut audio_rx: mpsc::Receiver<Bytes>,
-        out: mpsc::Sender<Transcript>,
-    ) -> anyhow::Result<String> {
-        let (mut tx, mut rx) = self.connect().await?.split();
-        tx.send(Message::Binary(self.config_frame(true)?)).await?;
+    let _ = tx.send(Message::Close(None)).await;
 
-        // Sender task: stream PCM chunks until the input closes, then mark the
-        // last chunk so the upstream finalizes.
-        let send_task = tokio::spawn(async move {
-            while let Some(chunk) = audio_rx.recv().await {
-                let mut offset = 0;
-                while offset < chunk.len() {
-                    let end = (offset + PCM_CHUNK_BYTES).min(chunk.len());
-                    tx.send(Message::Binary(frame(
-                        MSG_TYPE_AUDIO_ONLY,
-                        0,
-                        SER_RAW,
-                        &chunk[offset..end],
-                    )))
-                    .await?;
-                    offset = end;
-                }
-            }
-            tx.send(Message::Binary(frame(MSG_TYPE_AUDIO_ONLY, FLAG_LAST_CHUNK, SER_RAW, &[])))
+    // Empty is a valid result (no speech recognized), distinct from the
+    // errors above which `bail!` — those still propagate as failures.
+    Ok(final_text.trim().to_owned())
+}
+
+/// Full-duplex streaming: a sender task forwards incoming PCM as it arrives
+/// while this task reads incremental results. `audio_rx` carries raw 16 kHz
+/// mono 16-bit PCM (no WAV header — the caller already stripped/never added
+/// one). Each non-empty result is emitted on `out`; the polished final is
+/// returned.
+async fn transcribe_streaming_inner(
+    cfg: &Config,
+    mut audio_rx: mpsc::Receiver<Bytes>,
+    out: mpsc::Sender<Transcript>,
+) -> anyhow::Result<String> {
+    let (mut tx, mut rx) = connect(cfg).await?.split();
+    tx.send(Message::Binary(config_frame(cfg, true)?)).await?;
+
+    // Sender task: stream PCM chunks until the input closes, then mark the
+    // last chunk so the upstream finalizes.
+    let send_task = tokio::spawn(async move {
+        while let Some(chunk) = audio_rx.recv().await {
+            let mut offset = 0;
+            while offset < chunk.len() {
+                let end = (offset + PCM_CHUNK_BYTES).min(chunk.len());
+                tx.send(Message::Binary(frame(
+                    MSG_TYPE_AUDIO_ONLY,
+                    0,
+                    SER_RAW,
+                    &chunk[offset..end],
+                )))
                 .await?;
-            anyhow::Ok(())
-        });
-
-        // Reader: a continuous session over many utterances. The upstream sends
-        // rolling preliminaries (definite=false) then marks an utterance
-        // `definite=true` once its server-side VAD detects the endpoint. We emit
-        // every non-empty preliminary as a partial (the caller uses it for
-        // barge-in) and each finalized utterance as `is_final=true` (the caller
-        // dispatches those as discrete signals). The loop runs until the audio
-        // input closes and the upstream closes the socket — it does NOT stop at
-        // the first final.
-        let mut last_partial = String::new();
-        let mut last_final = String::new();
-        let mut last_returned = String::new();
-        while let Some(msg) = rx.next().await {
-            let msg = msg.map_err(|e| anyhow::anyhow!("volcengine STT WS recv: {e}"))?;
-            let bytes = match msg {
-                Message::Binary(b) => b,
-                Message::Close(_) => break,
-                _ => continue,
-            };
-            if bytes.len() < 4 {
-                continue;
-            }
-            let msg_type = (bytes[1] >> 4) & 0x0F;
-            let tail = &bytes[4..];
-            match msg_type {
-                MSG_TYPE_FULL_SERVER => {
-                    let Some(payload) = server_payload(&bytes) else { continue };
-                    let parsed: ServerResponse = match serde_json::from_slice(payload) {
-                        Ok(p) => p,
-                        Err(err) => {
-                            tracing::warn!(error = %err, "volcengine STT JSON parse failed");
-                            continue;
-                        }
-                    };
-                    if let Some(status) = parsed.header.as_ref().and_then(|h| h.status) {
-                        if status != SUCCESS_STATUS && status != 0 {
-                            anyhow::bail!(
-                                "volcengine STT error status={status} message={:?}",
-                                parsed.header.as_ref().and_then(|h| h.message.clone())
-                            );
-                        }
-                    }
-
-                    if parsed.is_definite() {
-                        // Utterance finalized. Dispatch its text once; a new
-                        // partial resets `last_final` so a later utterance with
-                        // identical text still dispatches.
-                        let text = parsed
-                            .result
-                            .as_ref()
-                            .and_then(|r| r.definite_text())
-                            .unwrap_or_default();
-                        if !text.is_empty() && text != last_final {
-                            last_final = text.clone();
-                            last_returned = text.clone();
-                            last_partial.clear();
-                            let _ = out.send(Transcript { text, is_final: true }).await;
-                        }
-                    } else if let Some(text) = parsed.text() {
-                        // Rolling preliminary. Dedupe identical updates.
-                        if !text.is_empty() && text != last_partial {
-                            last_partial = text.clone();
-                            last_final.clear();
-                            let _ = out.send(Transcript { text, is_final: false }).await;
-                        }
-                    }
-                }
-                MSG_TYPE_SERVER_ERROR => {
-                    let payload = extract_json(tail).unwrap_or(tail);
-                    anyhow::bail!(
-                        "volcengine STT server error: {}",
-                        String::from_utf8_lossy(payload)
-                    );
-                }
-                _ => continue,
+                offset = end;
             }
         }
+        tx.send(Message::Binary(frame(MSG_TYPE_AUDIO_ONLY, FLAG_LAST_CHUNK, SER_RAW, &[])))
+            .await?;
+        anyhow::Ok(())
+    });
 
-        send_task.abort();
-        // The return value is the last finalized utterance — a best-effort
-        // summary for callers that await the whole session; the live signal is
-        // the `out` stream above.
-        Ok(last_returned.trim().to_owned())
+    // Reader: a continuous session over many utterances. The upstream sends
+    // rolling preliminaries (definite=false) then marks an utterance
+    // `definite=true` once its server-side VAD detects the endpoint. We emit
+    // every non-empty preliminary as a partial (the caller uses it for
+    // barge-in) and each finalized utterance as `is_final=true` (the caller
+    // dispatches those as discrete signals). The loop runs until the audio
+    // input closes and the upstream closes the socket — it does NOT stop at
+    // the first final.
+    let mut last_partial = String::new();
+    let mut last_final = String::new();
+    let mut last_returned = String::new();
+    while let Some(msg) = rx.next().await {
+        let msg = msg.map_err(|e| anyhow::anyhow!("volcengine STT WS recv: {e}"))?;
+        let bytes = match msg {
+            Message::Binary(b) => b,
+            Message::Close(_) => break,
+            _ => continue,
+        };
+        if bytes.len() < 4 {
+            continue;
+        }
+        let msg_type = (bytes[1] >> 4) & 0x0F;
+        let tail = &bytes[4..];
+        match msg_type {
+            MSG_TYPE_FULL_SERVER => {
+                let Some(payload) = server_payload(&bytes) else { continue };
+                let parsed: ServerResponse = match serde_json::from_slice(payload) {
+                    Ok(p) => p,
+                    Err(err) => {
+                        tracing::warn!(error = %err, "volcengine STT JSON parse failed");
+                        continue;
+                    }
+                };
+                if let Some(status) = parsed.header.as_ref().and_then(|h| h.status) {
+                    if status != SUCCESS_STATUS && status != 0 {
+                        anyhow::bail!(
+                            "volcengine STT error status={status} message={:?}",
+                            parsed.header.as_ref().and_then(|h| h.message.clone())
+                        );
+                    }
+                }
+
+                if parsed.is_definite() {
+                    // Utterance finalized. Dispatch its text once; a new
+                    // partial resets `last_final` so a later utterance with
+                    // identical text still dispatches.
+                    let text = parsed
+                        .result
+                        .as_ref()
+                        .and_then(|r| r.definite_text())
+                        .unwrap_or_default();
+                    if !text.is_empty() && text != last_final {
+                        last_final = text.clone();
+                        last_returned = text.clone();
+                        last_partial.clear();
+                        let _ = out.send(Transcript { text, is_final: true }).await;
+                    }
+                } else if let Some(text) = parsed.text() {
+                    // Rolling preliminary. Dedupe identical updates.
+                    if !text.is_empty() && text != last_partial {
+                        last_partial = text.clone();
+                        last_final.clear();
+                        let _ = out.send(Transcript { text, is_final: false }).await;
+                    }
+                }
+            }
+            MSG_TYPE_SERVER_ERROR => {
+                let payload = extract_json(tail).unwrap_or(tail);
+                anyhow::bail!(
+                    "volcengine STT server error: {}",
+                    String::from_utf8_lossy(payload)
+                );
+            }
+            _ => continue,
+        }
     }
+
+    send_task.abort();
+    // The return value is the last finalized utterance — a best-effort
+    // summary for callers that await the whole session; the live signal is
+    // the `out` stream above.
+    Ok(last_returned.trim().to_owned())
 }
 
 /// Build a single protocol frame: 4-byte header + uint32 BE payload size + payload bytes.

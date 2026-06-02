@@ -16,7 +16,7 @@ use tokio::net::TcpListener;
 async fn spawn_server() -> (String, tempfile::TempDir, ServerSeams) {
     let dir = tempdir().expect("tempdir");
     let memory = Memory::open(dir.path()).await.expect("memory");
-    let (router, seams) = server::build(memory, dir.path().to_path_buf(), None);
+    let (router, seams) = server::build(memory, dir.path().to_path_buf());
 
     let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
     let addr = listener.local_addr().expect("local_addr");
@@ -129,7 +129,9 @@ async fn post_vision_accepts_and_persists_without_journaling() {
 #[tokio::test]
 async fn all_sensory_stubs_return_501() {
     // touch/smell/taste are still 501 in v0. /audio returns 501 only when
-    // STT is unconfigured, which the test fixture forces with stt: None.
+    // STT is unconfigured, which the test forces by never calling
+    // capabilities::init_from_env — the STT global stays uninitialized, so
+    // stt::available() is false.
     let (base, _dir, _seams) = spawn_server().await;
     let client = reqwest::Client::new();
 

@@ -38,18 +38,17 @@
 //!   ← AudioOnlyServer(0xB) frames (raw audio) … until TTSEnded(359)/SessionFinished(152)
 //!   → FinishConnection(2)  ← ConnectionFinished(52)
 //!
-//! We expose the provider-agnostic streaming [`Tts::start`]: one WS session per
-//! turn. [`start`](VolcengineTts::start) performs the connection + session
-//! handshake and returns a [`TtsStream`]; a background driver task then feeds
-//! each pushed text chunk as its own `TaskRequest` into the *same open session*
-//! and forwards every `AudioOnlyServer` frame to the stream's receiver as it
-//! arrives. Dropping the text sender sends `FinishSession`; the task tears the
-//! connection down once the session ends. The audio is thus one continuous
-//! stream for the whole turn, never a sequence of per-sentence clips.
+//! We expose the provider-agnostic streaming [`start`]: one WS session per
+//! turn. [`start`] performs the connection + session handshake and returns a
+//! [`TtsStream`]; a background driver task then feeds each pushed text chunk as
+//! its own `TaskRequest` into the *same open session* and forwards every
+//! `AudioOnlyServer` frame to the stream's receiver as it arrives. Dropping the
+//! text sender sends `FinishSession`; the task tears the connection down once
+//! the session ends. The audio is thus one continuous stream for the whole
+//! turn, never a sequence of per-sentence clips.
 
 use std::time::Duration;
 
-use async_trait::async_trait;
 use bytes::Bytes;
 use futures::{SinkExt, StreamExt};
 use serde_json::json;
@@ -60,7 +59,7 @@ use tokio_tungstenite::tungstenite::http::HeaderValue;
 use tokio_tungstenite::tungstenite::Message;
 use uuid::Uuid;
 
-use super::tts::{Tts, TtsStream};
+use crate::capabilities::tts::TtsStream;
 
 const DEFAULT_ENDPOINT: &str = "wss://openspeech.bytedance.com/api/v3/tts/bidirection";
 const DEFAULT_RESOURCE_ID: &str = "seed-tts-2.0";
@@ -110,7 +109,7 @@ fn is_connection_event(event: i32) -> bool {
     matches!(event, 1 | 2 | 50 | 51 | 52)
 }
 
-pub struct VolcengineTts {
+pub struct Config {
     api_key: String,
     resource_id: String,
     endpoint: String,
@@ -118,7 +117,7 @@ pub struct VolcengineTts {
     encoding: String,
 }
 
-impl VolcengineTts {
+impl Config {
     pub fn from_env() -> anyhow::Result<Self> {
         let api_key = std::env::var(ENV_API_KEY).map_err(|_| {
             anyhow::anyhow!("{ENV_API_KEY} is required when TTS_PROVIDER=volcengine")
@@ -140,81 +139,78 @@ impl VolcengineTts {
     }
 }
 
-#[async_trait]
-impl Tts for VolcengineTts {
-    async fn start(&self) -> anyhow::Result<TtsStream> {
-        let connect_id = Uuid::now_v7().to_string();
-        let session_id = Uuid::now_v7().to_string();
+pub async fn start(cfg: &Config) -> anyhow::Result<TtsStream> {
+    let connect_id = Uuid::now_v7().to_string();
+    let session_id = Uuid::now_v7().to_string();
 
-        let mut request = self.endpoint.as_str().into_client_request()?;
-        let headers = request.headers_mut();
-        headers.insert("X-Api-Key", HeaderValue::from_str(&self.api_key)?);
-        headers.insert("X-Api-Resource-Id", HeaderValue::from_str(&self.resource_id)?);
-        headers.insert("X-Api-Connect-Id", HeaderValue::from_str(&connect_id)?);
+    let mut request = cfg.endpoint.as_str().into_client_request()?;
+    let headers = request.headers_mut();
+    headers.insert("X-Api-Key", HeaderValue::from_str(&cfg.api_key)?);
+    headers.insert("X-Api-Resource-Id", HeaderValue::from_str(&cfg.resource_id)?);
+    headers.insert("X-Api-Connect-Id", HeaderValue::from_str(&connect_id)?);
 
-        let (ws, response) = tokio_tungstenite::connect_async(request)
-            .await
-            .map_err(|e| anyhow::anyhow!("volcengine TTS WS connect failed: {e}"))?;
-        tracing::debug!(
-            status = %response.status(),
-            connect_id = %connect_id,
-            "volcengine TTS WS connected"
-        );
-        let (mut tx, rx) = ws.split();
+    let (ws, response) = tokio_tungstenite::connect_async(request)
+        .await
+        .map_err(|e| anyhow::anyhow!("volcengine TTS WS connect failed: {e}"))?;
+    tracing::debug!(
+        status = %response.status(),
+        connect_id = %connect_id,
+        "volcengine TTS WS connected"
+    );
+    let (mut tx, rx) = ws.split();
 
-        let audio_params = json!({
-            "format": self.encoding,
-            "sample_rate": DEFAULT_SAMPLE_RATE,
-        });
+    let audio_params = json!({
+        "format": cfg.encoding,
+        "sample_rate": DEFAULT_SAMPLE_RATE,
+    });
 
-        // Handshake before returning, so `start()` only resolves once the
-        // session can accept text and a connect failure surfaces to the caller.
-        tx.send(Message::Binary(frame(
-            MSG_TYPE_FULL_CLIENT,
-            SER_JSON,
-            EV_START_CONNECTION,
-            None,
-            b"{}",
-        )))
-        .await?;
-        let start_payload = json!({
-            "user": { "uid": "hi-agent" },
-            "namespace": NAMESPACE,
-            "event": EV_START_SESSION,
-            "req_params": {
-                "speaker": self.voice,
-                "audio_params": audio_params,
-            },
-        });
-        tx.send(Message::Binary(frame(
-            MSG_TYPE_FULL_CLIENT,
-            SER_JSON,
-            EV_START_SESSION,
-            Some(&session_id),
-            &serde_json::to_vec(&start_payload)?,
-        )))
-        .await?;
+    // Handshake before returning, so `start()` only resolves once the
+    // session can accept text and a connect failure surfaces to the caller.
+    tx.send(Message::Binary(frame(
+        MSG_TYPE_FULL_CLIENT,
+        SER_JSON,
+        EV_START_CONNECTION,
+        None,
+        b"{}",
+    )))
+    .await?;
+    let start_payload = json!({
+        "user": { "uid": "hi-agent" },
+        "namespace": NAMESPACE,
+        "event": EV_START_SESSION,
+        "req_params": {
+            "speaker": cfg.voice,
+            "audio_params": audio_params,
+        },
+    });
+    tx.send(Message::Binary(frame(
+        MSG_TYPE_FULL_CLIENT,
+        SER_JSON,
+        EV_START_SESSION,
+        Some(&session_id),
+        &serde_json::to_vec(&start_payload)?,
+    )))
+    .await?;
 
-        let (text_tx, text_rx) = mpsc::channel::<String>(CHAN_DEPTH);
-        let (frame_tx, frame_rx) = mpsc::channel::<Bytes>(CHAN_DEPTH);
+    let (text_tx, text_rx) = mpsc::channel::<String>(CHAN_DEPTH);
+    let (frame_tx, frame_rx) = mpsc::channel::<Bytes>(CHAN_DEPTH);
 
-        let voice = self.voice.clone();
-        tokio::spawn(drive_session(
-            tx,
-            rx,
-            session_id,
-            voice,
-            audio_params,
-            text_rx,
-            frame_tx,
-        ));
+    let voice = cfg.voice.clone();
+    tokio::spawn(drive_session(
+        tx,
+        rx,
+        session_id,
+        voice,
+        audio_params,
+        text_rx,
+        frame_tx,
+    ));
 
-        Ok(TtsStream {
-            mime: encoding_to_mime(&self.encoding).to_string(),
-            text: text_tx,
-            frames: frame_rx,
-        })
-    }
+    Ok(TtsStream {
+        mime: encoding_to_mime(&cfg.encoding).to_string(),
+        text: text_tx,
+        frames: frame_rx,
+    })
 }
 
 /// Whether the driver loop should keep running after handling an event.
