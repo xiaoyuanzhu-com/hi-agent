@@ -20,6 +20,10 @@
   flex-direction: column;
   background: var(--bg);
   color: var(--fg);
+  /* This is a dark surface; without this it inherits the agent face's light
+     color-scheme (set on <html> in global.css) and the browser paints bright
+     light-mode scrollbars — a jarring bright bar across the dark panes. */
+  color-scheme: dark;
   font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
   font-size: 14px;
   overflow: hidden;
@@ -55,7 +59,10 @@
 
 /* ---- ACP tab: list (left) + detail (right) ---- */
 .acp { display: grid; grid-template-columns: 280px 1fr; height: 100%; min-height: 0; }
-.acp-list { border-right: 1px solid var(--line); overflow-y: auto; }
+/* These panes scroll only vertically; pinning overflow-x to hidden stops the
+   browser from inferring overflow-x: auto and flashing a spurious horizontal
+   scrollbar (content already reflows via min-width:0 / wrapping). */
+.acp-list { border-right: 1px solid var(--line); overflow: hidden auto; }
 .acp-list-head {
   display: flex; align-items: center; justify-content: space-between;
   padding: 10px 14px; font-size: 12px; text-transform: uppercase; letter-spacing: .06em; color: var(--dim);
@@ -80,7 +87,7 @@
 .dot.idle { background: var(--ok); }
 .dot.cold { background: var(--line); }
 
-.acp-detail { overflow-y: auto; padding: 16px; min-width: 0; }
+.acp-detail { overflow: hidden auto; padding: 16px; min-width: 0; }
 .detail-head .dh-title { display: flex; align-items: baseline; gap: 12px; margin-bottom: 14px; }
 .detail-head .dh-title b { font-size: 17px; }
 
