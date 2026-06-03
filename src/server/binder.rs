@@ -16,7 +16,8 @@ use chrono::Utc;
 use tokio::sync::{broadcast, mpsc};
 
 use crate::reactor::OutboundSignal;
-use crate::server::{AudioEvent, SurfaceEvent, TextBus};
+use crate::server::{AudioEvent, OutputEcho, SurfaceEvent, TextBus};
+use crate::types::Channel;
 
 /// Drain the reactor's outbound seam and bind each signal to its HTTP carrier.
 /// Owns the producing halves of the wire-side broadcasts; runs until the reactor
@@ -26,6 +27,7 @@ pub(crate) async fn bind_outbound(
     text_bus: TextBus,
     audio_out: broadcast::Sender<AudioEvent>,
     surface_out: broadcast::Sender<SurfaceEvent>,
+    output_echo: broadcast::Sender<OutputEcho>,
 ) {
     while let Some(signal) = rx.recv().await {
         match signal {
@@ -33,9 +35,24 @@ pub(crate) async fn bind_outbound(
             // connected is retained, not dropped); end-of-utterance is what
             // closes one streaming GET /out/text response.
             OutboundSignal::Text { scene, chunk } => {
+                // Echo a non-draining copy for observers before the bus consumes it.
+                let _ = output_echo.send(OutputEcho {
+                    scene: scene.clone(),
+                    channel: Channel::Text,
+                    text: chunk.clone(),
+                    is_final: false,
+                    ts: Utc::now(),
+                });
                 text_bus.push_chunk(&scene, chunk).await;
             }
             OutboundSignal::TextEnd { scene } => {
+                let _ = output_echo.send(OutputEcho {
+                    scene: scene.clone(),
+                    channel: Channel::Text,
+                    text: String::new(),
+                    is_final: true,
+                    ts: Utc::now(),
+                });
                 text_bus.end_utterance(&scene).await;
             }
             // /audio: one utterance's span is one chunked response. The codec

@@ -123,6 +123,31 @@
 .evscalar { color: var(--ok); }
 .evnull { color: var(--dim); font-style: italic; }
 
+/* session-kind tag in the ACP list */
+.skind {
+  font-family: var(--mono); font-size: 10px; line-height: 1;
+  padding: 2px 4px; border-radius: 4px; flex: 0 0 auto;
+  text-transform: uppercase; letter-spacing: .04em;
+}
+.skind.reactor { background: rgba(110,168,254,.18); color: var(--accent); }
+.skind.worker { background: rgba(232,183,90,.18); color: var(--warn); }
+
+/* a live-dot used inline beside a label (not just the sticky list head) */
+.dh-title .live-dot { display: inline-block; margin-left: 6px; vertical-align: middle; }
+
+/* ---- Scenes tab: per-channel live presence ---- */
+.chan-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(260px, 1fr)); gap: 12px; }
+.card.chan { margin-bottom: 0; display: flex; flex-direction: column; min-height: 120px; }
+.chan-idle { font-family: var(--mono); font-size: 12px; }
+.chan-feed { font-family: var(--mono); font-size: 12px; line-height: 1.55; overflow-y: auto; max-height: 260px; }
+.chan-line { display: flex; gap: 8px; padding: 1px 0; border-bottom: 1px solid rgba(42,47,58,.5); }
+.chan-line .ts { color: var(--dim); white-space: nowrap; }
+.chan-line .dir { white-space: nowrap; font-weight: 600; }
+.chan-line .dir.in { color: var(--ok); }
+.chan-line .dir.out { color: var(--accent); }
+.chan-line .chan-body { word-break: break-word; white-space: pre-wrap; }
+.chan-line .chan-body.partial { color: var(--dim); }
+
 @media (max-width: 760px) {
   .acp { grid-template-columns: 1fr; grid-template-rows: 200px 1fr; }
   .acp-list { border-right: none; border-bottom: 1px solid var(--line); }

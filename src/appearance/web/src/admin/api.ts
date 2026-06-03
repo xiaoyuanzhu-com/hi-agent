@@ -1,10 +1,11 @@
-// Admin data layer — typed views over the observatory endpoints the Rust
-// backend exposes:
-//   GET  /api/sessions          → live per-scene snapshot (JSON)
-//   GET  /api/sessions/events   → SSE of every lifecycle event (named "session")
+// Admin data layer — typed views over the endpoints the Rust backend exposes:
+//   GET  /api/sessions                    → live per-scene snapshot (JSON)
+//   GET  /api/sessions/events             → SSE of every lifecycle event ("session")
+//   GET  /api/scenes/{scene}/channels     → SSE of one scene's channel activity ("channel")
 //
-// These mirror the serde shapes in `src/observatory/mod.rs`. Kept deliberately
-// thin: the admin views poll the snapshot and subscribe to the event stream.
+// These mirror the serde shapes in `src/observatory/mod.rs` and
+// `src/server/channels.rs`. Kept deliberately thin: the admin views poll the
+// snapshot and subscribe to the event streams.
 
 export type SessionKind = "reactor" | "worker" | "summarizer";
 export type WorkerState = "running" | "done" | "failed";
@@ -69,6 +70,44 @@ export async function fetchSessions(signal?: AbortSignal): Promise<SceneView[]> 
   const res = await fetch("/api/sessions", { signal });
   if (!res.ok) throw new Error(`GET /api/sessions → ${res.status}`);
   return (await res.json()) as SceneView[];
+}
+
+export type Channel = "text" | "vision" | "audio" | "touch" | "smell" | "taste";
+export type Direction = "in" | "out";
+
+// One unit of channel activity for a scene — a recognized/spoken line on the
+// text channel, or a metadata summary for binary/structured channels. Mirrors
+// `ChannelSignal` in `src/server/channels.rs`.
+export interface ChannelSignal {
+  ts: string;
+  channel: Channel;
+  direction: Direction;
+  body: string;
+  final: boolean;
+}
+
+/**
+ * Subscribe to one scene's merged channel-activity stream. Returns an
+ * unsubscribe fn. This is live presence only — the backend replays nothing, so a
+ * fresh subscriber sees activity from the moment it connects. EventSource
+ * auto-reconnects. `scene` is encoded into the path (ids may contain `@`, `:`).
+ */
+export function subscribeChannels(
+  scene: string,
+  onSignal: (sig: ChannelSignal) => void,
+  onStatus?: (live: boolean) => void,
+): () => void {
+  const es = new EventSource(`/api/scenes/${encodeURIComponent(scene)}/channels`);
+  es.addEventListener("open", () => onStatus?.(true));
+  es.addEventListener("error", () => onStatus?.(false));
+  es.addEventListener("channel", (e) => {
+    try {
+      onSignal(JSON.parse((e as MessageEvent).data) as ChannelSignal);
+    } catch {
+      /* ignore malformed frame */
+    }
+  });
+  return () => es.close();
 }
 
 /**

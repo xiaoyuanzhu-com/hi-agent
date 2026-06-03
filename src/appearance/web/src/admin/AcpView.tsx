@@ -1,11 +1,14 @@
-import { useEffect, useMemo, useRef, useState } from "react";
+import { useEffect, useMemo, useState } from "react";
+import { selectedUnder, usePath } from "./router";
 import {
   fetchSessions,
   subscribeEvents,
   type SceneView,
   type SessionEvent,
+  type WorkerView,
 } from "./api";
 
+const BASE = "/admin/acp";
 const MAX_EVENTS = 2000;
 const POLL_MS = 1500;
 
@@ -56,13 +59,32 @@ function EventPayload({ d }: { d: SessionEvent }) {
   );
 }
 
+// One ACP session, flattened out of the per-scene snapshot. A scene contributes
+// its reactor session plus one row per live worker; the scene is part of the key
+// because worker ids are only unique within a scene.
+type Session =
+  | { key: string; scene: string; kind: "reactor"; scene_view: SceneView }
+  | { key: string; scene: string; kind: "worker"; scene_view: SceneView; worker: WorkerView };
+
+function flatten(scenes: SceneView[]): Session[] {
+  const out: Session[] = [];
+  for (const v of scenes) {
+    if (v.reactor_session) {
+      out.push({ key: `${v.scene}::reactor`, scene: v.scene, kind: "reactor", scene_view: v });
+    }
+    for (const w of v.workers) {
+      out.push({ key: `${v.scene}::w${w.id}`, scene: v.scene, kind: "worker", scene_view: v, worker: w });
+    }
+  }
+  return out;
+}
+
 export function AcpView() {
+  const { path, navigate } = usePath();
+  const selected = selectedUnder(path, BASE);
   const [scenes, setScenes] = useState<SceneView[]>([]);
   const [events, setEvents] = useState<SessionEvent[]>([]);
-  const [selected, setSelected] = useState<string | null>(null);
   const [live, setLive] = useState(false);
-  const selectedRef = useRef<string | null>(null);
-  selectedRef.current = selected;
 
   // Poll the live snapshot.
   useEffect(() => {
@@ -74,9 +96,6 @@ export function AcpView() {
         if (cancelled) return;
         data.sort((a, b) => a.scene.localeCompare(b.scene));
         setScenes(data);
-        // Auto-select the first scene once one appears.
-        const first = data[0];
-        if (!selectedRef.current && first) setSelected(first.scene);
       } catch {
         /* transient — next tick retries */
       }
@@ -102,92 +121,87 @@ export function AcpView() {
     );
   }, []);
 
-  const current = scenes.find((s) => s.scene === selected) ?? null;
-  const sceneEvents = useMemo(
-    () => events.filter((e) => e.scene === selected).slice().reverse(),
-    [events, selected],
-  );
+  const sessions = useMemo(() => flatten(scenes), [scenes]);
+  const current = sessions.find((s) => s.key === selected) ?? null;
 
   return (
     <div className="acp">
       <aside className="acp-list">
         <div className="acp-list-head">
-          <span>Scenes</span>
+          <span>Sessions</span>
           <span className={`live-dot ${live ? "on" : ""}`} title={live ? "event stream live" : "reconnecting"} />
         </div>
-        {scenes.length === 0 ? (
-          <div className="muted pad">No active scenes yet. They appear on a scene's first turn.</div>
+        {sessions.length === 0 ? (
+          <div className="muted pad">No active sessions yet. They appear on a scene's first turn.</div>
         ) : (
           <ul>
-            {scenes.map((s) => {
-              const inFlight = s.reactor_session?.in_flight;
-              const running = s.workers.filter((w) => w.state === "running").length;
-              return (
-                <li
-                  key={s.scene}
-                  className={s.scene === selected ? "sel" : ""}
-                  onClick={() => setSelected(s.scene)}
-                >
-                  <span className={`dot ${inFlight ? "busy" : s.reactor_session ? "idle" : "cold"}`} />
-                  <span className="nm">{s.scene}</span>
-                  <span className="badges">
-                    {running > 0 && <span className="mini">{running}⚙</span>}
-                    <span className="mini">{s.turns_total}t</span>
-                  </span>
-                </li>
-              );
-            })}
+            {sessions.map((s) => (
+              <li
+                key={s.key}
+                className={s.key === selected ? "sel" : ""}
+                onClick={() => navigate(`${BASE}/${encodeURIComponent(s.key)}`)}
+              >
+                <span className={`dot ${sessionDot(s)}`} />
+                <span className={`skind ${s.kind}`}>{s.kind === "reactor" ? "rx" : "wk"}</span>
+                <span className="nm">{sessionLabel(s)}</span>
+                <span className="badges">
+                  <span className="mini">{s.scene}</span>
+                </span>
+              </li>
+            ))}
           </ul>
         )}
       </aside>
 
       <section className="acp-detail">
         {!current ? (
-          <div className="muted pad">Select a scene.</div>
+          <div className="muted pad">Select a session.</div>
+        ) : current.kind === "reactor" ? (
+          <ReactorDetail scene={current.scene_view} events={events} />
         ) : (
-          <>
-            <SceneDetail scene={current} />
-            <div className="acp-events">
-              <h3>Events <span className="muted">({sceneEvents.length})</span></h3>
-              {sceneEvents.length === 0 ? (
-                <div className="muted pad">No events for this scene yet.</div>
-              ) : (
-                <div className="evlist">
-                  {sceneEvents.map((d) => (
-                    <div className="ev" key={d.seq}>
-                      <div className="evhead">
-                        <span className="ts">{time(d.ts)}</span>
-                        <span className={`evname ${d.event}`}>{d.event}</span>
-                        <span className="evseq">#{d.seq}</span>
-                      </div>
-                      <EventPayload d={d} />
-                    </div>
-                  ))}
-                </div>
-              )}
-            </div>
-          </>
+          <WorkerDetail scene={current.scene} worker={current.worker} events={events} />
         )}
       </section>
     </div>
   );
 }
 
-function SceneDetail({ scene: v }: { scene: SceneView }) {
+function sessionLabel(s: Session): string {
+  if (s.kind === "reactor") return `reactor ${s.scene_view.reactor_session?.id.slice(0, 16) ?? ""}`;
+  return `#${s.worker.id} ${s.worker.task}`;
+}
+
+function sessionDot(s: Session): string {
+  if (s.kind === "reactor") return s.scene_view.reactor_session?.in_flight ? "busy" : "idle";
+  return s.worker.state === "running" ? "busy" : s.worker.state === "failed" ? "cold" : "idle";
+}
+
+function ReactorDetail({ scene: v, events }: { scene: SceneView; events: SessionEvent[] }) {
   const rs = v.reactor_session;
   const pct = v.swap_after_chars > 0 ? Math.min(100, (100 * v.budget_chars) / v.swap_after_chars) : 0;
+  // A reactor session owns the scene-level lifecycle, so surface every event for
+  // the scene except worker-specific ones (those live on the worker detail).
+  const sceneEvents = useMemo(
+    () =>
+      events
+        .filter((e) => e.scene === v.scene && !String(e.event).startsWith("worker_"))
+        .slice()
+        .reverse(),
+    [events, v.scene],
+  );
+
   return (
     <div className="detail-head">
       <div className="dh-title">
-        <b>{v.scene}</b>
+        <b>reactor</b>
         <span className="muted">
-          process up {ago(v.process_spawned_at)} · {v.turns_total} turns · {v.swap_count} swaps
+          {v.scene} · process up {ago(v.process_spawned_at)} · {v.turns_total} turns · {v.swap_count} swaps
         </span>
       </div>
 
       <div className="cards">
         <div className="card">
-          <h4>Reactor session</h4>
+          <h4>Session</h4>
           {rs ? (
             <>
               <div className="kv">
@@ -227,30 +241,74 @@ function SceneDetail({ scene: v }: { scene: SceneView }) {
         </div>
       </div>
 
-      <div className="card">
-        <h4>Workers <span className="muted">({v.workers.length})</span></h4>
-        {v.workers.length === 0 ? (
-          <div className="muted">none</div>
-        ) : (
-          v.workers.map((w) => (
-            <div className="worker" key={w.id}>
-              <div className="wt">
-                <span className="task">#{w.id} {w.task}</span>
-                <span className={`wbadge ${w.state}`}>{w.state}</span>
-                <span className="muted started">{ago(w.started_at)}</span>
-              </div>
-              {w.transcript_tail && <div className="tail">{w.transcript_tail}</div>}
-              {w.last_question && <div className="q">⁇ {w.last_question}</div>}
-            </div>
-          ))
-        )}
-      </div>
-
       {v.pending_alarms.length > 0 && (
         <div className="card">
           <h4>Pending alarms <span className="muted">({v.pending_alarms.length})</span></h4>
           {v.pending_alarms.map((a, i) => (
             <div className="alarm" key={i}>⏰ {a.note || "(no note)"} · fires {time(a.fires_at)}</div>
+          ))}
+        </div>
+      )}
+
+      <EventLog events={sceneEvents} />
+    </div>
+  );
+}
+
+function WorkerDetail({
+  scene,
+  worker: w,
+  events,
+}: {
+  scene: string;
+  worker: WorkerView;
+  events: SessionEvent[];
+}) {
+  const workerEvents = useMemo(
+    () =>
+      events
+        .filter((e) => e.scene === scene && String(e.event).startsWith("worker_") && Number(e.id) === w.id)
+        .slice()
+        .reverse(),
+    [events, scene, w.id],
+  );
+
+  return (
+    <div className="detail-head">
+      <div className="dh-title">
+        <b>worker #{w.id}</b>
+        <span className="muted">{scene} · started {ago(w.started_at)}</span>
+      </div>
+
+      <div className="card">
+        <h4>Task <span className={`wbadge ${w.state}`}>{w.state}</span></h4>
+        <div className="kv">{w.task}</div>
+        {w.transcript_tail && <div className="tail">{w.transcript_tail}</div>}
+        {w.last_question && <div className="q">⁇ {w.last_question}</div>}
+      </div>
+
+      <EventLog events={workerEvents} />
+    </div>
+  );
+}
+
+function EventLog({ events }: { events: SessionEvent[] }) {
+  return (
+    <div className="acp-events">
+      <h3>Events <span className="muted">({events.length})</span></h3>
+      {events.length === 0 ? (
+        <div className="muted pad">No events yet.</div>
+      ) : (
+        <div className="evlist">
+          {events.map((d) => (
+            <div className="ev" key={d.seq}>
+              <div className="evhead">
+                <span className="ts">{time(d.ts)}</span>
+                <span className={`evname ${d.event}`}>{d.event}</span>
+                <span className="evseq">#{d.seq}</span>
+              </div>
+              <EventPayload d={d} />
+            </div>
           ))}
         </div>
       )}

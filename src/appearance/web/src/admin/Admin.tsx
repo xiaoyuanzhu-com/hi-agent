@@ -1,5 +1,6 @@
 import { useEffect } from "react";
 import { usePath } from "./router";
+import { ScenesView } from "./ScenesView";
 import { AcpView } from "./AcpView";
 import "./admin.css";
 
@@ -10,14 +11,18 @@ interface Tab {
   render: () => JSX.Element;
 }
 
-const TABS: Tab[] = [{ key: "acp", label: "ACP", path: "/admin/acp", render: () => <AcpView /> }];
+const TABS: Tab[] = [
+  { key: "scenes", label: "Scenes", path: "/admin/scenes", render: () => <ScenesView /> },
+  { key: "acp", label: "ACP", path: "/admin/acp", render: () => <AcpView /> },
+];
 // TABS is a static, non-empty list; the first tab is the default landing.
 const FIRST_TAB = TABS[0]!;
 
 /**
  * The admin console — an operator-facing surface distinct from the agent "face"
- * at `/`. Tabs map to nested routes (`/admin/acp`, …); the first tab is ACP
- * session visibility. Bare `/admin` redirects to the first tab.
+ * at `/`. Tabs map to nested routes: `/admin/scenes` inspects a scene's live
+ * channels, `/admin/acp` inspects ACP sessions. Bare `/admin` redirects to the
+ * first tab. Each tab owns deeper nested routes (`…/{id}`) for its detail view.
  */
 export function Admin() {
   const { path, navigate } = usePath();

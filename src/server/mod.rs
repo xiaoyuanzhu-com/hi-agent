@@ -18,6 +18,7 @@ use crate::types::{Channel, Scene, Signal, SurfaceEnvelope};
 
 pub mod audio;
 pub mod binder;
+pub mod channels;
 pub mod headers;
 pub mod observe;
 pub mod overlay;
@@ -125,6 +126,23 @@ pub struct InputEcho {
     pub ts: DateTime<Utc>,
 }
 
+/// One spoken/typed reply, echoed to scene observers — the outbound mirror of
+/// [`InputEcho`]. The agent's worded reply is *delivered* through the consuming
+/// [`TextBus`], so an operator can't watch it there without stealing it from the
+/// real client. The binder publishes a non-draining copy here, letting the admin
+/// channel inspector observe outbound text the same way `InputEcho` exposes
+/// inbound text. Presence, not a log: broadcast, lossy, no replay.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct OutputEcho {
+    pub scene: Scene,
+    pub channel: Channel,
+    pub text: String,
+    /// `false` while a reply is still streaming chunks, `true` at end-of-utterance.
+    #[serde(rename = "final")]
+    pub is_final: bool,
+    pub ts: DateTime<Utc>,
+}
+
 /// Shared state passed to every handler via `axum::extract::State`.
 pub struct AppState {
     /// Inbound signals from every channel POST. The reactor consumes these.
@@ -158,6 +176,11 @@ pub struct AppState {
     /// Inbound echo broadcast. GET /api/in/<channel> observers receive recognized
     /// inputs (typed text, recognized speech) from this — live, no replay.
     pub input_echo: broadcast::Sender<InputEcho>,
+
+    /// Outbound text echo broadcast — the non-draining mirror of the agent's
+    /// worded reply. The binder publishes here alongside the consuming `TextBus`
+    /// so the admin channel inspector can observe outbound text live.
+    pub output_echo: broadcast::Sender<OutputEcho>,
 
     /// Memory substrate — journal. Cloneable handle.
     pub memory: Memory,
@@ -195,6 +218,8 @@ pub fn build(memory: Memory, data_dir: PathBuf, observatory: Observatory) -> (Ro
     let (overlay_tx, _) = broadcast::channel::<OverlayEvent>(64);
     // Input echo: live broadcast, lossy ring, no replay (see `InputEcho`).
     let (input_echo_tx, _) = broadcast::channel::<InputEcho>(64);
+    // Output text echo: the binder's non-draining mirror (see `OutputEcho`).
+    let (output_echo_tx, _) = broadcast::channel::<OutputEcho>(64);
 
     // The reactor's single transport-free outbound seam. A binder task fans each
     // `OutboundSignal` out to the HTTP-shaped carriers above — assigning
@@ -206,6 +231,7 @@ pub fn build(memory: Memory, data_dir: PathBuf, observatory: Observatory) -> (Ro
         text_bus.clone(),
         audio_tx.clone(),
         surface_tx.clone(),
+        output_echo_tx.clone(),
     ));
 
     let state = Arc::new(AppState {
@@ -216,6 +242,7 @@ pub fn build(memory: Memory, data_dir: PathBuf, observatory: Observatory) -> (Ro
         vision_out: vision_tx.clone(),
         overlay_out: overlay_tx.clone(),
         input_echo: input_echo_tx.clone(),
+        output_echo: output_echo_tx.clone(),
         memory,
         observatory,
         data_dir,
@@ -244,6 +271,9 @@ pub fn build(memory: Memory, data_dir: PathBuf, observatory: Observatory) -> (Ro
         .route("/api/in/taste", post(stubs::post_taste))
         .route("/api/sessions", get(sessions::get_sessions))
         .route("/api/sessions/events", get(sessions::get_sessions_events))
+        // A scene's channels, observed live as one merged presence stream — the
+        // admin inspector's window onto every in/out channel of one scene.
+        .route("/api/scenes/{scene}/channels", get(channels::get_scene_channels))
         .with_state(state)
         .merge(crate::appearance::router())
         .fallback(not_found)
