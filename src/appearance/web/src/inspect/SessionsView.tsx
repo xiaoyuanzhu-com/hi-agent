@@ -1,7 +1,6 @@
 import { useEffect, useMemo, useState } from "react";
 import { selectedUnder, usePath } from "./router";
 import {
-  fetchSessions,
   subscribeEvents,
   type SceneView,
   type SessionEvent,
@@ -10,7 +9,6 @@ import {
 
 const BASE = "/inspect/sessions";
 const MAX_EVENTS = 2000;
-const POLL_MS = 1500;
 
 function ago(iso: string | null): string {
   if (!iso) return "—";
@@ -86,39 +84,23 @@ export function SessionsView() {
   const [events, setEvents] = useState<SessionEvent[]>([]);
   const [live, setLive] = useState(false);
 
-  // Poll the live snapshot.
+  // One SSE connection feeds both the per-scene snapshot (scene list, budgets,
+  // worker tails) and the lifecycle event log — no polling, so this view holds a
+  // single connection instead of leaking a poll request per tick into a pool the
+  // long-lived channel streams have already filled.
   useEffect(() => {
-    let cancelled = false;
-    const ctrl = new AbortController();
-    const tick = async () => {
-      try {
-        const data = await fetchSessions(ctrl.signal);
-        if (cancelled) return;
+    return subscribeEvents({
+      onSnapshot: (data) => {
         data.sort((a, b) => a.scene.localeCompare(b.scene));
         setScenes(data);
-      } catch {
-        /* transient — next tick retries */
-      }
-    };
-    void tick();
-    const h = window.setInterval(tick, POLL_MS);
-    return () => {
-      cancelled = true;
-      ctrl.abort();
-      window.clearInterval(h);
-    };
-  }, []);
-
-  // Subscribe to the lifecycle event stream.
-  useEffect(() => {
-    return subscribeEvents(
-      (ev) =>
+      },
+      onEvent: (ev) =>
         setEvents((prev) => {
           const next = prev.length >= MAX_EVENTS ? prev.slice(prev.length - MAX_EVENTS + 1) : prev;
           return [...next, ev];
         }),
-      setLive,
-    );
+      onStatus: setLive,
+    });
   }, []);
 
   const sessions = useMemo(() => flatten(scenes), [scenes]);

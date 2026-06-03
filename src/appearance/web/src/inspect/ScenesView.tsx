@@ -1,15 +1,14 @@
 import { useEffect, useMemo, useState } from "react";
 import { selectedUnder, usePath } from "./router";
 import {
-  fetchSessions,
   subscribeChannels,
+  subscribeEvents,
   type Channel,
   type ChannelSignal,
   type SceneView,
 } from "./api";
 
 const BASE = "/inspect/scenes";
-const POLL_MS = 1500;
 const MAX_PER_CHANNEL = 200;
 
 // Every channel a scene can carry, in display order. The detail view shows a
@@ -37,28 +36,16 @@ export function ScenesView() {
   const selected = selectedUnder(path, BASE);
   const [scenes, setScenes] = useState<SceneView[]>([]);
 
-  // Poll the observatory snapshot for the live scene list (observatory-only, as
-  // the Scenes tab is about channels — sessions are the Sessions tab's concern).
+  // The live scene roster rides the snapshot frames on the lifecycle SSE — one
+  // connection, no polling. The Scenes tab ignores the lifecycle events
+  // themselves; it only needs the per-scene list the snapshot carries.
   useEffect(() => {
-    let cancelled = false;
-    const ctrl = new AbortController();
-    const tick = async () => {
-      try {
-        const data = await fetchSessions(ctrl.signal);
-        if (cancelled) return;
+    return subscribeEvents({
+      onSnapshot: (data) => {
         data.sort((a, b) => a.scene.localeCompare(b.scene));
         setScenes(data);
-      } catch {
-        /* transient — next tick retries */
-      }
-    };
-    void tick();
-    const h = window.setInterval(tick, POLL_MS);
-    return () => {
-      cancelled = true;
-      ctrl.abort();
-      window.clearInterval(h);
-    };
+      },
+    });
   }, []);
 
   return (

@@ -110,21 +110,38 @@ export function subscribeChannels(
   return () => es.close();
 }
 
+export interface EventStreamHandlers {
+  /** A lifecycle event arrived — append it to the event log. */
+  onEvent?: (ev: SessionEvent) => void;
+  /** A fresh full per-scene snapshot arrived — replace prior scene state. */
+  onSnapshot?: (scenes: SceneView[]) => void;
+  /** Connection liveness toggled (open → true, error/reconnecting → false). */
+  onStatus?: (live: boolean) => void;
+}
+
 /**
- * Subscribe to the lifecycle event stream. Returns an unsubscribe fn. The
- * backend replays buffered history on connect, then streams live — so a fresh
- * subscriber sees recent context immediately. EventSource auto-reconnects.
+ * Subscribe to the lifecycle stream. Returns an unsubscribe fn. One SSE
+ * connection carries two frame types: `session` lifecycle events (buffered
+ * history replayed on connect, then live) and periodic `snapshot` frames (the
+ * full per-scene mirror). Reading scene state from the snapshot frames here
+ * means the dashboard polls nothing — it holds a single connection rather than
+ * leaking a `/api/sessions` request per tick into a starved HTTP/1.1 pool.
+ * EventSource auto-reconnects.
  */
-export function subscribeEvents(
-  onEvent: (ev: SessionEvent) => void,
-  onStatus?: (live: boolean) => void,
-): () => void {
+export function subscribeEvents(handlers: EventStreamHandlers): () => void {
   const es = new EventSource("/api/sessions/events");
-  es.addEventListener("open", () => onStatus?.(true));
-  es.addEventListener("error", () => onStatus?.(false));
+  es.addEventListener("open", () => handlers.onStatus?.(true));
+  es.addEventListener("error", () => handlers.onStatus?.(false));
   es.addEventListener("session", (e) => {
     try {
-      onEvent(JSON.parse((e as MessageEvent).data) as SessionEvent);
+      handlers.onEvent?.(JSON.parse((e as MessageEvent).data) as SessionEvent);
+    } catch {
+      /* ignore malformed frame */
+    }
+  });
+  es.addEventListener("snapshot", (e) => {
+    try {
+      handlers.onSnapshot?.(JSON.parse((e as MessageEvent).data) as SceneView[]);
     } catch {
       /* ignore malformed frame */
     }
