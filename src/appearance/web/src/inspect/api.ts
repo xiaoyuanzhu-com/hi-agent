@@ -1,10 +1,10 @@
-// Admin data layer — typed views over the endpoints the Rust backend exposes:
+// Inspect data layer — typed views over the endpoints the Rust backend exposes:
 //   GET  /api/sessions                    → live per-scene snapshot (JSON)
 //   GET  /api/sessions/events             → SSE of every lifecycle event ("session")
 //   GET  /api/scenes/{scene}/channels     → SSE of one scene's channel activity ("channel")
 //
 // These mirror the serde shapes in `src/observatory/mod.rs` and
-// `src/server/channels.rs`. Kept deliberately thin: the admin views poll the
+// `src/server/channels.rs`. Kept deliberately thin: the inspect views poll the
 // snapshot and subscribe to the event streams.
 
 export type SessionKind = "reactor" | "worker" | "summarizer";

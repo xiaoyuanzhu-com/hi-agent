@@ -8,7 +8,7 @@ import {
   type SceneView,
 } from "./api";
 
-const BASE = "/admin/scenes";
+const BASE = "/inspect/scenes";
 const POLL_MS = 1500;
 const MAX_PER_CHANNEL = 200;
 
@@ -38,7 +38,7 @@ export function ScenesView() {
   const [scenes, setScenes] = useState<SceneView[]>([]);
 
   // Poll the observatory snapshot for the live scene list (observatory-only, as
-  // the Scenes tab is about channels — sessions are the ACP tab's concern).
+  // the Scenes tab is about channels — sessions are the Sessions tab's concern).
   useEffect(() => {
     let cancelled = false;
     const ctrl = new AbortController();

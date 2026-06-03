@@ -1,6 +1,6 @@
-// A tiny history-API router — enough for the admin section's nested routes
-// (/admin, /admin/acp, …) without pulling in react-router. Components read the
-// current path with usePath() and move with its navigate().
+// A tiny history-API router — enough for the inspect section's nested routes
+// (/inspect, /inspect/sessions, …) without pulling in react-router. Components
+// read the current path with usePath() and move with its navigate().
 
 import { useCallback, useEffect, useState } from "react";
 
@@ -29,8 +29,8 @@ export function usePath(): Router {
 }
 
 /**
- * The selected id under a tab base, or null. `/admin/scenes/alice%40phone`
- * with base `/admin/scenes` → `alice@phone`. Ids are URL-encoded in links
+ * The selected id under a tab base, or null. `/inspect/scenes/alice%40phone`
+ * with base `/inspect/scenes` → `alice@phone`. Ids are URL-encoded in links
  * (scene ids may contain `@`/`:`), so they are decoded here.
  */
 export function selectedUnder(path: string, base: string): string | null {

@@ -8,7 +8,7 @@ import {
   type WorkerView,
 } from "./api";
 
-const BASE = "/admin/acp";
+const BASE = "/inspect/sessions";
 const MAX_EVENTS = 2000;
 const POLL_MS = 1500;
 
@@ -79,7 +79,7 @@ function flatten(scenes: SceneView[]): Session[] {
   return out;
 }
 
-export function AcpView() {
+export function SessionsView() {
   const { path, navigate } = usePath();
   const selected = selectedUnder(path, BASE);
   const [scenes, setScenes] = useState<SceneView[]>([]);

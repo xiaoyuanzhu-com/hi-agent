@@ -1,6 +1,6 @@
 //! `GET /api/scenes/{scene}/channels` — one scene's channels, observed live.
 //!
-//! The admin channel inspector wants a single window onto everything flowing
+//! The debug channel inspector wants a single window onto everything flowing
 //! through a scene's senses and expressions. Each channel already fans out on
 //! its own broadcast in [`AppState`](crate::server::AppState); this handler
 //! subscribes to all of them, keeps only what belongs to the path scene (plus

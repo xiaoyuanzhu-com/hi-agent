@@ -5,31 +5,32 @@
 // silent and not user-facing: a persisted default, no editor UI.
 //
 // On the first visit we mint a unique id and persist it, so each browser keeps a
-// stable scene across reloads until explicitly changed via setScene(). Falls
-// back to a shared default only when storage is unavailable (e.g. private mode),
-// where persistence isn't possible anyway.
+// stable scene across reloads until explicitly changed via setScene(). When
+// storage is unavailable (e.g. private mode) we still mint a valid id for the
+// session — it just won't survive a reload.
 
 const SCENE_KEY = "hi-agent.scene";
-const DEFAULT_SCENE = "web@local";
 
+// A short, plain scene id: 8 chars of [a-z0-9], always starting with a letter.
 function mintScene(): string {
-  const uuid =
-    typeof crypto !== "undefined" && "randomUUID" in crypto
-      ? crypto.randomUUID()
-      : Math.random().toString(36).slice(2) + Date.now().toString(36);
-  return `web-${uuid}@local`;
+  const letters = "abcdefghijklmnopqrstuvwxyz";
+  const alphanum = letters + "0123456789";
+  const pick = (set: string) => set[Math.floor(Math.random() * set.length)];
+  let id = pick(letters);
+  for (let i = 1; i < 8; i++) id += pick(alphanum);
+  return id;
 }
 
 export function getScene(): string {
   try {
     const stored = localStorage.getItem(SCENE_KEY);
     if (stored) return stored;
-    const minted = mintScene();
-    localStorage.setItem(SCENE_KEY, minted);
-    return minted;
   } catch {
-    return DEFAULT_SCENE;
+    /* storage unavailable — fall through to a fresh, unpersisted id */
   }
+  const minted = mintScene();
+  setScene(minted);
+  return minted;
 }
 
 export function setScene(scene: string): void {

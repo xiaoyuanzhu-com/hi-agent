@@ -1,8 +1,8 @@
 import React from "react";
 import { createRoot } from "react-dom/client";
 import { App } from "./App";
-import { Admin } from "./admin/Admin";
-import { usePath } from "./admin/router";
+import { Debug } from "./debug/Debug";
+import { usePath } from "./debug/router";
 import "./ui/global.css";
 
 const rootEl = document.getElementById("root");
@@ -11,11 +11,11 @@ if (!rootEl) {
 }
 
 // One SPA, two surfaces: the agent "face" at `/`, and the operator console
-// under `/admin/*`. A tiny path check picks between them; the admin section
+// under `/debug/*`. A tiny path check picks between them; the debug section
 // owns its own nested routing.
 function Root() {
   const { path } = usePath();
-  return path.startsWith("/admin") ? <Admin /> : <App />;
+  return path.startsWith("/debug") ? <Debug /> : <App />;
 }
 
 createRoot(rootEl).render(
