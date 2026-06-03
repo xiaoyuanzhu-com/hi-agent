@@ -24,35 +24,36 @@ function time(iso: string): string {
   }
 }
 
-// A one-line human summary of an event's payload (beyond its name).
-function eventDetail(d: SessionEvent): string {
-  const s = (k: string) => String(d[k] ?? "");
-  switch (d.event) {
-    case "session_opened":
-      return `reactor ${s("id").slice(0, 12)}`;
-    case "session_closed":
-      return `${s("kind")} ${s("id").slice(0, 12)} closed`;
-    case "turn_started":
-      return s("input") ? `turn ${s("turn")} ◂ ${s("input")}` : `turn ${s("turn")}`;
-    case "turn_finished": {
-      const head = `turn ${s("turn")} → ${s("stop_reason") || "?"} (${s("reply_chars")} chars)`;
-      return s("reply") ? `${head}\n▸ ${s("reply")}` : head;
-    }
-    case "hot_swap":
-      return `${s("old_id").slice(0, 8)} → ${s("new_id").slice(0, 8)} · brief ${s("briefing_chars")}`;
-    case "worker_spawned":
-      return `#${s("id")} ${s("task")}`;
-    case "worker_finished":
-      return `#${s("id")} ${s("state")} (${s("summary_chars")} chars)`;
-    case "worker_question":
-      return `#${s("id")}: ${s("question")}`;
-    case "alarm_scheduled":
-      return `+${s("delay_s")}s · ${s("note")}`;
-    case "alarm_fired":
-      return s("note");
-    default:
-      return "";
-  }
+// Fields shown in the event header (or redundant there); everything else is
+// rendered as raw payload below.
+const META_KEYS = new Set(["seq", "ts", "scene", "event"]);
+
+// Render one payload value exactly as it arrived — this is a debug surface, so
+// nothing is summarized or truncated: strings verbatim with whitespace and
+// newlines preserved, scalars plainly, objects/arrays as pretty JSON.
+function EventValue({ value }: { value: unknown }) {
+  if (value === null || value === undefined) return <span className="evnull">null</span>;
+  if (typeof value === "string") return <pre className="evstr">{value}</pre>;
+  if (typeof value === "number" || typeof value === "boolean")
+    return <span className="evscalar">{String(value)}</span>;
+  return <pre className="evstr">{JSON.stringify(value, null, 2)}</pre>;
+}
+
+// The structured payload of one event: every non-meta field as a key/value row,
+// in the order the backend serialized them.
+function EventPayload({ d }: { d: SessionEvent }) {
+  const keys = Object.keys(d).filter((k) => !META_KEYS.has(k));
+  if (keys.length === 0) return null;
+  return (
+    <div className="evpayload">
+      {keys.map((k) => (
+        <div className="evfield" key={k}>
+          <span className="evk">{k}</span>
+          <EventValue value={d[k]} />
+        </div>
+      ))}
+    </div>
+  );
 }
 
 export function AcpView() {
@@ -154,9 +155,12 @@ export function AcpView() {
                 <div className="evlist">
                   {sceneEvents.map((d) => (
                     <div className="ev" key={d.seq}>
-                      <span className="ts">{time(d.ts)}</span>
-                      <span className={`evname ${d.event}`}>{d.event}</span>
-                      <span className="evdetail">{eventDetail(d)}</span>
+                      <div className="evhead">
+                        <span className="ts">{time(d.ts)}</span>
+                        <span className={`evname ${d.event}`}>{d.event}</span>
+                        <span className="evseq">#{d.seq}</span>
+                      </div>
+                      <EventPayload d={d} />
                     </div>
                   ))}
                 </div>
