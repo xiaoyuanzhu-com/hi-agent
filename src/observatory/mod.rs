@@ -2,7 +2,7 @@
 //!
 //! ACP sessions are otherwise invisible: a scene's subprocess, its persistent
 //! reactor session, ephemeral worker sessions, in-flight prompts, heartbeat
-//! hot-swaps, barge-ins and self-alarms all live only as scattered `tracing`
+//! hot-swaps and self-alarms all live only as scattered `tracing`
 //! lines. The observatory is an additive, cloneable handle (like [`Memory`] or
 //! [`TextBus`]) that the agent layer, reactor, workers and heartbeat feed as
 //! those things happen. It keeps two things:
@@ -161,7 +161,6 @@ pub enum EventKind {
     TurnStarted { turn: u64, input: String },
     /// `reply` is the agent's spoken text for this turn (markers stripped).
     TurnFinished { turn: u64, stop_reason: Option<String>, reply_chars: usize, reply: String },
-    BargeIn,
     HotSwap { old_id: String, new_id: String, briefing_chars: usize },
     WorkerSpawned { id: u64, task: String },
     WorkerFinished { id: u64, state: WorkerState, summary_chars: usize },
@@ -343,7 +342,6 @@ impl Observatory {
                     reply_chars: Some(*reply_chars),
                 });
             }
-            EventKind::BargeIn => {}
             EventKind::HotSwap { new_id, .. } => {
                 view.swap_count += 1;
                 view.last_swap_at = Some(now);
@@ -549,7 +547,7 @@ mod tests {
         assert_eq!(replay.len(), 1);
         assert_eq!(replay[0].seq, 1);
 
-        obs.record(&s, EventKind::BargeIn).await;
+        obs.record(&s, EventKind::ProcessRestarted).await;
         let live = rx.recv().await.unwrap();
         assert_eq!(live.seq, 2, "live event follows replay with no gap or dup");
     }

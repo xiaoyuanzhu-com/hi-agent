@@ -21,12 +21,14 @@
 //!    Because the reply only starts once things have gone quiet, its output can
 //!    stream straight to the client — no holding, no turn-tagging on the wire;
 //!    superseded drafts are *never generated* rather than generated-then-discarded.
-//! 2. **Barge-in.** If the human starts talking again *during* generation, the
-//!    new signal cancels the in-flight *prompt* (`session/cancel`) — the
-//!    persistent session itself stays warm; the loop re-settles and re-prompts
-//!    with the merged batch. (The client mutes its
-//!    own speaker reflexively the instant its mic goes hot, so the interruption
-//!    feels instant regardless of this round-trip.)
+//! 2. **Fix-forward, no reflexive cancel.** A new signal never cancels the
+//!    in-flight prompt. The per-scene loop is serial — it runs one turn to
+//!    completion before draining the next batch — so a signal that lands during
+//!    generation simply queues and is folded into the next turn. The warm
+//!    session remembers fragments it chose not to act on yet, so a thought spread
+//!    across several bursts reassembles across turns; the mind corrects course
+//!    rather than being cut off. (The client mutes its own speaker reflexively the
+//!    instant its mic goes hot, so an interruption feels instant regardless.)
 //!
 //! ## Heavy work goes to a working session, not onto the floor
 //!
@@ -82,47 +84,37 @@ const RESPONSE_SETTLE: Duration = Duration::from_millis(700);
 
 /// Built-in default soul, embedded at compile time from `default_soul.md`. The
 /// agent's identity — how it speaks, what it values, how it renders surfaces — is
-/// authored here as a tracked asset so a fresh install ships fully characterful.
-/// On first run [`load_soul`] seeds `<data_dir>/SOUL.md` from this, after which
-/// the admin can shape the agent's character by editing that file.
+/// authored here as a tracked asset, so it ships in the binary and updates
+/// transparently with every build. [`load_soul`] uses this unless an admin drops
+/// an explicit `<data_dir>/SOUL.md` override.
 const DEFAULT_SOUL: &str = include_str!("default_soul.md");
 
 /// Load the agent's soul — its identity (voice, values, guardrails, surface
 /// house-style) — used as the system prompt for every scene's persistent reactor
-/// session. On first run this seeds `<data_dir>/SOUL.md` from the built-in
-/// [`DEFAULT_SOUL`], so a fresh install is immediately characterful and leaves an
-/// editable file on disk; thereafter the admin can shape the agent's character by
-/// editing SOUL.md without a rebuild. Read once at startup, so edits take effect
-/// on the next restart. If seeding or reading fails for any reason, the in-memory
-/// [`DEFAULT_SOUL`] still applies, so the agent always has a voice.
+/// session.
+///
+/// The bundled [`DEFAULT_SOUL`] is the shipped, auto-updating default: it's
+/// compiled into the binary, so every build and deploy carries the current
+/// character with no manual step and nothing to persist. `<data_dir>/SOUL.md` is
+/// an *optional* override — if an admin deliberately drops a non-empty file
+/// there, it replaces the default; we never create or seed it, so edits to the
+/// bundled soul always flow through transparently. Read once at startup, so an
+/// override takes effect on the next restart.
 pub fn load_soul(data_dir: &Path) -> String {
     let path = data_dir.join("SOUL.md");
-
-    // Seed the file from the built-in default on first run, so the admin has
-    // something concrete to edit and the on-disk soul matches what's running.
-    if !path.exists() {
-        match std::fs::create_dir_all(data_dir).and_then(|()| std::fs::write(&path, DEFAULT_SOUL)) {
-            Ok(()) => {
-                tracing::info!(path = %path.display(), "seeded SOUL.md from built-in default soul");
-            }
-            Err(err) => {
-                tracing::warn!(path = %path.display(), %err, "could not seed SOUL.md; using built-in default soul");
-                return DEFAULT_SOUL.to_string();
-            }
-        }
-    }
-
     match std::fs::read_to_string(&path) {
         Ok(text) if !text.trim().is_empty() => {
-            tracing::info!(path = %path.display(), "loaded soul from SOUL.md");
+            tracing::info!(path = %path.display(), "using SOUL.md override instead of bundled default soul");
             text
         }
         Ok(_) => {
-            tracing::warn!(path = %path.display(), "SOUL.md is empty; using built-in default soul");
+            tracing::warn!(path = %path.display(), "SOUL.md present but empty; using bundled default soul");
             DEFAULT_SOUL.to_string()
         }
+        // No override file is the common case — use the bundled default silently.
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => DEFAULT_SOUL.to_string(),
         Err(err) => {
-            tracing::warn!(path = %path.display(), %err, "could not read SOUL.md; using built-in default soul");
+            tracing::warn!(path = %path.display(), %err, "could not read SOUL.md override; using bundled default soul");
             DEFAULT_SOUL.to_string()
         }
     }
@@ -131,11 +123,10 @@ pub fn load_soul(data_dir: &Path) -> String {
 const SCENE_QUEUE_CAPACITY: usize = 64;
 
 /// One item in a scene's turn queue. Both a human utterance and a worker's
-/// report drive a reactor turn, but they enter differently: a human signal
-/// comes through [`Reactor::deliver_to_scene`] and triggers barge-in (it cancels
-/// the in-flight prompt); a worker report is posted straight into the queue by
-/// the worker's drive task, so it waits its turn and never interrupts live
-/// speech. Both land here and are settled into one batch.
+/// report drive a reactor turn; they differ only in source. A human signal comes
+/// through [`Reactor::deliver_to_scene`]; a worker report is posted straight into
+/// the queue by the worker's drive task. Neither interrupts live speech — both
+/// wait their turn and are settled into one batch.
 enum LoopInput {
     Human(Signal),
     Worker(workers::WorkerReport),
@@ -267,7 +258,7 @@ struct ReactorInner {
     /// has no knowledge of HTTP, `Content-Type`, or response framing.
     out: mpsc::Sender<OutboundSignal>,
     /// Structured visibility into the session lifecycle. Turn, session, swap,
-    /// barge-in, worker and alarm events feed it; the HTTP front serves it.
+    /// worker and alarm events feed it; the HTTP front serves it.
     observatory: Observatory,
     /// Monotonic cognition-turn counter. Each turn claims the next id;
     /// it tags audio spans and the channel logs so a reply is traceable end to
@@ -278,9 +269,6 @@ struct ReactorInner {
 
 struct SceneHandle {
     inbound: mpsc::Sender<LoopInput>,
-    /// `None` when idle. Set to the in-flight session so the dispatcher can
-    /// cancel it when a new signal arrives for this scene.
-    in_flight: Arc<Mutex<Option<Arc<AcpSession>>>>,
 }
 
 pub fn start(
@@ -317,57 +305,36 @@ pub fn start(
 
 impl Reactor {
     async fn deliver_to_scene(&self, scene: Scene, signal: Signal) {
-        let (sender, in_flight) = self.get_or_create_scene(scene.clone()).await;
+        let sender = self.get_or_create_scene(scene.clone()).await;
 
-        let in_flight_session: Option<Arc<AcpSession>> = {
-            let guard = in_flight.lock().await;
-            guard.as_ref().cloned()
-        };
-        if let Some(session) = in_flight_session {
-            if let Err(err) = session.cancel().await {
-                tracing::warn!(scene = %scene, error = %err, "session/cancel failed during interruption");
-            } else {
-                self.inner.observatory.record(&scene, EventKind::BargeIn).await;
-                tracing::debug!(scene = %scene, "interrupting in-flight turn");
-            }
-        }
-
+        // A new signal never cancels the in-flight prompt: the serial per-scene
+        // loop folds it into the next turn (fix-forward), and the lightweight
+        // reactor decides per turn whether to act or wait for the rest.
         if let Err(err) = sender.send(LoopInput::Human(signal)).await {
             tracing::error!(scene = %scene, error = %err, "scene inbound channel closed; dropping signal");
         }
     }
 
-    async fn get_or_create_scene(
-        &self,
-        scene: Scene,
-    ) -> (mpsc::Sender<LoopInput>, Arc<Mutex<Option<Arc<AcpSession>>>>) {
+    async fn get_or_create_scene(&self, scene: Scene) -> mpsc::Sender<LoopInput> {
         let mut scenes = self.inner.scenes.lock().await;
         if let Some(handle) = scenes.get(&scene) {
-            return (handle.inbound.clone(), handle.in_flight.clone());
+            return handle.inbound.clone();
         }
 
         let (tx, rx) = mpsc::channel::<LoopInput>(SCENE_QUEUE_CAPACITY);
-        let in_flight: Arc<Mutex<Option<Arc<AcpSession>>>> = Arc::new(Mutex::new(None));
-        scenes.insert(
-            scene.clone(),
-            SceneHandle {
-                inbound: tx.clone(),
-                in_flight: in_flight.clone(),
-            },
-        );
+        scenes.insert(scene.clone(), SceneHandle { inbound: tx.clone() });
         drop(scenes);
 
         let task_reactor = self.clone();
         let task_scene = scene.clone();
-        let task_in_flight = in_flight.clone();
         // The worker registry posts its reports back into this same queue, so
         // hand the loop a sender clone to seed it.
         let task_worker_inbound = tx.clone();
         tokio::spawn(async move {
-            per_scene_loop(task_reactor, task_scene, rx, task_in_flight, task_worker_inbound).await;
+            per_scene_loop(task_reactor, task_scene, rx, task_worker_inbound).await;
         });
 
-        (tx, in_flight)
+        tx
     }
 }
 
@@ -375,7 +342,6 @@ async fn per_scene_loop(
     reactor: Reactor,
     scene: Scene,
     mut inbound: mpsc::Receiver<LoopInput>,
-    in_flight: Arc<Mutex<Option<Arc<AcpSession>>>>,
     worker_inbound: mpsc::Sender<LoopInput>,
 ) {
     // The scene's persistent reactor session: opened lazily on the first turn,
@@ -456,7 +422,7 @@ async fn per_scene_loop(
         // Forget any workers that have finished, so the registry doesn't grow.
         workers.reap();
 
-        match run_turn(&reactor, &scene, &batch, &in_flight, &mut reactor_session, &mut budget, &mut workers, &mut alarms).await {
+        match run_turn(&reactor, &scene, &batch, &mut reactor_session, &mut budget, &mut workers, &mut alarms).await {
             Ok(()) => {
                 // Between turns: if the live session has grown past budget, hot-swap
                 // it now. The human is consuming the reply just delivered, so the
@@ -479,10 +445,6 @@ async fn per_scene_loop(
             }
             Err(err) => {
                 tracing::warn!(scene = %scene, error = %err, "turn failed");
-                {
-                    let mut guard = in_flight.lock().await;
-                    *guard = None;
-                }
                 // Discard the possibly-wedged session; the next turn cold-opens a
                 // fresh one and rebuilds context from the journal snapshot.
                 if let Some(dead) = reactor_session.take() {
@@ -517,7 +479,6 @@ async fn run_turn(
     reactor: &Reactor,
     scene: &Scene,
     batch: &[LoopInput],
-    in_flight: &Arc<Mutex<Option<Arc<AcpSession>>>>,
     reactor_session: &mut Option<Arc<AcpSession>>,
     budget: &mut heartbeat::ContextBudget,
     workers: &mut workers::WorkerRegistry,
@@ -586,11 +547,6 @@ async fn run_turn(
             opened
         }
     };
-
-    {
-        let mut guard = in_flight.lock().await;
-        *guard = Some(session.clone());
-    }
 
     let outcome: anyhow::Result<usize> = async {
         let mut run = session.prompt(prompt_text).await?;
@@ -756,8 +712,9 @@ async fn run_turn(
 
         // Dropping the text sender signals end-of-input: the TTS session sends
         // FinishSession, the drain task forwards trailing frames, then emits the
-        // turn's `End`. On a cancel (barge-in) abort the drain so stale frames
-        // aren't spoken over the user, and emit `End` ourselves so any open
+        // turn's `End`. If the run ended in error (a wedged or crashed session,
+        // not a human interruption — those no longer cancel) abort the drain so
+        // stale frames aren't spoken, and emit `End` ourselves so any open
         // GET /audio response for this turn closes promptly.
         drop(synth_tx);
         if let Some(handle) = synth_handle {
@@ -781,13 +738,8 @@ async fn run_turn(
     // streaming this turn's chunks.
     emit_end_of_utterance(reactor, scene).await;
 
-    {
-        let mut guard = in_flight.lock().await;
-        *guard = None;
-    }
-    // The session is persistent — do NOT drop it. `in_flight` is cleared above
-    // so a barge-in between turns finds no prompt to cancel; the caller's
-    // `reactor_session` slot keeps the warm session alive for the next turn.
+    // The session is persistent — do NOT drop it. The caller's `reactor_session`
+    // slot keeps the warm session alive for the next turn.
 
     // Fold this turn's size into the budget so the loop can decide whether the
     // session has grown enough to hot-swap. Only on success — a failed turn is

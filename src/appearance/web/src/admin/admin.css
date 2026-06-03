@@ -110,7 +110,7 @@
 .ev { display: flex; gap: 10px; padding: 2px 0; border-bottom: 1px solid rgba(42,47,58,.5); }
 .ev .ts { color: var(--dim); white-space: nowrap; }
 .ev .evname { font-weight: 600; white-space: nowrap; }
-.ev .evname.barge_in, .ev .evname.worker_question { color: var(--warn); }
+.ev .evname.worker_question { color: var(--warn); }
 .ev .evname.hot_swap, .ev .evname.session_opened { color: var(--accent); }
 .ev .evname.worker_finished { color: var(--ok); }
 .ev .evname.process_restarted, .ev .evname.session_closed { color: var(--bad); }
