@@ -46,6 +46,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
 mod heartbeat;
+mod interleave;
 pub mod outbound;
 mod workers;
 
@@ -60,7 +61,6 @@ pub fn swap_budget_chars() -> usize {
 use chrono::{DateTime, Utc};
 use tokio::sync::{Mutex, mpsc};
 use tokio::time::{Instant, sleep_until, timeout};
-use uuid::Uuid;
 
 use crate::acp::{AcpSession, SessionOpts, SessionUpdate};
 use crate::agent::AgentLayer;
@@ -68,7 +68,7 @@ use crate::capabilities::tts::{self, TtsStream};
 use crate::memory::{Memory, build_for_scene};
 use crate::observatory::{EventKind, Observatory, SessionKind};
 use crate::segment::{Segmenter, Terminator};
-use crate::types::{Channel, JournalEntry, Scene, Signal, SurfaceEnvelope, SurfaceMode, SurfaceOp};
+use crate::types::{Channel, JournalEntry, Scene, Signal, SurfaceEnvelope};
 use bytes::Bytes;
 
 /// How long the floor must stay quiet after the last finalized utterance before
@@ -595,26 +595,12 @@ async fn run_turn(
     let outcome: anyhow::Result<usize> = async {
         let mut run = session.prompt(prompt_text).await?;
 
-        // Per-turn streaming TTS: open ONE synthesis session for the whole turn
-        // and push text into it as the agent produces it. Audio frames stream
-        // back on a drain task as a single Start/Frame*/End run on /audio, so a
-        // turn's speech is one continuous stream rather than per-sentence clips.
-        // The sentence splitter survives only as a coalescer — it decides *when*
-        // to push text (for prosody/request size), not playback boundaries; the
-        // session stays open across sentences. All of this exists only when TTS
-        // is configured.
-        let mut splitter = Segmenter::new(Terminator, std::time::Instant::now());
-        let mut extractor = SurfaceExtractor::new();
-        // Pulls `[[delegate]] … [[/delegate]]` task blocks out of the reply: the
-        // reactor delegates heavy work by naming a task inline, which spawns a
-        // channel-mute working session and is NOT spoken to the scene.
-        let mut delegate_extractor = MarkerExtractor::new(OPEN_DELEGATE, CLOSE_DELEGATE);
-        // Pulls `[[alarm]] <delay> <note> [[/alarm]]` blocks out of the reply: the
-        // mind scheduling its own future wake. Like delegate markers, never spoken.
-        let mut alarm_extractor = MarkerExtractor::new(OPEN_ALARM, CLOSE_ALARM);
-        // Accumulate the spoken text so the whole reply is logged once at end of
-        // turn on the `channel` stream, rather than per-chunk (which is noisy).
-        let mut full_reply = String::new();
+        // Per-turn streaming TTS: open ONE synthesis session for the whole turn.
+        // Audio frames stream back on a drain task as a single Start/Frame*/End
+        // run on /audio, so a turn's speech is one continuous stream rather than
+        // per-sentence clips; the session stays open across sentences. The drain
+        // loop below owns this text sender and coalesces sentences into it. All of
+        // this exists only when TTS is configured.
         let (synth_tx, synth_handle) = if tts::available() {
             match tts::start().await {
                 Ok(TtsStream { mime, text, frames }) => {
@@ -641,82 +627,103 @@ async fn run_turn(
             (None, None)
         };
 
-        loop {
-            match run.next_update().await {
-                Some(SessionUpdate::Text(text)) => {
-                    // Split rich-content surface blocks out of the spoken text.
-                    let (clean, surfaces) = extractor.push(&text);
-                    for envelope in surfaces {
-                        emit_surface(reactor, scene, envelope).await;
-                    }
-                    // Then pull any `[[delegate]]` task blocks out of what's
-                    // left and spawn a worker per task — these are never spoken.
-                    let (spoken, tasks) = delegate_extractor.push(&clean);
-                    for task in tasks {
-                        if let Err(err) = workers.spawn(reactor, task).await {
-                            tracing::warn!(scene = %scene, error = %err, "failed to spawn working session");
-                        }
-                    }
-                    // Then pull any `[[alarm]]` blocks — self-scheduled wakes,
-                    // also never spoken.
-                    let (spoken, alarm_blocks) = alarm_extractor.push(&spoken);
-                    for block in alarm_blocks {
-                        schedule_alarm(reactor, alarms, scene, &block).await;
-                    }
-                    if !spoken.is_empty() {
-                        full_reply.push_str(&spoken);
-                        if let Some(tx) = &synth_tx {
-                            for sentence in splitter.commit(&spoken, std::time::Instant::now()) {
-                                let _ = tx.send(sentence).await;
-                            }
-                        }
-                        emit_thought_chunk(reactor, scene, spoken).await;
-                    }
-                }
-                Some(SessionUpdate::Thought(_)) => {
-                    // Internal reasoning; do not surface.
-                }
+        // Per-turn output state. The reply is parsed into ordered segments
+        // (`interleave::Extractor`) and each is released just-in-time below,
+        // decoupled from parse-time — so a surface is paced to its sentence
+        // instead of racing ahead of all audio. The splitter coalesces spoken text
+        // into sentences for TTS; the delegate/alarm extractors pull side-effect
+        // markers out of the spoken run; `full_reply` is logged once at end of turn.
+        let mut extractor = interleave::Extractor::new();
+        let mut splitter = Segmenter::new(Terminator, std::time::Instant::now());
+        let mut delegate_extractor = MarkerExtractor::new(OPEN_DELEGATE, CLOSE_DELEGATE);
+        let mut alarm_extractor = MarkerExtractor::new(OPEN_ALARM, CLOSE_ALARM);
+        let mut full_reply = String::new();
+
+        let mut ended = false;
+        while !ended {
+            let segs = match run.next_update().await {
+                Some(SessionUpdate::Text(text)) => extractor.push(&text),
+                Some(SessionUpdate::Thought(_)) => continue, // internal reasoning
                 Some(SessionUpdate::ToolCall(stub)) => {
                     tracing::debug!(scene = %scene, variant = stub.raw_variant, "tool call");
+                    continue;
                 }
                 Some(SessionUpdate::Other(name)) => {
                     tracing::trace!(scene = %scene, variant = %name, "ignored ACP update");
+                    continue;
                 }
-                None => break,
+                // End of stream: release the extractor's held-back tail through the
+                // same body, then leave the loop.
+                None => {
+                    ended = true;
+                    extractor.flush().into_iter().collect()
+                }
+            };
+
+            for seg in segs {
+                match seg {
+                    interleave::Segment::Spoken(text) => {
+                        // `[[delegate]]` / `[[alarm]]` are side-effects pulled out
+                        // here (spawn a worker / schedule a wake), never spoken.
+                        let (clean, tasks) = delegate_extractor.push(&text);
+                        for task in tasks {
+                            if let Err(err) = workers.spawn(reactor, task).await {
+                                tracing::warn!(scene = %scene, error = %err, "failed to spawn working session");
+                            }
+                        }
+                        let (residual, blocks) = alarm_extractor.push(&clean);
+                        for block in blocks {
+                            schedule_alarm(reactor, alarms, scene, &block).await;
+                        }
+                        if residual.is_empty() {
+                            continue;
+                        }
+                        full_reply.push_str(&residual);
+                        for emit in interleave::speak_emits(
+                            &residual,
+                            &mut splitter,
+                            std::time::Instant::now(),
+                        ) {
+                            perform(emit, &synth_tx, reactor, scene).await;
+                        }
+                        // /thought gets the raw residual chunk; TTS gets coalesced
+                        // sentences (above) — the two channels keep their own pacing.
+                        emit_thought_chunk(reactor, scene, residual).await;
+                    }
+                    interleave::Segment::Surface(env) => {
+                        for emit in interleave::surface_emits(&mut splitter, env) {
+                            perform(emit, &synth_tx, reactor, scene).await;
+                        }
+                    }
+                }
             }
         }
 
-        // Drain any text the surface extractor was still holding, then the
-        // delegate extractor, then flush the trailing partial sentence to TTS.
-        let clean_tail = extractor.flush();
-        let (mut spoken_tail, tail_tasks) = delegate_extractor.push(&clean_tail);
-        spoken_tail.push_str(&delegate_extractor.flush());
-        for task in tail_tasks {
-            if let Err(err) = workers.spawn(reactor, task).await {
-                tracing::warn!(scene = %scene, error = %err, "failed to spawn working session");
-            }
-        }
-        // Drain the alarm extractor too, so an `[[alarm]]` that ended the reply
-        // still schedules.
-        let (mut spoken_tail, tail_alarms) = alarm_extractor.push(&spoken_tail);
+        // The marker extractors may still hold a partial-opener tail; flush them
+        // (delegate first, feeding its tail through alarm, mirroring the streaming
+        // chain) so a marker that ended the reply still resolves.
+        let deleg_tail = delegate_extractor.flush();
+        let (mut spoken_tail, alarm_blocks) = alarm_extractor.push(&deleg_tail);
         spoken_tail.push_str(&alarm_extractor.flush());
-        for block in tail_alarms {
+        for block in alarm_blocks {
             schedule_alarm(reactor, alarms, scene, &block).await;
         }
         if !spoken_tail.is_empty() {
             full_reply.push_str(&spoken_tail);
-            if let Some(tx) = &synth_tx {
-                for sentence in splitter.commit(&spoken_tail, std::time::Instant::now()) {
-                    let _ = tx.send(sentence).await;
-                }
+            for emit in
+                interleave::speak_emits(&spoken_tail, &mut splitter, std::time::Instant::now())
+            {
+                perform(emit, &synth_tx, reactor, scene).await;
             }
             emit_thought_chunk(reactor, scene, spoken_tail).await;
         }
         if !full_reply.trim().is_empty() {
             crate::channel_log::outbound(Channel::Text, scene, full_reply.trim());
         }
-        if let Some(tx) = &synth_tx {
-            if let Some(tail) = splitter.flush() {
+        // Flush the splitter's trailing partial sentence to TTS only (no /thought —
+        // it was already mirrored as part of its raw chunk).
+        if let Some(tail) = splitter.flush() {
+            if let Some(tx) = &synth_tx {
                 let _ = tx.send(tail).await;
             }
         }
@@ -811,6 +818,26 @@ async fn emit_thought_chunk(reactor: &Reactor, scene: &Scene, text: String) {
             chunk: text,
         })
         .await;
+}
+
+/// Carry one release action to its wire carrier: speech to TTS, a surface to
+/// /surface. Thought mirroring and the once-per-turn reply log are handled inline
+/// by the caller, since they track the raw spoken chunk rather than the paced
+/// emits.
+async fn perform(
+    emit: interleave::Emit,
+    synth_tx: &Option<mpsc::Sender<String>>,
+    reactor: &Reactor,
+    scene: &Scene,
+) {
+    match emit {
+        interleave::Emit::Speak(sentence) => {
+            if let Some(tx) = synth_tx {
+                let _ = tx.send(sentence).await;
+            }
+        }
+        interleave::Emit::Show(env) => emit_surface(reactor, scene, env).await,
+    }
 }
 
 async fn emit_end_of_utterance(reactor: &Reactor, scene: &Scene) {
@@ -933,107 +960,6 @@ async fn emit_surface(reactor: &Reactor, scene: &Scene, envelope: SurfaceEnvelop
         .await;
 }
 
-const OPEN_CARD: &str = "[[surface:card]]";
-const OPEN_FULL: &str = "[[surface:full]]";
-const CLOSE: &str = "[[/surface]]";
-
-/// Streaming extractor that pulls `[[surface:…]] … [[/surface]]` HTML blocks out
-/// of the agent's text. Text outside the markers passes through (spoken +
-/// displayed); the inner HTML becomes a `SurfaceEnvelope`. A short tail that
-/// could be a partial opener is held back so a marker split across chunks is
-/// still recognized. Mirrors the convention taught in the soul (see [`DEFAULT_SOUL`]).
-struct SurfaceExtractor {
-    buf: String,
-    inside: Option<SurfaceMode>,
-}
-
-impl SurfaceExtractor {
-    fn new() -> Self {
-        Self { buf: String::new(), inside: None }
-    }
-
-    fn push(&mut self, chunk: &str) -> (String, Vec<SurfaceEnvelope>) {
-        self.buf.push_str(chunk);
-        let mut text_out = String::new();
-        let mut envelopes = Vec::new();
-
-        loop {
-            match self.inside {
-                None => {
-                    let card = self.buf.find(OPEN_CARD);
-                    let full = self.buf.find(OPEN_FULL);
-                    let opener = match (card, full) {
-                        (Some(c), Some(f)) if c <= f => Some((c, SurfaceMode::Card, OPEN_CARD.len())),
-                        (Some(_), Some(f)) => Some((f, SurfaceMode::Full, OPEN_FULL.len())),
-                        (Some(c), None) => Some((c, SurfaceMode::Card, OPEN_CARD.len())),
-                        (None, Some(f)) => Some((f, SurfaceMode::Full, OPEN_FULL.len())),
-                        (None, None) => None,
-                    };
-                    if let Some((idx, mode, tok_len)) = opener {
-                        text_out.push_str(&self.buf[..idx]);
-                        self.buf = self.buf[idx + tok_len..].to_string();
-                        self.inside = Some(mode);
-                        continue;
-                    }
-                    // No opener: emit everything except a tail that could be the
-                    // start of one continuing in the next chunk.
-                    let keep = partial_open_suffix_len(&self.buf);
-                    let emit_to = self.buf.len() - keep;
-                    text_out.push_str(&self.buf[..emit_to]);
-                    self.buf = self.buf[emit_to..].to_string();
-                    break;
-                }
-                Some(mode) => {
-                    if let Some(idx) = self.buf.find(CLOSE) {
-                        let html = self.buf[..idx].trim().to_string();
-                        self.buf = self.buf[idx + CLOSE.len()..].to_string();
-                        self.inside = None;
-                        envelopes.push(SurfaceEnvelope {
-                            id: Uuid::now_v7().to_string(),
-                            op: SurfaceOp::Show,
-                            mode: Some(mode),
-                            html: Some(html),
-                            ttl_ms: None,
-                        });
-                        continue;
-                    }
-                    break; // close not present yet; keep buffering the HTML
-                }
-            }
-        }
-        (text_out, envelopes)
-    }
-
-    /// Emit any held-back text at end of turn. An unterminated block is dropped.
-    fn flush(&mut self) -> String {
-        let out = if self.inside.is_none() {
-            std::mem::take(&mut self.buf)
-        } else {
-            String::new()
-        };
-        self.buf.clear();
-        self.inside = None;
-        out
-    }
-}
-
-/// Length (bytes) of the longest suffix of `buf` that is a proper prefix of a
-/// surface opener — i.e. a marker possibly split across chunks.
-fn partial_open_suffix_len(buf: &str) -> usize {
-    let max = OPEN_CARD.len().max(OPEN_FULL.len()) - 1;
-    let start = buf.len().saturating_sub(max);
-    for i in start..buf.len() {
-        if !buf.is_char_boundary(i) {
-            continue;
-        }
-        let suffix = &buf[i..];
-        if OPEN_CARD.starts_with(suffix) || OPEN_FULL.starts_with(suffix) {
-            return buf.len() - i;
-        }
-    }
-    0
-}
-
 const OPEN_DELEGATE: &str = "[[delegate]]";
 const CLOSE_DELEGATE: &str = "[[/delegate]]";
 
@@ -1042,9 +968,10 @@ const CLOSE_DELEGATE: &str = "[[/delegate]]";
 /// returned. A short tail that could be a partial opener is held back so a marker
 /// split across chunks is still recognized.
 ///
-/// The generic sibling of [`SurfaceExtractor`] (which carries a card/full mode
-/// and yields envelopes). Used for `[[delegate]]` on the reactor side — the
-/// mind names background work inline — and for `[[ask]]` on the worker side.
+/// The generic sibling of the surface extractor in [`interleave`] (which carries
+/// a card/full mode and yields envelopes). Used for `[[delegate]]` on the reactor
+/// side — the mind names background work inline — and for `[[ask]]` on the
+/// worker side.
 struct MarkerExtractor {
     open: &'static str,
     close: &'static str,
@@ -1127,46 +1054,6 @@ fn partial_marker_suffix_len(buf: &str, marker: &str) -> usize {
         }
     }
     0
-}
-
-#[cfg(test)]
-mod surface_tests {
-    use super::SurfaceExtractor;
-    use crate::types::SurfaceMode;
-
-    #[test]
-    fn passes_plain_text_through() {
-        let mut e = SurfaceExtractor::new();
-        let (t, s) = e.push("just talking, nothing to show");
-        assert!(s.is_empty());
-        assert_eq!(format!("{t}{}", e.flush()), "just talking, nothing to show");
-    }
-
-    #[test]
-    fn extracts_a_card_across_chunks() {
-        let mut e = SurfaceExtractor::new();
-        let (t1, s1) = e.push("Here you go. [[surface:card]]<b>hi</b>");
-        assert!(s1.is_empty());
-        assert_eq!(t1, "Here you go. ");
-        let (t2, s2) = e.push("[[/surface]] Done.");
-        assert_eq!(s2.len(), 1);
-        assert_eq!(s2[0].mode, Some(SurfaceMode::Card));
-        assert_eq!(s2[0].html.as_deref(), Some("<b>hi</b>"));
-        assert_eq!(format!("{t2}{}", e.flush()), " Done.");
-    }
-
-    #[test]
-    fn recognizes_marker_split_across_chunks() {
-        let mut e = SurfaceExtractor::new();
-        let (t1, s1) = e.push("look [[surf");
-        assert!(s1.is_empty());
-        assert_eq!(t1, "look ");
-        let (t2, s2) = e.push("ace:full]]<p>x</p>[[/surface]]");
-        assert_eq!(s2.len(), 1);
-        assert_eq!(s2[0].mode, Some(SurfaceMode::Full));
-        assert_eq!(s2[0].html.as_deref(), Some("<p>x</p>"));
-        assert_eq!(t2, "");
-    }
 }
 
 #[cfg(test)]
