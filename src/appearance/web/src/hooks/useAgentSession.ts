@@ -188,6 +188,15 @@ export function useAgentSession(): AgentSession {
   const busRef = useRef<AudioBus | null>(null);
   const micRef = useRef<AudioStreamer | null>(null);
   const micStreamRef = useRef<MediaStream | null>(null);
+  // Reentrancy guard for enableAudio: set synchronously before its first await,
+  // so two near-simultaneous calls (e.g. StrictMode's double-invoked effect)
+  // can't both open a /api/in/audio/stream socket — a second socket would
+  // transcribe + dispatch every utterance a second time, duplicating it.
+  const micStartingRef = useRef(false);
+  // Bumped by disableAudio/unmount to cancel an in-flight enableAudio: a start
+  // that finishes acquiring devices after a teardown tears its own socket down
+  // instead of leaking it.
+  const micGenRef = useRef(0);
   const voiceRef = useRef<VoicePlayer | null>(null);
   const visionRef = useRef<VisionCapture | null>(null);
   const visionStreamRef = useRef<MediaStream | null>(null);
@@ -421,11 +430,23 @@ export function useAgentSession(): AgentSession {
   // AudioBus to already exist (built in startSession).
   const enableAudio = useCallback(async () => {
     const audioBus = busRef.current;
-    if (!audioBus || micRef.current) return; // no session yet, or already live
+    // No session yet, already live, or a start is already in flight. The
+    // micStartingRef check closes the async gap below: micRef is only set after
+    // two awaits, so without it a concurrent second call would slip past and
+    // open a duplicate socket.
+    if (!audioBus || micRef.current || micStartingRef.current) return;
+    micStartingRef.current = true;
+    const gen = ++micGenRef.current;
+    // True once a teardown (disableAudio/unmount) has superseded this start.
+    const superseded = () => micGenRef.current !== gen;
     try {
       const stream = await navigator.mediaDevices.getUserMedia({
         audio: { channelCount: 1, echoCancellation: true, noiseSuppression: true },
       });
+      if (superseded()) {
+        stream.getTracks().forEach((t) => t.stop());
+        return;
+      }
       const micNode = audioBus.ctx.createMediaStreamSource(stream);
       audioBus.attachMic(micNode);
 
@@ -434,6 +455,12 @@ export function useAgentSession(): AgentSession {
       // — recognized speech (display + barge-in) arrives on the /in/audio observe
       // loop above, so even this client reads its own words from there.
       const streamer = await AudioStreamer.create(audioBus.ctx, micNode, { scene });
+      if (superseded()) {
+        // Disabled while we were acquiring — don't leave the socket open.
+        streamer.stop();
+        stream.getTracks().forEach((t) => t.stop());
+        return;
+      }
       micStreamRef.current = stream;
       micRef.current = streamer;
       setAudioError(null);
@@ -446,10 +473,17 @@ export function useAgentSession(): AgentSession {
           : "couldn't reach the microphone",
       );
       setAudioInput(false);
+    } finally {
+      // Leave the flag untouched if a newer start/teardown already owns it.
+      if (!superseded()) micStartingRef.current = false;
     }
   }, [scene]);
 
   const disableAudio = useCallback(() => {
+    // Cancel any enableAudio still acquiring devices, and clear the in-flight
+    // flag so a later enable can start.
+    micGenRef.current++;
+    micStartingRef.current = false;
     micRef.current?.stop();
     micRef.current = null;
     micStreamRef.current?.getTracks().forEach((t) => t.stop());
@@ -622,6 +656,10 @@ export function useAgentSession(): AgentSession {
   // cleanup on unmount
   useEffect(() => {
     return () => {
+      // Cancel an in-flight enableAudio so a start that resolves post-unmount
+      // tears its own socket down instead of leaking it.
+      micGenRef.current++;
+      micStartingRef.current = false;
       micRef.current?.stop();
       visionRef.current?.stop();
       voiceRef.current?.stop();

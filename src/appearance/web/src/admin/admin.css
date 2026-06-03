@@ -70,9 +70,11 @@
 }
 .acp-list li:hover { background: var(--panel); }
 .acp-list li.sel { background: var(--panel-2); }
-.acp-list li .nm { font-weight: 500; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-.acp-list li .badges { margin-left: auto; display: flex; gap: 5px; }
-.acp-list li .mini { font-family: var(--mono); font-size: 11px; color: var(--dim); }
+.acp-list li .nm { flex: 1 1 auto; min-width: 0; font-weight: 500; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.acp-list li .badges { margin-left: auto; flex: 0 1 auto; min-width: 0; display: flex; gap: 5px; }
+/* Scenes (e.g. web-<uuid>@local) are long unbreakable tokens; cap and ellipsis
+   them so a row can never push past the fixed-width sidebar. */
+.acp-list li .mini { font-family: var(--mono); font-size: 11px; color: var(--dim); max-width: 110px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .dot { width: 8px; height: 8px; border-radius: 50%; flex: 0 0 auto; background: var(--dim); }
 .dot.busy { background: var(--accent); box-shadow: 0 0 6px var(--accent); }
 .dot.idle { background: var(--ok); }
