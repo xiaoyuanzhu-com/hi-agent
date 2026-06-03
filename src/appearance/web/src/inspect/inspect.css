@@ -1,7 +1,7 @@
-/* Debug console — operator surface, intentionally plain/dense, distinct from
+/* Inspect console — operator surface, intentionally plain/dense, distinct from
    the calm agent face. Dark, monospace-leaning, information-first. */
 
-.debug {
+.inspect {
   --bg: #0f1115;
   --panel: #171a21;
   --panel-2: #1e222c;
@@ -28,20 +28,20 @@
   font-size: 14px;
   overflow: hidden;
 }
-.debug .muted { color: var(--dim); }
-.debug .pad { padding: 16px; }
-.debug code { font-family: var(--mono); font-size: 12px; }
+.inspect .muted { color: var(--dim); }
+.inspect .pad { padding: 16px; }
+.inspect code { font-family: var(--mono); font-size: 12px; }
 
-.debug-bar {
+.inspect-bar {
   display: flex;
   align-items: center;
   gap: 18px;
   padding: 10px 16px;
   border-bottom: 1px solid var(--line);
 }
-.debug-bar h1 { font-size: 15px; font-weight: 600; margin: 0; }
-.debug-bar .tabs { display: flex; gap: 4px; }
-.debug-bar .tab {
+.inspect-bar h1 { font-size: 15px; font-weight: 600; margin: 0; }
+.inspect-bar .tabs { display: flex; gap: 4px; }
+.inspect-bar .tab {
   background: transparent;
   border: 1px solid transparent;
   color: var(--dim);
@@ -50,12 +50,12 @@
   cursor: pointer;
   font-size: 13px;
 }
-.debug-bar .tab:hover { color: var(--fg); }
-.debug-bar .tab.sel { background: var(--panel-2); border-color: var(--line); color: var(--fg); }
-.debug-bar .exit { margin-left: auto; color: var(--dim); text-decoration: none; font-size: 16px; }
-.debug-bar .exit:hover { color: var(--fg); }
+.inspect-bar .tab:hover { color: var(--fg); }
+.inspect-bar .tab.sel { background: var(--panel-2); border-color: var(--line); color: var(--fg); }
+.inspect-bar .exit { margin-left: auto; color: var(--dim); text-decoration: none; font-size: 16px; }
+.inspect-bar .exit:hover { color: var(--fg); }
 
-.debug-main { flex: 1; min-height: 0; }
+.inspect-main { flex: 1; min-height: 0; }
 
 /* ---- shared list (left) + detail (right) layout: Sessions + Scenes tabs ---- */
 .acp { display: grid; grid-template-columns: 280px 1fr; height: 100%; min-height: 0; }

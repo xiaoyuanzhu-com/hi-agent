@@ -129,7 +129,7 @@ pub struct InputEcho {
 /// One spoken/typed reply, echoed to scene observers — the outbound mirror of
 /// [`InputEcho`]. The agent's worded reply is *delivered* through the consuming
 /// [`TextBus`], so an operator can't watch it there without stealing it from the
-/// real client. The binder publishes a non-draining copy here, letting the debug
+/// real client. The binder publishes a non-draining copy here, letting the
 /// channel inspector observe outbound text the same way `InputEcho` exposes
 /// inbound text. Presence, not a log: broadcast, lossy, no replay.
 #[derive(Debug, Clone, serde::Serialize)]
@@ -179,7 +179,7 @@ pub struct AppState {
 
     /// Outbound text echo broadcast — the non-draining mirror of the agent's
     /// worded reply. The binder publishes here alongside the consuming `TextBus`
-    /// so the debug channel inspector can observe outbound text live.
+    /// so the channel inspector can observe outbound text live.
     pub output_echo: broadcast::Sender<OutputEcho>,
 
     /// Memory substrate — journal. Cloneable handle.
@@ -272,7 +272,7 @@ pub fn build(memory: Memory, data_dir: PathBuf, observatory: Observatory) -> (Ro
         .route("/api/sessions", get(sessions::get_sessions))
         .route("/api/sessions/events", get(sessions::get_sessions_events))
         // A scene's channels, observed live as one merged presence stream — the
-        // debug inspector's window onto every in/out channel of one scene.
+        // channel inspector's window onto every in/out channel of one scene.
         .route("/api/scenes/{scene}/channels", get(channels::get_scene_channels))
         .with_state(state)
         .merge(crate::appearance::router())

@@ -6,7 +6,7 @@
 //!   replayed from the ring on connect then streamed live. One stream, all scenes.
 //!
 //! These read the [`Observatory`](crate::observatory::Observatory) mirror and
-//! feed; they never mutate it. The debug SPA (`/debug/sessions`) consumes both.
+//! feed; they never mutate it. The inspect SPA (`/inspect/sessions`) consumes both.
 //! Intended for the developer/operator, not the end-user face — sessions stay
 //! an internal concept on the channel side.
 
