@@ -82,41 +82,78 @@ use bytes::Bytes;
 /// follows.
 const RESPONSE_SETTLE: Duration = Duration::from_millis(700);
 
-/// Built-in default soul, embedded at compile time from `default_soul.md`. The
+/// Built-in base soul, embedded at compile time from `default_soul.md`. The
 /// agent's identity — how it speaks, what it values, how it renders surfaces — is
 /// authored here as a tracked asset, so it ships in the binary and updates
-/// transparently with every build. [`load_soul`] uses this unless an admin drops
-/// an explicit `<data_dir>/SOUL.md` override.
+/// transparently with every build. [`load_soul`] always uses this as the base,
+/// layering an optional `<data_dir>/SOUL.md` on top.
 const DEFAULT_SOUL: &str = include_str!("default_soul.md");
+
+/// Separator that introduces the operator's override layer. Placed after the
+/// bundled base so its instructions take precedence — the model honors the
+/// later, more specific guidance where the two conflict.
+const OVERRIDE_HEADER: &str = "\n\n# Operator overrides\n\nThe operator added the guidance below. It layers on top of everything above; where the two conflict, follow this.\n\n";
 
 /// Load the agent's soul — its identity (voice, values, guardrails, surface
 /// house-style) — used as the system prompt for every scene's persistent reactor
 /// session.
 ///
-/// The bundled [`DEFAULT_SOUL`] is the shipped, auto-updating default: it's
-/// compiled into the binary, so every build and deploy carries the current
-/// character with no manual step and nothing to persist. `<data_dir>/SOUL.md` is
-/// an *optional* override — if an admin deliberately drops a non-empty file
-/// there, it replaces the default; we never create or seed it, so edits to the
-/// bundled soul always flow through transparently. Read once at startup, so an
-/// override takes effect on the next restart.
+/// Two layers, composed rather than swapped. The bundled [`DEFAULT_SOUL`] is the
+/// base: compiled into the binary, so every build and deploy carries the current
+/// character automatically with nothing to persist. `<data_dir>/SOUL.md` is an
+/// *optional override layer* — when an admin drops a non-empty file there, its
+/// contents are appended after the base (under [`OVERRIDE_HEADER`]) so later,
+/// more-specific guidance wins. The file holds only the operator's deltas, never
+/// a full copy, so it can neither go stale nor shadow updates to the base — those
+/// always flow through. Read once at startup, so changes take effect on the next
+/// restart.
 pub fn load_soul(data_dir: &Path) -> String {
     let path = data_dir.join("SOUL.md");
     match std::fs::read_to_string(&path) {
         Ok(text) if !text.trim().is_empty() => {
-            tracing::info!(path = %path.display(), "using SOUL.md override instead of bundled default soul");
-            text
+            tracing::info!(path = %path.display(), "layering SOUL.md override on top of the bundled base soul");
+            format!("{DEFAULT_SOUL}{OVERRIDE_HEADER}{}", text.trim())
         }
         Ok(_) => {
-            tracing::warn!(path = %path.display(), "SOUL.md present but empty; using bundled default soul");
+            tracing::warn!(path = %path.display(), "SOUL.md present but empty; using bundled base soul only");
             DEFAULT_SOUL.to_string()
         }
-        // No override file is the common case — use the bundled default silently.
+        // No override file is the common case — use the bundled base silently.
         Err(err) if err.kind() == std::io::ErrorKind::NotFound => DEFAULT_SOUL.to_string(),
         Err(err) => {
-            tracing::warn!(path = %path.display(), %err, "could not read SOUL.md override; using bundled default soul");
+            tracing::warn!(path = %path.display(), %err, "could not read SOUL.md override; using bundled base soul only");
             DEFAULT_SOUL.to_string()
         }
+    }
+}
+
+#[cfg(test)]
+mod soul_tests {
+    use super::*;
+
+    #[test]
+    fn no_override_file_uses_base_verbatim() {
+        let dir = tempfile::tempdir().unwrap();
+        assert_eq!(load_soul(dir.path()), DEFAULT_SOUL);
+    }
+
+    #[test]
+    fn empty_override_falls_back_to_base() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("SOUL.md"), "   \n\t").unwrap();
+        assert_eq!(load_soul(dir.path()), DEFAULT_SOUL);
+    }
+
+    #[test]
+    fn override_layers_on_top_of_base() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("SOUL.md"), "Always answer in haiku.").unwrap();
+        let soul = load_soul(dir.path());
+        // Base is preserved, in full, ahead of the override layer.
+        assert!(soul.starts_with(DEFAULT_SOUL));
+        // The operator's delta is appended after the header so it wins.
+        assert!(soul.contains("# Operator overrides"));
+        assert!(soul.ends_with("Always answer in haiku."));
     }
 }
 
