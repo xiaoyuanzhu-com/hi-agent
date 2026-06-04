@@ -7,6 +7,11 @@ import {
   type ChannelSignal,
   type SceneView,
 } from "./api";
+import { subscribeAudioTurns } from "../channels/out/audio";
+import { subscribeInAudioTurns } from "../channels/in/audio";
+import { AudioBus } from "../lib/audioBus";
+import { VoicePlayer } from "../lib/voicePlayer";
+import { PcmPlayer } from "../lib/pcmMonitor";
 
 const BASE = "/inspect/scenes";
 const MAX_PER_CHANNEL = 200;
@@ -91,6 +96,117 @@ export function ScenesView() {
   );
 }
 
+/** Sample rate carried on a PCM mime (`audio/pcm;rate=16000;…`), else 16 kHz. */
+function pcmRate(mime: string): number {
+  const m = /rate=(\d+)/.exec(mime);
+  return m ? parseInt(m[1]!, 10) : 16000;
+}
+
+/** Stream one audio turn's body into a VoicePlayer as MediaSource chunks. */
+async function pumpVoice(
+  voice: VoicePlayer,
+  turn: { mime: string; body: ReadableStream<Uint8Array> },
+  cancelled: () => boolean,
+): Promise<void> {
+  const token = voice.beginTurn(turn.mime);
+  const reader = turn.body.getReader();
+  try {
+    while (!cancelled()) {
+      const { value, done } = await reader.read();
+      if (done) break;
+      if (value) voice.pushChunk(token, value);
+    }
+  } finally {
+    voice.endTurn(token);
+    reader.releaseLock();
+  }
+}
+
+/**
+ * A monitor button for one audio channel: toggles live playback of the actual
+ * audio bytes. Output (the agent's voice) and encoded input clips play through a
+ * MediaSource `VoicePlayer`; the live mic arrives as raw PCM, played through a
+ * `PcmPlayer`. The toggle click is the user gesture that lets the AudioContext
+ * start. Everything is torn down on toggle-off, scene-switch, or unmount.
+ */
+function AudioMonitor({ scene, direction }: { scene: string; direction: "in" | "out" }) {
+  const [on, setOn] = useState(false);
+  const [failed, setFailed] = useState(false);
+
+  useEffect(() => {
+    if (!on) return;
+    const ctrl = new AbortController();
+    let cancelled = false;
+    let bus: AudioBus | null = null;
+    let voice: VoicePlayer | null = null;
+    let pcm: PcmPlayer | null = null;
+    const ensureVoice = (): VoicePlayer => {
+      if (!bus) bus = new AudioBus();
+      void bus.resume();
+      if (!voice)
+        voice = new VoicePlayer(
+          bus,
+          () => {},
+          () => {},
+        );
+      return voice;
+    };
+
+    void (async () => {
+      try {
+        const turns =
+          direction === "out"
+            ? subscribeAudioTurns({ scene, signal: ctrl.signal })
+            : subscribeInAudioTurns({ scene, signal: ctrl.signal });
+        for await (const turn of turns) {
+          if (cancelled) break;
+          if (turn.mime.startsWith("audio/pcm")) {
+            pcm = new PcmPlayer(pcmRate(turn.mime));
+            const reader = turn.body.getReader();
+            try {
+              while (!cancelled) {
+                const { value, done } = await reader.read();
+                if (done) break;
+                if (value) pcm.push(value);
+              }
+            } finally {
+              reader.releaseLock();
+            }
+            pcm.stop();
+            pcm = null;
+          } else {
+            await pumpVoice(ensureVoice(), turn, () => cancelled);
+          }
+        }
+      } catch {
+        if (!cancelled && !ctrl.signal.aborted) setFailed(true);
+      }
+    })();
+
+    return () => {
+      cancelled = true;
+      ctrl.abort();
+      voice?.stop();
+      pcm?.stop();
+      bus?.close();
+    };
+  }, [on, scene, direction]);
+
+  return (
+    <button
+      type="button"
+      className={`chan-monitor ${on ? "on" : ""} ${failed ? "failed" : ""}`}
+      onClick={() => {
+        setFailed(false);
+        setOn((v) => !v);
+      }}
+      title={failed ? "audio unavailable" : on ? "stop listening" : "listen to this channel"}
+    >
+      {on ? "🔊" : "🔈"}
+    </button>
+  );
+}
+
 /**
  * Live presence across one scene's channels. Subscribes to the merged channel
  * stream and buckets signals by channel; each channel renders a rolling feed.
@@ -151,6 +267,7 @@ function SceneChannels({ scene }: { scene: string }) {
                 <div className="card chan" key={key}>
                   <h4>
                     {label} <span className="muted">({items.length})</span>
+                    {key === "audio" && <AudioMonitor scene={scene} direction={dir} />}
                   </h4>
                   {items.length === 0 ? (
                     <div className="muted chan-idle">idle</div>

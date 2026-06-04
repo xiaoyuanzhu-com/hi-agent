@@ -1,28 +1,52 @@
 // Client for the inbound audio channel.
 //
-// Live mic input streams continuously over the `/api/in/audio/stream` WebSocket
-// (see `lib/audioStreamer`), upload-only; the upstream STT does the endpointing
-// and the server publishes recognized speech to the scene's observe stream.
+// "Audio is audio": the inbound audio channel carries audio bytes, not text. Live
+// mic input streams continuously over the `/api/in/audio/stream` WebSocket (see
+// `lib/audioStreamer`), upload-only; the server transcribes it and posts the
+// recognized text to the *text* channel (observe via `/api/in/text`).
 //
-// `subscribeInAudio` observes that recognized speech (GET /api/in/audio): partial
-// frames (`final: false`) for the live rolling line, settled sentences
-// (`final: true`) for committed utterances. Every client — mic-holder or not —
-// renders from this same stream.
+// `subscribeInAudioTurns` observes the raw audio bytes on `GET /api/in/audio` —
+// one source (a mic stream or a posted clip) per response, the inbound mirror of
+// `out/audio`. The `Content-Type` tells the caller how to decode each turn
+// (`audio/pcm;rate=16000;channels=1` for the live mic, the clip's own type for a
+// posted clip). Used to *listen in* on a scene's audio (e.g. the inspector).
 //
 // `postAudio` is the one-shot batch path for `POST /api/in/audio` — kept for
 // non-streaming callers (e.g. uploading a finished clip); not used by the live mic.
 
-import { observeInput, type InputEvent } from "../ndjson";
+/** One source of inbound audio: a continuous byte body the caller plays. */
+export interface AudioInTurn {
+  /** Content-Type for the whole source (set from the response headers). */
+  mime: string;
+  /** The source's audio bytes, streamed as they arrive. */
+  body: ReadableStream<Uint8Array>;
+}
 
-/** One recognized-speech result: rolling partial (`final:false`) or settled. */
-export type TranscriptEvent = InputEvent;
-
-/** Observe recognized speech on this scene (live, no replay). */
-export function subscribeInAudio(opts: {
+/**
+ * Observe the live audio bytes on this scene. Each `GET /api/in/audio` response
+ * is one source — a continuous stream — so we yield one `AudioInTurn` per
+ * response and re-subscribe for the next. The generator pauses at each `yield`
+ * until the caller finishes consuming the body, so only one source is in flight
+ * at a time.
+ */
+export async function* subscribeInAudioTurns(opts: {
   scene: string;
   signal: AbortSignal;
-}): AsyncGenerator<TranscriptEvent, void, void> {
-  return observeInput("/api/in/audio", opts);
+}): AsyncGenerator<AudioInTurn, void, void> {
+  while (!opts.signal.aborted) {
+    const res = await fetch("/api/in/audio", {
+      method: "GET",
+      headers: { "X-HI-Scene": opts.scene, Accept: "audio/*" },
+      signal: opts.signal,
+      cache: "no-store",
+    });
+    if (!res.ok) {
+      throw new Error(`/api/in/audio subscribe failed: ${res.status} ${res.statusText}`);
+    }
+    if (!res.body) continue;
+    const mime = res.headers.get("content-type") ?? "application/octet-stream";
+    yield { mime, body: res.body };
+  }
 }
 
 export async function postAudio(opts: {
