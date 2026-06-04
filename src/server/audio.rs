@@ -1,25 +1,33 @@
 //! The audio channel: inbound speech and outbound voice.
 //!
+//! "Audio is audio." The audio *input* channel carries audio bytes — observable
+//! and playable the same way vision frames are. The transcript the agent reasons
+//! over is a *derived* representation, so STT output is dispatched onto the **text**
+//! channel (exactly like `POST /api/in/text`); the agent consumes text, while
+//! `GET /api/in/audio` lets any client hear the raw audio.
+//!
 //! Inbound clip (`POST /api/in/audio`): the body bytes are audio; we save them
-//! as a co-located `audio-<id>.<ext>` blob beside the scene's day-log, transcribe via the configured STT
-//! capability ([`crate::capabilities::stt`]), and feed the transcript into the
-//! same per-scene path that `POST /api/in/text` uses. The journal records a
-//! `SignalIn { channel: Audio, body: <transcript>, media: Some(..) }`
-//! so the reactor's snapshot can show that this signal arrived as speech
-//! while the body remains text-searchable. The transcript is also echoed to
-//! scene observers (`GET /api/in/audio`).
+//! as a co-located `audio-<id>.<ext>` blob beside the scene's day-log, publish
+//! them on the inbound-audio broadcast (so `GET /api/in/audio` can play the
+//! clip), transcribe via the configured STT capability
+//! ([`crate::capabilities::stt`]), and feed the transcript into the same
+//! per-scene path that `POST /api/in/text` uses. The journal records a
+//! `SignalIn { channel: Text, body: <transcript>, media: Some(..) }` — the
+//! agent reads text, while the media reference (sharing the blob's id) links
+//! back to the audio this transcript was derived from.
 //!
 //! Inbound stream (`WS /api/in/audio/stream`): the client streams raw 16 kHz mono
 //! 16-bit PCM as binary frames for the whole time the mic is open; the upstream
 //! STT does the endpointing. There is no client-side VAD and nothing is sent back
-//! on the socket — it is upload-only. Recognized results (partials + finalized
-//! sentences) are published to the per-scene input-echo bus, so the uploading
-//! client sees its own words the same way every other client does: via
-//! `GET /api/in/audio`. Each finalized sentence is also dispatched as a `SignalIn`.
+//! on the socket — it is upload-only. Each frame is republished on the
+//! inbound-audio broadcast (so `GET /api/in/audio` plays the live mic), and each
+//! finalized sentence is dispatched as a text `SignalIn`. There are no live
+//! partials: a sentence appears once, settled, on the text channel.
 //!
-//! Observe (`GET /api/in/audio`): a live NDJSON stream of recognized speech for
-//! the scene (see [`crate::server::observe`]). Drives both display and the
-//! scene-wide barge-in reflex (duck the agent's voice the moment a mic goes hot).
+//! Observe (`GET /api/in/audio`): the live audio bytes for the scene, one source
+//! (mic stream or posted clip) per chunked response — the inbound mirror of
+//! `GET /api/out/audio`. The `Start` event's mime tells the client how to decode
+//! (`audio/pcm;rate=16000;channels=1` for the mic, the clip's own type for a POST).
 //!
 //! Outbound (`GET /api/out/audio`): subscriber to the reactor's `audio_out`
 //! broadcast. A turn's speech arrives as a `Start`/`Frame`*/`End` run; this
@@ -35,6 +43,7 @@
 //! speaks).
 
 use std::sync::Arc;
+use std::sync::atomic::Ordering;
 use std::time::{Duration, Instant};
 
 use axum::body::{Body, Bytes};
@@ -43,7 +52,7 @@ use axum::extract::{Query, State};
 use axum::http::header::CONTENT_TYPE;
 use axum::http::{HeaderMap, HeaderValue, StatusCode};
 use axum::response::{IntoResponse, Response};
-use chrono::Utc;
+use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use tokio::sync::broadcast::error::RecvError;
 use tokio::sync::mpsc;
@@ -51,12 +60,16 @@ use tokio::sync::mpsc;
 use crate::capabilities::stt::{self, Transcript};
 use crate::memory::media;
 use crate::server::headers::{AuthBearer, RequiredScene, SceneHeader, StreamHeader};
-use crate::server::{observe, AppState, AudioEvent};
+use crate::server::{AppState, AudioEvent, AudioInEvent};
 use crate::segment::{Segmenter, Speech};
 use crate::types::{Channel, JournalEntry, Media, Origin, Scene, Signal};
 use uuid::Uuid;
 
 const DEFAULT_MIME: &str = "audio/wav";
+
+/// Format of the live mic stream: raw 16 kHz mono signed 16-bit little-endian PCM.
+/// Carried on the inbound-audio `Start` so a listener knows how to decode it.
+const PCM_MIME: &str = "audio/pcm;rate=16000;channels=1";
 
 #[derive(Debug, Serialize)]
 struct PostAudioAck {
@@ -115,7 +128,23 @@ pub async fn post_audio(
         }
     };
 
-    // 2. Transcribe. Errors surface as 502 — the upstream provider failed.
+    // 2. Publish the clip on the inbound-audio channel as one source, so any
+    //    `GET /api/in/audio` listener can play it. Bytes are refcounted, so with
+    //    no listener this is a cheap drop.
+    let turn = state.audio_in_turn.fetch_add(1, Ordering::Relaxed);
+    let _ = state.audio_in.send(AudioInEvent::Start {
+        scene: Some(scene.clone()),
+        turn,
+        mime: mime.clone(),
+    });
+    let _ = state.audio_in.send(AudioInEvent::Frame {
+        scene: Some(scene.clone()),
+        turn,
+        bytes: body.clone(),
+    });
+    let _ = state.audio_in.send(AudioInEvent::End { scene: Some(scene.clone()), turn });
+
+    // 3. Transcribe. Errors surface as 502 — the upstream provider failed.
     let transcript = match stt::transcribe(body, &mime).await {
         Ok(t) => t,
         Err(err) => {
@@ -139,39 +168,18 @@ pub async fn post_audio(
         return (StatusCode::ACCEPTED, axum::Json(ack)).into_response();
     }
 
-    // 3. Journal + dispatch — identical to text.rs from this point, except the
-    //    channel is Audio and we carry the media reference.
-    let signal = Signal {
-        channel: Channel::Audio,
-        scene: scene.clone(),
-        body: transcript.clone(),
-        stream: stream.clone(),
-        ts,
+    // 4. The transcript is text: dispatch it onto the text channel exactly like a
+    //    typed line. The agent reads text; the audio stays on the audio channel.
+    //    The clip's (ts, id, media) ride along so the journal entry links back to
+    //    the stored blob by the shared id.
+    let media = Media {
+        file: media_path.clone(),
+        mime: mime.clone(),
+        duration_ms: None,
+        width: None,
+        height: None,
     };
-    crate::channel_log::inbound(Channel::Audio, &scene, &transcript);
-    let entry = JournalEntry::SignalIn {
-        id,
-        ts,
-        channel: Channel::Audio,
-        scene: scene.clone(),
-        body: transcript.clone(),
-        stream,
-        media: Some(Media {
-            file: media_path.clone(),
-            mime: mime.clone(),
-            duration_ms: None,
-            width: None,
-            height: None,
-        }),
-        origin: Some(Origin::Human),
-    };
-    if let Err(err) = state.memory.journal.append(entry).await {
-        tracing::error!(error = %err, "journal append failed; accepting signal anyway");
-    }
-    // Echo the recognized clip to scene observers (a settled utterance).
-    state.echo_input(&scene, Channel::Audio, &transcript, true);
-    if let Err(err) = state.inbound.send(signal).await {
-        tracing::error!(error = %err, "inbound channel closed");
+    if !deliver_transcript(&state, &scene, stream, &transcript, Some((ts, id, media))).await {
         return (StatusCode::SERVICE_UNAVAILABLE, "inbound channel closed\n").into_response();
     }
 
@@ -194,12 +202,10 @@ pub struct StreamParams {
 ///
 /// Upload-only: the client streams raw 16 kHz mono 16-bit PCM as binary frames
 /// for the whole time the mic is open; the upstream STT does the endpointing.
-/// There is no client-side VAD and nothing is sent back on the socket. Recognized
-/// results (partials + finalized sentences) are published to the per-scene
-/// input-echo bus, so the uploader observes its own words via `GET /api/in/audio`
-/// exactly like every other client — that stream also drives barge-in. Each
-/// finalized sentence is dispatched as a `SignalIn` (the path `POST /api/in/audio`
-/// uses).
+/// There is no client-side VAD and nothing is sent back on the socket. Each frame
+/// is republished on the inbound-audio broadcast so `GET /api/in/audio` plays the
+/// live mic; each finalized sentence is dispatched on the text channel (the path
+/// `POST /api/in/audio` uses for its transcript).
 pub async fn get_audio_stream(
     State(state): State<Arc<AppState>>,
     Query(params): Query<StreamParams>,
@@ -229,18 +235,17 @@ async fn stream_audio_in(
     stream: Option<String>,
     mut socket: axum::extract::ws::WebSocket,
 ) {
-    // PCM client → STT; Transcripts STT → echo/dispatch. Bounded so a stalled
+    // PCM client → STT; Transcripts STT → dispatch. Bounded so a stalled
     // upstream exerts backpressure rather than buffering unboundedly.
     let (audio_tx, audio_rx) = mpsc::channel::<Bytes>(64);
     let (tr_tx, mut tr_rx) = mpsc::channel::<Transcript>(64);
 
     let stt_task = tokio::spawn(async move { stt::transcribe_streaming(audio_rx, tr_tx).await });
 
-    // Publish raw STT results to scene observers (partials drive display +
-    // barge-in everywhere) while an explicit Segmenter — not the upstream's
-    // silence flag — decides where the continuous word-stream is cut into
-    // sentences for the agent. A periodic tick drives the time-based cut rules
-    // when the speaker has gone quiet.
+    // An explicit Segmenter — not the upstream's silence flag — decides where the
+    // continuous word-stream is cut into sentences for the agent. A periodic tick
+    // drives the time-based cut rules when the speaker has gone quiet. Each
+    // finalized sentence is delivered on the text channel; there are no partials.
     let relay_state = state.clone();
     let relay_scene = scene.clone();
     let relay_stream = stream.clone();
@@ -251,36 +256,46 @@ async fn stream_audio_in(
         loop {
             let cuts = tokio::select! {
                 msg = tr_rx.recv() => match msg {
-                    Some(t) => {
-                        // Rolling partial → scene observers (display + barge-in);
-                        // the agent hears the segmenter's cut below, never this.
-                        if !t.text.trim().is_empty() {
-                            relay_state.echo_input(&relay_scene, Channel::Audio, &t.text, false);
-                        }
-                        seg.observe(&t.text, t.is_final, Instant::now())
-                    }
+                    Some(t) => seg.observe(&t.text, t.is_final, Instant::now()),
                     None => break, // STT session ended
                 },
                 _ = ticker.tick() => seg.tick(Instant::now()),
             };
             for sentence in cuts {
-                // A completed sentence: echo it as settled and hand it to the agent.
-                relay_state.echo_input(&relay_scene, Channel::Audio, &sentence, true);
-                dispatch_utterance(&relay_state, &relay_scene, relay_stream.clone(), &sentence).await;
+                deliver_transcript(&relay_state, &relay_scene, relay_stream.clone(), &sentence, None).await;
             }
         }
         // Flush any trailing words as a final sentence when the session ends.
         if let Some(sentence) = seg.flush() {
-            relay_state.echo_input(&relay_scene, Channel::Audio, &sentence, true);
-            dispatch_utterance(&relay_state, &relay_scene, relay_stream.clone(), &sentence).await;
+            deliver_transcript(&relay_state, &relay_scene, relay_stream.clone(), &sentence, None).await;
         }
     });
+
+    // One WS connection is one inbound-audio source: its frames carry a shared
+    // `turn` so a `GET /api/in/audio` listener stays bound to this mic alone.
+    let turn = state.audio_in_turn.fetch_add(1, Ordering::Relaxed);
+    let mut started = false;
 
     // Pump inbound PCM until the client closes or the STT session ends (a send
     // error means `audio_rx` was dropped because `transcribe_streaming` returned).
     while let Some(msg) = socket.recv().await {
         match msg {
             Ok(WsMessage::Binary(b)) => {
+                // Republish the raw PCM for `GET /api/in/audio` listeners. The
+                // `Start` (carrying the format) precedes the first frame.
+                if !started {
+                    started = true;
+                    let _ = state.audio_in.send(AudioInEvent::Start {
+                        scene: Some(scene.clone()),
+                        turn,
+                        mime: PCM_MIME.to_owned(),
+                    });
+                }
+                let _ = state.audio_in.send(AudioInEvent::Frame {
+                    scene: Some(scene.clone()),
+                    turn,
+                    bytes: b.clone(),
+                });
                 if audio_tx.send(b).await.is_err() {
                     break;
                 }
@@ -288,6 +303,11 @@ async fn stream_audio_in(
             Ok(WsMessage::Close(_)) | Err(_) => break,
             Ok(_) => {}
         }
+    }
+
+    // Close the inbound-audio source so listeners end their current response.
+    if started {
+        let _ = state.audio_in.send(AudioInEvent::End { scene: Some(scene.clone()), turn });
     }
 
     // Closing the audio side lets the STT session flush its last utterance.
@@ -301,35 +321,53 @@ async fn stream_audio_in(
     tracing::info!(scene = %scene, "WS /api/in/audio/stream closed");
 }
 
-/// Journal + dispatch one finalized utterance — the streaming counterpart of the
-/// tail of `post_audio`. Streaming utterances aren't persisted as discrete media
-/// files (no per-clip blob); the journal records the transcript with no `media`.
-async fn dispatch_utterance(state: &AppState, scene: &Scene, stream: Option<String>, text: &str) {
-    let ts = Utc::now();
+/// Deliver one finalized transcript onto the **text** channel — journal it, echo
+/// it to scene observers (settled), and hand it to the reactor — exactly as a
+/// typed `POST /api/in/text` line. Returns `false` if the inbound channel is
+/// closed. The agent consumes text either way; for a posted clip, `clip` carries
+/// the `(ts, id, media)` of the stored audio blob so the journal entry shares the
+/// blob's id and day-folder. The mic stream passes `None` — streaming utterances
+/// aren't persisted as discrete media files, so the journal records no `media`.
+async fn deliver_transcript(
+    state: &AppState,
+    scene: &Scene,
+    stream: Option<String>,
+    text: &str,
+    clip: Option<(DateTime<Utc>, String, Media)>,
+) -> bool {
+    let (ts, id, media) = match clip {
+        Some((ts, id, media)) => (ts, id, Some(media)),
+        None => (Utc::now(), Uuid::now_v7().to_string(), None),
+    };
     let signal = Signal {
-        channel: Channel::Audio,
+        channel: Channel::Text,
         scene: scene.clone(),
         body: text.to_owned(),
         stream: stream.clone(),
         ts,
     };
-    crate::channel_log::inbound(Channel::Audio, scene, text);
+    crate::channel_log::inbound(Channel::Text, scene, text);
     let entry = JournalEntry::SignalIn {
-        id: Uuid::now_v7().to_string(),
+        id,
         ts,
-        channel: Channel::Audio,
+        channel: Channel::Text,
         scene: scene.clone(),
         body: text.to_owned(),
         stream,
-        media: None,
+        media,
         origin: Some(Origin::Human),
     };
     if let Err(err) = state.memory.journal.append(entry).await {
         tracing::error!(error = %err, "journal append failed; accepting signal anyway");
     }
+    // Echo before dispatching inward, so the line shows on every client the same
+    // way a typed line does.
+    state.echo_input(scene, Channel::Text, text, true);
     if let Err(err) = state.inbound.send(signal).await {
         tracing::error!(error = %err, "inbound channel closed");
+        return false;
     }
+    true
 }
 
 /// Whether an event routed to `target` should reach this `scene` subscriber.
@@ -340,14 +378,76 @@ fn routed(target: &Option<Scene>, scene: &Scene) -> bool {
     }
 }
 
-/// `GET /api/in/audio` — observe recognized speech on this scene, live (NDJSON).
+/// `GET /api/in/audio` — the live audio bytes on this scene, one source per
+/// long-poll. The inbound mirror of [`get_out_audio`].
 pub async fn get_in_audio(
     State(state): State<Arc<AppState>>,
     RequiredScene(scene): RequiredScene,
     AuthBearer(auth): AuthBearer,
-) -> Response {
-    tracing::info!(scene = %scene, auth = ?auth, "GET /api/in/audio observe opened");
-    observe::stream_input(state, scene, Channel::Audio)
+) -> impl IntoResponse {
+    let mut rx = state.audio_in.subscribe();
+
+    tracing::info!(scene = %scene, auth = ?auth, "GET /api/in/audio long-poll opened");
+
+    // Block until a source for this subscriber starts. `Start` carries the mime,
+    // which must be set before any body byte; Frame/End seen before a Start (we
+    // subscribed mid-source) are skipped — the client re-polls and catches the
+    // next source cleanly.
+    let (turn, mime) = loop {
+        match rx.recv().await {
+            Ok(event) => {
+                if !routed(event.scene(), &scene) {
+                    continue;
+                }
+                if let AudioInEvent::Start { turn, mime, .. } = event {
+                    break (turn, mime);
+                }
+            }
+            Err(RecvError::Lagged(n)) => {
+                tracing::warn!(missed = n, "inbound-audio subscriber lagged");
+                continue;
+            }
+            Err(RecvError::Closed) => {
+                return (StatusCode::SERVICE_UNAVAILABLE, "broadcast closed\n").into_response();
+            }
+        }
+    };
+
+    // Stream this source's frames as a chunked body until its `End`. Frames from
+    // any other source or scene are filtered out, so a response stays bound to the
+    // single source it opened on.
+    let stream = futures::stream::unfold((rx, scene, turn), |(mut rx, scene, turn)| async move {
+        loop {
+            match rx.recv().await {
+                Ok(event) => {
+                    if !routed(event.scene(), &scene) || event.turn() != turn {
+                        continue;
+                    }
+                    match event {
+                        AudioInEvent::Frame { bytes, .. } => {
+                            return Some((
+                                Ok::<Bytes, std::convert::Infallible>(bytes),
+                                (rx, scene, turn),
+                            ));
+                        }
+                        AudioInEvent::End { .. } => return None,
+                        AudioInEvent::Start { .. } => continue,
+                    }
+                }
+                Err(RecvError::Lagged(n)) => {
+                    tracing::warn!(missed = n, "inbound-audio subscriber lagged mid-source");
+                    continue;
+                }
+                Err(RecvError::Closed) => return None,
+            }
+        }
+    });
+
+    let mut response = Body::from_stream(stream).into_response();
+    if let Ok(val) = HeaderValue::from_str(&mime) {
+        response.headers_mut().insert(CONTENT_TYPE, val);
+    }
+    response
 }
 
 /// `GET /api/out/audio` — the agent's voice, one turn per long-poll.

@@ -23,7 +23,7 @@ use futures::stream::Stream;
 use serde::Serialize;
 use tokio::sync::broadcast::error::RecvError;
 
-use crate::server::{AppState, AudioEvent};
+use crate::server::{AppState, AudioEvent, AudioInEvent};
 use crate::types::{Channel, Scene};
 
 /// One unit of channel activity, uniform across every channel and direction.
@@ -73,6 +73,7 @@ fn merge_channels(
         input: tokio::sync::broadcast::Receiver<crate::server::InputEcho>,
         output: tokio::sync::broadcast::Receiver<crate::server::OutputEcho>,
         audio: tokio::sync::broadcast::Receiver<crate::server::AudioEvent>,
+        audio_in: tokio::sync::broadcast::Receiver<crate::server::AudioInEvent>,
         view: tokio::sync::broadcast::Receiver<crate::server::ViewEvent>,
         vision: tokio::sync::broadcast::Receiver<crate::server::VisionFrameEvent>,
     }
@@ -81,6 +82,7 @@ fn merge_channels(
         input: state.input_echo.subscribe(),
         output: state.output_echo.subscribe(),
         audio: state.audio_out.subscribe(),
+        audio_in: state.audio_in.subscribe(),
         view: state.view_out.subscribe(),
         vision: state.vision_out.subscribe(),
     };
@@ -109,6 +111,12 @@ fn merge_channels(
                 },
                 r = s.audio.recv() => match r {
                     Ok(e) if targets(e.scene(), &scene) => audio_summary(&e),
+                    Ok(_) => None,
+                    Err(RecvError::Lagged(_)) => None,
+                    Err(RecvError::Closed) => return None,
+                },
+                r = s.audio_in.recv() => match r {
+                    Ok(e) if targets(e.scene(), &scene) => audio_in_summary(&e),
                     Ok(_) => None,
                     Err(RecvError::Lagged(_)) => None,
                     Err(RecvError::Closed) => return None,
@@ -159,6 +167,30 @@ fn audio_summary(e: &AudioEvent) -> Option<ChannelSignal> {
         }),
         // Frames are raw codec bytes — metadata only, so they're dropped here.
         AudioEvent::Frame { .. } => None,
+    }
+}
+
+/// Summarize an inbound audio source to metadata — the raw bytes stream on
+/// `GET /api/in/audio` for playback, so the inspector only surfaces the
+/// begin/end of each source (the recognized text rides the *text* channel).
+fn audio_in_summary(e: &AudioInEvent) -> Option<ChannelSignal> {
+    match e {
+        AudioInEvent::Start { mime, .. } => Some(ChannelSignal {
+            ts: Utc::now(),
+            channel: Channel::Audio,
+            direction: "in",
+            body: format!("▶ listening · {mime}"),
+            is_final: false,
+        }),
+        AudioInEvent::End { .. } => Some(ChannelSignal {
+            ts: Utc::now(),
+            channel: Channel::Audio,
+            direction: "in",
+            body: "■ end".to_owned(),
+            is_final: true,
+        }),
+        // Frames are raw bytes — metadata only, so they're dropped here.
+        AudioInEvent::Frame { .. } => None,
     }
 }
 

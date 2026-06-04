@@ -93,6 +93,7 @@ async fn forward(
     })?;
 
     let status = upstream_resp.status();
+    tracing::debug!(status = %status, path = %path_q, "proxy forwarded to upstream");
     let mut builder = Response::builder().status(status);
     for (name, value) in upstream_resp.headers().iter() {
         // content-length will not match a streamed body; let axum recompute.

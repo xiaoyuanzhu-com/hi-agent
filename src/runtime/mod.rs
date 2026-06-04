@@ -326,7 +326,13 @@ fn is_executable(p: &Path) -> bool {
 fn resolve_system() -> Option<ResolvedRuntime> {
     let node_bin = find_on_path("node")?;
     let adapter_entry = find_on_path("claude-agent-acp")?;
-    let claude_bin = find_on_path("claude")?;
+    // Resolve `claude` deliberately rather than by raw PATH order: GUI launchers
+    // (cmux, some IDEs) prepend their own `claude` *shim* to PATH that only
+    // authenticates inside that app's sandbox — running it standalone yields
+    // "Please run /login". `resolve_claude_bin` skips those. If it finds nothing
+    // usable we return None, dropping to the managed runtime (a real bundled
+    // claude) rather than pairing the system tools with a broken claude.
+    let claude_bin = resolve_claude_bin()?;
     tracing::debug!(
         node = %node_bin.display(),
         adapter = %adapter_entry.display(),
@@ -347,6 +353,72 @@ fn find_on_path(name: &str) -> Option<PathBuf> {
     std::env::split_paths(&path)
         .map(|dir| dir.join(name))
         .find(|candidate| is_executable(candidate))
+}
+
+/// Locate a *usable* `claude` CLI, resisting launcher shims.
+///
+/// Priority: `HI_AGENT_CLAUDE_BIN` override → first non-shim `claude` on PATH →
+/// canonical install locations (in case the launcher's PATH omits them). A
+/// "shim" is any candidate inside a macOS `.app` bundle — the pattern used by
+/// GUI launchers like cmux, whose `claude` only works in their own auth
+/// sandbox. Returns `None` when only a shim exists, so the caller falls back to
+/// the managed runtime instead of a `claude` that will fail at prompt time.
+fn resolve_claude_bin() -> Option<PathBuf> {
+    if let Some(raw) = std::env::var_os("HI_AGENT_CLAUDE_BIN") {
+        let p = PathBuf::from(raw);
+        if is_executable(&p) {
+            return Some(p);
+        }
+        tracing::warn!(path = %p.display(), "HI_AGENT_CLAUDE_BIN is not executable; ignoring");
+    }
+
+    let mut shim: Option<PathBuf> = None;
+    if let Some(path) = std::env::var_os("PATH") {
+        for cand in std::env::split_paths(&path).map(|dir| dir.join("claude")) {
+            if !is_executable(&cand) {
+                continue;
+            }
+            if is_app_bundle_path(&cand) {
+                shim.get_or_insert(cand); // remember, but keep looking for a real one
+                continue;
+            }
+            return Some(cand);
+        }
+    }
+
+    // PATH yielded only a shim (or nothing). Try canonical install locations the
+    // launcher's PATH may have dropped, before giving up.
+    for cand in canonical_claude_paths() {
+        if is_executable(&cand) && !is_app_bundle_path(&cand) {
+            return Some(cand);
+        }
+    }
+
+    if let Some(shim) = &shim {
+        tracing::warn!(
+            path = %shim.display(),
+            "the only `claude` on PATH is an app-bundle shim (e.g. a GUI launcher's); \
+             falling back to the managed runtime — set HI_AGENT_CLAUDE_BIN to override",
+        );
+    }
+    None
+}
+
+/// Standard places the official installer / package managers put `claude`.
+fn canonical_claude_paths() -> Vec<PathBuf> {
+    let mut out = Vec::new();
+    if let Some(home) = std::env::var_os("HOME") {
+        out.push(PathBuf::from(&home).join(".local/bin/claude"));
+    }
+    out.push(PathBuf::from("/opt/homebrew/bin/claude"));
+    out.push(PathBuf::from("/usr/local/bin/claude"));
+    out
+}
+
+/// True if any path component is a macOS application bundle (`*.app`).
+fn is_app_bundle_path(p: &Path) -> bool {
+    p.components()
+        .any(|c| c.as_os_str().to_string_lossy().ends_with(".app"))
 }
 
 /// First-run user-facing hint. Goes straight to stderr (not `tracing`) so it is
@@ -382,6 +454,15 @@ mod tests {
         );
         assert_eq!(r.node_bin_dir(), Path::new("/cache/runtimeX/node/bin"));
         assert_eq!(r.origin, "managed");
+    }
+
+    #[test]
+    fn app_bundle_paths_are_recognized_as_shims() {
+        assert!(is_app_bundle_path(Path::new(
+            "/Applications/cmux.app/Contents/Resources/bin/claude"
+        )));
+        assert!(!is_app_bundle_path(Path::new("/Users/me/.local/bin/claude")));
+        assert!(!is_app_bundle_path(Path::new("/opt/homebrew/bin/claude")));
     }
 
     #[test]

@@ -2,6 +2,7 @@
 
 use std::path::PathBuf;
 
+use anyhow::Context;
 use tokio::net::TcpListener;
 
 pub mod acp;
@@ -78,7 +79,19 @@ pub async fn run(config: Config) -> anyhow::Result<()> {
     .await?;
 
     // Render the managed settings.json into a hi-agent-owned config dir.
-    let claude_config_dir = config.data_dir.join("claude-config");
+    // Absolutize it: it's handed to the child as `CLAUDE_CONFIG_DIR`, and the
+    // child may run with a different cwd than us — a relative path would make
+    // claude read a *different* dir than the one we seed the approval into.
+    let claude_config_dir = {
+        let dir = config.data_dir.join("claude-config");
+        if dir.is_absolute() {
+            dir
+        } else {
+            std::env::current_dir()
+                .context("resolving cwd to absolutize claude config dir")?
+                .join(dir)
+        }
+    };
     config.agent.render_settings_json(&claude_config_dir)?;
     // Pre-approve the placeholder key, else Claude Code rejects the env-supplied
     // `ANTHROPIC_API_KEY` ("Please run /login") and prompts fail with -32000.
@@ -94,6 +107,35 @@ pub async fn run(config: Config) -> anyhow::Result<()> {
         runtime.node_bin_dir(),
         &runtime.claude_bin,
     );
+    // Diagnostic: surface exactly what differs between launchers (terminal vs.
+    // cmux etc.) — cwd, the resolved runtime binaries, the config dir claude
+    // will read, and the placeholder key's fingerprint vs. what we seeded.
+    {
+        let get = |k: &str| {
+            child_env
+                .iter()
+                .find(|(n, _)| n == k)
+                .map(|(_, v)| v.as_str())
+                .unwrap_or("<unset>")
+        };
+        let key = get("ANTHROPIC_API_KEY");
+        let fp = &key[key.len().saturating_sub(20)..];
+        tracing::info!(
+            cwd = ?std::env::current_dir().ok(),
+            config_dir = %claude_config_dir.display(),
+            config_dir_abs = ?std::fs::canonicalize(&claude_config_dir).ok(),
+            runtime_origin = runtime.origin,
+            claude_bin = %runtime.claude_bin.display(),
+            node_bin = %runtime.node_bin.display(),
+            anthropic_base_url = get("ANTHROPIC_BASE_URL"),
+            claude_config_dir_env = get("CLAUDE_CONFIG_DIR"),
+            claude_code_executable = get("CLAUDE_CODE_EXECUTABLE"),
+            placeholder_fp = fp,
+            path_head = child_env.iter().find(|(n,_)| n == "PATH").map(|(_,v)| v.split(':').next().unwrap_or("")).unwrap_or(""),
+            "child auth/runtime env resolved"
+        );
+    }
+
     let adapter_entry = runtime
         .adapter_entry
         .to_str()

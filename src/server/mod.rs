@@ -2,6 +2,7 @@
 
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::sync::atomic::AtomicU64;
 
 use axum::Router;
 use axum::http::StatusCode;
@@ -64,6 +65,46 @@ impl AudioEvent {
             AudioEvent::Start { turn, .. }
             | AudioEvent::Frame { turn, .. }
             | AudioEvent::End { turn, .. } => *turn,
+        }
+    }
+}
+
+/// Inbound audio event — the read side of the audio *input* channel, the mirror
+/// of [`AudioEvent`]. "Audio is audio": the bytes the world feeds the agent are
+/// observable as bytes, not summarized to a transcript. One source (a mic stream
+/// or a posted clip) is a `Start`/`Frame`*/`End` run; `GET /api/in/audio` turns
+/// one run into one chunked HTTP response a client can play.
+///
+/// `turn` is a per-source id (one WS connection or one POST), keeping a
+/// listener's response bound to a single source so concurrent uploaders in a
+/// scene never interleave in one body. `mime` carries the format so a listener
+/// can decode — `audio/pcm;rate=16000;channels=1` for the live mic stream, the
+/// clip's own type for a posted clip. Like the other channel broadcasts this is
+/// lossy presence with no replay; the transcript the agent actually consumes
+/// rides the *text* channel.
+#[derive(Debug, Clone)]
+pub enum AudioInEvent {
+    Start { scene: Option<Scene>, turn: u64, mime: String },
+    Frame { scene: Option<Scene>, turn: u64, bytes: Bytes },
+    End { scene: Option<Scene>, turn: u64 },
+}
+
+impl AudioInEvent {
+    /// The routing target, common to every variant.
+    pub fn scene(&self) -> &Option<Scene> {
+        match self {
+            AudioInEvent::Start { scene, .. }
+            | AudioInEvent::Frame { scene, .. }
+            | AudioInEvent::End { scene, .. } => scene,
+        }
+    }
+
+    /// The source this event belongs to (one mic stream or one posted clip).
+    pub fn turn(&self) -> u64 {
+        match self {
+            AudioInEvent::Start { turn, .. }
+            | AudioInEvent::Frame { turn, .. }
+            | AudioInEvent::End { turn, .. } => *turn,
         }
     }
 }
@@ -162,6 +203,18 @@ pub struct AppState {
     /// the view compiler has built its module.
     pub view_out: broadcast::Sender<ViewEvent>,
 
+    /// Inbound audio broadcast — the read side of the audio *input* channel.
+    /// `POST /api/in/audio` and `WS /api/in/audio/stream` publish the raw audio
+    /// bytes here; `GET /api/in/audio` subscribers play them. Written directly by
+    /// the ingest handlers, not the binder — it is input data, not the reactor's
+    /// voice. The transcript the agent consumes rides the *text* channel instead.
+    pub audio_in: broadcast::Sender<AudioInEvent>,
+
+    /// Hands each inbound-audio source (one WS connection or one posted clip) a
+    /// distinct `turn` id, so concurrent uploaders never interleave in one
+    /// `GET /api/in/audio` listener response.
+    pub audio_in_turn: AtomicU64,
+
     /// Vision-frame broadcast — the read side of the vision *input* channel.
     /// POST /api/in/vision publishes each frame here; GET /api/in/vision
     /// subscribers (a detector working session, …) consume it. Written directly by
@@ -230,6 +283,8 @@ pub fn build(
     let (warm_tx, warm_rx) = mpsc::channel::<Scene>(1024);
     let text_bus = TextBus::new();
     let (audio_tx, _) = broadcast::channel::<AudioEvent>(64);
+    // Inbound audio: small, frequent PCM frames, so a larger ring than the others.
+    let (audio_in_tx, _) = broadcast::channel::<AudioInEvent>(256);
     let (view_tx, _) = broadcast::channel::<ViewEvent>(64);
     let (vision_tx, _) = broadcast::channel::<VisionFrameEvent>(64);
     // Input echo: live broadcast, lossy ring, no replay (see `InputEcho`).
@@ -255,6 +310,8 @@ pub fn build(
         warm: warm_tx,
         text_bus: text_bus.clone(),
         audio_out: audio_tx.clone(),
+        audio_in: audio_in_tx.clone(),
+        audio_in_turn: AtomicU64::new(0),
         view_out: view_tx.clone(),
         vision_out: vision_tx.clone(),
         input_echo: input_echo_tx.clone(),
