@@ -19,6 +19,7 @@ pub mod segment;
 pub mod server;
 pub mod types;
 pub mod vendors;
+pub mod views;
 
 #[derive(Debug, Clone)]
 pub struct Config {

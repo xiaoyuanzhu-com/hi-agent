@@ -285,7 +285,9 @@ async fn run_with_heartbeat(
 }
 
 /// Map the host to Node's release naming. `Err` on platforms we don't auto-install.
-fn node_target() -> anyhow::Result<(&'static str, &'static str)> {
+/// Also names the esbuild platform package (`@esbuild/<os>-<arch>`), which uses
+/// the same `<os>-<arch>` convention — see `crate::views`.
+pub(crate) fn node_target() -> anyhow::Result<(&'static str, &'static str)> {
     let os = match std::env::consts::OS {
         "macos" => "darwin",
         "linux" => "linux",
