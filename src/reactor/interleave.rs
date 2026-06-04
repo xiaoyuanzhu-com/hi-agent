@@ -20,40 +20,57 @@ use std::time::Instant;
 use uuid::Uuid;
 
 use crate::segment::{Segmenter, Terminator};
-use crate::types::{SurfaceEnvelope, SurfaceMode, SurfaceOp};
+use crate::types::{SurfaceEnvelope, SurfaceMode, SurfaceOp, ViewOp};
 
 const OPEN_CARD: &str = "[[surface:card]]";
 const OPEN_FULL: &str = "[[surface:full]]";
 const CLOSE: &str = "[[/surface]]";
+// A view opener is variable-length (`[[view id=… op=…]]`): this is its prefix,
+// and the opening tag runs to the next `]]`. `[[view` cannot be mistaken for the
+// `[[/view]]` close, which starts `[[/`.
+const OPEN_VIEW: &str = "[[view";
+const VIEW_TAG_CLOSE: &str = "]]";
+const CLOSE_VIEW: &str = "[[/view]]";
 
 /// One ordered piece of a turn's reply, in document order. Plain text the agent
 /// speaks/displays is [`Spoken`](Segment::Spoken); a completed `[[surface:*]]`
-/// block is [`Surface`](Segment::Surface). Keeping these interleaved is what lets
-/// a slide be paced to the sentence that narrates it.
+/// block is [`Surface`](Segment::Surface); a completed `[[view…]]` block is
+/// [`View`](Segment::View), carrying its raw JSX source for later compilation.
+/// Keeping these interleaved is what lets a slide/view be paced to its sentence.
 #[derive(Debug)]
 pub(super) enum Segment {
     Spoken(String),
     Surface(SurfaceEnvelope),
+    View { id: String, op: ViewOp, source: String },
 }
 
 /// One release action the policy decides on. `Speak` goes to TTS only (the raw
 /// chunk is mirrored to /thought separately by the caller); `Show` goes to
-/// /surface.
+/// /surface; `ShowView` is compiled then sent to /view.
 #[derive(Debug)]
 pub(super) enum Emit {
     Speak(String),
     Show(SurfaceEnvelope),
+    ShowView { id: String, op: ViewOp, source: String },
+}
+
+/// Which kind of block the extractor is currently inside. `None` (outside) scans
+/// for the next opener.
+#[derive(Debug, Clone)]
+enum Inside {
+    Surface(SurfaceMode),
+    View { id: String, op: ViewOp },
 }
 
 /// Streaming extractor that turns the agent's text stream into an ordered run of
-/// [`Segment`]s, pulling `[[surface:…]] … [[/surface]]` HTML blocks out as
-/// [`Segment::Surface`] while the surrounding text passes through as
+/// [`Segment`]s, pulling `[[surface:…]] … [[/surface]]` and `[[view…]] …
+/// [[/view]]` blocks out while surrounding text passes through as
 /// [`Segment::Spoken`]. A short tail that could be a partial opener is held back
 /// so a marker split across chunks is still recognized. Mirrors the convention
 /// taught in the soul.
 pub(super) struct Extractor {
     buf: String,
-    inside: Option<SurfaceMode>,
+    inside: Option<Inside>,
 }
 
 impl Extractor {
@@ -68,32 +85,59 @@ impl Extractor {
         let mut out = Vec::new();
 
         loop {
-            match self.inside {
+            // Clone the small state so no borrow of `self.inside` is held while we
+            // mutate `self.buf` / `self.inside` in the arms.
+            match self.inside.clone() {
                 None => {
+                    // The earliest opener wins — the two fixed surface markers and
+                    // the variable-length view marker, in document order.
                     let card = self.buf.find(OPEN_CARD);
                     let full = self.buf.find(OPEN_FULL);
-                    let opener = match (card, full) {
-                        (Some(c), Some(f)) if c <= f => Some((c, SurfaceMode::Card, OPEN_CARD.len())),
-                        (Some(_), Some(f)) => Some((f, SurfaceMode::Full, OPEN_FULL.len())),
-                        (Some(c), None) => Some((c, SurfaceMode::Card, OPEN_CARD.len())),
-                        (None, Some(f)) => Some((f, SurfaceMode::Full, OPEN_FULL.len())),
-                        (None, None) => None,
+                    let view = self.buf.find(OPEN_VIEW);
+                    let Some(idx) = [card, full, view].into_iter().flatten().min() else {
+                        // No opener: emit everything except a tail that could be the
+                        // start of one continuing in the next chunk.
+                        let keep = partial_open_suffix_len(&self.buf);
+                        let emit_to = self.buf.len() - keep;
+                        push_spoken(&mut out, &self.buf[..emit_to]);
+                        self.buf = self.buf[emit_to..].to_string();
+                        break;
                     };
-                    if let Some((idx, mode, tok_len)) = opener {
+
+                    if self.buf[idx..].starts_with(OPEN_CARD) {
                         push_spoken(&mut out, &self.buf[..idx]);
-                        self.buf = self.buf[idx + tok_len..].to_string();
-                        self.inside = Some(mode);
+                        self.buf = self.buf[idx + OPEN_CARD.len()..].to_string();
+                        self.inside = Some(Inside::Surface(SurfaceMode::Card));
                         continue;
                     }
-                    // No opener: emit everything except a tail that could be the
-                    // start of one continuing in the next chunk.
-                    let keep = partial_open_suffix_len(&self.buf);
-                    let emit_to = self.buf.len() - keep;
-                    push_spoken(&mut out, &self.buf[..emit_to]);
-                    self.buf = self.buf[emit_to..].to_string();
-                    break;
+                    if self.buf[idx..].starts_with(OPEN_FULL) {
+                        push_spoken(&mut out, &self.buf[..idx]);
+                        self.buf = self.buf[idx + OPEN_FULL.len()..].to_string();
+                        self.inside = Some(Inside::Surface(SurfaceMode::Full));
+                        continue;
+                    }
+
+                    // A view opener: its opening tag runs from `[[view` to the next
+                    // `]]`. If that close hasn't arrived, hold the partial opener and
+                    // wait for the next chunk.
+                    let after = idx + OPEN_VIEW.len();
+                    let Some(rel) = self.buf[after..].find(VIEW_TAG_CLOSE) else {
+                        push_spoken(&mut out, &self.buf[..idx]);
+                        self.buf = self.buf[idx..].to_string();
+                        break;
+                    };
+                    let (id, op) = parse_view_attrs(&self.buf[after..after + rel]);
+                    push_spoken(&mut out, &self.buf[..idx]);
+                    self.buf = self.buf[after + rel + VIEW_TAG_CLOSE.len()..].to_string();
+                    if op == ViewOp::Dismiss {
+                        // A dismiss carries no body and needs no `[[/view]]`.
+                        out.push(Segment::View { id, op, source: String::new() });
+                        continue;
+                    }
+                    self.inside = Some(Inside::View { id, op });
+                    continue;
                 }
-                Some(mode) => {
+                Some(Inside::Surface(mode)) => {
                     if let Some(idx) = self.buf.find(CLOSE) {
                         let html = self.buf[..idx].trim().to_string();
                         self.buf = self.buf[idx + CLOSE.len()..].to_string();
@@ -108,6 +152,16 @@ impl Extractor {
                         continue;
                     }
                     break; // close not present yet; keep buffering the HTML
+                }
+                Some(Inside::View { id, op }) => {
+                    if let Some(idx) = self.buf.find(CLOSE_VIEW) {
+                        let source = self.buf[..idx].trim().to_string();
+                        self.buf = self.buf[idx + CLOSE_VIEW.len()..].to_string();
+                        self.inside = None;
+                        out.push(Segment::View { id, op, source });
+                        continue;
+                    }
+                    break; // close not present yet; keep buffering the source
                 }
             }
         }
@@ -137,20 +191,43 @@ fn push_spoken(out: &mut Vec<Segment>, text: &str) {
 }
 
 /// Length (bytes) of the longest suffix of `buf` that is a proper prefix of a
-/// surface opener — i.e. a marker possibly split across chunks.
+/// surface or view opener — i.e. a marker possibly split across chunks.
 fn partial_open_suffix_len(buf: &str) -> usize {
-    let max = OPEN_CARD.len().max(OPEN_FULL.len()) - 1;
+    let max = OPEN_CARD.len().max(OPEN_FULL.len()).max(OPEN_VIEW.len()) - 1;
     let start = buf.len().saturating_sub(max);
     for i in start..buf.len() {
         if !buf.is_char_boundary(i) {
             continue;
         }
         let suffix = &buf[i..];
-        if OPEN_CARD.starts_with(suffix) || OPEN_FULL.starts_with(suffix) {
+        if OPEN_CARD.starts_with(suffix)
+            || OPEN_FULL.starts_with(suffix)
+            || OPEN_VIEW.starts_with(suffix)
+        {
             return buf.len() - i;
         }
     }
     0
+}
+
+/// Parse a view opener's attributes (`id=… op=…`) from the text between `[[view`
+/// and `]]`. A missing `id` gets a fresh uuid (no animation continuity); an
+/// unknown or missing `op` defaults to `show`. Values may be optionally quoted.
+fn parse_view_attrs(attrs: &str) -> (String, ViewOp) {
+    let mut id: Option<String> = None;
+    let mut op = ViewOp::Show;
+    for tok in attrs.split_whitespace() {
+        if let Some(v) = tok.strip_prefix("id=") {
+            id = Some(v.trim_matches('"').to_string());
+        } else if let Some(v) = tok.strip_prefix("op=") {
+            op = match v.trim_matches('"') {
+                "replace" => ViewOp::Replace,
+                "dismiss" => ViewOp::Dismiss,
+                _ => ViewOp::Show,
+            };
+        }
+    }
+    (id.unwrap_or_else(|| Uuid::now_v7().to_string()), op)
 }
 
 /// Coalesce spoken text into sentences for TTS. Pure: no side-effects, so the
@@ -177,6 +254,23 @@ pub(super) fn surface_emits(splitter: &mut Segmenter<Terminator>, env: SurfaceEn
     out
 }
 
+/// Release a view, paced to its sentence exactly like [`surface_emits`]: flush
+/// whatever spoken text the splitter is still holding FIRST, so the view lands
+/// after the sentence before it and right as the next begins. Pure.
+pub(super) fn view_emits(
+    splitter: &mut Segmenter<Terminator>,
+    id: String,
+    op: ViewOp,
+    source: String,
+) -> Vec<Emit> {
+    let mut out = Vec::new();
+    if let Some(tail) = splitter.flush() {
+        out.push(Emit::Speak(tail));
+    }
+    out.push(Emit::ShowView { id, op, source });
+    out
+}
+
 #[cfg(test)]
 mod interleave_tests {
     use super::*;
@@ -184,6 +278,13 @@ mod interleave_tests {
     fn spoken(seg: &Segment) -> Option<&str> {
         match seg {
             Segment::Spoken(s) => Some(s.as_str()),
+            _ => None,
+        }
+    }
+
+    fn view(seg: &Segment) -> Option<(&str, ViewOp, &str)> {
+        match seg {
+            Segment::View { id, op, source } => Some((id.as_str(), *op, source.as_str())),
             _ => None,
         }
     }
@@ -241,6 +342,47 @@ mod interleave_tests {
         assert_eq!(spoken(&segs[1]), Some(" mid "));
         assert!(matches!(&segs[2], Segment::Surface(_)));
         assert_eq!(spoken(&segs[3]), Some(" end"));
+    }
+
+    #[test]
+    fn interleaves_text_and_view_in_order() {
+        let mut e = Extractor::new();
+        let segs = e.push("Here. [[view id=q op=show]]<X/>[[/view]] Done.");
+        assert_eq!(segs.len(), 3);
+        assert_eq!(spoken(&segs[0]), Some("Here. "));
+        assert_eq!(view(&segs[1]), Some(("q", ViewOp::Show, "<X/>")));
+        assert_eq!(spoken(&segs[2]), Some(" Done."));
+    }
+
+    #[test]
+    fn recognizes_view_marker_split_across_chunks() {
+        let mut e = Extractor::new();
+        // The opener itself is split mid-attribute across the chunk boundary.
+        let s1 = e.push("look [[view id=q op=re");
+        assert_eq!(s1.len(), 1);
+        assert_eq!(spoken(&s1[0]), Some("look "));
+        let s2 = e.push("place]]<Y/>[[/view]]");
+        assert_eq!(s2.len(), 1);
+        assert_eq!(view(&s2[0]), Some(("q", ViewOp::Replace, "<Y/>")));
+    }
+
+    #[test]
+    fn view_dismiss_needs_no_close() {
+        let mut e = Extractor::new();
+        let segs = e.push("[[view id=old op=dismiss]] bye");
+        assert_eq!(segs.len(), 2);
+        assert_eq!(view(&segs[0]), Some(("old", ViewOp::Dismiss, "")));
+        assert_eq!(spoken(&segs[1]), Some(" bye"));
+    }
+
+    #[test]
+    fn view_attrs_default_op_and_synthesize_id() {
+        let (id, op) = parse_view_attrs("");
+        assert!(!id.is_empty(), "a missing id is synthesized");
+        assert_eq!(op, ViewOp::Show);
+        let (id2, op2) = parse_view_attrs(r#"id="quiz" op="replace""#);
+        assert_eq!(id2, "quiz");
+        assert_eq!(op2, ViewOp::Replace);
     }
 }
 

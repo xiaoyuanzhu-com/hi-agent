@@ -70,7 +70,7 @@ use crate::capabilities::tts::{self, TtsStream};
 use crate::memory::{Memory, build_for_scene};
 use crate::observatory::{EventKind, Observatory, SessionKind};
 use crate::segment::{Segmenter, Terminator};
-use crate::types::{Channel, JournalEntry, Scene, Signal, SurfaceEnvelope};
+use crate::types::{Channel, JournalEntry, Scene, Signal, SurfaceEnvelope, ViewEnvelope, ViewOp};
 use bytes::Bytes;
 
 /// How long the floor must stay quiet after the last finalized utterance before
@@ -297,6 +297,10 @@ struct ReactorInner {
     /// Structured visibility into the session lifecycle. Turn, session, swap,
     /// worker and alarm events feed it; the HTTP front serves it.
     observatory: Observatory,
+    /// Compiles agent-authored `[[view]]` source into an ESM module the browser
+    /// imports. Invoked just-in-time when a view segment is released, so the
+    /// compiled module URL is what rides the /view channel.
+    view_compiler: crate::views::ViewCompiler,
     /// Monotonic cognition-turn counter. Each turn claims the next id;
     /// it tags audio spans and the channel logs so a reply is traceable end to
     /// end. (The client no longer needs it — turns are internal to the mind.)
@@ -316,6 +320,7 @@ pub fn start(
     mut warm_rx: mpsc::Receiver<Scene>,
     out: mpsc::Sender<OutboundSignal>,
     observatory: Observatory,
+    view_compiler: crate::views::ViewCompiler,
 ) -> Reactor {
     let reactor = Reactor {
         inner: Arc::new(ReactorInner {
@@ -324,6 +329,7 @@ pub fn start(
             soul,
             out,
             observatory,
+            view_compiler,
             turn_seq: AtomicU64::new(0),
             scenes: Mutex::new(HashMap::new()),
         }),
@@ -768,6 +774,11 @@ async fn run_turn(
                             perform(emit, &synth_tx, reactor, scene).await;
                         }
                     }
+                    interleave::Segment::View { id, op, source } => {
+                        for emit in interleave::view_emits(&mut splitter, id, op, source) {
+                            perform(emit, &synth_tx, reactor, scene).await;
+                        }
+                    }
                 }
             }
         }
@@ -909,6 +920,9 @@ async fn perform(
             }
         }
         interleave::Emit::Show(env) => emit_surface(reactor, scene, env).await,
+        interleave::Emit::ShowView { id, op, source } => {
+            emit_view(reactor, scene, id, op, source).await
+        }
     }
 }
 
@@ -1029,6 +1043,43 @@ async fn emit_surface(reactor: &Reactor, scene: &Scene, envelope: SurfaceEnvelop
         .send(OutboundSignal::Surface {
             scene: scene.clone(),
             envelope,
+        })
+        .await;
+}
+
+/// Emit one agent-authored view on the /view channel for this scene. A `show`/
+/// `replace` compiles the source to a module first (just-in-time, after the
+/// preceding sentence has flushed, so it stays paced to narration); a `dismiss`
+/// carries no module. A compile failure is logged and the view is dropped — the
+/// turn's speech already went out, so a broken view never breaks the reply.
+async fn emit_view(reactor: &Reactor, scene: &Scene, id: String, op: ViewOp, source: String) {
+    let module_url = if op == ViewOp::Dismiss {
+        None
+    } else {
+        match reactor.inner.view_compiler.compile(&source).await {
+            Ok(url) => Some(url),
+            Err(err) => {
+                tracing::warn!(scene = %scene, id = %id, error = %err, "view compile failed; dropping view");
+                return;
+            }
+        }
+    };
+    tracing::info!(
+        target: "channel",
+        dir = "out",
+        channel = "view",
+        scene = %scene,
+        id = %id,
+        op = ?op,
+        module = module_url.as_deref().unwrap_or(""),
+        "channel out (view)",
+    );
+    let _ = reactor
+        .inner
+        .out
+        .send(OutboundSignal::View {
+            scene: scene.clone(),
+            envelope: ViewEnvelope { id, op, module_url, ttl_ms: None },
         })
         .await;
 }

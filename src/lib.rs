@@ -100,6 +100,9 @@ pub async fn run(config: Config) -> anyhow::Result<()> {
     let _proxy = proxy;
 
     let soul = reactor::load_soul(&config.data_dir);
+    // The reactor compiles `[[view]]` source to ESM via esbuild from the resolved
+    // runtime; modules land under data_dir/generated/views.
+    let view_compiler = views::ViewCompiler::new(&runtime, &config.data_dir);
     let _reactor = reactor::start(
         memory,
         agent,
@@ -108,6 +111,7 @@ pub async fn run(config: Config) -> anyhow::Result<()> {
         seams.warm_rx,
         seams.out_tx,
         observatory,
+        view_compiler,
     );
     tracing::info!("reactor started");
 
