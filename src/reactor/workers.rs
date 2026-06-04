@@ -4,17 +4,18 @@
 //! work, so heavy or long-running tasks are delegated here. A worker is a
 //! *voice-mute capability within the scene*: it has the full substrate — the
 //! scene's memory, tools, code execution, the right to spawn further workers —
-//! but no voice of its own. It never speaks: it cannot emit on the reactor's
-//! expression channels (thought / audio / surface). That voice-mute-ness is what
-//! preserves single-voice coherence: only the reactor speaks to the person.
+//! but no voice of its own. It never speaks and never draws on the screen: it
+//! cannot emit on the reactor's expression channels (thought, audio, view). That
+//! mute-ness is what preserves single-voice coherence: only the reactor expresses
+//! to the person.
 //!
 //! It is *not*, however, channel-blind. Over hi-agent's own HTTP surface
 //! (`HI_AGENT_BASE_URL` in its env) a worker may **perceive input channels**
-//! (e.g. `GET /api/in/vision` for live frames) and **drive the non-voice `overlay`
-//! channel** (`POST /api/out/overlay`) — the deliberate continuous-data exception
-//! that lets a worker, say, run face detection and push rects to the UI without
-//! ever holding the voice. Both ride *outside* the turn loop, so they never
-//! contend with the reactor's serialized speech.
+//! (e.g. `GET /api/in/vision` for live frames) — running detection, CV, whatever
+//! the task needs on the raw bytes, all *outside* the turn loop so it never
+//! contends with the reactor's serialized speech. It does not write to any output
+//! channel: expression (speech and views alike) stays the reactor's, so a worker
+//! reports what it found and the reactor decides what to show.
 //!
 //! The collaboration bus is asynchronous and worker→reactor here: a worker runs
 //! to completion (or until it must ask something), then posts a [`WorkerReport`]
@@ -58,27 +59,23 @@ human-interface agent to carry out one specific delegated task. You have full \
 access to files, code execution, memory, and the rest of the harness's tools — \
 use them freely to actually complete the work, not merely plan it.\n\
 \n\
-You have no voice of your own. You are not talking to the human, and nothing \
-you write is spoken aloud — never try to address the person. The agent owns the \
-voice: do NOT write to the thought, audio, or surface channels. Your job is to \
-DO the task and then report the result: finish with a clear, self-contained \
-summary of what you did and what came of it. That summary is handed back to the \
-agent verbatim, so include everything it needs to act on or to relay — don't \
-assume it can see your working notes.\n\
+You have no voice of your own and nothing you produce reaches the person \
+directly: you neither speak nor draw on their screen. The agent owns all \
+expression — it does the talking and decides what to show. Your job is to DO the \
+task and then report the result: finish with a clear, self-contained summary of \
+what you did and what came of it. That summary is handed back to the agent \
+verbatim, so include everything it needs to act on or to relay — don't assume it \
+can see your working notes. If something should be shown to the person, say so in \
+your report and let the agent present it.\n\
 \n\
-You ARE allowed to use hi-agent's own channels for perception and for the one \
-non-voice output, the overlay. The server's base URL is in the \
-`HI_AGENT_BASE_URL` environment variable, and your scene is `{scene}` — send it \
-as the `X-HI-Scene` header on every request. Specifically:\n\
-- Perceive input channels, e.g. live camera frames:\n\
+You MAY use hi-agent's own input channels to perceive. The server's base URL is \
+in the `HI_AGENT_BASE_URL` environment variable, and your scene is `{scene}` — \
+send it as the `X-HI-Scene` header on every request. For example, live camera \
+frames:\n\
     `GET $HI_AGENT_BASE_URL/api/in/vision` with header `X-HI-Scene: {scene}`\n\
   (one frame per response; re-request for the next). Process the raw bytes \
-however the task needs — detection, CV, etc. is your job.\n\
-- Drive the overlay (a continuous, non-voice visual channel — e.g. face rects):\n\
-    `POST $HI_AGENT_BASE_URL/api/out/overlay` with header `X-HI-Scene: {scene}` and \
-a JSON body (one frame per POST; the UI repaints each line).\n\
-The overlay is the ONLY thing you may write to the person's screen, and it is \
-not speech — never use it to talk. Speaking stays the agent's job.\n\
+however the task needs — detection, CV, etc. is your job. You do not write to any \
+output channel; presenting is the agent's job.\n\
 \n\
 If you hit something genuinely ambiguous, do not stall waiting for an answer. \
 Make the most reasonable assumption, note it, and keep going — the agent can \
