@@ -11,16 +11,21 @@ import {
 const BASE = "/inspect/scenes";
 const MAX_PER_CHANNEL = 200;
 
-// Every channel a scene can carry, in display order. The detail view shows a
-// card per channel so an operator sees the full sensory/expressive surface —
-// including the quiet ones — not only the channels that happen to be active.
+// Channels shown in the detail view, in display order. A card per channel lets
+// an operator see the expressive/sensory surface — including the quiet ones —
+// not only the channels that happen to be active. Touch/smell/taste are hidden
+// for now until they carry real signal.
 const CHANNELS: { key: Channel; label: string }[] = [
   { key: "text", label: "Text" },
   { key: "audio", label: "Audio" },
   { key: "vision", label: "Vision" },
-  { key: "touch", label: "Touch" },
-  { key: "smell", label: "Smell" },
-  { key: "taste", label: "Taste" },
+];
+
+// Top-level sectioning: the view splits into what the agent perceives (in) and
+// what it expresses (out), and each section lays out the channels beneath it.
+const DIRECTIONS: { key: ChannelSignal["direction"]; label: string }[] = [
+  { key: "in", label: "Input" },
+  { key: "out", label: "Output" },
 ];
 
 function time(iso: string): string {
@@ -112,13 +117,16 @@ function SceneChannels({ scene }: { scene: string }) {
     );
   }, [scene]);
 
-  const byChannel = useMemo(() => {
-    const m = new Map<Channel, ChannelSignal[]>();
+  // Bucket per (direction, channel) so each section's channel card draws only
+  // its own side of the conversation.
+  const byCell = useMemo(() => {
+    const m = new Map<string, ChannelSignal[]>();
     for (const sig of signals) {
-      const arr = m.get(sig.channel) ?? [];
+      const cell = `${sig.direction}:${sig.channel}`;
+      const arr = m.get(cell) ?? [];
       arr.push(sig);
       if (arr.length > MAX_PER_CHANNEL) arr.shift();
-      m.set(sig.channel, arr);
+      m.set(cell, arr);
     }
     return m;
   }, [signals]);
@@ -133,34 +141,38 @@ function SceneChannels({ scene }: { scene: string }) {
         </span>
       </div>
 
-      <div className="chan-grid">
-        {CHANNELS.map(({ key, label }) => {
-          const items = byChannel.get(key) ?? [];
-          return (
-            <div className="card chan" key={key}>
-              <h4>
-                {label} <span className="muted">({items.length})</span>
-              </h4>
-              {items.length === 0 ? (
-                <div className="muted chan-idle">idle</div>
-              ) : (
-                <div className="chan-feed">
-                  {items
-                    .slice()
-                    .reverse()
-                    .map((sig, i) => (
-                      <div className="chan-line" key={`${sig.ts}-${i}`}>
-                        <span className="ts">{time(sig.ts)}</span>
-                        <span className={`dir ${sig.direction}`}>{sig.direction === "in" ? "◂ in" : "▸ out"}</span>
-                        <span className={`chan-body ${sig.final ? "" : "partial"}`}>{sig.body}</span>
-                      </div>
-                    ))}
+      {DIRECTIONS.map(({ key: dir, label: dirLabel }) => (
+        <section className={`chan-section ${dir}`} key={dir}>
+          <h3 className="chan-section-title">{dirLabel}</h3>
+          <div className="chan-grid">
+            {CHANNELS.map(({ key, label }) => {
+              const items = byCell.get(`${dir}:${key}`) ?? [];
+              return (
+                <div className="card chan" key={key}>
+                  <h4>
+                    {label} <span className="muted">({items.length})</span>
+                  </h4>
+                  {items.length === 0 ? (
+                    <div className="muted chan-idle">idle</div>
+                  ) : (
+                    <div className="chan-feed">
+                      {items
+                        .slice()
+                        .reverse()
+                        .map((sig, i) => (
+                          <div className="chan-line" key={`${sig.ts}-${i}`}>
+                            <span className="ts">{time(sig.ts)}</span>
+                            <span className={`chan-body ${sig.final ? "" : "partial"}`}>{sig.body}</span>
+                          </div>
+                        ))}
+                    </div>
+                  )}
                 </div>
-              )}
-            </div>
-          );
-        })}
-      </div>
+              );
+            })}
+          </div>
+        </section>
+      ))}
     </div>
   );
 }

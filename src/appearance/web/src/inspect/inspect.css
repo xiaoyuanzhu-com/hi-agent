@@ -115,21 +115,20 @@
 
 /* events */
 .acp-events h3 { font-size: 12px; text-transform: uppercase; letter-spacing: .06em; color: var(--dim); margin: 16px 0 8px; }
-.evlist { font-family: var(--mono); font-size: 12px; line-height: 1.6; }
-.ev { display: flex; flex-direction: column; gap: 4px; padding: 6px 0; border-bottom: 1px solid rgba(42,47,58,.5); }
-.ev .evhead { display: flex; gap: 10px; align-items: baseline; }
-.ev .ts { color: var(--dim); white-space: nowrap; }
-.ev .evname { font-weight: 600; white-space: nowrap; }
-.ev .evseq { color: var(--dim); margin-left: auto; }
-.ev .evname.worker_question { color: var(--warn); }
-.ev .evname.hot_swap, .ev .evname.session_opened { color: var(--accent); }
-.ev .evname.worker_finished { color: var(--ok); }
-.ev .evname.process_restarted, .ev .evname.session_closed { color: var(--bad); }
-.evpayload { display: grid; grid-template-columns: max-content minmax(0, 1fr); gap: 2px 12px; padding-left: 14px; }
-.evfield { display: contents; }
-.evk { color: var(--accent); white-space: nowrap; }
-.evstr { margin: 0; font-family: var(--mono); color: var(--fg); white-space: pre-wrap; overflow-wrap: anywhere; }
-.evscalar { color: var(--ok); }
+.evtable { width: 100%; border-collapse: collapse; font-family: var(--mono); font-size: 12px; line-height: 1.6; table-layout: fixed; }
+.evtable th { text-align: left; font-weight: 600; color: var(--dim); text-transform: uppercase; font-size: 11px; letter-spacing: .04em; padding: 4px 12px 4px 0; border-bottom: 1px solid rgba(42,47,58,.8); }
+.evtable th:nth-child(1) { width: 96px; }
+.evtable th:nth-child(2) { width: 160px; }
+.evtable th:nth-child(3) { width: 48px; }
+.evtable td { padding: 5px 12px 5px 0; border-bottom: 1px solid rgba(42,47,58,.5); vertical-align: top; }
+.evtable .ts { color: var(--dim); white-space: nowrap; }
+.evtable .evname { font-weight: 600; white-space: nowrap; }
+.evtable .evseq { color: var(--dim); }
+.evtable .evname.worker_question { color: var(--warn); }
+.evtable .evname.hot_swap, .evtable .evname.session_opened { color: var(--accent); }
+.evtable .evname.worker_finished { color: var(--ok); }
+.evtable .evname.process_restarted, .evtable .evname.session_closed { color: var(--bad); }
+.evtable .evraw pre { margin: 0; font-family: var(--mono); color: var(--fg); white-space: pre-wrap; overflow-wrap: anywhere; }
 .evnull { color: var(--dim); font-style: italic; }
 
 /* session-kind tag in the ACP list */
@@ -145,15 +144,19 @@
 .dh-title .live-dot { display: inline-block; margin-left: 6px; vertical-align: middle; }
 
 /* ---- Scenes tab: per-channel live presence ---- */
+.chan-section { margin-top: 18px; }
+.chan-section-title {
+  margin: 0 0 8px; font-size: 11px; letter-spacing: .08em; text-transform: uppercase;
+  font-weight: 700; padding-left: 8px; border-left: 3px solid var(--line); color: var(--dim);
+}
+.chan-section.in .chan-section-title { border-left-color: var(--ok); color: var(--ok); }
+.chan-section.out .chan-section-title { border-left-color: var(--accent); color: var(--accent); }
 .chan-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(260px, 1fr)); gap: 12px; }
 .card.chan { margin-bottom: 0; display: flex; flex-direction: column; min-height: 120px; }
 .chan-idle { font-family: var(--mono); font-size: 12px; }
 .chan-feed { font-family: var(--mono); font-size: 12px; line-height: 1.55; overflow-y: auto; max-height: 260px; }
 .chan-line { display: flex; gap: 8px; padding: 1px 0; border-bottom: 1px solid rgba(42,47,58,.5); }
 .chan-line .ts { color: var(--dim); white-space: nowrap; }
-.chan-line .dir { white-space: nowrap; font-weight: 600; }
-.chan-line .dir.in { color: var(--ok); }
-.chan-line .dir.out { color: var(--accent); }
 .chan-line .chan-body { word-break: break-word; white-space: pre-wrap; }
 .chan-line .chan-body.partial { color: var(--dim); }
 

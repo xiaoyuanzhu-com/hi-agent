@@ -25,36 +25,19 @@ function time(iso: string): string {
   }
 }
 
-// Fields shown in the event header (or redundant there); everything else is
-// rendered as raw payload below.
+// Fixed columns of the event table; every other field is rolled into the raw
+// JSON payload cell.
 const META_KEYS = new Set(["seq", "ts", "scene", "event"]);
 
-// Render one payload value exactly as it arrived — this is a debug surface, so
-// nothing is summarized or truncated: strings verbatim with whitespace and
-// newlines preserved, scalars plainly, objects/arrays as pretty JSON.
-function EventValue({ value }: { value: unknown }) {
-  if (value === null || value === undefined) return <span className="evnull">null</span>;
-  if (typeof value === "string") return <pre className="evstr">{value}</pre>;
-  if (typeof value === "number" || typeof value === "boolean")
-    return <span className="evscalar">{String(value)}</span>;
-  return <pre className="evstr">{JSON.stringify(value, null, 2)}</pre>;
-}
-
-// The structured payload of one event: every non-meta field as a key/value row,
-// in the order the backend serialized them.
-function EventPayload({ d }: { d: SessionEvent }) {
+// The leftover payload of one event — everything that isn't a fixed column —
+// dumped verbatim as pretty JSON. This is a debug surface, so nothing is
+// summarized or truncated.
+function rawPayload(d: SessionEvent): string | null {
   const keys = Object.keys(d).filter((k) => !META_KEYS.has(k));
   if (keys.length === 0) return null;
-  return (
-    <div className="evpayload">
-      {keys.map((k) => (
-        <div className="evfield" key={k}>
-          <span className="evk">{k}</span>
-          <EventValue value={d[k]} />
-        </div>
-      ))}
-    </div>
-  );
+  const payload: Record<string, unknown> = {};
+  for (const k of keys) payload[k] = d[k];
+  return JSON.stringify(payload, null, 2);
 }
 
 // One ACP session, flattened out of the per-scene snapshot. A scene contributes
@@ -281,18 +264,29 @@ function EventLog({ events }: { events: SessionEvent[] }) {
       {events.length === 0 ? (
         <div className="muted pad">No events yet.</div>
       ) : (
-        <div className="evlist">
-          {events.map((d) => (
-            <div className="ev" key={d.seq}>
-              <div className="evhead">
-                <span className="ts">{time(d.ts)}</span>
-                <span className={`evname ${d.event}`}>{d.event}</span>
-                <span className="evseq">#{d.seq}</span>
-              </div>
-              <EventPayload d={d} />
-            </div>
-          ))}
-        </div>
+        <table className="evtable">
+          <thead>
+            <tr>
+              <th>Time</th>
+              <th>Event</th>
+              <th>#</th>
+              <th>Payload</th>
+            </tr>
+          </thead>
+          <tbody>
+            {events.map((d) => {
+              const raw = rawPayload(d);
+              return (
+                <tr key={d.seq}>
+                  <td className="ts">{time(d.ts)}</td>
+                  <td className={`evname ${d.event}`}>{d.event}</td>
+                  <td className="evseq">{d.seq}</td>
+                  <td className="evraw">{raw ? <pre>{raw}</pre> : <span className="evnull">—</span>}</td>
+                </tr>
+              );
+            })}
+          </tbody>
+        </table>
       )}
     </div>
   );
