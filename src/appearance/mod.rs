@@ -111,6 +111,14 @@ async fn index() -> Response {
                 None => format!("{html}{injection}"),
             };
 
+            // An import map must precede the first module script — the browser
+            // rejects one added after a module has begun loading — so this
+            // injects ahead of Vite's `<script type="module">`, not before
+            // </head> like the OG tags. It lets a runtime-imported agent view
+            // module resolve `react` / `@hi/core` / `motion/react` to the same
+            // shared chunks the host loaded (see web/vite.config.ts).
+            let injected = inject_importmap(injected);
+
             html_response(injected, StatusCode::OK)
         }
         None => {
@@ -123,6 +131,35 @@ async fn index() -> Response {
 /// `GET /assets/*path` — serve a hashed asset from the embedded dist.
 async fn asset(Path(path): Path<String>) -> Response {
     serve_embedded(&format!("assets/{path}"))
+}
+
+/// Inject the build's `importmap.json` (if embedded) as a `<script type=
+/// "importmap">` ahead of the first module script. A no-op when no map is
+/// embedded (debug builds before the SPA is built).
+fn inject_importmap(html: String) -> String {
+    match embed::get("importmap.json") {
+        Some(file) => {
+            let map = String::from_utf8_lossy(file.data.as_ref());
+            splice_importmap(&html, map.trim())
+        }
+        None => html,
+    }
+}
+
+/// Splice an import map script before the first `<script type="module"` in
+/// `html`. Pure (no embed access) so the ordering invariant is unit-testable.
+/// Returns `html` unchanged if it has no module script.
+fn splice_importmap(html: &str, map_json: &str) -> String {
+    let needle = "<script type=\"module\"";
+    let Some(idx) = html.find(needle) else {
+        return html.to_string();
+    };
+    let tag = format!("<script type=\"importmap\">\n{map_json}\n    </script>\n    ");
+    let mut out = String::with_capacity(html.len() + tag.len());
+    out.push_str(&html[..idx]);
+    out.push_str(&tag);
+    out.push_str(&html[idx..]);
+    out
 }
 
 async fn favicon() -> Response {
@@ -243,5 +280,21 @@ mod tests {
         assert!(embed::content_type_for("x.js").starts_with("application/javascript"));
         assert!(embed::content_type_for("x.css").starts_with("text/css"));
         assert!(embed::content_type_for("x.unknown").starts_with("application/octet-stream"));
+    }
+
+    #[test]
+    fn importmap_spliced_before_first_module_script() {
+        let html = r#"<head><script type="module" crossorigin src="/x.js"></script></head>"#;
+        let out = splice_importmap(html, r#"{"imports":{"react":"/assets/r.js"}}"#);
+        let map_pos = out.find("type=\"importmap\"").expect("import map present");
+        let mod_pos = out.find("type=\"module\"").expect("module script present");
+        assert!(map_pos < mod_pos, "import map must precede the module script");
+        assert!(out.contains(r#""react":"/assets/r.js""#));
+    }
+
+    #[test]
+    fn splice_importmap_noops_without_module_script() {
+        let html = "<head></head>";
+        assert_eq!(splice_importmap(html, "{}"), "<head></head>");
     }
 }
