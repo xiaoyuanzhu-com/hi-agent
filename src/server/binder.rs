@@ -16,7 +16,7 @@ use chrono::Utc;
 use tokio::sync::{broadcast, mpsc};
 
 use crate::reactor::OutboundSignal;
-use crate::server::{AudioEvent, OutputEcho, SurfaceEvent, TextBus};
+use crate::server::{AudioEvent, OutputEcho, SurfaceEvent, TextBus, ViewEvent};
 use crate::types::Channel;
 
 /// Drain the reactor's outbound seam and bind each signal to its HTTP carrier.
@@ -27,6 +27,7 @@ pub(crate) async fn bind_outbound(
     text_bus: TextBus,
     audio_out: broadcast::Sender<AudioEvent>,
     surface_out: broadcast::Sender<SurfaceEvent>,
+    view_out: broadcast::Sender<ViewEvent>,
     output_echo: broadcast::Sender<OutputEcho>,
 ) {
     while let Some(signal) = rx.recv().await {
@@ -83,6 +84,15 @@ pub(crate) async fn bind_outbound(
             // by scene.
             OutboundSignal::Surface { scene, envelope } => {
                 let _ = surface_out.send(SurfaceEvent {
+                    scene: Some(scene),
+                    envelope,
+                    ts: Utc::now(),
+                });
+            }
+            // /view: one view event broadcast the long-poll handler filters by
+            // scene. Mirrors /surface — turn-paced, one event per response.
+            OutboundSignal::View { scene, envelope } => {
+                let _ = view_out.send(ViewEvent {
                     scene: Some(scene),
                     envelope,
                     ts: Utc::now(),

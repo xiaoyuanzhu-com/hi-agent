@@ -14,7 +14,7 @@ use tower_http::trace::TraceLayer;
 use crate::memory::Memory;
 use crate::observatory::Observatory;
 use crate::reactor::OutboundSignal;
-use crate::types::{Channel, Scene, Signal, SurfaceEnvelope};
+use crate::types::{Channel, Scene, Signal, SurfaceEnvelope, ViewEnvelope};
 
 pub mod audio;
 pub mod binder;
@@ -28,6 +28,7 @@ pub mod stubs;
 pub mod surface;
 pub mod text;
 pub mod text_bus;
+pub mod view;
 pub mod vision;
 
 pub use text_bus::TextBus;
@@ -74,6 +75,16 @@ impl AudioEvent {
 pub struct SurfaceEvent {
     pub scene: Option<Scene>,
     pub envelope: SurfaceEnvelope,
+    pub ts: DateTime<Utc>,
+}
+
+/// Outbound agent-authored view event. Carries the view envelope (compiled
+/// module URL + op) plus the routing target the GET /out/view long-poll filters
+/// on. The view-channel analogue of [`SurfaceEvent`].
+#[derive(Debug, Clone)]
+pub struct ViewEvent {
+    pub scene: Option<Scene>,
+    pub envelope: ViewEnvelope,
     pub ts: DateTime<Utc>,
 }
 
@@ -175,6 +186,11 @@ pub struct AppState {
     /// from this; the reactor produces envelopes when the agent emits a surface.
     pub surface_out: broadcast::Sender<SurfaceEvent>,
 
+    /// Outbound view-module broadcast. GET /api/out/view subscribers receive from
+    /// this; the reactor produces envelopes when the agent emits a `[[view]]` and
+    /// the view compiler has built its module.
+    pub view_out: broadcast::Sender<ViewEvent>,
+
     /// Vision-frame broadcast — the read side of the vision *input* channel.
     /// POST /api/in/vision publishes each frame here; GET /api/in/vision
     /// subscribers (a detector working session, …) consume it. Written directly by
@@ -240,6 +256,7 @@ pub fn build(memory: Memory, data_dir: PathBuf, observatory: Observatory) -> (Ro
     let text_bus = TextBus::new();
     let (audio_tx, _) = broadcast::channel::<AudioEvent>(64);
     let (surface_tx, _) = broadcast::channel::<SurfaceEvent>(64);
+    let (view_tx, _) = broadcast::channel::<ViewEvent>(64);
     let (vision_tx, _) = broadcast::channel::<VisionFrameEvent>(64);
     let (overlay_tx, _) = broadcast::channel::<OverlayEvent>(64);
     // Input echo: live broadcast, lossy ring, no replay (see `InputEcho`).
@@ -257,6 +274,7 @@ pub fn build(memory: Memory, data_dir: PathBuf, observatory: Observatory) -> (Ro
         text_bus.clone(),
         audio_tx.clone(),
         surface_tx.clone(),
+        view_tx.clone(),
         output_echo_tx.clone(),
     ));
 
@@ -266,6 +284,7 @@ pub fn build(memory: Memory, data_dir: PathBuf, observatory: Observatory) -> (Ro
         text_bus: text_bus.clone(),
         audio_out: audio_tx.clone(),
         surface_out: surface_tx.clone(),
+        view_out: view_tx.clone(),
         vision_out: vision_tx.clone(),
         overlay_out: overlay_tx.clone(),
         input_echo: input_echo_tx.clone(),
@@ -286,6 +305,9 @@ pub fn build(memory: Memory, data_dir: PathBuf, observatory: Observatory) -> (Ro
         .route("/api/in/audio/stream", get(audio::get_audio_stream))
         .route("/api/out/audio", get(audio::get_out_audio))
         .route("/api/out/surface", get(surface::get_out_surface))
+        // The view channel — agent-authored view modules, turn-paced like
+        // surface (one envelope per long-poll response, scene-filtered).
+        .route("/api/out/view", get(view::get_out_view))
         // Vision is an input channel that is also observable: POST a frame,
         // GET the live frame stream (a worker session reads it).
         .route("/api/in/vision", post(vision::post_vision).get(vision::get_vision))

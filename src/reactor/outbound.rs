@@ -16,7 +16,7 @@
 
 use bytes::Bytes;
 
-use crate::types::{Scene, SurfaceEnvelope};
+use crate::types::{Scene, SurfaceEnvelope, ViewEnvelope};
 
 /// One continuous outbound signal on a channel, addressed to a scene. The
 /// reactor's entire output surface in human-channel terms.
@@ -37,4 +37,8 @@ pub enum OutboundSignal {
     AudioEnd { scene: Scene, turn: u64 },
     /// A rich-content surface to show on the /surface channel.
     Surface { scene: Scene, envelope: SurfaceEnvelope },
+    /// An agent-authored view module to mount on the /view channel. `envelope`
+    /// carries the compiled module URL; the binder broadcasts it to GET
+    /// /api/out/view subscribers.
+    View { scene: Scene, envelope: ViewEnvelope },
 }

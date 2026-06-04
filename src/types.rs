@@ -198,3 +198,34 @@ pub struct SurfaceEnvelope {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub ttl_ms: Option<u64>,
 }
+
+// -----------------------------------------------------------------------------
+// ViewEnvelope — outbound agent-authored view module for the UI view slot
+// -----------------------------------------------------------------------------
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ViewOp {
+    /// Mount a new view under `id`.
+    Show,
+    /// Swap the module mounted under an existing `id` in place. Reusing the id
+    /// is the continuity lever — the client keeps the slot, so a `motion`-tagged
+    /// element animates rather than popping.
+    Replace,
+    /// Remove the view mounted under `id`.
+    Dismiss,
+}
+
+/// One view event delivered to the browser over GET /api/out/view. `module_url`
+/// points at the compiled ESM module (`/generated/views/<hash>.mjs`) the client
+/// dynamically imports and mounts under `id` in the view slot. For
+/// `op = dismiss` only `id` is meaningful.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ViewEnvelope {
+    pub id: String,
+    pub op: ViewOp,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub module_url: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub ttl_ms: Option<u64>,
+}
