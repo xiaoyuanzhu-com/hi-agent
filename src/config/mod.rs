@@ -39,6 +39,10 @@ pub struct AgentConfig {
     pub effort: Option<String>,
     pub permission_mode: Option<String>,
     pub upstream_key: String,
+    /// Throwaway `sk-…` key the child uses to reach the local proxy. Generated
+    /// once per process; the proxy discards it and injects [`Self::upstream_key`].
+    /// Pre-approved in the managed `.claude.json` so the child will send it.
+    pub placeholder_key: String,
 }
 
 // Hand-written so the upstream credential never lands in logs (`Config` derives
@@ -51,6 +55,7 @@ impl std::fmt::Debug for AgentConfig {
             .field("effort", &self.effort)
             .field("permission_mode", &self.permission_mode)
             .field("upstream_key", &"<redacted>")
+            .field("placeholder_key", &self.placeholder_key)
             .finish()
     }
 }
@@ -102,6 +107,7 @@ impl AgentConfig {
             effort: raw.effort,
             permission_mode: raw.permission_mode,
             upstream_key,
+            placeholder_key: format!("sk-{}", uuid::Uuid::now_v7().simple()),
         })
     }
 
@@ -127,9 +133,46 @@ impl AgentConfig {
         Ok(())
     }
 
-    /// Placeholder API key handed to the adapter. The proxy supplies the real
-    /// upstream key; the SDK only requires *some* non-empty value here.
-    pub const PLACEHOLDER_KEY: &'static str = "hi-agent-proxy";
+    /// Pre-approve the generated placeholder key in the managed config dir's
+    /// `.claude.json`.
+    ///
+    /// Claude Code treats any key supplied via `ANTHROPIC_API_KEY` as a "custom"
+    /// key and refuses to use it unless its last-20-char fingerprint appears in
+    /// `customApiKeyResponses.approved`. Without this, `session/prompt` fails with
+    /// "Please run /login", which the ACP adapter surfaces as
+    /// `-32000 Authentication required`. We seed the approval so the proxy's
+    /// placeholder is accepted; the real upstream key never reaches the child.
+    ///
+    /// The key rotates every startup, so we pin `approved` to exactly the current
+    /// fingerprint — this dir is hi-agent-owned and the only custom key is ours,
+    /// so there is nothing else to preserve and the list stays bounded.
+    pub fn approve_placeholder_key(&self, config_dir: &Path) -> anyhow::Result<()> {
+        std::fs::create_dir_all(config_dir)
+            .with_context(|| format!("creating config dir {}", config_dir.display()))?;
+        let path = config_dir.join(".claude.json");
+
+        // Read-modify-write: `.claude.json` also holds userID, caches, etc.
+        let mut root: serde_json::Map<String, serde_json::Value> = match std::fs::read(&path) {
+            Ok(bytes) => {
+                serde_json::from_slice(&bytes).with_context(|| format!("parsing {}", path.display()))?
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => serde_json::Map::new(),
+            Err(e) => return Err(e).with_context(|| format!("reading {}", path.display())),
+        };
+
+        // Claude matches approvals by the key's last 20 chars (`key.slice(-20)`).
+        let key = self.placeholder_key.as_str();
+        let fingerprint = &key[key.len().saturating_sub(20)..];
+
+        root.insert(
+            "customApiKeyResponses".to_string(),
+            serde_json::json!({ "approved": [fingerprint], "rejected": [] }),
+        );
+
+        std::fs::write(&path, serde_json::to_vec_pretty(&serde_json::Value::Object(root))?)
+            .with_context(|| format!("writing {}", path.display()))?;
+        Ok(())
+    }
 
     /// Build the env var pairs for the ACP child process.
     ///
@@ -153,7 +196,7 @@ impl AgentConfig {
                 "ANTHROPIC_BASE_URL".to_string(),
                 format!("http://127.0.0.1:{proxy_port}"),
             ),
-            ("ANTHROPIC_API_KEY".to_string(), Self::PLACEHOLDER_KEY.to_string()),
+            ("ANTHROPIC_API_KEY".to_string(), self.placeholder_key.clone()),
             (
                 ENV_SERVER_BASE_URL.to_string(),
                 format!("http://127.0.0.1:{server_port}"),
@@ -292,12 +335,35 @@ mod tests {
         );
         let map: std::collections::HashMap<_, _> = env.into_iter().collect();
         assert_eq!(map["ANTHROPIC_BASE_URL"], "http://127.0.0.1:7777");
-        assert_eq!(map["ANTHROPIC_API_KEY"], "hi-agent-proxy");
+        // Generated per process; the env carries exactly the config's placeholder.
+        assert!(map["ANTHROPIC_API_KEY"].starts_with("sk-"));
+        assert_eq!(map["ANTHROPIC_API_KEY"], cfg.placeholder_key);
         assert_eq!(map["HI_AGENT_BASE_URL"], "http://127.0.0.1:8080");
         assert_eq!(map["ANTHROPIC_MODEL"], "claude-opus-4-8");
         assert!(!map.contains_key("MAX_THINKING_TOKENS"));
         assert_eq!(map["CLAUDE_CONFIG_DIR"], "/cache/config");
         assert_eq!(map["CLAUDE_CODE_EXECUTABLE"], "/cache/runtime/claude");
         assert!(map["PATH"].starts_with("/cache/runtime/node/bin"));
+    }
+
+    #[test]
+    fn approve_placeholder_key_seeds_fingerprint_and_preserves_other_fields() {
+        let cfg = AgentConfig::from_toml_str("", "https://x/v1".to_string(), "k".to_string())
+            .unwrap();
+        let dir = std::env::temp_dir().join(format!("hi-agent-test-{}", uuid::Uuid::now_v7()));
+        std::fs::create_dir_all(&dir).unwrap();
+        // Pre-existing managed state that must survive the read-modify-write.
+        std::fs::write(dir.join(".claude.json"), br#"{"userID":"abc"}"#).unwrap();
+
+        cfg.approve_placeholder_key(&dir).unwrap();
+
+        let v: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(dir.join(".claude.json")).unwrap()).unwrap();
+        assert_eq!(v["userID"], "abc");
+        let key = &cfg.placeholder_key;
+        let fp = &key[key.len().saturating_sub(20)..];
+        assert_eq!(v["customApiKeyResponses"]["approved"][0], fp);
+
+        std::fs::remove_dir_all(&dir).ok();
     }
 }

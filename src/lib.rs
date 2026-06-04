@@ -80,6 +80,9 @@ pub async fn run(config: Config) -> anyhow::Result<()> {
     // Render the managed settings.json into a hi-agent-owned config dir.
     let claude_config_dir = config.data_dir.join("claude-config");
     config.agent.render_settings_json(&claude_config_dir)?;
+    // Pre-approve the placeholder key, else Claude Code rejects the env-supplied
+    // `ANTHROPIC_API_KEY` ("Please run /login") and prompts fail with -32000.
+    config.agent.approve_placeholder_key(&claude_config_dir)?;
 
     // Spawn config for the agent session layer. The subprocess itself is spawned
     // lazily, one per scene, on that scene's first session (Chrome-style isolation);
