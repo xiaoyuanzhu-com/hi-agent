@@ -18,6 +18,7 @@ use axum::http::request::Parts;
 use crate::types::Scene;
 
 const HDR_SCENE: &str = "x-hi-scene";
+const HDR_STREAM: &str = "x-hi-stream";
 const HDR_AUTH: &str = "authorization";
 
 const ANONYMOUS: &str = "anonymous";
@@ -73,6 +74,32 @@ where
                 "X-HI-Scene required to name the subscribing scene\n",
             )),
         }
+    }
+}
+
+/// `X-HI-Stream`. Names a stream within the scene (`webcam`, `headset`); the
+/// scene can carry several concurrent streams per channel. Defaults to `None`
+/// — the scene's default stream — when missing or empty, so a client that never
+/// sets it behaves exactly as before. This is the single place `""` is folded to
+/// `None`, so a bare default never leaks downstream as `Some("")`.
+#[derive(Debug, Clone)]
+pub struct StreamHeader(pub Option<String>);
+
+impl<S> FromRequestParts<S> for StreamHeader
+where
+    S: Send + Sync,
+{
+    type Rejection = (StatusCode, &'static str);
+
+    async fn from_request_parts(parts: &mut Parts, _state: &S) -> Result<Self, Self::Rejection> {
+        let stream = parts
+            .headers
+            .get(HDR_STREAM)
+            .and_then(|v| v.to_str().ok())
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(str::to_owned);
+        Ok(StreamHeader(stream))
     }
 }
 

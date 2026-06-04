@@ -86,6 +86,10 @@ pub struct SurfaceEvent {
 #[derive(Debug, Clone)]
 pub struct VisionFrameEvent {
     pub scene: Option<Scene>,
+    /// Named stream within the scene (`webcam`), or `None` for the default
+    /// stream. `GET /api/in/vision` filters on this so concurrent feeds in one
+    /// scene stay separable; a subscriber asks for one with `?stream=`.
+    pub stream: Option<String>,
     pub bytes: Bytes,
     pub mime: String,
     pub ts: DateTime<Utc>,
@@ -148,6 +152,15 @@ pub struct AppState {
     /// Inbound signals from every channel POST. The reactor consumes these.
     pub inbound: mpsc::Sender<Signal>,
 
+    /// Scene warm-up requests. A scene-presence GET (`GET /api/out/*`, the
+    /// long-polls a client opens on scene entry) sends the scene here so the
+    /// reactor stands it up — spawning the subprocess and opening the ACP session —
+    /// before the first utterance lands, keeping that cold-start off the first
+    /// reply's critical path. Bounded and best-effort: a full channel only means
+    /// warm-ups are already queued, so a dropped request costs at most the
+    /// cold-start it would have saved.
+    pub warm: mpsc::Sender<Scene>,
+
     /// Outbound text buffer. GET /api/out/text readers drain it per scene.
     /// Unlike a broadcast, a reply produced while no reader is connected is
     /// retained for the next GET instead of being dropped.
@@ -207,10 +220,22 @@ impl AppState {
             ts: Utc::now(),
         });
     }
+
+    /// Ask the reactor to warm this scene up now — spawn its subprocess and open
+    /// its ACP session — triggered when a client opens one of the scene's
+    /// `/api/out/*` long-polls. Best-effort and non-blocking: a full queue drops
+    /// the request, leaving the scene to cold-start on first use as before.
+    /// Idempotent on the reactor side, so repeated GETs are harmless.
+    pub fn warm_scene(&self, scene: &Scene) {
+        let _ = self.warm.try_send(scene.clone());
+    }
 }
 
 pub fn build(memory: Memory, data_dir: PathBuf, observatory: Observatory) -> (Router, ServerSeams) {
     let (inbound_tx, inbound_rx) = mpsc::channel::<Signal>(1024);
+    // Scene warm-up requests: a presence GET asks the reactor to stand a scene up
+    // ahead of its first utterance (see `AppState::warm`).
+    let (warm_tx, warm_rx) = mpsc::channel::<Scene>(1024);
     let text_bus = TextBus::new();
     let (audio_tx, _) = broadcast::channel::<AudioEvent>(64);
     let (surface_tx, _) = broadcast::channel::<SurfaceEvent>(64);
@@ -236,6 +261,7 @@ pub fn build(memory: Memory, data_dir: PathBuf, observatory: Observatory) -> (Ro
 
     let state = Arc::new(AppState {
         inbound: inbound_tx,
+        warm: warm_tx,
         text_bus: text_bus.clone(),
         audio_out: audio_tx.clone(),
         surface_out: surface_tx.clone(),
@@ -281,6 +307,7 @@ pub fn build(memory: Memory, data_dir: PathBuf, observatory: Observatory) -> (Ro
 
     let seams = ServerSeams {
         inbound_rx,
+        warm_rx,
         text_bus,
         out_tx,
     };
@@ -289,12 +316,14 @@ pub fn build(memory: Memory, data_dir: PathBuf, observatory: Observatory) -> (Ro
 }
 
 /// What `build` hands back to wire the reactor to the HTTP front. `inbound_rx`
-/// is the channel POSTs feed; `out_tx` is the reactor's single transport-free
-/// outbound seam (the binder spawned in `build` carries it to the wire). The
-/// `text_bus` is exposed only so integration tests can drive utterances
-/// directly without standing up a reactor.
+/// is the channel POSTs feed; `warm_rx` carries scene warm-up requests a presence
+/// GET raises; `out_tx` is the reactor's single transport-free outbound seam (the
+/// binder spawned in `build` carries it to the wire). The `text_bus` is exposed
+/// only so integration tests can drive utterances directly without standing up a
+/// reactor.
 pub struct ServerSeams {
     pub inbound_rx: mpsc::Receiver<Signal>,
+    pub warm_rx: mpsc::Receiver<Scene>,
     pub text_bus: TextBus,
     pub out_tx: mpsc::Sender<OutboundSignal>,
 }

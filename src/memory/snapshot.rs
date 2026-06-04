@@ -49,8 +49,9 @@ impl Snapshot {
 fn render_entry(e: &JournalEntry) -> String {
     let ts = entry_ts(e).format("%H:%M:%S");
     match e {
-        JournalEntry::SignalIn { channel, scene, body, .. } => {
-            format!("[{}] {}\u{2192}agent on /{}: \"{}\"", ts, scene, channel, truncate(body, 200))
+        JournalEntry::SignalIn { channel, scene, body, stream, .. } => {
+            let chan = channel.with_stream(stream.as_deref());
+            format!("[{}] {}\u{2192}agent on /{}: \"{}\"", ts, scene, chan, truncate(body, 200))
         }
         JournalEntry::SignalOut { channel, scene, body, .. } => {
             format!("[{}] agent\u{2192}{} on /{}: \"{}\"", ts, scene, channel, truncate(body, 200))

@@ -104,6 +104,7 @@ pub async fn run(config: Config) -> anyhow::Result<()> {
         agent,
         soul,
         seams.inbound_rx,
+        seams.warm_rx,
         seams.out_tx,
         observatory,
     );

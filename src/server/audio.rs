@@ -50,7 +50,7 @@ use tokio::sync::mpsc;
 
 use crate::capabilities::stt::{self, Transcript};
 use crate::memory::media::{self, Direction};
-use crate::server::headers::{AuthBearer, RequiredScene, SceneHeader};
+use crate::server::headers::{AuthBearer, RequiredScene, SceneHeader, StreamHeader};
 use crate::server::{observe, AppState, AudioEvent};
 use crate::segment::{Segmenter, Speech};
 use crate::types::{Channel, JournalEntry, Scene, Signal};
@@ -66,6 +66,7 @@ struct PostAudioAck {
 pub async fn post_audio(
     State(state): State<Arc<AppState>>,
     SceneHeader(scene): SceneHeader,
+    StreamHeader(stream): StreamHeader,
     AuthBearer(auth): AuthBearer,
     headers: HeaderMap,
     body: Bytes,
@@ -139,6 +140,7 @@ pub async fn post_audio(
         channel: Channel::Audio,
         scene: scene.clone(),
         body: transcript.clone(),
+        stream: stream.clone(),
         ts,
     };
     crate::channel_log::inbound(Channel::Audio, &scene, &transcript);
@@ -147,6 +149,7 @@ pub async fn post_audio(
         channel: Channel::Audio,
         scene: scene.clone(),
         body: transcript.clone(),
+        stream,
         media_path: Some(media_path.clone()),
     };
     if let Err(err) = state.memory.journal.append(entry).await {
@@ -168,6 +171,10 @@ pub struct StreamParams {
     /// The streaming scene. Browsers can't set `X-HI-Scene` on a WebSocket
     /// handshake, so the scene rides in the query string instead.
     scene: Option<String>,
+    /// The named stream within the scene, same role as `X-HI-Stream` on the POST
+    /// path; absent/empty → the default stream. Rides the query string for the
+    /// same handshake reason as `scene`.
+    stream: Option<String>,
 }
 
 /// `GET /api/in/audio/stream` — continuous inbound speech over a WebSocket.
@@ -198,13 +205,15 @@ pub async fn get_audio_stream(
             .filter(|s| !s.is_empty())
             .unwrap_or_else(|| "anonymous".to_string()),
     );
-    tracing::info!(scene = %scene, "WS /api/in/audio/stream opened");
-    ws.on_upgrade(move |socket| stream_audio_in(state, scene, socket))
+    let stream = params.stream.map(|s| s.trim().to_owned()).filter(|s| !s.is_empty());
+    tracing::info!(scene = %scene, stream = ?stream, "WS /api/in/audio/stream opened");
+    ws.on_upgrade(move |socket| stream_audio_in(state, scene, stream, socket))
 }
 
 async fn stream_audio_in(
     state: Arc<AppState>,
     scene: Scene,
+    stream: Option<String>,
     mut socket: axum::extract::ws::WebSocket,
 ) {
     // PCM client → STT; Transcripts STT → echo/dispatch. Bounded so a stalled
@@ -221,6 +230,7 @@ async fn stream_audio_in(
     // when the speaker has gone quiet.
     let relay_state = state.clone();
     let relay_scene = scene.clone();
+    let relay_stream = stream.clone();
     let out_task = tokio::spawn(async move {
         let mut seg = Segmenter::new(Speech::default(), Instant::now());
         let mut ticker = tokio::time::interval(Duration::from_millis(150));
@@ -243,13 +253,13 @@ async fn stream_audio_in(
             for sentence in cuts {
                 // A completed sentence: echo it as settled and hand it to the agent.
                 relay_state.echo_input(&relay_scene, Channel::Audio, &sentence, true);
-                dispatch_utterance(&relay_state, &relay_scene, &sentence).await;
+                dispatch_utterance(&relay_state, &relay_scene, relay_stream.clone(), &sentence).await;
             }
         }
         // Flush any trailing words as a final sentence when the session ends.
         if let Some(sentence) = seg.flush() {
             relay_state.echo_input(&relay_scene, Channel::Audio, &sentence, true);
-            dispatch_utterance(&relay_state, &relay_scene, &sentence).await;
+            dispatch_utterance(&relay_state, &relay_scene, relay_stream.clone(), &sentence).await;
         }
     });
 
@@ -282,12 +292,13 @@ async fn stream_audio_in(
 /// tail of `post_audio`. Streaming utterances aren't persisted as discrete media
 /// files (no per-clip blob); the journal records the transcript with no
 /// `media_path`.
-async fn dispatch_utterance(state: &AppState, scene: &Scene, text: &str) {
+async fn dispatch_utterance(state: &AppState, scene: &Scene, stream: Option<String>, text: &str) {
     let ts = Utc::now();
     let signal = Signal {
         channel: Channel::Audio,
         scene: scene.clone(),
         body: text.to_owned(),
+        stream: stream.clone(),
         ts,
     };
     crate::channel_log::inbound(Channel::Audio, scene, text);
@@ -296,6 +307,7 @@ async fn dispatch_utterance(state: &AppState, scene: &Scene, text: &str) {
         channel: Channel::Audio,
         scene: scene.clone(),
         body: text.to_owned(),
+        stream,
         media_path: None,
     };
     if let Err(err) = state.memory.journal.append(entry).await {
@@ -333,6 +345,10 @@ pub async fn get_out_audio(
     let mut rx = state.audio_out.subscribe();
 
     tracing::info!(scene = %scene, auth = ?auth, "GET /api/out/audio long-poll opened");
+
+    // Opening this long-poll is a scene-presence signal: warm the scene up so its
+    // process + session + upstream cache are hot before the first utterance.
+    state.warm_scene(&scene);
 
     // Block until a turn for this subscriber starts. `Start` carries the mime,
     // which must be set before any body byte; Frame/End seen before a Start

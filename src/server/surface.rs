@@ -24,6 +24,10 @@ pub async fn get_out_surface(
 
     tracing::info!(scene = %scene, auth = ?auth, "GET /api/out/surface long-poll opened");
 
+    // Opening this long-poll is a scene-presence signal: warm the scene up so its
+    // process + session + upstream cache are hot before the first utterance.
+    state.warm_scene(&scene);
+
     loop {
         match rx.recv().await {
             Ok(event) => {

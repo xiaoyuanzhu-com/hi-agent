@@ -136,7 +136,7 @@ fn merge_channels(
                 r = s.vision.recv() => match r {
                     Ok(e) if targets(&e.scene, &scene) => Some(ChannelSignal {
                         ts: e.ts, channel: Channel::Vision, direction: "in",
-                        body: format!("frame · {} · {} bytes", e.mime, e.bytes.len()), is_final: true,
+                        body: vision_summary(&e), is_final: true,
                     }),
                     Ok(_) => None,
                     Err(RecvError::Lagged(_)) => None,
@@ -170,6 +170,16 @@ fn audio_summary(e: &AudioEvent) -> Option<ChannelSignal> {
         }),
         // Frames are raw codec bytes — metadata only, so they're dropped here.
         AudioEvent::Frame { .. } => None,
+    }
+}
+
+/// Summarize an inbound vision frame to metadata. Includes the `#stream` label
+/// when the frame came from a named stream, so the inspector shows concurrent
+/// feeds in one scene as distinct rows; the default stream renders bare.
+fn vision_summary(e: &crate::server::VisionFrameEvent) -> String {
+    match &e.stream {
+        Some(label) => format!("frame · #{label} · {} · {} bytes", e.mime, e.bytes.len()),
+        None => format!("frame · {} · {} bytes", e.mime, e.bytes.len()),
     }
 }
 

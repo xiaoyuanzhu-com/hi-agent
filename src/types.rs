@@ -70,6 +70,17 @@ impl Channel {
             Channel::Taste => "taste",
         }
     }
+
+    /// The channel's textual form for a prompt/journal line, suffixed with a
+    /// `#stream` label when the signal came from a named stream within the scene
+    /// (`audio#webcam`). The default stream (`None`) renders bare (`audio`), so
+    /// single-stream output stays identical. The `#` notation lives only here.
+    pub fn with_stream(self, stream: Option<&str>) -> String {
+        match stream {
+            Some(s) => format!("{}#{s}", self.as_str()),
+            None => self.as_str().to_owned(),
+        }
+    }
 }
 
 impl fmt::Display for Channel {
@@ -107,6 +118,11 @@ pub struct Signal {
     pub channel: Channel,
     pub scene: Scene,
     pub body: String,
+    /// The named stream this signal arrived on within the scene (`webcam`,
+    /// `headset`), or `None` for the scene's default stream. Carried so the
+    /// reactor can tell concurrent sources of one channel apart.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stream: Option<String>,
     pub ts: DateTime<Utc>,
 }
 
@@ -125,6 +141,12 @@ pub enum JournalEntry {
         #[serde(alias = "from")]
         scene: Scene,
         body: String,
+        /// Named stream within the scene this signal arrived on, or absent for
+        /// the default stream. Old journals (no key) load as `None`, and
+        /// default-stream entries omit the key entirely, so existing lines stay
+        /// byte-identical — no migration.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        stream: Option<String>,
         /// Stable file reference for non-text bodies (audio bytes, future
         /// images). `body` stays the text representation (e.g. STT transcript).
         #[serde(default)]

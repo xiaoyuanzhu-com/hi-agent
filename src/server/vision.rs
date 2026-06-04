@@ -23,15 +23,16 @@
 use std::sync::Arc;
 
 use axum::body::Bytes;
-use axum::extract::State;
+use axum::extract::{Query, State};
 use axum::http::header::CONTENT_TYPE;
 use axum::http::{HeaderMap, HeaderValue, StatusCode};
 use axum::response::IntoResponse;
 use chrono::Utc;
+use serde::Deserialize;
 use tokio::sync::broadcast::error::RecvError;
 
 use crate::memory::media::{self, Direction};
-use crate::server::headers::{AuthBearer, RequiredScene, SceneHeader};
+use crate::server::headers::{AuthBearer, RequiredScene, SceneHeader, StreamHeader};
 use crate::server::{AppState, VisionFrameEvent};
 
 const DEFAULT_MIME: &str = "image/jpeg";
@@ -39,6 +40,7 @@ const DEFAULT_MIME: &str = "image/jpeg";
 pub async fn post_vision(
     State(state): State<Arc<AppState>>,
     SceneHeader(scene): SceneHeader,
+    StreamHeader(stream): StreamHeader,
     headers: HeaderMap,
     body: Bytes,
 ) -> impl IntoResponse {
@@ -53,12 +55,13 @@ pub async fn post_vision(
         .unwrap_or_else(|| DEFAULT_MIME.to_string());
     let ext = mime_to_ext(&mime);
 
-    tracing::debug!(scene = %scene, mime = %mime, bytes = body.len(), "POST /api/in/vision");
+    tracing::debug!(scene = %scene, stream = ?stream, mime = %mime, bytes = body.len(), "POST /api/in/vision");
 
     // Publish the live frame to any subscriber (the read side of the channel).
     // A send error just means nobody is watching — fine, mirrors audio out.
     let _ = state.vision_out.send(VisionFrameEvent {
         scene: Some(scene.clone()),
+        stream,
         bytes: body.clone(),
         mime,
         ts: Utc::now(),
@@ -74,28 +77,43 @@ pub async fn post_vision(
     }
 }
 
-/// `GET /api/in/vision` — long-poll for the next live frame in this scene.
+/// Query selector for `GET /api/in/vision`: which stream within the scene to
+/// read. Absent or empty → the default stream (`None`), matching a POST that set
+/// no `X-HI-Stream`. A named feed is requested with `?stream=webcam`.
+#[derive(Debug, Deserialize)]
+pub struct StreamSelect {
+    stream: Option<String>,
+}
+
+/// `GET /api/in/vision` — long-poll for the next live frame in this scene's
+/// selected stream.
 ///
 /// Mirrors [`crate::server::surface::get_out_surface`]: subscribe to `vision_out`,
-/// skip frames routed to other scenes, and return the next matching frame's
-/// bytes with its `Content-Type`. The subscriber re-GETs for the frame after.
+/// skip frames routed to other scenes or other streams, and return the next
+/// matching frame's bytes with its `Content-Type`. The subscriber re-GETs for the
+/// frame after.
 pub async fn get_vision(
     State(state): State<Arc<AppState>>,
     RequiredScene(scene): RequiredScene,
+    Query(select): Query<StreamSelect>,
     AuthBearer(auth): AuthBearer,
 ) -> impl IntoResponse {
+    let want = select.stream.as_deref().map(str::trim).filter(|s| !s.is_empty());
     let mut rx = state.vision_out.subscribe();
 
-    tracing::info!(scene = %scene, auth = ?auth, "GET /api/in/vision long-poll opened");
+    tracing::info!(scene = %scene, stream = ?want, auth = ?auth, "GET /api/in/vision long-poll opened");
 
     loop {
         match rx.recv().await {
             Ok(event) => {
-                let deliver = match &event.scene {
+                let scene_ok = match &event.scene {
                     None => true,
                     Some(target) => target == &scene,
                 };
-                if !deliver {
+                // A frame belongs to exactly one stream — plain equality, no
+                // wildcard. Default GET (`None`) reads only default frames.
+                let stream_ok = event.stream.as_deref() == want;
+                if !(scene_ok && stream_ok) {
                     continue;
                 }
                 let mut response = event.bytes.into_response();

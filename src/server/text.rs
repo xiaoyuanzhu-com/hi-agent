@@ -26,13 +26,14 @@ use axum::response::{IntoResponse, Response};
 use chrono::Utc;
 
 use crate::server::observe;
-use crate::server::headers::{AuthBearer, RequiredScene, SceneHeader};
+use crate::server::headers::{AuthBearer, RequiredScene, SceneHeader, StreamHeader};
 use crate::server::AppState;
 use crate::types::{Channel, JournalEntry, Signal};
 
 pub async fn post_text(
     State(state): State<Arc<AppState>>,
     SceneHeader(scene): SceneHeader,
+    StreamHeader(stream): StreamHeader,
     AuthBearer(auth): AuthBearer,
     body: Bytes,
 ) -> impl IntoResponse {
@@ -47,6 +48,7 @@ pub async fn post_text(
         channel: Channel::Text,
         scene: scene.clone(),
         body: body_str,
+        stream,
         ts: Utc::now(),
     };
 
@@ -63,6 +65,7 @@ pub async fn post_text(
         channel: signal.channel,
         scene: signal.scene.clone(),
         body: signal.body.clone(),
+        stream: signal.stream.clone(),
         media_path: None,
     };
     if let Err(err) = state.memory.journal.append(entry).await {
@@ -88,6 +91,10 @@ pub async fn get_out_text(
     AuthBearer(auth): AuthBearer,
 ) -> Response {
     tracing::info!(scene = %scene, auth = ?auth, "GET /api/out/text long-poll opened");
+
+    // Opening this long-poll is a scene-presence signal: warm the scene up so its
+    // process + session + upstream cache are hot before the first utterance.
+    state.warm_scene(&scene);
 
     let stream = state.text_bus.subscribe(scene);
 

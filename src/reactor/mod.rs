@@ -313,6 +313,7 @@ pub fn start(
     agent: AgentLayer,
     soul: String,
     mut inbound_rx: mpsc::Receiver<Signal>,
+    mut warm_rx: mpsc::Receiver<Scene>,
     out: mpsc::Sender<OutboundSignal>,
     observatory: Observatory,
 ) -> Reactor {
@@ -337,6 +338,18 @@ pub fn start(
         tracing::warn!("reactor inbound channel closed; dispatch loop exiting");
     });
 
+    // Warm-up requests: a scene-presence GET (a client opening a `/api/out/*`
+    // long-poll) asks us to stand the scene up now, so its subprocess and ACP
+    // session are open before the first utterance lands. `ensure_scene` is
+    // idempotent — repeated GETs for an already-live scene are no-ops.
+    let warm_reactor = reactor.clone();
+    tokio::spawn(async move {
+        while let Some(scene) = warm_rx.recv().await {
+            warm_reactor.ensure_scene(scene).await;
+        }
+        tracing::warn!("reactor warm channel closed; warm-up loop exiting");
+    });
+
     reactor
 }
 
@@ -350,6 +363,14 @@ impl Reactor {
         if let Err(err) = sender.send(LoopInput::Human(signal)).await {
             tracing::error!(scene = %scene, error = %err, "scene inbound channel closed; dropping signal");
         }
+    }
+
+    /// Stand a scene's loop up now (idempotent), so its warm-up prologue runs and
+    /// the scene is hot before the first utterance. Driven by a scene-presence
+    /// signal — a client opening one of the scene's `/api/out/*` long-polls; an
+    /// already-live scene is a no-op.
+    pub async fn ensure_scene(&self, scene: Scene) {
+        let _ = self.get_or_create_scene(scene).await;
     }
 
     async fn get_or_create_scene(&self, scene: Scene) -> mpsc::Sender<LoopInput> {
@@ -386,6 +407,13 @@ async fn per_scene_loop(
     // loop touches it, so a plain local `Option` suffices; the heartbeat swap
     // below replaces it in place, between turns.
     let mut reactor_session: Option<Arc<AcpSession>> = None;
+    // Whether the live session has been seeded with the journal snapshot yet.
+    // Warm-up opens the session without prompting, so it can be `Some` yet
+    // unseeded; the first real turn sends the snapshot and flips this. A hot-swap
+    // bakes the journal tail into the replacement's system prompt, so a swapped
+    // session stays seeded; a session discarded after a turn failure resets this
+    // so the next cold-open re-seeds.
+    let mut seeded = false;
     // Tracks how much the live session has accumulated, so we know when to
     // hot-swap it before it rots or overflows.
     let mut budget = heartbeat::ContextBudget::new();
@@ -396,6 +424,16 @@ async fn per_scene_loop(
     // Self-alarms the mind has scheduled. They give the loop a second reason to
     // wake — time passing — on top of an incoming signal; see the `select!` below.
     let mut alarms = Alarms::new();
+
+    // Warm-up: this loop was just stood up (a scene-presence GET, or the first
+    // utterance). Pull the cold-start forward now — spawn the subprocess and open
+    // the persistent ACP session — so that work is off the first real turn's
+    // critical path. We deliberately do NOT prompt the model here: the soul and
+    // journal snapshot are still delivered by the first real turn (which sees an
+    // open-but-unseeded session). Best-effort; on failure the first turn cold-opens
+    // as before.
+    warm_up(&reactor, &scene, &mut reactor_session).await;
+
     loop {
         // Wait for the first reason to wake: a new signal, or — when the mind has
         // set alarms — the soonest firing. An alarm wake injects synthetic batch
@@ -459,7 +497,7 @@ async fn per_scene_loop(
         // Forget any workers that have finished, so the registry doesn't grow.
         workers.reap();
 
-        match run_turn(&reactor, &scene, &batch, &mut reactor_session, &mut budget, &mut workers, &mut alarms).await {
+        match run_turn(&reactor, &scene, &batch, &mut reactor_session, &mut seeded, &mut budget, &mut workers, &mut alarms).await {
             Ok(()) => {
                 // Between turns: if the live session has grown past budget, hot-swap
                 // it now. The human is consuming the reply just delivered, so the
@@ -497,6 +535,8 @@ async fn per_scene_loop(
                         )
                         .await;
                 }
+                // The fresh session that replaces it must re-ingest the snapshot.
+                seeded = false;
                 budget.reset();
                 reactor.inner.observatory.set_budget(&scene, 0).await;
             }
@@ -504,19 +544,82 @@ async fn per_scene_loop(
     }
 }
 
+/// One-time scene warm-up, run once before the per-scene loop blocks on its first
+/// input. Opens the scene's persistent reactor session so the subprocess spawn and
+/// ACP `session/new` are off the first reply's critical path — that's the whole
+/// job. It does NOT prompt the model: the soul (system prompt) and journal
+/// snapshot are still delivered by the first real turn, which sees an
+/// open-but-unseeded session. Warming the upstream prompt cache would need a
+/// throwaway round-trip; that is deliberately not done here — unproven benefit,
+/// real cost.
+///
+/// Best-effort: any failure is logged and leaves the session unopened, so the
+/// first real turn just cold-opens as it did before.
+async fn warm_up(reactor: &Reactor, scene: &Scene, reactor_session: &mut Option<Arc<AcpSession>>) {
+    // Defensive: the prologue runs once on a fresh loop, so the session is always
+    // cold here, but never re-open an already-open session.
+    if reactor_session.is_some() {
+        return;
+    }
+    match open_session(reactor, scene).await {
+        Ok(session) => {
+            *reactor_session = Some(session);
+            tracing::info!(scene = %scene, "reactor session warmed up (opened, unseeded)");
+        }
+        Err(err) => {
+            tracing::warn!(scene = %scene, error = %err, "scene warm-up failed; first turn will cold-start");
+        }
+    }
+}
+
+/// Open a fresh persistent reactor session for `scene`, carrying the soul as its
+/// system prompt, and record the lifecycle event. The session consumes the system
+/// prompt on its first `prompt()` and never re-sends it. Shared by the warm-up
+/// prologue and the cold path of [`run_turn`].
+async fn open_session(reactor: &Reactor, scene: &Scene) -> anyhow::Result<Arc<AcpSession>> {
+    let session = Arc::new(
+        reactor
+            .inner
+            .agent
+            .session(
+                scene,
+                SessionOpts {
+                    system_prompt: Some(reactor.inner.soul.clone()),
+                    cwd: None,
+                },
+            )
+            .await?,
+    );
+    reactor
+        .inner
+        .observatory
+        .record(
+            scene,
+            EventKind::SessionOpened {
+                kind: SessionKind::Reactor,
+                id: session.id().0.to_string(),
+            },
+        )
+        .await;
+    Ok(session)
+}
+
 /// One turn: prompt the scene's persistent reactor session (opening it on the
 /// first turn), stream text updates to `/thought`, and broadcast
 /// `EndOfUtterance` when the turn ends.
 ///
-/// A cold session — just opened, or discarded after an error — is seeded with
-/// the journal snapshot, since it has no memory of prior turns. A warm session
-/// already lived through them, so it gets only the new signals; the snapshot is
-/// the durable backstop, not per-turn context to re-send.
+/// An unseeded session — never prompted (freshly cold-opened, or warmed by the
+/// prologue) — is seeded with the journal snapshot, since it carries no memory of
+/// prior turns. A seeded session already ingested that history, so it gets only
+/// the new signals; the snapshot is the durable backstop, not per-turn context to
+/// re-send. `seeded` decouples "snapshot delivered" from "session open", since
+/// warm-up opens a session without seeding it.
 async fn run_turn(
     reactor: &Reactor,
     scene: &Scene,
     batch: &[LoopInput],
     reactor_session: &mut Option<Arc<AcpSession>>,
+    seeded: &mut bool,
     budget: &mut heartbeat::ContextBudget,
     workers: &mut workers::WorkerRegistry,
     alarms: &mut Alarms,
@@ -537,15 +640,15 @@ async fn run_turn(
     let worker_status = workers.render_status().await;
     let new_signals = format!("## New signals\n{}", render_batch(batch));
 
-    // Seed the journal snapshot only when cold; a warm session already lived the
-    // history and gets only what's new (plus the live worker view). The snapshot
-    // is the durable backstop, not per-turn context to re-send.
-    let prompt_text = match reactor_session.as_ref() {
-        Some(_) => join_sections(&[&worker_status, &new_signals]),
-        None => {
-            let snap = build_for_scene(&reactor.inner.memory, scene).await?;
-            join_sections(&[&snap.render_for_prompt(), &worker_status, &new_signals])
-        }
+    // Seed the journal snapshot only when the session is unseeded; a seeded
+    // session already lived the history and gets only what's new (plus the live
+    // worker view). The snapshot is the durable backstop, not per-turn context to
+    // re-send.
+    let prompt_text = if *seeded {
+        join_sections(&[&worker_status, &new_signals])
+    } else {
+        let snap = build_for_scene(&reactor.inner.memory, scene).await?;
+        join_sections(&[&snap.render_for_prompt(), &worker_status, &new_signals])
     };
     let prompt_chars = prompt_text.chars().count();
 
@@ -556,30 +659,7 @@ async fn run_turn(
     let session = match reactor_session {
         Some(s) => s.clone(),
         None => {
-            let opened = Arc::new(
-                reactor
-                    .inner
-                    .agent
-                    .session(
-                        scene,
-                        SessionOpts {
-                            system_prompt: Some(reactor.inner.soul.clone()),
-                            cwd: None,
-                        },
-                    )
-                    .await?,
-            );
-            reactor
-                .inner
-                .observatory
-                .record(
-                    scene,
-                    EventKind::SessionOpened {
-                        kind: SessionKind::Reactor,
-                        id: opened.id().0.to_string(),
-                    },
-                )
-                .await;
+            let opened = open_session(reactor, scene).await?;
             *reactor_session = Some(opened.clone());
             opened
         }
@@ -782,6 +862,9 @@ async fn run_turn(
     // session has grown enough to hot-swap. Only on success — a failed turn is
     // discarded along with its (possibly wedged) session.
     let reply_chars = outcome?;
+    // The session has now ingested the snapshot (this turn delivered it if it was
+    // unseeded); later turns send only what's new.
+    *seeded = true;
     budget.record_turn(prompt_chars, reply_chars);
     reactor.inner.observatory.set_budget(scene, budget.chars()).await;
     Ok(())
@@ -869,10 +952,11 @@ fn render_batch(batch: &[LoopInput]) -> String {
         match input {
             LoopInput::Human(sig) => {
                 let ts = sig.ts.format("%H:%M:%S");
+                let chan = sig.channel.with_stream(sig.stream.as_deref());
                 let _ = writeln!(
                     s,
                     "[{}] {} on /{}: \"{}\"",
-                    ts, sig.scene, sig.channel, sig.body
+                    ts, sig.scene, chan, sig.body
                 );
             }
             LoopInput::Worker(report) => {
