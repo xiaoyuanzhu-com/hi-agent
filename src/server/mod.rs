@@ -19,6 +19,7 @@ use crate::types::{Channel, Scene, Signal, SurfaceEnvelope};
 pub mod audio;
 pub mod binder;
 pub mod channels;
+pub mod generated;
 pub mod headers;
 pub mod observe;
 pub mod overlay;
@@ -300,6 +301,10 @@ pub fn build(memory: Memory, data_dir: PathBuf, observatory: Observatory) -> (Ro
         // A scene's channels, observed live as one merged presence stream — the
         // channel inspector's window onto every in/out channel of one scene.
         .route("/api/scenes/{scene}/channels", get(channels::get_scene_channels))
+        // Compiled agent view modules (runtime artifacts on disk under data_dir,
+        // not embedded). Served here, not in the appearance router, because that
+        // router is embed-only and stateless.
+        .route("/generated/views/{file}", get(generated::generated_view))
         .with_state(state)
         .merge(crate::appearance::router())
         .fallback(not_found)
