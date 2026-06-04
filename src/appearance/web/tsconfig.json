@@ -9,6 +9,10 @@
     "moduleResolution": "bundler",
     "allowImportingTsExtensions": true,
     "resolveJsonModule": true,
+    "paths": {
+      "@hi/core": ["./src/core/index.ts"],
+      "@hi/ui": ["./src/ui/kit/index.tsx"]
+    },
     "isolatedModules": true,
     "moduleDetection": "force",
     "noEmit": true,

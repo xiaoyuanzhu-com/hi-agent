@@ -2,6 +2,10 @@ import { defineConfig, type ProxyOptions } from "vite";
 import react from "@vitejs/plugin-react";
 import basicSsl from "@vitejs/plugin-basic-ssl";
 
+// Resolve a path relative to this config file (ESM has no __dirname). Uses the
+// global URL (no node:url import) so it needs no @types/node.
+const r = (p: string) => new URL(p, import.meta.url).pathname;
+
 // During dev, the browser only talks to Vite (:5173). Vite proxies every
 // human-interface channel route — all under `/api/*` — to the Rust server on
 // :8080.
@@ -67,6 +71,14 @@ const proxy: Record<string, ProxyOptions> = Object.fromEntries(
 
 export default defineConfig({
   plugins: [react(), basicSsl()],
+  // `@hi/core` (session hooks) and `@hi/ui` (static primitives) are the stable
+  // import surface both host chrome and agent-authored views author against.
+  resolve: {
+    alias: {
+      "@hi/core": r("./src/core/index.ts"),
+      "@hi/ui": r("./src/ui/kit/index.tsx"),
+    },
+  },
   server: {
     port: 5173,
     strictPort: true,
