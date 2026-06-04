@@ -1,7 +1,6 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { subscribeOutText } from "../channels/out/text";
 import { subscribeAudioTurns } from "../channels/out/audio";
-import { subscribeSurface, type SurfaceEnvelope } from "../channels/out/surface";
 import { postInText, subscribeInText } from "../channels/in/text";
 import { subscribeInAudio } from "../channels/in/audio";
 import { postVision } from "../channels/in/vision";
@@ -91,14 +90,10 @@ function loadPrefs(): ChannelPrefs {
 export interface AgentSession {
   state: PresenceState;
   reactive: boolean;
-  /** 0..1 — how much the presence should dim for the content overlay. */
-  demote: number;
   bus: AudioBus | null;
   /** Live cognition cadence (streamed-chunk pulses) the field reacts to. */
   activity: ActivityMeter;
   sentences: SpeechItem[];
-  activeSurface: SurfaceEnvelope | null;
-  surfaceHistory: SurfaceEnvelope[];
   woken: boolean;
   waking: boolean;
   wakeError: string | null;
@@ -127,8 +122,6 @@ export interface AgentSession {
   /** Turn the text input channel on/off (shows/hides the input line). */
   setTextChannel: (on: boolean) => void;
   sendText: (text: string) => void;
-  dismissSurface: () => void;
-  openSurface: (surface: SurfaceEnvelope) => void;
 }
 
 /**
@@ -182,8 +175,6 @@ export function useAgentSession(): AgentSession {
   const [awaiting, setAwaiting] = useState(false);
   const [ttsPlaying, setTtsPlaying] = useState(false);
   const [offline, setOffline] = useState(false);
-  const [activeSurface, setActiveSurface] = useState<SurfaceEnvelope | null>(null);
-  const [surfaceHistory, setSurfaceHistory] = useState<SurfaceEnvelope[]>([]);
 
   const busRef = useRef<AudioBus | null>(null);
   const micRef = useRef<AudioStreamer | null>(null);
@@ -201,7 +192,6 @@ export function useAgentSession(): AgentSession {
   const visionRef = useRef<VisionCapture | null>(null);
   const visionStreamRef = useRef<MediaStream | null>(null);
   const sentenceIdRef = useRef(0);
-  const surfaceTtlRef = useRef<number | null>(null);
   // Live cognition cadence: bumped per streamed chunk, decays between them, so
   // the Presence pulses with the agent's real output rate (not a canned loop).
   const activityRef = useRef(new ActivityMeter());
@@ -308,41 +298,6 @@ export function useAgentSession(): AgentSession {
             } finally {
               voice.endTurn(token);
               reader.releaseLock();
-            }
-          }
-        } catch {
-          if (cancelled || ctrl.signal.aborted) break;
-          await new Promise((r) => setTimeout(r, 1500));
-        }
-      }
-    })();
-    return () => {
-      cancelled = true;
-      ctrl.abort();
-    };
-  }, [woken, scene]);
-
-  // ---- GET /surface subscription loop (Phase 3: content overlays) --------
-  useEffect(() => {
-    if (!woken) return;
-    const ctrl = new AbortController();
-    let cancelled = false;
-    void (async () => {
-      while (!cancelled) {
-        try {
-          for await (const env of subscribeSurface({ scene, signal: ctrl.signal })) {
-            if (cancelled) break;
-            if (env.op === "dismiss") {
-              setActiveSurface((cur) => (cur && cur.id === env.id ? null : cur));
-              continue;
-            }
-            setActiveSurface(env);
-            setSurfaceHistory((prev) => [...prev, env]);
-            if (surfaceTtlRef.current) window.clearTimeout(surfaceTtlRef.current);
-            if (env.ttl_ms && env.ttl_ms > 0) {
-              surfaceTtlRef.current = window.setTimeout(() => {
-                setActiveSurface((cur) => (cur && cur.id === env.id ? null : cur));
-              }, env.ttl_ms);
             }
           }
         } catch {
@@ -682,16 +637,6 @@ export function useAgentSession(): AgentSession {
     [scene],
   );
 
-  const dismissSurface = useCallback(() => {
-    if (surfaceTtlRef.current) window.clearTimeout(surfaceTtlRef.current);
-    setActiveSurface(null);
-  }, []);
-
-  const openSurface = useCallback((surface: SurfaceEnvelope) => {
-    if (surfaceTtlRef.current) window.clearTimeout(surfaceTtlRef.current);
-    setActiveSurface(surface);
-  }, []);
-
   const state: PresenceState = !woken
     ? "waking"
     : offline
@@ -707,9 +652,6 @@ export function useAgentSession(): AgentSession {
   // Dots track live audio while listening (mic) or while the agent's voice plays.
   const reactive = state === "listening" || (state === "speaking" && ttsPlaying);
 
-  // The content overlay dims/demotes the presence — more for full-screen.
-  const demote = activeSurface ? (activeSurface.mode === "full" ? 1 : 0.72) : 0;
-
   // Render the current exchange — the user's line pinned, the agent's reply
   // rolling beneath it — plus the user's in-progress line (if any). A live line
   // becomes the new anchor, so starting to speak/type clears the prior turn.
@@ -724,12 +666,9 @@ export function useAgentSession(): AgentSession {
   return {
     state,
     reactive,
-    demote,
     bus,
     activity: activityRef.current,
     sentences: displaySentences,
-    activeSurface,
-    surfaceHistory,
     woken,
     waking,
     wakeError,
@@ -746,7 +685,5 @@ export function useAgentSession(): AgentSession {
     toggleAudioOutput,
     setTextChannel,
     sendText,
-    dismissSurface,
-    openSurface,
   };
 }

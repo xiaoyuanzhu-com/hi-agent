@@ -33,7 +33,19 @@ export function useSpeech() {
 /** The agent's presence: animation/voice state plus the live audio + cadence. */
 export function usePresence() {
   const s = useSession();
-  return { state: s.state, reactive: s.reactive, activity: s.activity, demote: s.demote, bus: s.bus };
+  return { state: s.state, reactive: s.reactive, activity: s.activity, bus: s.bus };
+}
+
+/** Session entry/wake state for the host gate (not for agent views). */
+export function useWake() {
+  const s = useSession();
+  return {
+    woken: s.woken,
+    waking: s.waking,
+    wakeError: s.wakeError,
+    wake: s.wake,
+    startTextOnly: s.startTextOnly,
+  };
 }
 
 /** Every in/out channel's live on/off state and its toggle. */
