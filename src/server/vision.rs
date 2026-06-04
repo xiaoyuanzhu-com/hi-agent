@@ -88,7 +88,7 @@ pub struct StreamSelect {
 /// `GET /api/in/vision` — long-poll for the next live frame in this scene's
 /// selected stream.
 ///
-/// Mirrors [`crate::server::surface::get_out_surface`]: subscribe to `vision_out`,
+/// Mirrors [`crate::server::view::get_out_view`]: subscribe to `vision_out`,
 /// skip frames routed to other scenes or other streams, and return the next
 /// matching frame's bytes with its `Content-Type`. The subscriber re-GETs for the
 /// frame after.

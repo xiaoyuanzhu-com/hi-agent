@@ -1,17 +1,16 @@
 //! Turn output: parsed into ordered pieces, then paced onto the wire.
 //!
 //! A turn's reply is parsed into an ordered run of [`Segment`]s — plain spoken
-//! text interleaved with completed `[[surface:*]]` blocks, in document order.
-//! Keeping the pieces interleaved (rather than detaching all surfaces up front)
-//! is the whole point: it lets a slide be paced to the sentence that narrates it.
-//! [`surface_emits`] flushes the pending spoken text to TTS *before* showing the
-//! slide, so the slide lands after the sentence before it and right as the
-//! sentence after it begins synthesizing — never racing ahead of already-produced
-//! narration.
+//! text interleaved with completed `[[view…]]` blocks, in document order. Keeping
+//! the pieces interleaved (rather than detaching all views up front) is the whole
+//! point: it lets a view be paced to the sentence that narrates it. [`view_emits`]
+//! flushes the pending spoken text to TTS *before* showing the view, so it lands
+//! after the sentence before it and right as the sentence after it begins
+//! synthesizing — never racing ahead of already-produced narration.
 //!
 //! Both halves are pure and `Reactor`-free so the ordering is unit-testable:
 //! [`Extractor`] turns the text stream into [`Segment`]s; [`speak_emits`] /
-//! [`surface_emits`] turn one segment into ordered [`Emit`] actions. The reactor's
+//! [`view_emits`] turn one segment into ordered [`Emit`] actions. The reactor's
 //! `run_turn` owns the orchestration — the sentence splitter, the delegate/alarm
 //! side-effects, the TTS sender — and performs the emits.
 
@@ -20,11 +19,8 @@ use std::time::Instant;
 use uuid::Uuid;
 
 use crate::segment::{Segmenter, Terminator};
-use crate::types::{SurfaceEnvelope, SurfaceMode, SurfaceOp, ViewOp};
+use crate::types::ViewOp;
 
-const OPEN_CARD: &str = "[[surface:card]]";
-const OPEN_FULL: &str = "[[surface:full]]";
-const CLOSE: &str = "[[/surface]]";
 // A view opener is variable-length (`[[view id=… op=…]]`): this is its prefix,
 // and the opening tag runs to the next `]]`. `[[view` cannot be mistaken for the
 // `[[/view]]` close, which starts `[[/`.
@@ -33,44 +29,33 @@ const VIEW_TAG_CLOSE: &str = "]]";
 const CLOSE_VIEW: &str = "[[/view]]";
 
 /// One ordered piece of a turn's reply, in document order. Plain text the agent
-/// speaks/displays is [`Spoken`](Segment::Spoken); a completed `[[surface:*]]`
-/// block is [`Surface`](Segment::Surface); a completed `[[view…]]` block is
-/// [`View`](Segment::View), carrying its raw JSX source for later compilation.
-/// Keeping these interleaved is what lets a slide/view be paced to its sentence.
+/// speaks/displays is [`Spoken`](Segment::Spoken); a completed `[[view…]]` block
+/// is [`View`](Segment::View), carrying its raw JSX source for later compilation.
+/// Keeping these interleaved is what lets a view be paced to its narrating sentence.
 #[derive(Debug)]
 pub(super) enum Segment {
     Spoken(String),
-    Surface(SurfaceEnvelope),
     View { id: String, op: ViewOp, source: String },
 }
 
 /// One release action the policy decides on. `Speak` goes to TTS only (the raw
-/// chunk is mirrored to /thought separately by the caller); `Show` goes to
-/// /surface; `ShowView` is compiled then sent to /view.
+/// chunk is mirrored to /thought separately by the caller); `ShowView` is compiled
+/// then sent to /view.
 #[derive(Debug)]
 pub(super) enum Emit {
     Speak(String),
-    Show(SurfaceEnvelope),
     ShowView { id: String, op: ViewOp, source: String },
 }
 
-/// Which kind of block the extractor is currently inside. `None` (outside) scans
-/// for the next opener.
-#[derive(Debug, Clone)]
-enum Inside {
-    Surface(SurfaceMode),
-    View { id: String, op: ViewOp },
-}
-
 /// Streaming extractor that turns the agent's text stream into an ordered run of
-/// [`Segment`]s, pulling `[[surface:…]] … [[/surface]]` and `[[view…]] …
-/// [[/view]]` blocks out while surrounding text passes through as
-/// [`Segment::Spoken`]. A short tail that could be a partial opener is held back
-/// so a marker split across chunks is still recognized. Mirrors the convention
-/// taught in the soul.
+/// [`Segment`]s, pulling `[[view…]] … [[/view]]` blocks out as [`Segment::View`]
+/// while the surrounding text passes through as [`Segment::Spoken`]. A short tail
+/// that could be a partial opener is held back so a marker split across chunks is
+/// still recognized. Mirrors the convention taught in the soul.
 pub(super) struct Extractor {
     buf: String,
-    inside: Option<Inside>,
+    /// `Some((id, op))` while buffering a view body, waiting for `[[/view]]`.
+    inside: Option<(String, ViewOp)>,
 }
 
 impl Extractor {
@@ -89,12 +74,7 @@ impl Extractor {
             // mutate `self.buf` / `self.inside` in the arms.
             match self.inside.clone() {
                 None => {
-                    // The earliest opener wins — the two fixed surface markers and
-                    // the variable-length view marker, in document order.
-                    let card = self.buf.find(OPEN_CARD);
-                    let full = self.buf.find(OPEN_FULL);
-                    let view = self.buf.find(OPEN_VIEW);
-                    let Some(idx) = [card, full, view].into_iter().flatten().min() else {
+                    let Some(idx) = self.buf.find(OPEN_VIEW) else {
                         // No opener: emit everything except a tail that could be the
                         // start of one continuing in the next chunk.
                         let keep = partial_open_suffix_len(&self.buf);
@@ -103,23 +83,8 @@ impl Extractor {
                         self.buf = self.buf[emit_to..].to_string();
                         break;
                     };
-
-                    if self.buf[idx..].starts_with(OPEN_CARD) {
-                        push_spoken(&mut out, &self.buf[..idx]);
-                        self.buf = self.buf[idx + OPEN_CARD.len()..].to_string();
-                        self.inside = Some(Inside::Surface(SurfaceMode::Card));
-                        continue;
-                    }
-                    if self.buf[idx..].starts_with(OPEN_FULL) {
-                        push_spoken(&mut out, &self.buf[..idx]);
-                        self.buf = self.buf[idx + OPEN_FULL.len()..].to_string();
-                        self.inside = Some(Inside::Surface(SurfaceMode::Full));
-                        continue;
-                    }
-
-                    // A view opener: its opening tag runs from `[[view` to the next
-                    // `]]`. If that close hasn't arrived, hold the partial opener and
-                    // wait for the next chunk.
+                    // The opening tag runs from `[[view` to the next `]]`. If that
+                    // close hasn't arrived, hold the partial opener and wait.
                     let after = idx + OPEN_VIEW.len();
                     let Some(rel) = self.buf[after..].find(VIEW_TAG_CLOSE) else {
                         push_spoken(&mut out, &self.buf[..idx]);
@@ -134,26 +99,10 @@ impl Extractor {
                         out.push(Segment::View { id, op, source: String::new() });
                         continue;
                     }
-                    self.inside = Some(Inside::View { id, op });
+                    self.inside = Some((id, op));
                     continue;
                 }
-                Some(Inside::Surface(mode)) => {
-                    if let Some(idx) = self.buf.find(CLOSE) {
-                        let html = self.buf[..idx].trim().to_string();
-                        self.buf = self.buf[idx + CLOSE.len()..].to_string();
-                        self.inside = None;
-                        out.push(Segment::Surface(SurfaceEnvelope {
-                            id: Uuid::now_v7().to_string(),
-                            op: SurfaceOp::Show,
-                            mode: Some(mode),
-                            html: Some(html),
-                            ttl_ms: None,
-                        }));
-                        continue;
-                    }
-                    break; // close not present yet; keep buffering the HTML
-                }
-                Some(Inside::View { id, op }) => {
+                Some((id, op)) => {
                     if let Some(idx) = self.buf.find(CLOSE_VIEW) {
                         let source = self.buf[..idx].trim().to_string();
                         self.buf = self.buf[idx + CLOSE_VIEW.len()..].to_string();
@@ -190,20 +139,16 @@ fn push_spoken(out: &mut Vec<Segment>, text: &str) {
     }
 }
 
-/// Length (bytes) of the longest suffix of `buf` that is a proper prefix of a
-/// surface or view opener — i.e. a marker possibly split across chunks.
+/// Length (bytes) of the longest suffix of `buf` that is a proper prefix of the
+/// view opener — i.e. a marker possibly split across chunks.
 fn partial_open_suffix_len(buf: &str) -> usize {
-    let max = OPEN_CARD.len().max(OPEN_FULL.len()).max(OPEN_VIEW.len()) - 1;
+    let max = OPEN_VIEW.len() - 1;
     let start = buf.len().saturating_sub(max);
     for i in start..buf.len() {
         if !buf.is_char_boundary(i) {
             continue;
         }
-        let suffix = &buf[i..];
-        if OPEN_CARD.starts_with(suffix)
-            || OPEN_FULL.starts_with(suffix)
-            || OPEN_VIEW.starts_with(suffix)
-        {
+        if OPEN_VIEW.starts_with(&buf[i..]) {
             return buf.len() - i;
         }
     }
@@ -240,23 +185,10 @@ pub(super) fn speak_emits(
     splitter.commit(residual, now).into_iter().map(Emit::Speak).collect()
 }
 
-/// Release a surface, paced to its sentence: flush whatever spoken text the
-/// splitter is still holding FIRST, so the slide lands after the sentence before
-/// it and right as the sentence after it begins synthesizing — never jumping
-/// ahead of already-produced narration. Pure, for the same reason as
-/// [`speak_emits`].
-pub(super) fn surface_emits(splitter: &mut Segmenter<Terminator>, env: SurfaceEnvelope) -> Vec<Emit> {
-    let mut out = Vec::new();
-    if let Some(tail) = splitter.flush() {
-        out.push(Emit::Speak(tail));
-    }
-    out.push(Emit::Show(env));
-    out
-}
-
-/// Release a view, paced to its sentence exactly like [`surface_emits`]: flush
-/// whatever spoken text the splitter is still holding FIRST, so the view lands
-/// after the sentence before it and right as the next begins. Pure.
+/// Release a view, paced to its sentence: flush whatever spoken text the splitter
+/// is still holding FIRST, so the view lands after the sentence before it and
+/// right as the sentence after it begins synthesizing — never jumping ahead of
+/// already-produced narration. Pure, for the same reason as [`speak_emits`].
 pub(super) fn view_emits(
     splitter: &mut Segmenter<Terminator>,
     id: String,
@@ -299,52 +231,6 @@ mod interleave_tests {
     }
 
     #[test]
-    fn interleaves_text_and_surface_in_order() {
-        let mut e = Extractor::new();
-        let segs = e.push("Here. [[surface:card]]<b>hi</b>[[/surface]] Done.");
-        assert_eq!(segs.len(), 3);
-        assert_eq!(spoken(&segs[0]), Some("Here. "));
-        match &segs[1] {
-            Segment::Surface(env) => {
-                assert_eq!(env.mode, Some(SurfaceMode::Card));
-                assert_eq!(env.html.as_deref(), Some("<b>hi</b>"));
-            }
-            _ => panic!("expected surface"),
-        }
-        assert_eq!(spoken(&segs[2]), Some(" Done."));
-    }
-
-    #[test]
-    fn recognizes_marker_split_across_chunks() {
-        let mut e = Extractor::new();
-        let s1 = e.push("look [[surf");
-        assert_eq!(s1.len(), 1);
-        assert_eq!(spoken(&s1[0]), Some("look "));
-        let s2 = e.push("ace:full]]<p>x</p>[[/surface]]");
-        assert_eq!(s2.len(), 1);
-        match &s2[0] {
-            Segment::Surface(env) => {
-                assert_eq!(env.mode, Some(SurfaceMode::Full));
-                assert_eq!(env.html.as_deref(), Some("<p>x</p>"));
-            }
-            _ => panic!("expected surface"),
-        }
-    }
-
-    #[test]
-    fn two_adjacent_surfaces_keep_order() {
-        let mut e = Extractor::new();
-        let segs =
-            e.push("[[surface:card]]A[[/surface]] mid [[surface:card]]B[[/surface]] end");
-        // Surface(A), Spoken(" mid "), Surface(B), Spoken(" end")
-        assert_eq!(segs.len(), 4);
-        assert!(matches!(&segs[0], Segment::Surface(_)));
-        assert_eq!(spoken(&segs[1]), Some(" mid "));
-        assert!(matches!(&segs[2], Segment::Surface(_)));
-        assert_eq!(spoken(&segs[3]), Some(" end"));
-    }
-
-    #[test]
     fn interleaves_text_and_view_in_order() {
         let mut e = Extractor::new();
         let segs = e.push("Here. [[view id=q op=show]]<X/>[[/view]] Done.");
@@ -364,6 +250,17 @@ mod interleave_tests {
         let s2 = e.push("place]]<Y/>[[/view]]");
         assert_eq!(s2.len(), 1);
         assert_eq!(view(&s2[0]), Some(("q", ViewOp::Replace, "<Y/>")));
+    }
+
+    #[test]
+    fn two_adjacent_views_keep_order() {
+        let mut e = Extractor::new();
+        let segs = e.push("[[view id=a]]A[[/view]] mid [[view id=b]]B[[/view]] end");
+        assert_eq!(segs.len(), 4);
+        assert_eq!(view(&segs[0]), Some(("a", ViewOp::Show, "A")));
+        assert_eq!(spoken(&segs[1]), Some(" mid "));
+        assert_eq!(view(&segs[2]), Some(("b", ViewOp::Show, "B")));
+        assert_eq!(spoken(&segs[3]), Some(" end"));
     }
 
     #[test]
@@ -390,64 +287,46 @@ mod interleave_tests {
 mod release_tests {
     use super::*;
 
-    fn card(html: &str) -> SurfaceEnvelope {
-        SurfaceEnvelope {
-            id: html.to_string(),
-            op: SurfaceOp::Show,
-            mode: Some(SurfaceMode::Card),
-            html: Some(html.to_string()),
-            ttl_ms: None,
-        }
-    }
-
     /// Render the emit stream into a compact ordered transcript for assertion.
     fn trace(emits: &[Emit]) -> Vec<String> {
         emits
             .iter()
             .map(|e| match e {
                 Emit::Speak(s) => format!("speak:{s}"),
-                Emit::Show(env) => format!("show:{}", env.html.as_deref().unwrap_or("")),
+                Emit::ShowView { source, .. } => format!("show:{source}"),
             })
             .collect()
     }
 
     #[test]
-    fn surface_is_paced_to_its_following_sentence() {
-        // The core race fix: card1, narrate one, card2, narrate two — each card
-        // emitted before its sentence, never both cards up front. Trailing spaces
-        // mirror real LLM output so each sentence cuts cleanly on its terminator.
+    fn view_is_paced_to_its_following_sentence() {
+        // The core race fix: view1, narrate one, view2, narrate two — each view
+        // emitted before its sentence, never both up front. Trailing spaces mirror
+        // real LLM output so each sentence cuts cleanly on its terminator.
         let now = Instant::now();
         let mut sp = Segmenter::new(Terminator, now);
         let mut emits = Vec::new();
-        emits.extend(surface_emits(&mut sp, card("c1")));
+        emits.extend(view_emits(&mut sp, "a".into(), ViewOp::Show, "c1".into()));
         emits.extend(speak_emits("Narrate one. ", &mut sp, now));
-        emits.extend(surface_emits(&mut sp, card("c2")));
+        emits.extend(view_emits(&mut sp, "b".into(), ViewOp::Show, "c2".into()));
         emits.extend(speak_emits("Narrate two. ", &mut sp, now));
         if let Some(tail) = sp.flush() {
             emits.push(Emit::Speak(tail));
         }
         assert_eq!(
             trace(&emits),
-            vec![
-                "show:c1",
-                "speak:Narrate one.",
-                "show:c2",
-                "speak:Narrate two.",
-            ]
+            vec!["show:c1", "speak:Narrate one.", "show:c2", "speak:Narrate two."]
         );
     }
 
     #[test]
-    fn surface_flushes_a_preceding_partial_sentence_first() {
-        // A sentence with no terminator before a surface: the surface flushes it as
-        // a Speak BEFORE the Show, so the slide never jumps ahead of its narration.
+    fn view_flushes_a_preceding_partial_sentence_first() {
+        // A sentence with no terminator before a view: the view flushes it as a
+        // Speak BEFORE the Show, so it never jumps ahead of its narration.
         let now = Instant::now();
         let mut sp = Segmenter::new(Terminator, now);
         let mut emits = speak_emits("partial no period", &mut sp, now);
-        emits.extend(surface_emits(&mut sp, card("c1")));
-        assert_eq!(
-            trace(&emits),
-            vec!["speak:partial no period", "show:c1"]
-        );
+        emits.extend(view_emits(&mut sp, "a".into(), ViewOp::Show, "c1".into()));
+        assert_eq!(trace(&emits), vec!["speak:partial no period", "show:c1"]);
     }
 }

@@ -70,7 +70,7 @@ use crate::capabilities::tts::{self, TtsStream};
 use crate::memory::{Memory, build_for_scene};
 use crate::observatory::{EventKind, Observatory, SessionKind};
 use crate::segment::{Segmenter, Terminator};
-use crate::types::{Channel, JournalEntry, Scene, Signal, SurfaceEnvelope, ViewEnvelope, ViewOp};
+use crate::types::{Channel, JournalEntry, Scene, Signal, ViewEnvelope, ViewOp};
 use bytes::Bytes;
 
 /// How long the floor must stay quiet after the last finalized utterance before
@@ -769,11 +769,6 @@ async fn run_turn(
                         // sentences (above) — the two channels keep their own pacing.
                         emit_thought_chunk(reactor, scene, residual).await;
                     }
-                    interleave::Segment::Surface(env) => {
-                        for emit in interleave::surface_emits(&mut splitter, env) {
-                            perform(emit, &synth_tx, reactor, scene).await;
-                        }
-                    }
                     interleave::Segment::View { id, op, source } => {
                         for emit in interleave::view_emits(&mut splitter, id, op, source) {
                             perform(emit, &synth_tx, reactor, scene).await;
@@ -919,7 +914,6 @@ async fn perform(
                 let _ = tx.send(sentence).await;
             }
         }
-        interleave::Emit::Show(env) => emit_surface(reactor, scene, env).await,
         interleave::Emit::ShowView { id, op, source } => {
             emit_view(reactor, scene, id, op, source).await
         }
@@ -1023,28 +1017,6 @@ async fn forward_frames(
         bytes = total,
         "channel out (tts stream)",
     );
-}
-
-/// Emit one rich-content envelope on the /surface channel for this scene.
-async fn emit_surface(reactor: &Reactor, scene: &Scene, envelope: SurfaceEnvelope) {
-    tracing::info!(
-        target: "channel",
-        dir = "out",
-        channel = "surface",
-        scene = %scene,
-        op = ?envelope.op,
-        mode = ?envelope.mode,
-        html_len = envelope.html.as_deref().map(str::len).unwrap_or(0),
-        "channel out (surface)",
-    );
-    let _ = reactor
-        .inner
-        .out
-        .send(OutboundSignal::Surface {
-            scene: scene.clone(),
-            envelope,
-        })
-        .await;
 }
 
 /// Emit one agent-authored view on the /view channel for this scene. A `show`/

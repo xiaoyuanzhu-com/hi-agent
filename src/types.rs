@@ -167,39 +167,6 @@ pub enum JournalEntry {
 }
 
 // -----------------------------------------------------------------------------
-// SurfaceEnvelope — outbound rich-content block for the UI overlay
-// -----------------------------------------------------------------------------
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum SurfaceOp {
-    Show,
-    Dismiss,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum SurfaceMode {
-    Card,
-    Full,
-}
-
-/// One rich-content event delivered to the browser over GET /surface. `html` is
-/// agent-authored and rendered inside a sandboxed iframe; `mode` chooses the
-/// overlay presentation. For `op = dismiss` only `id` is meaningful.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct SurfaceEnvelope {
-    pub id: String,
-    pub op: SurfaceOp,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub mode: Option<SurfaceMode>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub html: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub ttl_ms: Option<u64>,
-}
-
-// -----------------------------------------------------------------------------
 // ViewEnvelope — outbound agent-authored view module for the UI view slot
 // -----------------------------------------------------------------------------
 

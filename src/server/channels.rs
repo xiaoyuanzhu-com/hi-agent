@@ -73,8 +73,7 @@ fn merge_channels(
         input: tokio::sync::broadcast::Receiver<crate::server::InputEcho>,
         output: tokio::sync::broadcast::Receiver<crate::server::OutputEcho>,
         audio: tokio::sync::broadcast::Receiver<crate::server::AudioEvent>,
-        surface: tokio::sync::broadcast::Receiver<crate::server::SurfaceEvent>,
-        overlay: tokio::sync::broadcast::Receiver<crate::server::OverlayEvent>,
+        view: tokio::sync::broadcast::Receiver<crate::server::ViewEvent>,
         vision: tokio::sync::broadcast::Receiver<crate::server::VisionFrameEvent>,
     }
 
@@ -82,8 +81,7 @@ fn merge_channels(
         input: state.input_echo.subscribe(),
         output: state.output_echo.subscribe(),
         audio: state.audio_out.subscribe(),
-        surface: state.surface_out.subscribe(),
-        overlay: state.overlay_out.subscribe(),
+        view: state.view_out.subscribe(),
         vision: state.vision_out.subscribe(),
     };
 
@@ -115,19 +113,10 @@ fn merge_channels(
                     Err(RecvError::Lagged(_)) => None,
                     Err(RecvError::Closed) => return None,
                 },
-                r = s.surface.recv() => match r {
+                r = s.view.recv() => match r {
                     Ok(e) if targets(&e.scene, &scene) => Some(ChannelSignal {
                         ts: e.ts, channel: Channel::Vision, direction: "out",
-                        body: surface_summary(&e.envelope), is_final: true,
-                    }),
-                    Ok(_) => None,
-                    Err(RecvError::Lagged(_)) => None,
-                    Err(RecvError::Closed) => return None,
-                },
-                r = s.overlay.recv() => match r {
-                    Ok(e) if targets(&e.scene, &scene) => Some(ChannelSignal {
-                        ts: e.ts, channel: Channel::Vision, direction: "out",
-                        body: format!("overlay · {} bytes", e.payload.len()), is_final: true,
+                        body: view_summary(&e.envelope), is_final: true,
                     }),
                     Ok(_) => None,
                     Err(RecvError::Lagged(_)) => None,
@@ -183,15 +172,14 @@ fn vision_summary(e: &crate::server::VisionFrameEvent) -> String {
     }
 }
 
-/// A compact one-line summary of a surface envelope for the inspector.
-fn surface_summary(env: &crate::types::SurfaceEnvelope) -> String {
-    use crate::types::SurfaceOp;
+/// A compact one-line summary of a view envelope for the inspector.
+fn view_summary(env: &crate::types::ViewEnvelope) -> String {
+    use crate::types::ViewOp;
+    let url = env.module_url.as_deref().unwrap_or("");
     match env.op {
-        SurfaceOp::Show => {
-            let chars = env.html.as_ref().map(|h| h.len()).unwrap_or(0);
-            format!("surface show · {} · {chars} bytes html", env.id)
-        }
-        SurfaceOp::Dismiss => format!("surface dismiss · {}", env.id),
+        ViewOp::Show => format!("view show · {} · {url}", env.id),
+        ViewOp::Replace => format!("view replace · {} · {url}", env.id),
+        ViewOp::Dismiss => format!("view dismiss · {}", env.id),
     }
 }
 
