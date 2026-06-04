@@ -1,10 +1,49 @@
-import { defineConfig, type ProxyOptions } from "vite";
+import { defineConfig, type Plugin, type ProxyOptions } from "vite";
 import react from "@vitejs/plugin-react";
 import basicSsl from "@vitejs/plugin-basic-ssl";
 
 // Resolve a path relative to this config file (ESM has no __dirname). Uses the
 // global URL (no node:url import) so it needs no @types/node.
 const r = (p: string) => new URL(p, import.meta.url).pathname;
+
+// The shared-instance contract. Each shim entry (src/shared/*) re-exports a
+// dependency that BOTH host chrome and agent-authored view modules must share a
+// single instance of. Rollup dedupes the real module into a common chunk that
+// the host and each shim reference; we emit an import map pointing every bare
+// specifier at its shim chunk, so an agent module's `import {…} from "react"` /
+// `"@hi/core"` resolves to the very same instance the host loaded.
+const SHARED_SPECIFIERS: Record<string, string> = {
+  "src/shared/react.ts": "react",
+  "src/shared/react-dom.ts": "react-dom",
+  "src/shared/jsx-runtime.ts": "react/jsx-runtime",
+  "src/shared/motion.ts": "motion/react",
+  "src/shared/core.ts": "@hi/core",
+  "src/shared/ui.ts": "@hi/ui",
+};
+
+// After the bundle is built, write dist/importmap.json mapping each shared bare
+// specifier to its emitted, content-hashed chunk URL. The Rust `index()` handler
+// injects this map into the served HTML (Stage 2).
+function emitImportMap(): Plugin {
+  return {
+    name: "hi-emit-importmap",
+    generateBundle(_options, bundle) {
+      const imports: Record<string, string> = {};
+      for (const chunk of Object.values(bundle)) {
+        if (chunk.type !== "chunk" || !chunk.isEntry || !chunk.facadeModuleId) continue;
+        const facade = chunk.facadeModuleId.replace(/\\/g, "/");
+        for (const [suffix, spec] of Object.entries(SHARED_SPECIFIERS)) {
+          if (facade.endsWith(suffix)) imports[spec] = "/" + chunk.fileName;
+        }
+      }
+      this.emitFile({
+        type: "asset",
+        fileName: "importmap.json",
+        source: JSON.stringify({ imports }, null, 2),
+      });
+    },
+  };
+}
 
 // During dev, the browser only talks to Vite (:5173). Vite proxies every
 // human-interface channel route — all under `/api/*` — to the Rust server on
@@ -70,7 +109,7 @@ const proxy: Record<string, ProxyOptions> = Object.fromEntries(
 );
 
 export default defineConfig({
-  plugins: [react(), basicSsl()],
+  plugins: [react(), basicSsl(), emitImportMap()],
   // `@hi/core` (session hooks) and `@hi/ui` (static primitives) are the stable
   // import surface both host chrome and agent-authored views author against.
   resolve: {
@@ -94,5 +133,19 @@ export default defineConfig({
     // base64 data URLs — and the worklet is small enough to be inlined, which
     // silently breaks mic capture. Force it to be emitted as a hashed file.
     assetsInlineLimit: (filePath) => (filePath.endsWith("pcmWorklet.js") ? false : undefined),
+    rollupOptions: {
+      // Keep each shim entry's full export surface (don't tree-shake an entry's
+      // re-exports just because nothing in this build imports it).
+      preserveEntrySignatures: "exports-only",
+      input: {
+        index: r("index.html"),
+        "share-react": r("src/shared/react.ts"),
+        "share-react-dom": r("src/shared/react-dom.ts"),
+        "share-jsx-runtime": r("src/shared/jsx-runtime.ts"),
+        "share-motion": r("src/shared/motion.ts"),
+        "share-core": r("src/shared/core.ts"),
+        "share-ui": r("src/shared/ui.ts"),
+      },
+    },
   },
 });

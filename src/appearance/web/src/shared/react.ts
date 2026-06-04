@@ -1,0 +1,78 @@
+// Shared-instance shim: re-exports React so the import map can point the bare
+// specifier "react" at one chunk shared by host chrome and agent view modules.
+// Without a single instance, hooks throw across the host/view boundary.
+//
+// React 18 is CommonJS, so `export * from "react"` would drop every named export
+// (they aren't statically analyzable). We instead name each export explicitly —
+// the same CJS-interop the host uses everywhere — so Rollup emits them as real
+// ESM named exports that an agent's `import { useState } from "react"` resolves.
+import React, {
+  Children,
+  Component,
+  Fragment,
+  Profiler,
+  PureComponent,
+  StrictMode,
+  Suspense,
+  cloneElement,
+  createContext,
+  createElement,
+  createRef,
+  forwardRef,
+  isValidElement,
+  lazy,
+  memo,
+  startTransition,
+  useCallback,
+  useContext,
+  useDebugValue,
+  useDeferredValue,
+  useEffect,
+  useId,
+  useImperativeHandle,
+  useInsertionEffect,
+  useLayoutEffect,
+  useMemo,
+  useReducer,
+  useRef,
+  useState,
+  useSyncExternalStore,
+  useTransition,
+  version,
+} from "react";
+
+export {
+  Children,
+  Component,
+  Fragment,
+  Profiler,
+  PureComponent,
+  StrictMode,
+  Suspense,
+  cloneElement,
+  createContext,
+  createElement,
+  createRef,
+  forwardRef,
+  isValidElement,
+  lazy,
+  memo,
+  startTransition,
+  useCallback,
+  useContext,
+  useDebugValue,
+  useDeferredValue,
+  useEffect,
+  useId,
+  useImperativeHandle,
+  useInsertionEffect,
+  useLayoutEffect,
+  useMemo,
+  useReducer,
+  useRef,
+  useState,
+  useSyncExternalStore,
+  useTransition,
+  version,
+};
+export default React;
