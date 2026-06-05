@@ -1,18 +1,22 @@
-//! Memory substrate — `journal.jsonl` and snapshot building.
+//! Memory substrate — the lossless raw signal store and snapshot building.
 //!
 //! `Memory` is a cheap-to-clone handle that holds the journal writer. Server
-//! handlers and the reactor share one instance.
+//! handlers and the reactor share one instance. On-disk, signals live under
+//! `<data_dir>/memory/raw/` (see [`layout`]); blobs are co-located with the
+//! day-log that references them.
 
 use std::path::Path;
 
+pub mod core;
+pub mod episodes;
 pub mod journal;
+pub mod layout;
 pub mod media;
 pub mod snapshot;
 
+pub use self::core::{load_core, refresh_hot};
 pub use journal::Journal;
 pub use snapshot::{Snapshot, build_for_scene};
-
-const JOURNAL_FILE: &str = "journal.jsonl";
 
 #[derive(Clone)]
 pub struct Memory {
@@ -21,8 +25,12 @@ pub struct Memory {
 
 impl Memory {
     pub async fn open(data_dir: &Path) -> anyhow::Result<Self> {
-        tokio::fs::create_dir_all(data_dir).await?;
-        let journal = Journal::open(data_dir.join(JOURNAL_FILE)).await?;
+        let journal = Journal::open(data_dir.to_path_buf()).await?;
         Ok(Self { journal })
+    }
+
+    /// The data directory backing this store (root of `<data_dir>/memory/…`).
+    pub fn data_dir(&self) -> &Path {
+        self.journal.data_dir()
     }
 }

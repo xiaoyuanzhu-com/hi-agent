@@ -20,8 +20,8 @@
 //! after `cargo build --release && ./target/release/hi-agent`:
 //!
 //! ```sh
-//! # in one terminal, watch journal.jsonl
-//! tail -F data/journal.jsonl
+//! # in one terminal, watch the scene's day-log
+//! tail -F data/memory/raw/*/signals/*/log.jsonl
 //!
 //! # in another, fire two POSTs in rapid succession to the same scene
 //! BASE=http://127.0.0.1:8080

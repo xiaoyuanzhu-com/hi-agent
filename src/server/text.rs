@@ -24,11 +24,12 @@ use axum::extract::State;
 use axum::http::{StatusCode, header};
 use axum::response::{IntoResponse, Response};
 use chrono::Utc;
+use uuid::Uuid;
 
 use crate::server::observe;
 use crate::server::headers::{AuthBearer, RequiredScene, SceneHeader, StreamHeader};
 use crate::server::AppState;
-use crate::types::{Channel, JournalEntry, Signal};
+use crate::types::{Channel, JournalEntry, Origin, Signal};
 
 pub async fn post_text(
     State(state): State<Arc<AppState>>,
@@ -61,12 +62,14 @@ pub async fn post_text(
     crate::channel_log::inbound(Channel::Text, &scene, &signal.body);
 
     let entry = JournalEntry::SignalIn {
+        id: Uuid::now_v7().to_string(),
         ts: signal.ts,
         channel: signal.channel,
         scene: signal.scene.clone(),
         body: signal.body.clone(),
         stream: signal.stream.clone(),
-        media_path: None,
+        media: None,
+        origin: Some(Origin::Human),
     };
     if let Err(err) = state.memory.journal.append(entry).await {
         tracing::error!(error = %err, "journal append failed; accepting signal anyway");

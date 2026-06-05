@@ -127,42 +127,78 @@ pub struct Signal {
 }
 
 // -----------------------------------------------------------------------------
-// JournalEntry — the discriminated union written to journal.jsonl
+// Origin — which mind produced a signal
+// -----------------------------------------------------------------------------
+
+/// Mechanical provenance: which mind produced a signal. NOT the speaker's
+/// identity (that stays soft, inferred from content). Inbound human signals are
+/// `Human`, the reactor's own articulation is `Reactor`, and delegated workers
+/// (once they journal) are `Worker`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Origin {
+    Human,
+    Reactor,
+    Worker,
+}
+
+// -----------------------------------------------------------------------------
+// Media — the multimodal payload a signal carries (audio bytes, image, …)
+// -----------------------------------------------------------------------------
+
+/// A signal's media payload, co-located with the day-log that references it as
+/// `<channel>-<id>.<ext>`. The signal's `body` stays the text surface (an STT
+/// transcript, a caption); this carries the blob plus enough metadata that a
+/// reader needn't open the bytes to know what they are.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Media {
+    /// Blob filename within the signal's day-folder, e.g. `audio-<id>.mp3`.
+    pub file: String,
+    pub mime: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub duration_ms: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub width: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub height: Option<u32>,
+}
+
+// -----------------------------------------------------------------------------
+// JournalEntry — the discriminated union written to each scene's day-log
 // -----------------------------------------------------------------------------
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum JournalEntry {
     SignalIn {
+        /// Stable, time-sortable id (uuidv7): the cursor + citation key, and the
+        /// stem of any co-located media blob (`audio-<id>.mp3`).
+        id: String,
         ts: DateTime<Utc>,
         channel: Channel,
-        // `alias = "from"` keeps journals written before the X-HI-Scene rename
-        // (which stored the sender as `from`) loadable on cold start.
         #[serde(alias = "from")]
         scene: Scene,
         body: String,
         /// Named stream within the scene this signal arrived on, or absent for
-        /// the default stream. Old journals (no key) load as `None`, and
-        /// default-stream entries omit the key entirely, so existing lines stay
-        /// byte-identical — no migration.
+        /// the default stream.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         stream: Option<String>,
-        /// Stable file reference for non-text bodies (audio bytes, future
-        /// images). `body` stays the text representation (e.g. STT transcript).
-        #[serde(default)]
-        media_path: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        media: Option<Media>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        origin: Option<Origin>,
     },
     SignalOut {
+        id: String,
         ts: DateTime<Utc>,
         channel: Channel,
-        // `alias = "to"` keeps pre-rename journals (which stored the recipient
-        // as `to`) loadable.
         #[serde(alias = "to")]
         scene: Scene,
         body: String,
-        /// For outbound audio: where the rendered bytes live.
-        #[serde(default)]
-        media_path: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        media: Option<Media>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        origin: Option<Origin>,
     },
 }
 

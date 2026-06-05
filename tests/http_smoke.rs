@@ -36,19 +36,40 @@ async fn spawn_server() -> (String, tempfile::TempDir, ServerSeams) {
     (format!("http://{addr}"), dir, seams)
 }
 
-/// Read every line of `journal.jsonl` into typed entries.
-async fn read_journal(dir: &std::path::Path) -> Vec<JournalEntry> {
-    let path = dir.join("journal.jsonl");
-    let contents = match tokio::fs::read_to_string(&path).await {
-        Ok(s) => s,
-        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Vec::new(),
-        Err(err) => panic!("read journal: {err}"),
-    };
-    contents
-        .lines()
-        .filter(|line| !line.trim().is_empty())
-        .map(|line| serde_json::from_str(line).expect("decode journal entry"))
-        .collect()
+/// Read every `log.jsonl` under `memory/raw/` into typed entries (across all
+/// scenes and day-folders).
+fn read_journal(dir: &std::path::Path) -> Vec<JournalEntry> {
+    let mut out = Vec::new();
+    for log in walk_files(&dir.join("memory").join("raw")) {
+        if log.file_name().and_then(|n| n.to_str()) != Some("log.jsonl") {
+            continue;
+        }
+        let contents = std::fs::read_to_string(&log).expect("read log");
+        for line in contents.lines().filter(|l| !l.trim().is_empty()) {
+            out.push(serde_json::from_str(line).expect("decode journal entry"));
+        }
+    }
+    out
+}
+
+/// Every file (recursively) under `root`; empty if `root` does not exist.
+fn walk_files(root: &std::path::Path) -> Vec<std::path::PathBuf> {
+    let mut files = Vec::new();
+    let mut stack = vec![root.to_path_buf()];
+    while let Some(path) = stack.pop() {
+        let Ok(rd) = std::fs::read_dir(&path) else {
+            continue;
+        };
+        for ent in rd.flatten() {
+            let p = ent.path();
+            if p.is_dir() {
+                stack.push(p);
+            } else {
+                files.push(p);
+            }
+        }
+    }
+    files
 }
 
 #[tokio::test]
@@ -66,7 +87,7 @@ async fn post_thought_accepts_and_journals() {
     assert_eq!(resp.status(), reqwest::StatusCode::ACCEPTED);
 
     tokio::time::sleep(Duration::from_millis(50)).await;
-    let entries = read_journal(dir.path()).await;
+    let entries = read_journal(dir.path());
     assert_eq!(entries.len(), 1, "expected one journal entry, got {entries:?}");
     match &entries[0] {
         JournalEntry::SignalIn { scene, body, .. } => {
@@ -93,7 +114,7 @@ async fn post_thought_without_scene_header_is_anonymous() {
     assert_eq!(resp.status(), reqwest::StatusCode::ACCEPTED);
 
     tokio::time::sleep(Duration::from_millis(50)).await;
-    let entries = read_journal(dir.path()).await;
+    let entries = read_journal(dir.path());
     assert_eq!(entries.len(), 1);
     match &entries[0] {
         JournalEntry::SignalIn { scene, .. } => assert_eq!(scene.0, "anonymous"),
@@ -121,15 +142,21 @@ async fn post_vision_accepts_and_persists_without_journaling() {
     assert_eq!(resp.status(), reqwest::StatusCode::ACCEPTED);
 
     tokio::time::sleep(Duration::from_millis(50)).await;
-    let entries = read_journal(dir.path()).await;
+    let entries = read_journal(dir.path());
     assert!(entries.is_empty(), "vision must not journal yet, got {entries:?}");
 
-    // The frame should have been written under media/image/in/.
-    let img_dir = dir.path().join("media").join("image").join("in");
-    let count = std::fs::read_dir(&img_dir)
-        .map(|rd| rd.count())
-        .unwrap_or(0);
-    assert_eq!(count, 1, "expected one persisted frame under {img_dir:?}");
+    // The frame should have been written as a co-located `vision-<id>.jpg` blob
+    // under memory/raw/<scene>/signals/<day>/, with no journal entry.
+    let raw = dir.path().join("memory").join("raw");
+    let frames = walk_files(&raw)
+        .into_iter()
+        .filter(|p| {
+            p.file_name()
+                .and_then(|n| n.to_str())
+                .is_some_and(|n| n.starts_with("vision-"))
+        })
+        .count();
+    assert_eq!(frames, 1, "expected one persisted vision frame under {raw:?}");
 }
 
 #[tokio::test]

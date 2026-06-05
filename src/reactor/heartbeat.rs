@@ -13,8 +13,11 @@
 
 use std::sync::Arc;
 
+use chrono::{DateTime, Utc};
+
 use crate::acp::{AcpSession, SessionOpts};
-use crate::memory::build_for_scene;
+use crate::memory::journal::entry_ts;
+use crate::memory::{Snapshot, build_for_scene, episodes, load_core, refresh_hot};
 use crate::observatory::EventKind;
 use crate::types::Scene;
 
@@ -79,27 +82,50 @@ pub(super) async fn swap(
     scene: &Scene,
     current: &Arc<AcpSession>,
 ) -> anyhow::Result<Arc<AcpSession>> {
-    // Ask the live session to brief its successor. The reply is captured here
-    // and never emitted to the channel or spoken — it only seeds the new session.
+    // Ask the live session to brief its successor. The reply is captured here and
+    // never emitted or spoken — it seeds the new session and, as the gist of the
+    // conversation, doubles as the consolidated episode.
     let briefing = {
         let run = current.prompt(SUMMARIZE_PROMPT.to_string()).await?;
         run.wait().await?.text
     };
     let briefing_chars = briefing.chars().count();
 
-    // The verbatim recent tail from the journal — the immediate thread the
-    // briefing might compress away. Together they seed the replacement so it
-    // continues without a visible seam.
-    let tail = build_for_scene(&reactor.inner.memory, scene)
-        .await
-        .map(|snap| snap.render_for_prompt())
+    // The verbatim recent tail — the immediate thread the briefing might compress
+    // away. Kept as a snapshot so its time span also bounds the episode.
+    let snapshot = build_for_scene(&reactor.inner.memory, scene).await.ok();
+    let tail = snapshot
+        .as_ref()
+        .map(Snapshot::render_for_prompt)
         .unwrap_or_default();
 
+    // The heartbeat is the "sleep" moment: persist the briefing as an episode and
+    // regenerate hot.md from episodes. Both best-effort — a failure here must
+    // never block the swap.
+    if !briefing.trim().is_empty() {
+        let (from, to) = episode_window(snapshot.as_ref());
+        if let Err(err) =
+            episodes::write_episode(&reactor.inner.memory, scene, &briefing, from, to).await
+        {
+            tracing::warn!(scene = %scene, error = %err, "failed to persist heartbeat episode");
+        }
+        if let Err(err) = refresh_hot(&reactor.inner.memory).await {
+            tracing::warn!(scene = %scene, error = %err, "failed to refresh hot.md");
+        }
+    }
+
+    // Seed the replacement with the freshly-updated core (self.md + hot.md) plus
+    // the briefing and recent tail, so it continues without a visible seam.
+    let core = load_core(&reactor.inner.memory).await;
+    let core_block = if core.trim().is_empty() {
+        String::new()
+    } else {
+        format!("{}\n\n", core.trim())
+    };
     let seeded_system_prompt = format!(
-        "{}\n\n\
-         ## Briefing from your earlier conversation\n{}\n\n\
-         {}",
+        "{}\n\n{}## Briefing from your earlier conversation\n{}\n\n{}",
         reactor.inner.soul,
+        core_block,
         briefing.trim(),
         tail.trim(),
     );
@@ -132,4 +158,17 @@ pub(super) async fn swap(
         .await;
 
     Ok(Arc::new(fresh))
+}
+
+/// The `[from, to]` span an episode covers: the first and last timestamps in the
+/// recent snapshot, or `now` for both when it is empty or unavailable.
+fn episode_window(snapshot: Option<&Snapshot>) -> (DateTime<Utc>, DateTime<Utc>) {
+    let now = Utc::now();
+    snapshot
+        .and_then(|s| {
+            let first = s.recent_entries.first()?;
+            let last = s.recent_entries.last()?;
+            Some((entry_ts(first), entry_ts(last)))
+        })
+        .unwrap_or((now, now))
 }

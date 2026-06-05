@@ -31,9 +31,11 @@ use chrono::Utc;
 use serde::Deserialize;
 use tokio::sync::broadcast::error::RecvError;
 
-use crate::memory::media::{self, Direction};
+use crate::memory::media;
 use crate::server::headers::{AuthBearer, RequiredScene, SceneHeader, StreamHeader};
 use crate::server::{AppState, VisionFrameEvent};
+use crate::types::Channel;
+use uuid::Uuid;
 
 const DEFAULT_MIME: &str = "image/jpeg";
 
@@ -57,6 +59,7 @@ pub async fn post_vision(
 
     tracing::debug!(scene = %scene, stream = ?stream, mime = %mime, bytes = body.len(), "POST /api/in/vision");
 
+    let ts = Utc::now();
     // Publish the live frame to any subscriber (the read side of the channel).
     // A send error just means nobody is watching — fine, mirrors audio out.
     let _ = state.vision_out.send(VisionFrameEvent {
@@ -64,12 +67,14 @@ pub async fn post_vision(
         stream,
         bytes: body.clone(),
         mime,
-        ts: Utc::now(),
+        ts,
     });
 
-    // Persist only — no journal, no dispatch (see module docs).
-    match media::store_image(&state.data_dir, Direction::In, ext, &body).await {
-        Ok(_path) => StatusCode::ACCEPTED.into_response(),
+    // Persist only — no journal, no dispatch (see module docs). The frame is a
+    // standalone blob with its own id, since vision isn't journaled yet.
+    let id = Uuid::now_v7().to_string();
+    match media::store_blob(&state.data_dir, &scene, ts, Channel::Vision, &id, ext, &body).await {
+        Ok(_file) => StatusCode::ACCEPTED.into_response(),
         Err(err) => {
             tracing::error!(error = %err, "failed to persist vision frame");
             (StatusCode::INTERNAL_SERVER_ERROR, "vision store failed\n").into_response()

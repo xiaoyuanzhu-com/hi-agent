@@ -71,8 +71,9 @@ use crate::acp::{AcpSession, SessionOpts, SessionUpdate};
 use crate::agent::{AgentLayer, SessionRole};
 use crate::memory::{Memory, build_for_scene};
 use crate::observatory::{EventKind, Observatory, SessionKind};
-use crate::types::{Channel, JournalEntry, Scene, Signal, ViewEnvelope, ViewOp};
+use crate::types::{Channel, JournalEntry, Origin, Scene, Signal, ViewEnvelope, ViewOp};
 use bytes::Bytes;
+use uuid::Uuid;
 
 /// How long the floor must stay quiet after the last finalized utterance before
 /// the mind commits to replying. The human-interface tradeoff knob: higher =
@@ -683,11 +684,25 @@ async fn warm_up(reactor: &Reactor, scene: &Scene, reactor_session: &mut Option<
     }
 }
 
-/// Open a fresh persistent reactor session for `scene`, carrying the soul as its
-/// system prompt, and record the lifecycle event. The session consumes the system
-/// prompt on its first `prompt()` and never re-sends it. Shared by the warm-up
-/// prologue and the cold path of [`run_turn`].
+/// Compose a session's system prompt: the soul, plus the always-loaded memory
+/// core (`self.md` + `hot.md`) when it exists. Loaded at session-creation, so a
+/// hot-swap picks up whatever the last reflection wrote.
+pub(super) fn system_prompt_with_core(soul: &str, core: &str) -> String {
+    let core = core.trim();
+    if core.is_empty() {
+        soul.to_owned()
+    } else {
+        format!("{soul}\n\n{core}")
+    }
+}
+
+/// Open a fresh persistent reactor session for `scene`, carrying the soul (plus
+/// the memory core) as its system prompt, and record the lifecycle event. The
+/// session consumes the system prompt on its first `prompt()` and never re-sends
+/// it. Shared by the warm-up prologue and the cold path of [`run_turn`].
 async fn open_session(reactor: &Reactor, scene: &Scene) -> anyhow::Result<Arc<AcpSession>> {
+    let core = crate::memory::load_core(&reactor.inner.memory).await;
+    let system_prompt = system_prompt_with_core(&reactor.inner.soul, &core);
     let session = Arc::new(
         reactor
             .inner
@@ -697,7 +712,7 @@ async fn open_session(reactor: &Reactor, scene: &Scene) -> anyhow::Result<Arc<Ac
                 SessionRole::Reactor,
                 None,
                 SessionOpts {
-                    system_prompt: Some(reactor.inner.soul.clone()),
+                    system_prompt: Some(system_prompt),
                     cwd: None,
                 },
             )
@@ -858,11 +873,13 @@ async fn run_turn(
 async fn emit_thought_chunk(reactor: &Reactor, scene: &Scene, text: String) {
     let ts = Utc::now();
     let entry = JournalEntry::SignalOut {
+        id: Uuid::now_v7().to_string(),
         ts,
         channel: Channel::Text,
         scene: scene.clone(),
         body: text.clone(),
-        media_path: None,
+        media: None,
+        origin: Some(Origin::Reactor),
     };
     if let Err(err) = reactor.inner.memory.journal.append(entry).await {
         tracing::error!(scene = %scene, error = %err, "journal append failed for outbound thought");

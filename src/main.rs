@@ -11,7 +11,7 @@ struct Cli {
     #[arg(long, default_value_t = 8080)]
     port: u16,
 
-    /// Where journal.jsonl lives.
+    /// Root for memory (`memory/raw/…`), the soul, and runtime state.
     #[arg(long, default_value = "./data")]
     data_dir: PathBuf,
 }

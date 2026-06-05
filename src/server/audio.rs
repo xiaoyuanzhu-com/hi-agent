@@ -1,10 +1,10 @@
 //! The audio channel: inbound speech and outbound voice.
 //!
 //! Inbound clip (`POST /api/in/audio`): the body bytes are audio; we save them
-//! under `data/media/audio/in/<uuid>.<ext>`, transcribe via the configured STT
+//! as a co-located `audio-<id>.<ext>` blob beside the scene's day-log, transcribe via the configured STT
 //! capability ([`crate::capabilities::stt`]), and feed the transcript into the
 //! same per-scene path that `POST /api/in/text` uses. The journal records a
-//! `SignalIn { channel: Audio, body: <transcript>, media_path: Some(path) }`
+//! `SignalIn { channel: Audio, body: <transcript>, media: Some(..) }`
 //! so the reactor's snapshot can show that this signal arrived as speech
 //! while the body remains text-searchable. The transcript is also echoed to
 //! scene observers (`GET /api/in/audio`).
@@ -49,11 +49,12 @@ use tokio::sync::broadcast::error::RecvError;
 use tokio::sync::mpsc;
 
 use crate::capabilities::stt::{self, Transcript};
-use crate::memory::media::{self, Direction};
+use crate::memory::media;
 use crate::server::headers::{AuthBearer, RequiredScene, SceneHeader, StreamHeader};
 use crate::server::{observe, AppState, AudioEvent};
 use crate::segment::{Segmenter, Speech};
-use crate::types::{Channel, JournalEntry, Scene, Signal};
+use crate::types::{Channel, JournalEntry, Media, Origin, Scene, Signal};
+use uuid::Uuid;
 
 const DEFAULT_MIME: &str = "audio/wav";
 
@@ -98,11 +99,16 @@ pub async fn post_audio(
         "POST /audio"
     );
 
-    // 1. Persist the raw bytes so we can replay/audit and so the journal has
-    //    a stable reference. We do this before STT so a transcription failure
+    // The signal's id (uuidv7) also names its co-located blob; `ts` places both
+    // in the same day-folder. Generate them before storing so the two agree.
+    let ts = Utc::now();
+    let id = Uuid::now_v7().to_string();
+
+    // 1. Persist the raw bytes so we can replay/audit and so the log has a
+    //    stable reference. We do this before STT so a transcription failure
     //    still leaves the audio on disk.
-    let media_path = match media::store_audio(&state.data_dir, Direction::In, ext, &body).await {
-        Ok(p) => p,
+    let media_path = match media::store_blob(&state.data_dir, &scene, ts, Channel::Audio, &id, ext, &body).await {
+        Ok(f) => f,
         Err(err) => {
             tracing::error!(error = %err, "failed to persist incoming audio");
             return (StatusCode::INTERNAL_SERVER_ERROR, "audio store failed\n").into_response();
@@ -133,9 +139,8 @@ pub async fn post_audio(
         return (StatusCode::ACCEPTED, axum::Json(ack)).into_response();
     }
 
-    // 3. Journal + dispatch — identical to thought.rs from this point, except
-    //    the channel is Audio and we carry the media_path.
-    let ts = Utc::now();
+    // 3. Journal + dispatch — identical to text.rs from this point, except the
+    //    channel is Audio and we carry the media reference.
     let signal = Signal {
         channel: Channel::Audio,
         scene: scene.clone(),
@@ -145,12 +150,20 @@ pub async fn post_audio(
     };
     crate::channel_log::inbound(Channel::Audio, &scene, &transcript);
     let entry = JournalEntry::SignalIn {
+        id,
         ts,
         channel: Channel::Audio,
         scene: scene.clone(),
         body: transcript.clone(),
         stream,
-        media_path: Some(media_path.clone()),
+        media: Some(Media {
+            file: media_path.clone(),
+            mime: mime.clone(),
+            duration_ms: None,
+            width: None,
+            height: None,
+        }),
+        origin: Some(Origin::Human),
     };
     if let Err(err) = state.memory.journal.append(entry).await {
         tracing::error!(error = %err, "journal append failed; accepting signal anyway");
@@ -290,8 +303,7 @@ async fn stream_audio_in(
 
 /// Journal + dispatch one finalized utterance — the streaming counterpart of the
 /// tail of `post_audio`. Streaming utterances aren't persisted as discrete media
-/// files (no per-clip blob); the journal records the transcript with no
-/// `media_path`.
+/// files (no per-clip blob); the journal records the transcript with no `media`.
 async fn dispatch_utterance(state: &AppState, scene: &Scene, stream: Option<String>, text: &str) {
     let ts = Utc::now();
     let signal = Signal {
@@ -303,12 +315,14 @@ async fn dispatch_utterance(state: &AppState, scene: &Scene, stream: Option<Stri
     };
     crate::channel_log::inbound(Channel::Audio, scene, text);
     let entry = JournalEntry::SignalIn {
+        id: Uuid::now_v7().to_string(),
         ts,
         channel: Channel::Audio,
         scene: scene.clone(),
         body: text.to_owned(),
         stream,
-        media_path: None,
+        media: None,
+        origin: Some(Origin::Human),
     };
     if let Err(err) = state.memory.journal.append(entry).await {
         tracing::error!(error = %err, "journal append failed; accepting signal anyway");
