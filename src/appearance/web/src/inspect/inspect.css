@@ -131,6 +131,17 @@
 .evtable .evraw pre { margin: 0; font-family: var(--mono); color: var(--fg); white-space: pre-wrap; overflow-wrap: anywhere; }
 .evnull { color: var(--dim); font-style: italic; }
 
+/* Raw ACP frame log — five columns (Time, Dir, Method, #, Frame); override the
+   generic four-column widths above. */
+.frtable th:nth-child(1) { width: 96px; }
+.frtable th:nth-child(2) { width: 32px; }
+.frtable th:nth-child(3) { width: 200px; }
+.frtable th:nth-child(4) { width: 56px; }
+.frtable .frdir { font-weight: 700; text-align: center; }
+.frtable .frdir.send { color: var(--accent); }
+.frtable .frdir.recv { color: var(--ok); }
+.frtable .frdir.stderr { color: var(--bad); }
+
 /* session-kind tag in the ACP list */
 .skind {
   font-family: var(--mono); font-size: 10px; line-height: 1;

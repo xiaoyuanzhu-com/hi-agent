@@ -18,7 +18,7 @@ use std::sync::Arc;
 use agent_client_protocol::schema::{HttpHeader, McpServer, McpServerHttp};
 use tokio::sync::{Mutex, OnceCell};
 
-use crate::acp::{AcpProcess, AcpSession, SessionOpts};
+use crate::acp::{AcpProcess, AcpSession, AcpTap, SessionOpts};
 use crate::config::{HEADER_ROLE, HEADER_SCENE, HEADER_WORKER_ID};
 use crate::observatory::{EventKind, Observatory};
 use crate::types::Scene;
@@ -66,6 +66,9 @@ struct Inner {
     server_base_url: String,
     /// Structured visibility — process spawn/restart events feed it.
     observatory: Observatory,
+    /// Raw JSON-RPC wire tap — every scene's subprocess records its frames here
+    /// for the raw ACP inspector. Handed to each [`AcpProcess`] at spawn.
+    tap: AcpTap,
     /// One lazily-initialised process per scene. The `OnceCell` makes concurrent
     /// first-contacts for the *same* scene wait on a single spawn, while leaving
     /// other scenes free to proceed (the map lock is held only to fetch the cell,
@@ -74,12 +77,18 @@ struct Inner {
 }
 
 impl AgentLayer {
-    pub fn new(spawn: SpawnConfig, observatory: Observatory, server_base_url: String) -> Self {
+    pub fn new(
+        spawn: SpawnConfig,
+        observatory: Observatory,
+        tap: AcpTap,
+        server_base_url: String,
+    ) -> Self {
         Self {
             inner: Arc::new(Inner {
                 spawn,
                 server_base_url,
                 observatory,
+                tap,
                 scenes: Mutex::new(HashMap::new()),
             }),
         }
@@ -146,6 +155,7 @@ impl AgentLayer {
 
         let spawn = &self.inner.spawn;
         let observatory = &self.inner.observatory;
+        let tap = &self.inner.tap;
         let process = cell
             .get_or_try_init(|| async {
                 tracing::info!(scene = %scene, "spawning ACP subprocess for scene");
@@ -153,6 +163,8 @@ impl AgentLayer {
                     spawn.program.clone(),
                     spawn.args.clone(),
                     spawn.env.clone(),
+                    tap.clone(),
+                    scene.0.clone(),
                 )
                 .await?;
                 observatory.record(scene, EventKind::ProcessSpawned).await;

@@ -46,6 +46,11 @@ pub async fn run(config: Config) -> anyhow::Result<()> {
         reactor::swap_budget_chars(),
     );
 
+    // Raw ACP wire tap — every JSON-RPC frame, business-logic agnostic. The agent
+    // layer hands it to each scene's subprocess; `GET /api/acp/frames/events`
+    // streams it to the raw session inspector.
+    let acp_tap = acp::AcpTap::new();
+
     // Resolve all capabilities from the environment. Unconfigured capabilities
     // are fine; gates affect /audio (STT) and the speak path (TTS) only.
     capabilities::init_from_env()?;
@@ -64,6 +69,7 @@ pub async fn run(config: Config) -> anyhow::Result<()> {
         memory.clone(),
         config.data_dir.clone(),
         observatory.clone(),
+        acp_tap.clone(),
         tool_registry.clone(),
     );
 
@@ -148,6 +154,7 @@ pub async fn run(config: Config) -> anyhow::Result<()> {
             env: child_env,
         },
         observatory.clone(),
+        acp_tap,
         format!("http://127.0.0.1:{}", config.port),
     );
     tracing::info!("agent session layer ready (per-scene processes spawn on first contact)");

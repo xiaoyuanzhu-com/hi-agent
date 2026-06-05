@@ -241,6 +241,15 @@ async function playVideoSession(
     if (cancelled()) return;
 
     const sb = ms.addSourceBuffer(turn.mime);
+    // An observer almost always joins a camera that's been running a while, so
+    // the media's timestamps start seconds in. "sequence" mode ignores those
+    // timestamps and lays each appended chunk right after the last, so playback
+    // starts at 0 and the <video> doesn't sit black waiting at currentTime 0.
+    try {
+      sb.mode = "sequence";
+    } catch {
+      /* some browsers fix the mode; segments mode still plays a from-start join */
+    }
     const queue: Uint8Array[] = [];
     let ended = false;
     const pump = () => {
@@ -265,13 +274,36 @@ async function playVideoSession(
       /* autoplay race; the next append/play retries */
     });
 
-    while (!cancelled()) {
-      const { value, done } = await reader.read();
-      if (done) break;
-      if (value) {
-        queue.push(value);
-        pump();
+    // Temporary diagnostic: surface whether the <video> is decoding frames or
+    // just sitting black (e.g. waiting for a keyframe after a mid-stream join).
+    let appended = 0;
+    let ticks = 0;
+    const diag = setInterval(() => {
+      const buf =
+        video.buffered.length > 0
+          ? `${video.buffered.start(0).toFixed(2)}–${video.buffered.end(video.buffered.length - 1).toFixed(2)}`
+          : "none";
+      // eslint-disable-next-line no-console
+      console.log(
+        `[vision diag] mime=${turn.mime} appended=${appended} readyState=${video.readyState} ` +
+          `videoW=${video.videoWidth} t=${video.currentTime.toFixed(2)} paused=${video.paused} buffered=${buf} ` +
+          `msState=${ms.readyState}`,
+      );
+      if (++ticks >= 8) clearInterval(diag);
+    }, 1000);
+
+    try {
+      while (!cancelled()) {
+        const { value, done } = await reader.read();
+        if (done) break;
+        if (value) {
+          appended++;
+          queue.push(value);
+          pump();
+        }
       }
+    } finally {
+      clearInterval(diag);
     }
     ended = true;
     pump();
@@ -305,8 +337,12 @@ function VisionMonitor({ scene }: { scene: string }) {
           if (cancelled) break;
           await playVideoSession(video, turn, () => cancelled);
         }
-      } catch {
-        if (!cancelled && !ctrl.signal.aborted) setFailed(true);
+      } catch (err) {
+        if (!cancelled && !ctrl.signal.aborted) {
+          // eslint-disable-next-line no-console
+          console.warn("[vision monitor] playback failed:", err);
+          setFailed(true);
+        }
       }
     })();
 

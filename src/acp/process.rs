@@ -26,6 +26,7 @@ use tokio::sync::{Mutex, mpsc, oneshot};
 use tokio::task::JoinHandle;
 
 use crate::acp::session::{AcpSession, SessionUpdate};
+use crate::acp::tap::{AcpTap, Dir};
 
 /// Options for opening a new ACP session.
 #[derive(Debug, Default, Clone)]
@@ -57,6 +58,8 @@ impl AcpProcess {
         program: PathBuf,
         args: Vec<String>,
         env: Vec<(String, String)>,
+        tap: AcpTap,
+        scene: String,
     ) -> anyhow::Result<Self> {
         let program_str = program
             .to_str()
@@ -67,7 +70,18 @@ impl AcpProcess {
         let agent = acp::AcpAgent::from_args(argv.iter())
             .with_context(|| format!("constructing AcpAgent for {}", program.display()))?;
 
-        let agent = agent.with_debug(|line: &str, direction: acp::LineDirection| {
+        let agent = agent.with_debug(move |line: &str, direction: acp::LineDirection| {
+            // Mirror every frame to the raw ACP tap (the inspector's window),
+            // tagged with this scene, before the existing tracing.
+            tap.record(
+                &scene,
+                match direction {
+                    acp::LineDirection::Stdin => Dir::Send,
+                    acp::LineDirection::Stdout => Dir::Recv,
+                    acp::LineDirection::Stderr => Dir::Stderr,
+                },
+                line,
+            );
             match direction {
                 acp::LineDirection::Stdin => tracing::trace!(target: "acp::send", "{line}"),
                 acp::LineDirection::Stdout => tracing::trace!(target: "acp::recv", "{line}"),

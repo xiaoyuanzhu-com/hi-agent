@@ -14,10 +14,12 @@ use tokio::sync::{broadcast, mpsc};
 use tower_http::trace::TraceLayer;
 
 use crate::memory::Memory;
+use crate::acp::AcpTap;
 use crate::observatory::Observatory;
 use crate::reactor::{OutboundSignal, ToolRegistry};
 use crate::types::{Channel, Scene, Signal, ViewEnvelope};
 
+pub mod acp;
 pub mod audio;
 pub mod binder;
 pub mod channels;
@@ -280,6 +282,10 @@ pub struct AppState {
     /// the `/api/sessions` endpoints.
     pub observatory: Observatory,
 
+    /// Raw JSON-RPC wire tap — every ACP frame, business-logic agnostic. Served
+    /// read-only by `GET /api/acp/frames/events` for the raw session inspector.
+    pub acp_tap: AcpTap,
+
     /// Where blob media lives. POST /api/in/audio and POST /api/in/vision write
     /// incoming bytes here before journaling the reference.
     pub data_dir: PathBuf,
@@ -318,6 +324,7 @@ pub fn build(
     memory: Memory,
     data_dir: PathBuf,
     observatory: Observatory,
+    acp_tap: AcpTap,
     tool_registry: ToolRegistry,
 ) -> (Router, ServerSeams) {
     let (inbound_tx, inbound_rx) = mpsc::channel::<Signal>(1024);
@@ -364,6 +371,7 @@ pub fn build(
         output_echo: output_echo_tx.clone(),
         memory,
         observatory,
+        acp_tap,
         data_dir,
         tool_registry,
     });
@@ -390,6 +398,9 @@ pub fn build(
         .route("/api/in/taste", post(stubs::post_taste))
         .route("/api/sessions", get(sessions::get_sessions))
         .route("/api/sessions/events", get(sessions::get_sessions_events))
+        // The raw ACP wire feed — every JSON-RPC frame, business-logic agnostic.
+        // Backs the raw session inspector at `/inspect/sessions`.
+        .route("/api/acp/frames/events", get(acp::get_acp_frames_events))
         // The MCP tool endpoint a session's `mcp_servers` attach connects to. The
         // mind drives output and side-effects by calling tools here; routing is by
         // the X-HI-Scene/X-HI-Role headers the attach carries.

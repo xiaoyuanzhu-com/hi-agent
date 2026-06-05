@@ -110,6 +110,45 @@ export function subscribeChannels(
   return () => es.close();
 }
 
+// One raw JSON-RPC line on the ACP wire, business-logic agnostic. Mirrors
+// `RawFrame` in `src/acp/tap.rs`. `raw` is the verbatim line; the rest is the
+// little we parse out for grouping (the inspector keys sessions off `session_id`).
+export type AcpDir = "send" | "recv" | "stderr";
+
+export interface RawFrame {
+  seq: number;
+  ts: string;
+  scene: string;
+  dir: AcpDir;
+  session_id: string | null;
+  method: string | null;
+  id: unknown;
+  raw: string;
+}
+
+/**
+ * Subscribe to the raw ACP frame feed (`GET /api/acp/frames/events`). Returns an
+ * unsubscribe fn. One SSE connection carries one frame type, `frame`: the
+ * buffered ring replays on connect, then live frames stream. EventSource
+ * auto-reconnects.
+ */
+export function subscribeAcpFrames(
+  onFrame: (frame: RawFrame) => void,
+  onStatus?: (live: boolean) => void,
+): () => void {
+  const es = new EventSource("/api/acp/frames/events");
+  es.addEventListener("open", () => onStatus?.(true));
+  es.addEventListener("error", () => onStatus?.(false));
+  es.addEventListener("frame", (e) => {
+    try {
+      onFrame(JSON.parse((e as MessageEvent).data) as RawFrame);
+    } catch {
+      /* ignore malformed frame */
+    }
+  });
+  return () => es.close();
+}
+
 export interface EventStreamHandlers {
   /** A lifecycle event arrived — append it to the event log. */
   onEvent?: (ev: SessionEvent) => void;

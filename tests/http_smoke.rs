@@ -21,6 +21,7 @@ async fn spawn_server() -> (String, tempfile::TempDir, ServerSeams) {
         memory,
         dir.path().to_path_buf(),
         observatory,
+        hi_agent::acp::AcpTap::new(),
         hi_agent::reactor::ToolRegistry::new(),
     );
 
