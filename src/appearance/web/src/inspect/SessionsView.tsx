@@ -5,17 +5,27 @@ import { subscribeAcpFrames, type AcpDir, type RawFrame } from "./api";
 const BASE = "/inspect/sessions";
 const MAX_FRAMES = 5000;
 
+// 24-hour wall-clock with milliseconds — frames arrive faster than a second, so
+// the ms part is what tells two adjacent frames apart.
 function time(iso: string): string {
-  try {
-    return new Date(iso).toLocaleTimeString();
-  } catch {
-    return iso;
-  }
+  const d = new Date(iso);
+  if (Number.isNaN(d.getTime())) return iso;
+  const p = (n: number, w = 2) => String(n).padStart(w, "0");
+  return `${p(d.getHours())}:${p(d.getMinutes())}:${p(d.getSeconds())}.${p(d.getMilliseconds(), 3)}`;
 }
 
-// A direction glyph for the frame log: what hi-agent did with the line.
-function dirGlyph(dir: AcpDir): string {
-  return dir === "send" ? "→" : dir === "recv" ? "←" : "!";
+// Direction from the *session's* point of view (this is the sessions page): a
+// frame hi-agent sends is `in`coming to the session; one the subprocess emits is
+// `out`going from it; `err` is what it wrote to stderr.
+function dirLabel(dir: AcpDir): string {
+  return dir === "send" ? "in" : dir === "recv" ? "out" : "err";
+}
+
+// A one-line, whitespace-collapsed preview of the raw frame — shown as the
+// collapsed summary so the log scans without expanding every payload.
+function preview(raw: string): string {
+  const line = raw.replace(/\s+/g, " ").trim();
+  return line.length > 160 ? `${line.slice(0, 160)}…` : line;
 }
 
 // Pretty-print the verbatim line as JSON; fall back to the raw string when it
@@ -154,10 +164,15 @@ function FrameLog({ group: g }: { group: Group }) {
             {g.frames.map((f) => (
               <tr key={f.seq}>
                 <td className="ts">{time(f.ts)}</td>
-                <td className={`frdir ${f.dir}`} title={f.dir}>{dirGlyph(f.dir)}</td>
+                <td className={`frdir ${f.dir}`}>{dirLabel(f.dir)}</td>
                 <td className="evname">{frameLabel(f)}</td>
                 <td className="evseq">{f.seq}</td>
-                <td className="evraw"><pre>{pretty(f.raw)}</pre></td>
+                <td className="evraw">
+                  <details>
+                    <summary>{preview(f.raw)}</summary>
+                    <pre>{pretty(f.raw)}</pre>
+                  </details>
+                </td>
               </tr>
             ))}
           </tbody>

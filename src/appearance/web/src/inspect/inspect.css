@@ -132,15 +132,26 @@
 .evnull { color: var(--dim); font-style: italic; }
 
 /* Raw ACP frame log — five columns (Time, Dir, Method, #, Frame); override the
-   generic four-column widths above. */
-.frtable th:nth-child(1) { width: 96px; }
-.frtable th:nth-child(2) { width: 32px; }
+   generic four-column widths above. Time is wider for the HH:MM:SS.mmm stamp. */
+.frtable th:nth-child(1) { width: 108px; }
+.frtable th:nth-child(2) { width: 44px; }
 .frtable th:nth-child(3) { width: 200px; }
 .frtable th:nth-child(4) { width: 56px; }
-.frtable .frdir { font-weight: 700; text-align: center; }
+.frtable .frdir { font-weight: 700; text-transform: uppercase; font-size: 11px; letter-spacing: .04em; }
 .frtable .frdir.send { color: var(--accent); }
 .frtable .frdir.recv { color: var(--ok); }
 .frtable .frdir.stderr { color: var(--bad); }
+/* Payload collapsed by default — the one-line summary scans; click to expand the
+   full pretty JSON. */
+.frtable .evraw details > summary {
+  cursor: pointer;
+  color: var(--dim);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.frtable .evraw details[open] > summary { color: var(--fg); margin-bottom: 4px; }
+.frtable .evraw pre { margin: 0; }
 
 /* session-kind tag in the ACP list */
 .skind {
