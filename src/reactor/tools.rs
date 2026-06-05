@@ -16,6 +16,8 @@ use tokio::sync::{Mutex, mpsc};
 
 use crate::types::Scene;
 
+use super::sequencer::Beat;
+
 /// One command the MCP tool server routes to a scene's reactor loop. Delegate and
 /// alarm are pure side-effects applied without a spoken turn; a worker `ask`
 /// becomes a question report the loop folds into its next turn (fix-forward — the
@@ -33,11 +35,15 @@ pub enum SceneControl {
     WorkerAsk { id: u64, question: String },
 }
 
-/// Per-scene handle the MCP handler dispatches to. Cheap to clone; holds only the
-/// control-channel sender.
+/// Per-scene handle the MCP handler dispatches to. Cheap to clone. Carries two
+/// senders: `control` for loop-applied side-effects (delegate/alarm/ask), and
+/// `beats` for output (say/show_view) that the scene's sequencer renders directly
+/// — output bypasses the turn loop so it streams while the prompt is still
+/// running.
 #[derive(Clone)]
 pub struct ToolSink {
     pub(super) control: mpsc::Sender<SceneControl>,
+    pub(super) beats: mpsc::Sender<Beat>,
 }
 
 impl ToolSink {
@@ -48,6 +54,30 @@ impl ToolSink {
             .send(control)
             .await
             .map_err(|_| anyhow::anyhow!("scene loop gone; control dropped"))
+    }
+
+    /// Speak `text` (the `say` tool): queue it onto the scene's output sequencer,
+    /// which paces it to TTS. Acks immediately — never waits on synthesis.
+    pub async fn say(&self, text: String) -> anyhow::Result<()> {
+        self.beats
+            .send(Beat::Say(text))
+            .await
+            .map_err(|_| anyhow::anyhow!("scene sequencer gone; say dropped"))
+    }
+
+    /// Show a view (the `show_view` tool): queue it onto the sequencer, which
+    /// paces it to the surrounding narration. `op` is `show`/`replace`/`dismiss`;
+    /// `id` may be omitted (one is synthesized).
+    pub async fn show_view(
+        &self,
+        id: Option<String>,
+        op: String,
+        source: String,
+    ) -> anyhow::Result<()> {
+        self.beats
+            .send(Beat::Show { id, op, source })
+            .await
+            .map_err(|_| anyhow::anyhow!("scene sequencer gone; show_view dropped"))
     }
 }
 

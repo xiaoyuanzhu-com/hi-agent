@@ -50,6 +50,7 @@ use std::time::Duration;
 mod heartbeat;
 mod interleave;
 pub mod outbound;
+mod sequencer;
 mod tools;
 mod workers;
 
@@ -63,15 +64,13 @@ pub fn swap_budget_chars() -> usize {
 }
 
 use chrono::{DateTime, Utc};
-use tokio::sync::{Mutex, mpsc};
+use tokio::sync::{Mutex, mpsc, oneshot};
 use tokio::time::{Instant, sleep_until, timeout};
 
 use crate::acp::{AcpSession, SessionOpts, SessionUpdate};
 use crate::agent::{AgentLayer, SessionRole};
-use crate::capabilities::tts::{self, TtsStream};
 use crate::memory::{Memory, build_for_scene};
 use crate::observatory::{EventKind, Observatory, SessionKind};
-use crate::segment::{Segmenter, Terminator};
 use crate::types::{Channel, JournalEntry, Scene, Signal, ViewEnvelope, ViewOp};
 use bytes::Bytes;
 
@@ -394,9 +393,25 @@ impl Reactor {
         // alarm/ask calls here, the loop applies them. Register the sink before the
         // loop's session opens so a tool call can never arrive with no route.
         let (control_tx, control_rx) = mpsc::channel::<SceneControl>(SCENE_QUEUE_CAPACITY);
+
+        // The scene's output beats: say/show_view tool calls (and the loop's turn
+        // brackets) flow to a dedicated sequencer task that paces speech and views.
+        // Output bypasses the turn loop so it streams while the prompt still runs.
+        let (beats_tx, beats_rx) = mpsc::channel::<sequencer::Beat>(SCENE_QUEUE_CAPACITY);
+        {
+            let seq_reactor = self.clone();
+            let seq_scene = scene.clone();
+            tokio::spawn(async move {
+                sequencer::run_sequencer(seq_reactor, seq_scene, beats_rx).await;
+            });
+        }
+
         self.inner
             .tools
-            .register(scene.clone(), ToolSink { control: control_tx.clone() })
+            .register(
+                scene.clone(),
+                ToolSink { control: control_tx.clone(), beats: beats_tx.clone() },
+            )
             .await;
 
         let task_reactor = self.clone();
@@ -405,8 +420,16 @@ impl Reactor {
         // hand the loop a sender clone to seed it.
         let task_worker_inbound = tx.clone();
         tokio::spawn(async move {
-            per_scene_loop(task_reactor, task_scene, rx, task_worker_inbound, control_rx, control_tx)
-                .await;
+            per_scene_loop(
+                task_reactor,
+                task_scene,
+                rx,
+                task_worker_inbound,
+                control_rx,
+                control_tx,
+                beats_tx,
+            )
+            .await;
         });
 
         tx
@@ -465,6 +488,10 @@ async fn per_scene_loop(
     // sender, but keeping a clone here means `control.recv()` never resolves to
     // `None` while this loop runs, so a quiet tool channel can't end the scene.
     _control_keepalive: mpsc::Sender<SceneControl>,
+    // The scene's output sequencer inlet. The loop sends each turn's TurnStart/
+    // TurnEnd brackets here; the `/mcp` handler sends the say/show_view beats
+    // between them. The same sender is the keepalive for the sequencer task.
+    beats: mpsc::Sender<sequencer::Beat>,
 ) {
     // The scene's persistent reactor session: opened lazily on the first turn,
     // then reused for every later turn as the scene's continuous mind. Only this
@@ -581,7 +608,7 @@ async fn per_scene_loop(
         // Forget any workers that have finished, so the registry doesn't grow.
         workers.reap();
 
-        match run_turn(&reactor, &scene, &batch, &mut reactor_session, &mut seeded, &mut budget, &mut workers).await {
+        match run_turn(&reactor, &scene, &batch, &mut reactor_session, &mut seeded, &mut budget, &mut workers, &beats).await {
             Ok(()) => {
                 // Between turns: if the live session has grown past budget, hot-swap
                 // it now. The human is consuming the reply just delivered, so the
@@ -691,8 +718,11 @@ async fn open_session(reactor: &Reactor, scene: &Scene) -> anyhow::Result<Arc<Ac
 }
 
 /// One turn: prompt the scene's persistent reactor session (opening it on the
-/// first turn), stream text updates to `/thought`, and broadcast
-/// `EndOfUtterance` when the turn ends.
+/// first turn) and bracket it on the scene's output sequencer. Spoken text and
+/// views no longer ride the reply stream — the mind emits them as `say`/`show_view`
+/// tool calls that land on the sequencer out of band — so here we only seed the
+/// prompt, drive it to completion, and report the turn. The sequencer returns the
+/// turn's spoken reply (for the context budget and the turn log).
 ///
 /// An unseeded session — never prompted (freshly cold-opened, or warmed by the
 /// prologue) — is seeded with the journal snapshot, since it carries no memory of
@@ -708,6 +738,7 @@ async fn run_turn(
     seeded: &mut bool,
     budget: &mut heartbeat::ContextBudget,
     workers: &mut workers::WorkerRegistry,
+    beats: &mpsc::Sender<sequencer::Beat>,
 ) -> anyhow::Result<()> {
     let turn_id = reactor.inner.turn_seq.fetch_add(1, Ordering::Relaxed);
     reactor
@@ -750,176 +781,76 @@ async fn run_turn(
         }
     };
 
-    let outcome: anyhow::Result<usize> = async {
+    // Bracket the turn on the sequencer (it renders say()/show_view() that arrive
+    // out-of-band as tool calls between these two beats).
+    let _ = beats.send(sequencer::Beat::TurnStart { turn: turn_id }).await;
+
+    // Drive the prompt to completion. Output rides the tool channel now, so this
+    // stream carries only tool-call notifications and the stop; any plain text the
+    // model emits instead of a say() call is dropped (and warned).
+    let drive: anyhow::Result<Option<String>> = async {
         let mut run = session.prompt(prompt_text).await?;
-
-        // Per-turn streaming TTS: open ONE synthesis session for the whole turn.
-        // Audio frames stream back on a drain task as a single Start/Frame*/End
-        // run on /audio, so a turn's speech is one continuous stream rather than
-        // per-sentence clips; the session stays open across sentences. The drain
-        // loop below owns this text sender and coalesces sentences into it. All of
-        // this exists only when TTS is configured.
-        let (synth_tx, synth_handle) = if tts::available() {
-            match tts::start().await {
-                Ok(TtsStream { mime, text, frames }) => {
-                    let out = reactor.inner.out.clone();
-                    // Announce the span first so the adapter can open a response
-                    // with the right Content-Type before any frame arrives.
-                    let _ = out
-                        .send(OutboundSignal::AudioBegin {
-                            scene: scene.clone(),
-                            turn: turn_id,
-                            codec: mime,
-                        })
-                        .await;
-                    let handle =
-                        tokio::spawn(forward_frames(frames, out, scene.clone(), turn_id));
-                    (Some(text), Some(handle))
-                }
-                Err(err) => {
-                    tracing::warn!(scene = %scene, error = %err, "TTS session start failed; turn is silent");
-                    (None, None)
-                }
-            }
-        } else {
-            (None, None)
-        };
-
-        // Per-turn output state. The reply is parsed into ordered segments
-        // (`interleave::Extractor`) and each is released just-in-time below,
-        // decoupled from parse-time — so a view is paced to its sentence instead of
-        // racing ahead of all audio. The splitter coalesces spoken text into
-        // sentences for TTS; `full_reply` is logged once at end of turn. Side-effects
-        // (delegate/alarm) are no longer parsed here — the mind drives them by
-        // calling tools over `/mcp`, which arrive on the loop's control channel.
-        let mut extractor = interleave::Extractor::new();
-        let mut splitter = Segmenter::new(Terminator, std::time::Instant::now());
-        let mut full_reply = String::new();
-
         let mut ended = false;
         while !ended {
-            let segs = match run.next_update().await {
-                Some(SessionUpdate::Text(text)) => extractor.push(&text),
-                Some(SessionUpdate::Thought(_)) => continue, // internal reasoning
+            match run.next_update().await {
                 Some(SessionUpdate::ToolCall(stub)) => {
                     tracing::debug!(scene = %scene, variant = stub.raw_variant, "tool call");
-                    continue;
                 }
-                Some(SessionUpdate::Other(name)) => {
-                    tracing::trace!(scene = %scene, variant = %name, "ignored ACP update");
-                    continue;
-                }
-                // End of stream: release the extractor's held-back tail through the
-                // same body, then leave the loop.
-                None => {
-                    ended = true;
-                    extractor.flush().into_iter().collect()
-                }
-            };
-
-            for seg in segs {
-                match seg {
-                    interleave::Segment::Spoken(text) => {
-                        if text.is_empty() {
-                            continue;
-                        }
-                        full_reply.push_str(&text);
-                        for emit in interleave::speak_emits(
-                            &text,
-                            &mut splitter,
-                            std::time::Instant::now(),
-                        ) {
-                            perform(emit, &synth_tx, reactor, scene).await;
-                        }
-                        // /thought gets the raw chunk; TTS gets coalesced sentences
-                        // (above) — the two channels keep their own pacing.
-                        emit_thought_chunk(reactor, scene, text).await;
-                    }
-                    interleave::Segment::View { id, op, source } => {
-                        for emit in interleave::view_emits(&mut splitter, id, op, source) {
-                            perform(emit, &synth_tx, reactor, scene).await;
-                        }
+                Some(SessionUpdate::Text(text)) => {
+                    if !text.trim().is_empty() {
+                        tracing::warn!(scene = %scene, "reactor emitted plain text instead of a say() tool call; dropping it");
                     }
                 }
+                Some(_) => {} // thoughts and unmodelled updates
+                None => ended = true,
             }
         }
-
-        if !full_reply.trim().is_empty() {
-            crate::channel_log::outbound(Channel::Text, scene, full_reply.trim());
-        }
-        // Flush the splitter's trailing partial sentence to TTS only (no /thought —
-        // it was already mirrored as part of its raw chunk).
-        if let Some(tail) = splitter.flush() {
-            if let Some(tx) = &synth_tx {
-                let _ = tx.send(tail).await;
-            }
-        }
-
-        let mut cancelled = false;
         let stop_reason = match run.wait().await {
             Ok(result) => {
                 tracing::debug!(scene = %scene, stop = ?result.stop_reason, "turn finished");
                 Some(format!("{:?}", result.stop_reason))
             }
             Err(err) => {
-                cancelled = true;
                 tracing::debug!(scene = %scene, error = %err, "turn run ended with error (likely cancel)");
                 None
             }
         };
-        reactor
-            .inner
-            .observatory
-            .record(
-                scene,
-                EventKind::TurnFinished {
-                    turn: turn_id,
-                    stop_reason,
-                    reply_chars: full_reply.chars().count(),
-                    reply: preview(&full_reply),
-                },
-            )
-            .await;
-
-        // Dropping the text sender signals end-of-input: the TTS session sends
-        // FinishSession, the drain task forwards trailing frames, then emits the
-        // turn's `End`. If the run ended in error (a wedged or crashed session,
-        // not a human interruption — those no longer cancel) abort the drain so
-        // stale frames aren't spoken, and emit `End` ourselves so any open
-        // GET /audio response for this turn closes promptly.
-        drop(synth_tx);
-        if let Some(handle) = synth_handle {
-            if cancelled {
-                handle.abort();
-                let _ = reactor
-                    .inner
-                    .out
-                    .send(OutboundSignal::AudioEnd {
-                        scene: scene.clone(),
-                        turn: turn_id,
-                    })
-                    .await;
-            }
-        }
-        Ok(full_reply.chars().count())
+        Ok(stop_reason)
     }
     .await;
 
-    // End of utterance — closes the GET /thought response that's been
-    // streaming this turn's chunks.
-    emit_end_of_utterance(reactor, scene).await;
+    // Always close the turn on the sequencer, even on error, so any open audio
+    // span ends and the /thought utterance closes. It hands back this turn's
+    // spoken reply, accumulated from the say() calls.
+    let (done_tx, done_rx) = oneshot::channel();
+    let _ = beats.send(sequencer::Beat::TurnEnd { done: done_tx }).await;
+    let reply = done_rx.await.unwrap_or_default();
+
+    // A prompt that never started (wedged session) is the only error we propagate,
+    // so the caller discards the session. A stream that ended in error is treated
+    // as a (rare) cancel — reported, session kept.
+    let stop_reason = drive?;
+    reactor
+        .inner
+        .observatory
+        .record(
+            scene,
+            EventKind::TurnFinished {
+                turn: turn_id,
+                stop_reason,
+                reply_chars: reply.chars().count(),
+                reply: preview(&reply),
+            },
+        )
+        .await;
 
     // The session is persistent — do NOT drop it. The caller's `reactor_session`
     // slot keeps the warm session alive for the next turn.
 
-    // Fold this turn's size into the budget so the loop can decide whether the
-    // session has grown enough to hot-swap. Only on success — a failed turn is
-    // discarded along with its (possibly wedged) session.
-    let reply_chars = outcome?;
     // The session has now ingested the snapshot (this turn delivered it if it was
     // unseeded); later turns send only what's new.
     *seeded = true;
-    budget.record_turn(prompt_chars, reply_chars);
+    budget.record_turn(prompt_chars, reply.chars().count());
     reactor.inner.observatory.set_budget(scene, budget.chars()).await;
     Ok(())
 }

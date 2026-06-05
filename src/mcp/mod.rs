@@ -48,6 +48,33 @@ fn tools_for_role(role: Option<&str>) -> Vec<Value> {
         // Default to the reactor surface (the soul describes these).
         _ => vec![
             tool(
+                "say",
+                "Speak to the person. Everything you want said aloud goes through this tool — \
+                 plain text you write is NOT spoken. Call it with one natural chunk at a time; \
+                 several calls in a turn are spoken in order. To stay silent, don't call it at all.",
+                json!({
+                    "type": "object",
+                    "properties": { "text": { "type": "string", "description": "What to say, as natural spoken language (no markdown)." } },
+                    "required": ["text"],
+                }),
+            ),
+            tool(
+                "show_view",
+                "Put a view on the screen — a small React component you write as JSX. Interleave \
+                 show_view and say calls in the order you want them experienced (say, then show, \
+                 then say) so each view lands as you speak to it. Reuse an `id` with op=replace to \
+                 evolve a view in place; op=dismiss takes one down.",
+                json!({
+                    "type": "object",
+                    "properties": {
+                        "op": { "type": "string", "enum": ["show", "replace", "dismiss"], "description": "show mounts; replace swaps the same id in place; dismiss removes it." },
+                        "id": { "type": "string", "description": "A stable name for this view, so replace/dismiss can target it. Omit to auto-generate." },
+                        "source": { "type": "string", "description": "The view's JSX (default-exported component). Omit for dismiss." },
+                    },
+                    "required": ["op"],
+                }),
+            ),
+            tool(
                 "delegate",
                 "Hand a heavy or long-running task (research, multi-step tool use, writing and \
                  running code) to a background working session, so you stay free to keep talking. \
@@ -131,9 +158,9 @@ pub async fn handle(
 }
 
 /// Run one tool call, returning the MCP `tools/call` result shape (a content list
-/// with an `isError` flag). Tools are fire-and-forget: we forward the command to
-/// the scene loop and ack immediately, never blocking on playback or on the
-/// worker the delegate spawns.
+/// with an `isError` flag). Tools are fire-and-forget: we forward the call to the
+/// scene (its loop for side-effects, its sequencer for output) and ack
+/// immediately, never blocking on playback or on the worker a delegate spawns.
 async fn dispatch_tool(
     registry: &ToolRegistry,
     scene: Option<&Scene>,
@@ -148,36 +175,47 @@ async fn dispatch_tool(
         return tool_error(&format!("no active scene loop for {}", scene.0));
     };
 
-    let arg_str = |key: &str| args.get(key).and_then(Value::as_str).unwrap_or_default().to_string();
+    let arg_str =
+        |key: &str| args.get(key).and_then(Value::as_str).unwrap_or_default().to_string();
+    let arg_opt = |key: &str| args.get(key).and_then(Value::as_str).map(str::to_owned);
 
-    let (control, ack) = match name {
+    let outcome = match name {
+        "say" => {
+            let text = arg_str("text");
+            if text.trim().is_empty() {
+                return tool_error("say requires non-empty `text`");
+            }
+            sink.say(text).await.map(|()| "spoken")
+        }
+        "show_view" => {
+            let op = args.get("op").and_then(Value::as_str).unwrap_or("show").to_string();
+            sink.show_view(arg_opt("id"), op, arg_str("source")).await.map(|()| "shown")
+        }
         "delegate" => {
             let task = arg_str("task");
             if task.trim().is_empty() {
                 return tool_error("delegate requires a non-empty `task`");
             }
-            (SceneControl::Delegate { task }, "delegated to a working session")
+            sink.send(SceneControl::Delegate { task }).await.map(|()| "delegated to a working session")
         }
         "alarm" => {
             let delay = arg_str("delay");
-            let note = arg_str("note");
             if delay.trim().is_empty() {
                 return tool_error("alarm requires a `delay`");
             }
-            (SceneControl::Alarm { delay, note }, "alarm scheduled")
+            sink.send(SceneControl::Alarm { delay, note: arg_str("note") }).await.map(|()| "alarm scheduled")
         }
         "ask" => {
-            let question = arg_str("question");
             let Some(id) = worker_id else {
                 return tool_error("ask is only available to working sessions");
             };
-            (SceneControl::WorkerAsk { id, question }, "question noted")
+            sink.send(SceneControl::WorkerAsk { id, question: arg_str("question") }).await.map(|()| "question noted")
         }
         other => return tool_error(&format!("unknown tool: {other}")),
     };
 
-    match sink.send(control).await {
-        Ok(()) => tool_ok(ack),
+    match outcome {
+        Ok(ack) => tool_ok(ack),
         Err(err) => tool_error(&err.to_string()),
     }
 }
