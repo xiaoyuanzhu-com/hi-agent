@@ -34,12 +34,12 @@
 //!
 //! The mind keeps a single voice, so it must never block the floor on slow
 //! work. When a turn needs research, multi-step tool use, or anything
-//! long-running, the reply names the task inside `[[delegate]] … [[/delegate]]`
-//! markers; the reactor spawns a channel-mute [`workers`] session for it and
-//! keeps talking. The worker runs with the same substrate (memory, tools) but
-//! no voice of its own, and posts its result — or a question, if it gets
-//! stuck — back into this scene's queue, where it lands as just another input
-//! the next turn folds into what the mind says.
+//! long-running, the mind calls the `delegate` tool with the task; the reactor
+//! spawns a channel-mute [`workers`] session for it and keeps talking. The worker
+//! runs with the same substrate (memory, tools) but no voice of its own, and
+//! posts its result — or a question, if it gets stuck — back into this scene's
+//! queue, where it lands as just another input the next turn folds into what the
+//! mind says.
 
 use std::collections::HashMap;
 use std::path::Path;
@@ -168,8 +168,8 @@ const SCENE_QUEUE_CAPACITY: usize = 64;
 enum LoopInput {
     Human(Signal),
     Worker(workers::WorkerReport),
-    /// A self-scheduled wake firing. The mind asked for it earlier with an
-    /// `[[alarm]]` marker; when its deadline passes the loop injects this so a
+    /// A self-scheduled wake firing. The mind asked for it earlier with the
+    /// `alarm` tool; when its deadline passes the loop injects this so a
     /// turn runs even though no new signal arrived.
     Alarm(AlarmFired),
 }
@@ -184,7 +184,7 @@ struct AlarmFired {
 
 /// A scene loop's pending self-alarms. The scene wakes for one of two reasons —
 /// a new signal, or the soonest of these firing. Only the mind schedules them,
-/// by emitting `[[alarm]]` markers. A flat Vec is plenty: a scene has at most a
+/// by calling the `alarm` tool. A flat Vec is plenty: a scene has at most a
 /// handful pending at once.
 struct Alarms {
     pending: Vec<PendingAlarm>,

@@ -34,21 +34,24 @@ turn per scene; adding a global cap is a localized change in `reactor.rs`
 
 ## MCP attachment per ephemeral session
 
-**Status:** unverified.
+**Status:** built (2026-06-05).
 
-Each routing session needs the toolbelt available. The hub launches a tiny
-shim subprocess (`hi-agent mcp-shim`) that bridges stdio↔Unix socket, and
-attaches it through the ACP `mcp_servers` capability. Per-session attach
-cost is unknown; impl.md flags this as something to measure in the same
-spike.
+Each session needs its tool surface. Rather than the stdio shim sketched
+originally, hi-agent attaches its own HTTP MCP endpoint (`/mcp`, served by the
+running axum app) through the ACP `mcp_servers` capability — `McpServer::Http`
+with scene/role/worker-id carried as `X-HI-Scene` / `X-HI-Role` /
+`X-HI-Worker-Id` headers, so one endpoint routes every session's calls. No
+subprocess, no socket. The reactor's whole expression + side-effect contract
+rides these tools: `say` / `show_view` (output), `delegate` / `alarm` (reactor
+side-effects), `ask` (worker).
 
-**Verify with:** same `acp_spike` example — extend it to attach the hub's
-shim to each session and confirm `tools/list` returns the seven router
-tools within a reasonable budget (target: < 500 ms per attach).
+The deployed adapter (`@agentclientprotocol/claude-agent-acp` 0.36.1) advertises
+`mcpCapabilities { http: true, sse: true }` and forwards http servers with
+headers to the SDK, so HTTP works; the stdio shim is the fallback only if a
+future adapter drops http support.
 
-**Fallback:** investigate session-template / shared-MCP-server reuse if
-`claude-code` exposes one. Otherwise pre-spawn shims in a small pool keyed
-by scene.
+**Still to measure:** per-session attach cost (each session's initialize +
+tools/list round-trip) under many concurrent scenes — not yet load-tested.
 
 ## Journal-as-context coherence
 

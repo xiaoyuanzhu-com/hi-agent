@@ -22,7 +22,7 @@
 //! back into the scene's queue as a `LoopInput::Worker`. It never interrupts live
 //! speech — the report waits its turn like any other input, and the next turn
 //! folds it into what the mind says. Questions are *non-blocking*: a worker that
-//! hits ambiguity flags it via `[[ask]]` and then proceeds on its best
+//! hits ambiguity flags it via the `ask` tool and then proceeds on its best
 //! assumption (fix-forward), so the floor is never held waiting on an answer.
 //!
 //! Progress-checking is emergent rather than wired: each worker streams its
