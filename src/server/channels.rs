@@ -23,7 +23,7 @@ use futures::stream::Stream;
 use serde::Serialize;
 use tokio::sync::broadcast::error::RecvError;
 
-use crate::server::{AppState, AudioEvent, AudioInEvent};
+use crate::server::{AppState, AudioEvent, AudioInEvent, VideoInEvent};
 use crate::types::{Channel, Scene};
 
 /// One unit of channel activity, uniform across every channel and direction.
@@ -75,7 +75,7 @@ fn merge_channels(
         audio: tokio::sync::broadcast::Receiver<crate::server::AudioEvent>,
         audio_in: tokio::sync::broadcast::Receiver<crate::server::AudioInEvent>,
         view: tokio::sync::broadcast::Receiver<crate::server::ViewEvent>,
-        vision: tokio::sync::broadcast::Receiver<crate::server::VisionFrameEvent>,
+        vision: tokio::sync::broadcast::Receiver<crate::server::VideoInEvent>,
     }
 
     let subs = Subs {
@@ -84,7 +84,7 @@ fn merge_channels(
         audio: state.audio_out.subscribe(),
         audio_in: state.audio_in.subscribe(),
         view: state.view_out.subscribe(),
-        vision: state.vision_out.subscribe(),
+        vision: state.video_in.subscribe(),
     };
 
     futures::stream::unfold((subs, scene), |(mut s, scene)| async move {
@@ -131,10 +131,7 @@ fn merge_channels(
                     Err(RecvError::Closed) => return None,
                 },
                 r = s.vision.recv() => match r {
-                    Ok(e) if targets(&e.scene, &scene) => Some(ChannelSignal {
-                        ts: e.ts, channel: Channel::Vision, direction: "in",
-                        body: vision_summary(&e), is_final: true,
-                    }),
+                    Ok(e) if targets(e.scene(), &scene) => video_in_summary(&e),
                     Ok(_) => None,
                     Err(RecvError::Lagged(_)) => None,
                     Err(RecvError::Closed) => return None,
@@ -194,13 +191,27 @@ fn audio_in_summary(e: &AudioInEvent) -> Option<ChannelSignal> {
     }
 }
 
-/// Summarize an inbound vision frame to metadata. Includes the `#stream` label
-/// when the frame came from a named stream, so the inspector shows concurrent
-/// feeds in one scene as distinct rows; the default stream renders bare.
-fn vision_summary(e: &crate::server::VisionFrameEvent) -> String {
-    match &e.stream {
-        Some(label) => format!("frame · #{label} · {} · {} bytes", e.mime, e.bytes.len()),
-        None => format!("frame · {} · {} bytes", e.mime, e.bytes.len()),
+/// Summarize an inbound video source to metadata — the raw WebM bytes stream on
+/// `GET /api/in/vision` for playback, so the inspector only surfaces the
+/// begin/end of each camera session.
+fn video_in_summary(e: &VideoInEvent) -> Option<ChannelSignal> {
+    match e {
+        VideoInEvent::Start { mime, .. } => Some(ChannelSignal {
+            ts: Utc::now(),
+            channel: Channel::Vision,
+            direction: "in",
+            body: format!("▶ camera · {mime}"),
+            is_final: false,
+        }),
+        VideoInEvent::End { .. } => Some(ChannelSignal {
+            ts: Utc::now(),
+            channel: Channel::Vision,
+            direction: "in",
+            body: "■ end".to_owned(),
+            is_final: true,
+        }),
+        // Frames are raw bytes — metadata only, so they're dropped here.
+        VideoInEvent::Frame { .. } => None,
     }
 }
 

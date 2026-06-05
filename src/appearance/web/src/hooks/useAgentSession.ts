@@ -2,11 +2,10 @@ import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { subscribeOutText } from "../channels/out/text";
 import { subscribeAudioTurns } from "../channels/out/audio";
 import { postInText, subscribeInText } from "../channels/in/text";
-import { postVision } from "../channels/in/vision";
 import { AudioBus } from "../lib/audioBus";
 import { ActivityMeter } from "../lib/activityMeter";
 import { AudioStreamer } from "../lib/audioStreamer";
-import { VisionCapture } from "../lib/visionCapture";
+import { VideoStreamer } from "../lib/videoStreamer";
 import { VoicePlayer } from "../lib/voicePlayer";
 import { SentenceBuffer } from "../lib/sentences";
 import { getScene } from "../lib/scene";
@@ -180,7 +179,7 @@ export function useAgentSession(): AgentSession {
   // instead of leaking it.
   const micGenRef = useRef(0);
   const voiceRef = useRef<VoicePlayer | null>(null);
-  const visionRef = useRef<VisionCapture | null>(null);
+  const visionRef = useRef<VideoStreamer | null>(null);
   const visionStreamRef = useRef<MediaStream | null>(null);
   const sentenceIdRef = useRef(0);
   // Live cognition cadence: bumped per streamed chunk, decays between them, so
@@ -407,21 +406,21 @@ export function useAgentSession(): AgentSession {
 
   // ---- vision-input channel: acquire/release the camera ------------------
   // A continuous channel like the mic, but fully independent — usable with or
-  // without audio, and toggled on its own. Frames stream a couple seconds apart
-  // and a dropped frame is fine, so posting is fire-and-forget.
+  // without audio, and toggled on its own. The camera streams continuously as
+  // WebM (MediaRecorder → WS); the backend decides how much to look. No
+  // client-side sampling.
   const enableVision = useCallback(async () => {
     if (visionRef.current) return; // already live
     try {
       const videoStream = await navigator.mediaDevices.getUserMedia({ video: true });
       visionStreamRef.current = videoStream;
-      visionRef.current = new VisionCapture(videoStream, {
-        onFrame: (frameBlob, frameMime) => {
-          postVision({ scene, blob: frameBlob, mime: frameMime }).catch(() => {});
-        },
-      });
+      visionRef.current = await VideoStreamer.create(videoStream, { scene });
       setVideoError(null);
       setVideoInput(true);
     } catch (err) {
+      // Stop a half-acquired stream so a denied/failed start leaves no camera on.
+      visionStreamRef.current?.getTracks().forEach((t) => t.stop());
+      visionStreamRef.current = null;
       const msg = (err instanceof Error ? err.message : String(err)).toLowerCase();
       setVideoError(
         msg.includes("denied") || msg.includes("permission") || msg.includes("notallowed")

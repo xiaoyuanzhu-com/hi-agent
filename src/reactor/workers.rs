@@ -65,12 +65,13 @@ your report and let the agent present it.\n\
 \n\
 You MAY use hi-agent's own input channels to perceive. The server's base URL is \
 in the `HI_AGENT_BASE_URL` environment variable, and your scene is `{scene}` — \
-send it as the `X-HI-Scene` header on every such request. For example, live \
-camera frames:\n\
+send it as the `X-HI-Scene` header on every such request. For example, the live \
+camera:\n\
     `GET $HI_AGENT_BASE_URL/api/in/vision` with header `X-HI-Scene: {scene}`\n\
-  (one frame per response; re-request for the next). Process the raw bytes \
-however the task needs — detection, CV, etc. is your job. You do not write to any \
-output channel; presenting is the agent's job.\n\
+  (a live video stream — one camera session per response, `video/webm`; \
+re-request for the next). Decode and sample frames however the task needs — \
+detection, CV, etc. is your job. You do not write to any output channel; \
+presenting is the agent's job.\n\
 \n\
 If you hit something genuinely ambiguous, do not stall waiting for an answer. \
 Make the most reasonable assumption, note it, and keep going — the agent can \

@@ -222,14 +222,18 @@ async fn homepage_returns_html() {
 }
 
 #[tokio::test]
-async fn vision_get_receives_posted_frame() {
-    // GET /api/in/vision is the read side of the input channel: one frame per
-    // scene-filtered long-poll response, carrying the frame's Content-Type.
-    let (base, _dir, _seams) = spawn_server().await;
-    let client = reqwest::Client::new();
+async fn vision_get_streams_camera_video() {
+    // "Vision is video": the camera streams WebM over WS /api/in/vision/stream and
+    // GET /api/in/vision plays it back — one camera session per long-poll response,
+    // carrying the stream's Content-Type. The first chunk is the init segment; the
+    // GET body is the concatenation of every chunk the camera sent.
+    use futures::SinkExt;
+    use tokio_tungstenite::tungstenite::Message;
 
-    // The GET blocks until a frame arrives, so drive it from a task and POST
-    // after it has had time to subscribe.
+    let (base, _dir, _seams) = spawn_server().await;
+
+    // The GET blocks until a camera starts, so drive it from a task and open the
+    // streaming WS after it has had time to subscribe.
     let get_base = base.clone();
     let getter = tokio::spawn(async move {
         let c = reqwest::Client::new();
@@ -250,21 +254,26 @@ async fn vision_get_receives_posted_frame() {
     });
 
     tokio::time::sleep(Duration::from_millis(80)).await;
-    let frame = vec![0xFFu8, 0xD8, 0xFF, 0xD9];
-    let post = client
-        .post(format!("{base}/api/in/vision"))
-        .header("X-HI-Scene", "alice@phone")
-        .header("Content-Type", "image/jpeg")
-        .body(frame.clone())
-        .send()
-        .await
-        .expect("send POST");
-    assert_eq!(post.status(), reqwest::StatusCode::ACCEPTED);
+
+    let ws_url = format!(
+        "{}/api/in/vision/stream?scene=alice@phone&mime=video/webm",
+        base.replace("http://", "ws://")
+    );
+    let (mut ws, _) = tokio_tungstenite::connect_async(ws_url).await.expect("ws connect");
+    let init = vec![0x1A, 0x45, 0xDF, 0xA3]; // EBML magic — stands in for the init segment
+    let frame = vec![0x42u8, 0x82, 0x88];
+    ws.send(Message::Binary(init.clone())).await.expect("send init");
+    ws.send(Message::Binary(frame.clone())).await.expect("send frame");
+    // Give the frames time to fan out to the GET body before closing the source.
+    tokio::time::sleep(Duration::from_millis(80)).await;
+    ws.close(None).await.expect("close ws");
 
     let (ct, body) = tokio::time::timeout(Duration::from_secs(2), getter)
         .await
         .expect("vision GET within timeout")
         .expect("getter task");
-    assert!(ct.starts_with("image/jpeg"), "content-type echoes frame mime, got {ct:?}");
-    assert_eq!(body.as_ref(), frame.as_slice(), "frame bytes round-trip");
+    assert!(ct.starts_with("video/webm"), "content-type echoes stream mime, got {ct:?}");
+    let mut expected = init.clone();
+    expected.extend_from_slice(&frame);
+    assert_eq!(body.as_ref(), expected.as_slice(), "GET body is the streamed chunks");
 }

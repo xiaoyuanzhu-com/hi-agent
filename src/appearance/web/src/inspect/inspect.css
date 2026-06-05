@@ -153,15 +153,16 @@
 .chan-section.out .chan-section-title { border-left-color: var(--accent); color: var(--accent); }
 .chan-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(260px, 1fr)); gap: 12px; }
 .card.chan { margin-bottom: 0; display: flex; flex-direction: column; min-height: 120px; }
-.card.chan h4 { display: flex; align-items: center; gap: 6px; }
+.chan-monitor-row { margin: 0 0 8px; }
 .chan-monitor {
-  margin-left: auto; padding: 1px 6px; font-size: 13px; line-height: 1.4; cursor: pointer;
+  padding: 1px 7px; font-size: 13px; line-height: 1.5; cursor: pointer;
   background: transparent; border: 1px solid var(--line); border-radius: 5px;
-  color: var(--dim); opacity: .7; transition: opacity .12s, border-color .12s;
+  color: var(--dim); opacity: .7; transition: opacity .12s, border-color .12s, color .12s;
 }
 .chan-monitor:hover { opacity: 1; }
 .chan-monitor.on { opacity: 1; border-color: var(--accent); color: var(--accent); }
 .chan-monitor.failed { border-color: var(--bad); color: var(--bad); }
+.chan-frame { display: block; width: 100%; margin-top: 8px; border-radius: 6px; background: #000; }
 .chan-idle { font-family: var(--mono); font-size: 12px; }
 .chan-feed { font-family: var(--mono); font-size: 12px; line-height: 1.55; overflow-y: auto; max-height: 260px; }
 .chan-line { display: flex; gap: 8px; padding: 1px 0; border-bottom: 1px solid rgba(42,47,58,.5); }

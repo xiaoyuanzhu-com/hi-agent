@@ -1,7 +1,8 @@
 //! HTTP front — axum router and shared application state.
 
+use std::collections::HashMap;
 use std::path::PathBuf;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::sync::atomic::AtomicU64;
 
 use axum::Router;
@@ -119,23 +120,55 @@ pub struct ViewEvent {
     pub ts: DateTime<Utc>,
 }
 
-/// A vision frame, broadcast so any local party can *read* the input channel —
-/// not just the reactor. `POST /api/in/vision` keeps persisting and additionally
-/// publishes the frame here; `GET /api/in/vision` subscribers (e.g. a detector
-/// working session) receive it. The bytes are `Bytes` (refcounted), so a frame
-/// with no subscriber is a cheap drop. This rides *outside* the cognition turn
-/// loop — it never enters the journal or a prompt; perceiving raw frames is the
-/// subscriber's job.
+/// Inbound video event — the read side of the vision *input* channel, the visual
+/// twin of [`AudioInEvent`]. "Vision is video": the camera streams continuously
+/// and the bytes are observable as bytes (the backend never decodes or samples
+/// frames — that's a future perception path's job). One camera session is a
+/// `Start`/`Frame`*/`End` run; `GET /api/in/vision` turns one run into one chunked
+/// HTTP response a client can play.
+///
+/// `turn` is a per-source id (one WS connection); `mime` is the container/codec
+/// (`video/webm;codecs=…`). Like the other channel broadcasts this is lossy
+/// presence with no replay — but unlike audio frames a WebM stream is only
+/// decodable from its first chunk (the initialization segment), so the active
+/// source's init bytes are cached separately (see [`VideoSource`]) to let a late
+/// observer join mid-stream.
 #[derive(Debug, Clone)]
-pub struct VisionFrameEvent {
-    pub scene: Option<Scene>,
-    /// Named stream within the scene (`webcam`), or `None` for the default
-    /// stream. `GET /api/in/vision` filters on this so concurrent feeds in one
-    /// scene stay separable; a subscriber asks for one with `?stream=`.
-    pub stream: Option<String>,
-    pub bytes: Bytes,
+pub enum VideoInEvent {
+    Start { scene: Option<Scene>, turn: u64, mime: String },
+    Frame { scene: Option<Scene>, turn: u64, bytes: Bytes },
+    End { scene: Option<Scene>, turn: u64 },
+}
+
+impl VideoInEvent {
+    /// The routing target, common to every variant.
+    pub fn scene(&self) -> &Option<Scene> {
+        match self {
+            VideoInEvent::Start { scene, .. }
+            | VideoInEvent::Frame { scene, .. }
+            | VideoInEvent::End { scene, .. } => scene,
+        }
+    }
+
+    /// The source this event belongs to (one camera WS connection).
+    pub fn turn(&self) -> u64 {
+        match self {
+            VideoInEvent::Start { turn, .. }
+            | VideoInEvent::Frame { turn, .. }
+            | VideoInEvent::End { turn, .. } => *turn,
+        }
+    }
+}
+
+/// The currently-active inbound-video source for a scene: its turn id, mime, and
+/// cached WebM initialization segment (the first chunk). A `GET /api/in/vision`
+/// observer that connects after the camera started writes this init before the
+/// live frames so MSE can decode the stream; without it the `<video>` stalls.
+#[derive(Debug, Clone)]
+pub struct VideoSource {
+    pub turn: u64,
     pub mime: String,
-    pub ts: DateTime<Utc>,
+    pub init: Bytes,
 }
 
 /// One recognized input, echoed to scene observers on `GET /api/in/<channel>`.
@@ -215,11 +248,21 @@ pub struct AppState {
     /// `GET /api/in/audio` listener response.
     pub audio_in_turn: AtomicU64,
 
-    /// Vision-frame broadcast — the read side of the vision *input* channel.
-    /// POST /api/in/vision publishes each frame here; GET /api/in/vision
-    /// subscribers (a detector working session, …) consume it. Written directly by
-    /// the POST handler, not the binder — it is input data, not the reactor's voice.
-    pub vision_out: broadcast::Sender<VisionFrameEvent>,
+    /// Inbound video broadcast — the read side of the vision *input* channel.
+    /// `WS /api/in/vision/stream` publishes the camera's WebM chunks here;
+    /// `GET /api/in/vision` subscribers play them. Written directly by the ingest
+    /// handler, not the binder — it is input data, not the reactor's voice. The
+    /// backend never decodes the video; perceiving frames is a future job.
+    pub video_in: broadcast::Sender<VideoInEvent>,
+
+    /// Hands each inbound-video source (one camera WS connection) a distinct
+    /// `turn` id, keeping a `GET /api/in/vision` observer bound to one camera.
+    pub video_in_turn: AtomicU64,
+
+    /// The active inbound-video source per scene, holding its cached WebM init
+    /// segment so an observer can join the live stream mid-flight (see
+    /// [`VideoSource`]). Inserted on a camera's first chunk, removed on close.
+    pub video_in_live: Mutex<HashMap<Scene, VideoSource>>,
 
     /// Inbound echo broadcast. GET /api/in/<channel> observers receive recognized
     /// inputs (typed text, recognized speech) from this — live, no replay.
@@ -286,7 +329,8 @@ pub fn build(
     // Inbound audio: small, frequent PCM frames, so a larger ring than the others.
     let (audio_in_tx, _) = broadcast::channel::<AudioInEvent>(256);
     let (view_tx, _) = broadcast::channel::<ViewEvent>(64);
-    let (vision_tx, _) = broadcast::channel::<VisionFrameEvent>(64);
+    // Inbound video: continuous WebM chunks, so a larger ring like inbound audio.
+    let (video_in_tx, _) = broadcast::channel::<VideoInEvent>(256);
     // Input echo: live broadcast, lossy ring, no replay (see `InputEcho`).
     let (input_echo_tx, _) = broadcast::channel::<InputEcho>(64);
     // Output text echo: the binder's non-draining mirror (see `OutputEcho`).
@@ -313,7 +357,9 @@ pub fn build(
         audio_in: audio_in_tx.clone(),
         audio_in_turn: AtomicU64::new(0),
         view_out: view_tx.clone(),
-        vision_out: vision_tx.clone(),
+        video_in: video_in_tx.clone(),
+        video_in_turn: AtomicU64::new(0),
+        video_in_live: Mutex::new(HashMap::new()),
         input_echo: input_echo_tx.clone(),
         output_echo: output_echo_tx.clone(),
         memory,
@@ -335,9 +381,10 @@ pub fn build(
         // The view channel — agent-authored view modules, turn-paced (one
         // envelope per long-poll response, scene-filtered).
         .route("/api/out/view", get(view::get_out_view))
-        // Vision is an input channel that is also observable: POST a frame,
-        // GET the live frame stream (a worker session reads it).
+        // Vision is an input channel that is also observable: the camera streams
+        // WebM over the WS, GET plays the live video; POST persists a still frame.
         .route("/api/in/vision", post(vision::post_vision).get(vision::get_vision))
+        .route("/api/in/vision/stream", get(vision::get_vision_stream))
         .route("/api/in/touch", post(stubs::post_touch))
         .route("/api/in/smell", post(stubs::post_smell))
         .route("/api/in/taste", post(stubs::post_taste))

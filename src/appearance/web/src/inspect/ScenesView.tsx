@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import { selectedUnder, usePath } from "./router";
 import {
   subscribeChannels,
@@ -9,6 +9,7 @@ import {
 } from "./api";
 import { subscribeAudioTurns } from "../channels/out/audio";
 import { subscribeInAudioTurns } from "../channels/in/audio";
+import { subscribeInVideo, type VideoInTurn } from "../channels/in/vision";
 import { AudioBus } from "../lib/audioBus";
 import { VoicePlayer } from "../lib/voicePlayer";
 import { PcmPlayer } from "../lib/pcmMonitor";
@@ -208,6 +209,138 @@ function AudioMonitor({ scene, direction }: { scene: string; direction: "in" | "
 }
 
 /**
+ * Play one camera session into a `<video>` via MediaSource: open a MediaSource,
+ * add a SourceBuffer for the session's mime, and append WebM chunks from the body
+ * as they arrive (a small append-queue/pump, like `lib/voicePlayer.ts`, drained on
+ * each `updateend`). Resolves when the session ends or playback is cancelled.
+ */
+async function playVideoSession(
+  video: HTMLVideoElement,
+  turn: VideoInTurn,
+  cancelled: () => boolean,
+): Promise<void> {
+  const reader = turn.body.getReader();
+  if (typeof MediaSource === "undefined" || !MediaSource.isTypeSupported(turn.mime)) {
+    // Can't decode this codec here — drain the body so the loop moves on.
+    while (!cancelled()) {
+      const { done } = await reader.read();
+      if (done) break;
+    }
+    reader.releaseLock();
+    return;
+  }
+
+  const ms = new MediaSource();
+  const url = URL.createObjectURL(ms);
+  video.src = url;
+  try {
+    await new Promise<void>((resolve, reject) => {
+      ms.addEventListener("sourceopen", () => resolve(), { once: true });
+      ms.addEventListener("error", () => reject(new Error("MediaSource error")), { once: true });
+    });
+    if (cancelled()) return;
+
+    const sb = ms.addSourceBuffer(turn.mime);
+    const queue: Uint8Array[] = [];
+    let ended = false;
+    const pump = () => {
+      if (sb.updating) return;
+      const next = queue.shift();
+      if (next) {
+        try {
+          sb.appendBuffer(next as unknown as BufferSource);
+        } catch {
+          queue.length = 0; // quota/parse error — drop the rest rather than wedge
+        }
+      } else if (ended && ms.readyState === "open") {
+        try {
+          ms.endOfStream();
+        } catch {
+          /* already ended */
+        }
+      }
+    };
+    sb.addEventListener("updateend", pump);
+    void video.play().catch(() => {
+      /* autoplay race; the next append/play retries */
+    });
+
+    while (!cancelled()) {
+      const { value, done } = await reader.read();
+      if (done) break;
+      if (value) {
+        queue.push(value);
+        pump();
+      }
+    }
+    ended = true;
+    pump();
+  } finally {
+    reader.releaseLock();
+    URL.revokeObjectURL(url);
+  }
+}
+
+/**
+ * A monitor for the vision input channel: toggles a live view of the camera.
+ * `GET /api/in/vision` streams one camera session (WebM) per response, which we
+ * play into a `<video>` via MediaSource and re-GET for the next session. The
+ * MediaSource + fetch are torn down on toggle-off / scene-switch / unmount.
+ */
+function VisionMonitor({ scene }: { scene: string }) {
+  const [on, setOn] = useState(false);
+  const [failed, setFailed] = useState(false);
+  const videoRef = useRef<HTMLVideoElement | null>(null);
+
+  useEffect(() => {
+    if (!on) return;
+    const video = videoRef.current;
+    if (!video) return;
+    const ctrl = new AbortController();
+    let cancelled = false;
+
+    void (async () => {
+      try {
+        for await (const turn of subscribeInVideo({ scene, signal: ctrl.signal })) {
+          if (cancelled) break;
+          await playVideoSession(video, turn, () => cancelled);
+        }
+      } catch {
+        if (!cancelled && !ctrl.signal.aborted) setFailed(true);
+      }
+    })();
+
+    return () => {
+      cancelled = true;
+      ctrl.abort();
+      try {
+        video.removeAttribute("src");
+        video.load();
+      } catch {
+        /* ignore */
+      }
+    };
+  }, [on, scene]);
+
+  return (
+    <>
+      <button
+        type="button"
+        className={`chan-monitor ${on ? "on" : ""} ${failed ? "failed" : ""}`}
+        onClick={() => {
+          setFailed(false);
+          setOn((v) => !v);
+        }}
+        title={failed ? "vision unavailable" : on ? "stop watching" : "watch this camera"}
+      >
+        {on ? "📹" : "📷"}
+      </button>
+      {on && <video ref={videoRef} className="chan-frame" autoPlay muted playsInline />}
+    </>
+  );
+}
+
+/**
  * Live presence across one scene's channels. Subscribes to the merged channel
  * stream and buckets signals by channel; each channel renders a rolling feed.
  * Keyed by scene at the call site so switching scenes remounts a fresh stream.
@@ -267,8 +400,17 @@ function SceneChannels({ scene }: { scene: string }) {
                 <div className="card chan" key={key}>
                   <h4>
                     {label} <span className="muted">({items.length})</span>
-                    {key === "audio" && <AudioMonitor scene={scene} direction={dir} />}
                   </h4>
+                  {key === "audio" && (
+                    <div className="chan-monitor-row">
+                      <AudioMonitor scene={scene} direction={dir} />
+                    </div>
+                  )}
+                  {key === "vision" && dir === "in" && (
+                    <div className="chan-monitor-row">
+                      <VisionMonitor scene={scene} />
+                    </div>
+                  )}
                   {items.length === 0 ? (
                     <div className="muted chan-idle">idle</div>
                   ) : (

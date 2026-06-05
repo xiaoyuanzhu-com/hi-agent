@@ -1,10 +1,41 @@
-// Client for the inbound vision channel (camera frames).
+// Client for the inbound vision channel (the live camera).
 //
-// Vision mirrors audio: a continuous input channel. The client captures frames
-// from the camera and POSTs each one here (POST /api/in/vision); there is no
-// commit — the backend brain decides what (if anything) to do with the signal.
-// The server currently just persists the frame (it can't perceive images yet),
-// so this is fire-and-forget; we don't read the response body.
+// "Vision is video": the camera streams continuously as WebM over the WS (see
+// `lib/videoStreamer`), upload-only; the backend relays the bytes and decides how
+// much to look. There is no client-side sampling.
+//
+// `subscribeInVideo` is the read side: `GET /api/in/vision` long-polls one camera
+// session per response (the live video bytes), so we yield a session and re-GET
+// for the next — the same shape `out/audio` uses for TTS turns. Used to watch a
+// scene's camera (e.g. the inspector); each session's bytes go to a MediaSource.
+
+/** One camera session: a continuous video byte body the caller plays. */
+export interface VideoInTurn {
+  /** Content-Type for the whole session (the recorder's `video/webm;codecs=…`). */
+  mime: string;
+  /** The session's video bytes, streamed as they arrive. */
+  body: ReadableStream<Uint8Array>;
+}
+
+export async function* subscribeInVideo(opts: {
+  scene: string;
+  signal: AbortSignal;
+}): AsyncGenerator<VideoInTurn, void, void> {
+  while (!opts.signal.aborted) {
+    const res = await fetch("/api/in/vision", {
+      method: "GET",
+      headers: { "X-HI-Scene": opts.scene, Accept: "video/*" },
+      signal: opts.signal,
+      cache: "no-store",
+    });
+    if (!res.ok) {
+      throw new Error(`/api/in/vision subscribe failed: ${res.status} ${res.statusText}`);
+    }
+    if (!res.body) continue;
+    const mime = res.headers.get("content-type") ?? "video/webm";
+    yield { mime, body: res.body };
+  }
+}
 
 export async function postVision(opts: {
   scene: string;
