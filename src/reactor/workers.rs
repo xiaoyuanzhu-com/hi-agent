@@ -39,20 +39,15 @@ use tokio::sync::{Mutex, mpsc};
 use tokio::task::JoinHandle;
 
 use crate::acp::{AcpSession, SessionOpts, SessionUpdate};
+use crate::agent::SessionRole;
 use crate::observatory::{EventKind, Observatory, WorkerState};
 use crate::types::Scene;
 
-use super::{LoopInput, MarkerExtractor, Reactor};
+use super::{LoopInput, Reactor};
 
 /// Per-scene-unique handle for a working session. Small and `Copy`; it tags the
 /// worker in status lines and in the reports it posts back.
 pub(super) type WorkerId = u64;
-
-/// A worker flags a question it needs the reactor to weigh in on with these
-/// markers, then proceeds on its best assumption. The content is lifted out of
-/// the transcript and posted as a [`WorkerReportKind::Question`].
-const OPEN_ASK: &str = "[[ask]]";
-const CLOSE_ASK: &str = "[[/ask]]";
 
 const WORKER_SYSTEM_PROMPT: &str = "You are a working session spun up by a \
 human-interface agent to carry out one specific delegated task. You have full \
@@ -70,8 +65,8 @@ your report and let the agent present it.\n\
 \n\
 You MAY use hi-agent's own input channels to perceive. The server's base URL is \
 in the `HI_AGENT_BASE_URL` environment variable, and your scene is `{scene}` — \
-send it as the `X-HI-Scene` header on every request. For example, live camera \
-frames:\n\
+send it as the `X-HI-Scene` header on every such request. For example, live \
+camera frames:\n\
     `GET $HI_AGENT_BASE_URL/api/in/vision` with header `X-HI-Scene: {scene}`\n\
   (one frame per response; re-request for the next). Process the raw bytes \
 however the task needs — detection, CV, etc. is your job. You do not write to any \
@@ -79,14 +74,16 @@ output channel; presenting is the agent's job.\n\
 \n\
 If you hit something genuinely ambiguous, do not stall waiting for an answer. \
 Make the most reasonable assumption, note it, and keep going — the agent can \
-correct course later. If you must surface a question, wrap it in `[[ask]] … \
-[[/ask]]` markers and then proceed on your best assumption anyway. Work to \
-completion.";
+correct course later. If you must surface a question, call the `ask` tool with it \
+and then proceed on your best assumption anyway; the agent sees the question and \
+may steer you, but you never wait. Work to completion.";
 
 /// The worker's system prompt, with its scene interpolated so it can tag every
-/// channel request with the right `X-HI-Scene`. The server base URL is delivered
-/// out-of-band in the subprocess env ([`crate::config::ENV_SERVER_BASE_URL`]),
-/// which the prompt references as `$HI_AGENT_BASE_URL`.
+/// input-channel request with the right `X-HI-Scene`. The server base URL is
+/// delivered out-of-band in the subprocess env
+/// ([`crate::config::ENV_SERVER_BASE_URL`]), which the prompt references as
+/// `$HI_AGENT_BASE_URL`. Output side-effects (the `ask` tool) ride the MCP attach,
+/// which carries the scene/role/worker-id headers for the worker automatically.
 fn worker_system_prompt(scene: &Scene) -> String {
     WORKER_SYSTEM_PROMPT.replace("{scene}", &scene.0)
 }
@@ -160,6 +157,8 @@ impl WorkerRegistry {
                 .agent
                 .session(
                     &self.scene,
+                    SessionRole::Worker,
+                    Some(id),
                     SessionOpts {
                         system_prompt: Some(worker_system_prompt(&self.scene)),
                         cwd: None,
@@ -200,6 +199,19 @@ impl WorkerRegistry {
     /// Their result already rode back as a report; this just drops the handle.
     pub(super) fn reap(&mut self) {
         self.workers.retain(|_, w| !w.drive.is_finished());
+    }
+
+    /// Build a question report for the `ask` tool, attributing it to the worker's
+    /// task. The MCP `ask` handler only knows the worker id; the loop owns the
+    /// registry, so it resolves the task here. An ask from an unknown id (already
+    /// reaped, say) still surfaces, tagged as such.
+    pub(super) fn question_report(&self, id: WorkerId, question: String) -> WorkerReport {
+        let task = self
+            .workers
+            .get(&id)
+            .map(|w| w.task.clone())
+            .unwrap_or_else(|| "(finished worker)".to_string());
+        WorkerReport { id, task, kind: WorkerReportKind::Question(question) }
     }
 
     /// A compact, stable-ordered view of every running worker — its task and a
@@ -264,9 +276,7 @@ async fn drive_worker(
     observatory: Observatory,
     scene: Scene,
 ) {
-    let kind = match run_worker(id, &task, &session, &transcript, &inbound, &observatory, &scene)
-        .await
-    {
+    let kind = match run_worker(id, &task, &session, &transcript, &observatory, &scene).await {
         Ok(answer) => WorkerReportKind::Done(answer),
         Err(err) => WorkerReportKind::Failed(err.to_string()),
     };
@@ -286,56 +296,35 @@ async fn drive_worker(
     }
 }
 
-/// Prompt the worker session with the task, stream its output into the
-/// transcript while lifting out `[[ask]]` questions (posted as they appear),
-/// and return the full reply as the task's result.
+/// Prompt the worker session with the task, streaming its output into the
+/// transcript, and return the full reply as the task's result. Questions are no
+/// longer parsed from the text — the worker raises them by calling the `ask`
+/// tool, which arrives on the loop's control channel out of band.
 async fn run_worker(
     id: WorkerId,
     task: &str,
     session: &AcpSession,
     transcript: &Arc<Mutex<String>>,
-    inbound: &mpsc::Sender<LoopInput>,
     observatory: &Observatory,
     scene: &Scene,
 ) -> anyhow::Result<String> {
     let mut run = session.prompt(task.to_string()).await?;
-    let mut asks = MarkerExtractor::new(OPEN_ASK, CLOSE_ASK);
     let mut full = String::new();
 
     loop {
         match run.next_update().await {
             Some(SessionUpdate::Text(text)) => {
-                let (clean, questions) = asks.push(&text);
-                if !clean.is_empty() {
-                    full.push_str(&clean);
-                    transcript.lock().await.push_str(&clean);
-                    // Mirror the live tail so the dashboard shows what the worker
-                    // is doing right now.
-                    observatory.worker_progress(scene, id, &full).await;
-                }
-                for q in questions {
-                    observatory
-                        .record(scene, EventKind::WorkerQuestion { id, question: q.clone() })
-                        .await;
-                    let report = WorkerReport {
-                        id,
-                        task: task.to_string(),
-                        kind: WorkerReportKind::Question(q),
-                    };
-                    let _ = inbound.send(LoopInput::Worker(report)).await;
-                }
+                full.push_str(&text);
+                transcript.lock().await.push_str(&text);
+                // Mirror the live tail so the dashboard shows what the worker is
+                // doing right now.
+                observatory.worker_progress(scene, id, &full).await;
             }
             // Thoughts, tool calls, and unmodelled events don't enter the
             // transcript — only the worker's text output does.
             Some(_) => {}
             None => break,
         }
-    }
-
-    let tail = asks.flush();
-    if !tail.is_empty() {
-        full.push_str(&tail);
-        transcript.lock().await.push_str(&tail);
     }
 
     run.wait().await?;

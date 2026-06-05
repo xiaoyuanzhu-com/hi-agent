@@ -19,6 +19,16 @@ pub const ENV_CONFIG_PATH: &str = "HI_AGENT_CONFIG";
 /// wire the browser uses. See [`AgentConfig::child_env`].
 pub const ENV_SERVER_BASE_URL: &str = "HI_AGENT_BASE_URL";
 
+/// HTTP headers a session's MCP attach carries on every tool call, so the `/mcp`
+/// server can route a call back to the right scene loop and tool surface. Set
+/// when the session is opened (see `agent::AgentLayer::session`) and read by the
+/// MCP handler (see `crate::mcp`). The scene is the isolation key; the role
+/// selects which tools are exposed; the worker id (workers only) names which
+/// working session raised an `ask`.
+pub const HEADER_SCENE: &str = "X-HI-Scene";
+pub const HEADER_ROLE: &str = "X-HI-Role";
+pub const HEADER_WORKER_ID: &str = "X-HI-Worker-Id";
+
 /// Dev-managed cognition parameters. Non-secret managed fields come from
 /// `config.toml`; the upstream base URL and key are injected from the
 /// environment so the credential never lives in git.

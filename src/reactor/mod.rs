@@ -50,9 +50,11 @@ use std::time::Duration;
 mod heartbeat;
 mod interleave;
 pub mod outbound;
+mod tools;
 mod workers;
 
 pub use outbound::OutboundSignal;
+pub use tools::{SceneControl, ToolRegistry, ToolSink};
 
 /// The heartbeat's soft context-budget ceiling, surfaced so the observatory can
 /// render each scene's budget as a fraction of where a hot-swap kicks in.
@@ -65,7 +67,7 @@ use tokio::sync::{Mutex, mpsc};
 use tokio::time::{Instant, sleep_until, timeout};
 
 use crate::acp::{AcpSession, SessionOpts, SessionUpdate};
-use crate::agent::AgentLayer;
+use crate::agent::{AgentLayer, SessionRole};
 use crate::capabilities::tts::{self, TtsStream};
 use crate::memory::{Memory, build_for_scene};
 use crate::observatory::{EventKind, Observatory, SessionKind};
@@ -227,10 +229,7 @@ impl Alarms {
     }
 }
 
-const OPEN_ALARM: &str = "[[alarm]]";
-const CLOSE_ALARM: &str = "[[/alarm]]";
-
-/// Parse an `[[alarm]]` delay token: a bare integer is seconds, or an integer
+/// Parse an alarm delay token: a bare integer is seconds, or an integer
 /// with an `s`/`m`/`h` suffix (`30s`, `20m`, `1h`). `None` for anything
 /// unparseable, so a malformed alarm is dropped rather than firing at a wrong
 /// time.
@@ -249,15 +248,11 @@ fn parse_delay(tok: &str) -> Option<Duration> {
     Some(Duration::from_secs(n.saturating_mul(mult)))
 }
 
-/// Parse one `[[alarm]]` block body — `"<delay> <note>"` — and register it: the
-/// first whitespace-delimited token is the delay, the rest is the note. A block
-/// whose delay won't parse is logged and dropped.
-async fn schedule_alarm(reactor: &Reactor, alarms: &mut Alarms, scene: &Scene, block: &str) {
-    let (delay_tok, note) = match block.split_once(char::is_whitespace) {
-        Some((d, rest)) => (d, rest.trim()),
-        None => (block, ""),
-    };
-    match parse_delay(delay_tok) {
+/// Register a self-alarm from the `alarm` tool's `delay`/`note` arguments. A
+/// delay that won't parse is logged and dropped (fix-forward — the mind isn't
+/// blocked on it).
+async fn schedule_alarm(reactor: &Reactor, alarms: &mut Alarms, scene: &Scene, delay: &str, note: &str) {
+    match parse_delay(delay) {
         Some(delay) => {
             alarms.schedule(delay, note.to_owned(), Instant::now());
             reactor
@@ -271,7 +266,7 @@ async fn schedule_alarm(reactor: &Reactor, alarms: &mut Alarms, scene: &Scene, b
             tracing::info!(scene = %scene, delay_s = delay.as_secs(), note = %note, "alarm scheduled");
         }
         None => {
-            tracing::warn!(scene = %scene, token = %delay_tok, "ignoring [[alarm]] with unparseable delay");
+            tracing::warn!(scene = %scene, token = %delay, "ignoring alarm with unparseable delay");
         }
     }
 }
@@ -301,6 +296,10 @@ struct ReactorInner {
     /// imports. Invoked just-in-time when a view segment is released, so the
     /// compiled module URL is what rides the /view channel.
     view_compiler: crate::views::ViewCompiler,
+    /// Scene→tool-sink table the `/mcp` server routes tool calls through. Each
+    /// scene loop registers its sink here as it stands up; shared (cloneable)
+    /// with the HTTP front. See [`tools`].
+    tools: ToolRegistry,
     /// Monotonic cognition-turn counter. Each turn claims the next id;
     /// it tags audio spans and the channel logs so a reply is traceable end to
     /// end. (The client no longer needs it — turns are internal to the mind.)
@@ -321,6 +320,7 @@ pub fn start(
     out: mpsc::Sender<OutboundSignal>,
     observatory: Observatory,
     view_compiler: crate::views::ViewCompiler,
+    tools: ToolRegistry,
 ) -> Reactor {
     let reactor = Reactor {
         inner: Arc::new(ReactorInner {
@@ -330,6 +330,7 @@ pub fn start(
             out,
             observatory,
             view_compiler,
+            tools,
             turn_seq: AtomicU64::new(0),
             scenes: Mutex::new(HashMap::new()),
         }),
@@ -389,16 +390,68 @@ impl Reactor {
         scenes.insert(scene.clone(), SceneHandle { inbound: tx.clone() });
         drop(scenes);
 
+        // The scene's tool control channel: the `/mcp` server forwards delegate/
+        // alarm/ask calls here, the loop applies them. Register the sink before the
+        // loop's session opens so a tool call can never arrive with no route.
+        let (control_tx, control_rx) = mpsc::channel::<SceneControl>(SCENE_QUEUE_CAPACITY);
+        self.inner
+            .tools
+            .register(scene.clone(), ToolSink { control: control_tx.clone() })
+            .await;
+
         let task_reactor = self.clone();
         let task_scene = scene.clone();
         // The worker registry posts its reports back into this same queue, so
         // hand the loop a sender clone to seed it.
         let task_worker_inbound = tx.clone();
         tokio::spawn(async move {
-            per_scene_loop(task_reactor, task_scene, rx, task_worker_inbound).await;
+            per_scene_loop(task_reactor, task_scene, rx, task_worker_inbound, control_rx, control_tx)
+                .await;
         });
 
         tx
+    }
+}
+
+/// Why the per-scene loop's wait resolved. Keeps the `select!` arms tiny so the
+/// borrow checker doesn't trip on mutating `workers`/`alarms` inside them.
+enum Woke {
+    Inbound(Option<LoopInput>),
+    Control(Option<SceneControl>),
+    Timer,
+}
+
+/// Apply one tool control command. Delegate and alarm are side-effects that run
+/// without a turn (returns `None`); a worker `ask` becomes a question report the
+/// loop folds into its next turn (returns `Some`). Worker-registry and alarm
+/// state are the loop's own, so this is the only place off-loop tool calls touch
+/// them — through the control channel, no locking.
+async fn apply_control(
+    reactor: &Reactor,
+    scene: &Scene,
+    workers: &mut workers::WorkerRegistry,
+    alarms: &mut Alarms,
+    ctl: SceneControl,
+) -> Option<LoopInput> {
+    match ctl {
+        SceneControl::Delegate { task } => {
+            if let Err(err) = workers.spawn(reactor, task).await {
+                tracing::warn!(scene = %scene, error = %err, "failed to spawn working session");
+            }
+            None
+        }
+        SceneControl::Alarm { delay, note } => {
+            schedule_alarm(reactor, alarms, scene, &delay, &note).await;
+            None
+        }
+        SceneControl::WorkerAsk { id, question } => {
+            reactor
+                .inner
+                .observatory
+                .record(scene, EventKind::WorkerQuestion { id, question: question.clone() })
+                .await;
+            Some(LoopInput::Worker(workers.question_report(id, question)))
+        }
     }
 }
 
@@ -407,6 +460,11 @@ async fn per_scene_loop(
     scene: Scene,
     mut inbound: mpsc::Receiver<LoopInput>,
     worker_inbound: mpsc::Sender<LoopInput>,
+    mut control: mpsc::Receiver<SceneControl>,
+    // Held only to keep the control channel open: the registry holds the other
+    // sender, but keeping a clone here means `control.recv()` never resolves to
+    // `None` while this loop runs, so a quiet tool channel can't end the scene.
+    _control_keepalive: mpsc::Sender<SceneControl>,
 ) {
     // The scene's persistent reactor session: opened lazily on the first turn,
     // then reused for every later turn as the scene's continuous mind. Only this
@@ -441,40 +499,60 @@ async fn per_scene_loop(
     warm_up(&reactor, &scene, &mut reactor_session).await;
 
     loop {
-        // Wait for the first reason to wake: a new signal, or — when the mind has
-        // set alarms — the soonest firing. An alarm wake injects synthetic batch
-        // items so a turn runs even with no new signal; the mind then looks at the
-        // situation and decides what to do (including nothing).
+        // Wait for a turn-driving reason: a new signal, a fired alarm, or a worker
+        // question. Tool control commands (delegate/alarm) are pure side-effects —
+        // applied as they arrive without starting a turn; only a worker `ask`
+        // becomes a turn-driving item. When the mind has set alarms, the soonest
+        // also wakes the loop.
         let mut batch: Vec<LoopInput> = Vec::new();
-        match alarms.next_deadline() {
-            Some(deadline) => {
-                tokio::select! {
-                    recvd = inbound.recv() => match recvd {
-                        Some(s) => batch.push(s),
-                        None => {
-                            tracing::info!(scene = %scene, "per-scene inbound closed; exiting loop");
-                            return;
-                        }
-                    },
-                    _ = sleep_until(deadline) => {
-                        for fired in alarms.take_due(Instant::now()) {
-                            reactor
-                                .inner
-                                .observatory
-                                .record(&scene, EventKind::AlarmFired { note: fired.note.clone() })
-                                .await;
-                            batch.push(LoopInput::Alarm(fired));
-                        }
-                    }
+        'wait: loop {
+            let woke = match alarms.next_deadline() {
+                Some(deadline) => tokio::select! {
+                    recvd = inbound.recv() => Woke::Inbound(recvd),
+                    ctl = control.recv() => Woke::Control(ctl),
+                    _ = sleep_until(deadline) => Woke::Timer,
+                },
+                None => tokio::select! {
+                    recvd = inbound.recv() => Woke::Inbound(recvd),
+                    ctl = control.recv() => Woke::Control(ctl),
+                },
+            };
+            match woke {
+                Woke::Inbound(Some(s)) => {
+                    batch.push(s);
+                    break 'wait;
                 }
-            }
-            None => match inbound.recv().await {
-                Some(s) => batch.push(s),
-                None => {
+                Woke::Inbound(None) => {
                     tracing::info!(scene = %scene, "per-scene inbound closed; exiting loop");
                     return;
                 }
-            },
+                // The keepalive sender means this is effectively unreachable; treat
+                // a closed control channel as "nothing to apply" and keep waiting.
+                Woke::Control(None) => continue 'wait,
+                Woke::Control(Some(ctl)) => {
+                    if let Some(input) =
+                        apply_control(&reactor, &scene, &mut workers, &mut alarms, ctl).await
+                    {
+                        batch.push(input);
+                        break 'wait;
+                    }
+                    // A delegate/alarm side-effect was applied; keep waiting for a
+                    // turn-driving reason rather than running an empty turn.
+                }
+                Woke::Timer => {
+                    for fired in alarms.take_due(Instant::now()) {
+                        reactor
+                            .inner
+                            .observatory
+                            .record(&scene, EventKind::AlarmFired { note: fired.note.clone() })
+                            .await;
+                        batch.push(LoopInput::Alarm(fired));
+                    }
+                    if !batch.is_empty() {
+                        break 'wait;
+                    }
+                }
+            }
         }
 
         // A timer can resolve with nothing actually due; don't run an empty turn.
@@ -503,7 +581,7 @@ async fn per_scene_loop(
         // Forget any workers that have finished, so the registry doesn't grow.
         workers.reap();
 
-        match run_turn(&reactor, &scene, &batch, &mut reactor_session, &mut seeded, &mut budget, &mut workers, &mut alarms).await {
+        match run_turn(&reactor, &scene, &batch, &mut reactor_session, &mut seeded, &mut budget, &mut workers).await {
             Ok(()) => {
                 // Between turns: if the live session has grown past budget, hot-swap
                 // it now. The human is consuming the reply just delivered, so the
@@ -589,6 +667,8 @@ async fn open_session(reactor: &Reactor, scene: &Scene) -> anyhow::Result<Arc<Ac
             .agent
             .session(
                 scene,
+                SessionRole::Reactor,
+                None,
                 SessionOpts {
                     system_prompt: Some(reactor.inner.soul.clone()),
                     cwd: None,
@@ -628,7 +708,6 @@ async fn run_turn(
     seeded: &mut bool,
     budget: &mut heartbeat::ContextBudget,
     workers: &mut workers::WorkerRegistry,
-    alarms: &mut Alarms,
 ) -> anyhow::Result<()> {
     let turn_id = reactor.inner.turn_seq.fetch_add(1, Ordering::Relaxed);
     reactor
@@ -708,14 +787,13 @@ async fn run_turn(
 
         // Per-turn output state. The reply is parsed into ordered segments
         // (`interleave::Extractor`) and each is released just-in-time below,
-        // decoupled from parse-time — so a surface is paced to its sentence
-        // instead of racing ahead of all audio. The splitter coalesces spoken text
-        // into sentences for TTS; the delegate/alarm extractors pull side-effect
-        // markers out of the spoken run; `full_reply` is logged once at end of turn.
+        // decoupled from parse-time — so a view is paced to its sentence instead of
+        // racing ahead of all audio. The splitter coalesces spoken text into
+        // sentences for TTS; `full_reply` is logged once at end of turn. Side-effects
+        // (delegate/alarm) are no longer parsed here — the mind drives them by
+        // calling tools over `/mcp`, which arrive on the loop's control channel.
         let mut extractor = interleave::Extractor::new();
         let mut splitter = Segmenter::new(Terminator, std::time::Instant::now());
-        let mut delegate_extractor = MarkerExtractor::new(OPEN_DELEGATE, CLOSE_DELEGATE);
-        let mut alarm_extractor = MarkerExtractor::new(OPEN_ALARM, CLOSE_ALARM);
         let mut full_reply = String::new();
 
         let mut ended = false;
@@ -742,32 +820,20 @@ async fn run_turn(
             for seg in segs {
                 match seg {
                     interleave::Segment::Spoken(text) => {
-                        // `[[delegate]]` / `[[alarm]]` are side-effects pulled out
-                        // here (spawn a worker / schedule a wake), never spoken.
-                        let (clean, tasks) = delegate_extractor.push(&text);
-                        for task in tasks {
-                            if let Err(err) = workers.spawn(reactor, task).await {
-                                tracing::warn!(scene = %scene, error = %err, "failed to spawn working session");
-                            }
-                        }
-                        let (residual, blocks) = alarm_extractor.push(&clean);
-                        for block in blocks {
-                            schedule_alarm(reactor, alarms, scene, &block).await;
-                        }
-                        if residual.is_empty() {
+                        if text.is_empty() {
                             continue;
                         }
-                        full_reply.push_str(&residual);
+                        full_reply.push_str(&text);
                         for emit in interleave::speak_emits(
-                            &residual,
+                            &text,
                             &mut splitter,
                             std::time::Instant::now(),
                         ) {
                             perform(emit, &synth_tx, reactor, scene).await;
                         }
-                        // /thought gets the raw residual chunk; TTS gets coalesced
-                        // sentences (above) — the two channels keep their own pacing.
-                        emit_thought_chunk(reactor, scene, residual).await;
+                        // /thought gets the raw chunk; TTS gets coalesced sentences
+                        // (above) — the two channels keep their own pacing.
+                        emit_thought_chunk(reactor, scene, text).await;
                     }
                     interleave::Segment::View { id, op, source } => {
                         for emit in interleave::view_emits(&mut splitter, id, op, source) {
@@ -778,24 +844,6 @@ async fn run_turn(
             }
         }
 
-        // The marker extractors may still hold a partial-opener tail; flush them
-        // (delegate first, feeding its tail through alarm, mirroring the streaming
-        // chain) so a marker that ended the reply still resolves.
-        let deleg_tail = delegate_extractor.flush();
-        let (mut spoken_tail, alarm_blocks) = alarm_extractor.push(&deleg_tail);
-        spoken_tail.push_str(&alarm_extractor.flush());
-        for block in alarm_blocks {
-            schedule_alarm(reactor, alarms, scene, &block).await;
-        }
-        if !spoken_tail.is_empty() {
-            full_reply.push_str(&spoken_tail);
-            for emit in
-                interleave::speak_emits(&spoken_tail, &mut splitter, std::time::Instant::now())
-            {
-                perform(emit, &synth_tx, reactor, scene).await;
-            }
-            emit_thought_chunk(reactor, scene, spoken_tail).await;
-        }
         if !full_reply.trim().is_empty() {
             crate::channel_log::outbound(Channel::Text, scene, full_reply.trim());
         }
@@ -1054,102 +1102,6 @@ async fn emit_view(reactor: &Reactor, scene: &Scene, id: String, op: ViewOp, sou
             envelope: ViewEnvelope { id, op, module_url, ttl_ms: None },
         })
         .await;
-}
-
-const OPEN_DELEGATE: &str = "[[delegate]]";
-const CLOSE_DELEGATE: &str = "[[/delegate]]";
-
-/// Streaming extractor for a single `OPEN … CLOSE` marker pair. Text outside the
-/// markers passes through; each enclosed block's inner content is collected and
-/// returned. A short tail that could be a partial opener is held back so a marker
-/// split across chunks is still recognized.
-///
-/// The generic sibling of the surface extractor in [`interleave`] (which carries
-/// a card/full mode and yields envelopes). Used for `[[delegate]]` on the reactor
-/// side — the mind names background work inline — and for `[[ask]]` on the
-/// worker side.
-struct MarkerExtractor {
-    open: &'static str,
-    close: &'static str,
-    buf: String,
-    inside: bool,
-}
-
-impl MarkerExtractor {
-    fn new(open: &'static str, close: &'static str) -> Self {
-        Self {
-            open,
-            close,
-            buf: String::new(),
-            inside: false,
-        }
-    }
-
-    /// Feed a chunk. Returns `(text_outside_markers, blocks_completed_this_call)`.
-    fn push(&mut self, chunk: &str) -> (String, Vec<String>) {
-        self.buf.push_str(chunk);
-        let mut text_out = String::new();
-        let mut blocks = Vec::new();
-
-        loop {
-            if self.inside {
-                if let Some(idx) = self.buf.find(self.close) {
-                    let inner = self.buf[..idx].trim().to_string();
-                    self.buf = self.buf[idx + self.close.len()..].to_string();
-                    self.inside = false;
-                    if !inner.is_empty() {
-                        blocks.push(inner);
-                    }
-                    continue;
-                }
-                break; // close not present yet; keep buffering the block body
-            } else {
-                if let Some(idx) = self.buf.find(self.open) {
-                    text_out.push_str(&self.buf[..idx]);
-                    self.buf = self.buf[idx + self.open.len()..].to_string();
-                    self.inside = true;
-                    continue;
-                }
-                // No opener: emit everything except a tail that could be the
-                // start of one continuing in the next chunk.
-                let keep = partial_marker_suffix_len(&self.buf, self.open);
-                let emit_to = self.buf.len() - keep;
-                text_out.push_str(&self.buf[..emit_to]);
-                self.buf = self.buf[emit_to..].to_string();
-                break;
-            }
-        }
-        (text_out, blocks)
-    }
-
-    /// Emit any held-back text at end of stream. An unterminated block is dropped.
-    fn flush(&mut self) -> String {
-        let out = if self.inside {
-            String::new()
-        } else {
-            std::mem::take(&mut self.buf)
-        };
-        self.buf.clear();
-        self.inside = false;
-        out
-    }
-}
-
-/// Length (bytes) of the longest suffix of `buf` that is a proper prefix of
-/// `marker` — i.e. a marker possibly split across chunks.
-fn partial_marker_suffix_len(buf: &str, marker: &str) -> usize {
-    let max = marker.len() - 1;
-    let start = buf.len().saturating_sub(max);
-    for i in start..buf.len() {
-        if !buf.is_char_boundary(i) {
-            continue;
-        }
-        let suffix = &buf[i..];
-        if marker.starts_with(suffix) {
-            return buf.len() - i;
-        }
-    }
-    0
 }
 
 #[cfg(test)]

@@ -13,7 +13,7 @@ use tower_http::trace::TraceLayer;
 
 use crate::memory::Memory;
 use crate::observatory::Observatory;
-use crate::reactor::OutboundSignal;
+use crate::reactor::{OutboundSignal, ToolRegistry};
 use crate::types::{Channel, Scene, Signal, ViewEnvelope};
 
 pub mod audio;
@@ -21,6 +21,7 @@ pub mod binder;
 pub mod channels;
 pub mod generated;
 pub mod headers;
+pub mod mcp;
 pub mod observe;
 pub mod sessions;
 pub mod stubs;
@@ -186,6 +187,11 @@ pub struct AppState {
     /// Where blob media lives. POST /api/in/audio and POST /api/in/vision write
     /// incoming bytes here before journaling the reference.
     pub data_dir: PathBuf,
+
+    /// Scene→tool-sink table. The `/mcp` handler looks a scene up here to route a
+    /// tool call to its reactor loop; the reactor registers each scene's sink as
+    /// it stands the loop up. See [`crate::reactor::ToolRegistry`].
+    pub tool_registry: ToolRegistry,
 }
 
 impl AppState {
@@ -212,7 +218,12 @@ impl AppState {
     }
 }
 
-pub fn build(memory: Memory, data_dir: PathBuf, observatory: Observatory) -> (Router, ServerSeams) {
+pub fn build(
+    memory: Memory,
+    data_dir: PathBuf,
+    observatory: Observatory,
+    tool_registry: ToolRegistry,
+) -> (Router, ServerSeams) {
     let (inbound_tx, inbound_rx) = mpsc::channel::<Signal>(1024);
     // Scene warm-up requests: a presence GET asks the reactor to stand a scene up
     // ahead of its first utterance (see `AppState::warm`).
@@ -251,6 +262,7 @@ pub fn build(memory: Memory, data_dir: PathBuf, observatory: Observatory) -> (Ro
         memory,
         observatory,
         data_dir,
+        tool_registry,
     });
 
     // Channels are namespaced by boundary: `/api/in/*` is the world→agent side
@@ -274,6 +286,10 @@ pub fn build(memory: Memory, data_dir: PathBuf, observatory: Observatory) -> (Ro
         .route("/api/in/taste", post(stubs::post_taste))
         .route("/api/sessions", get(sessions::get_sessions))
         .route("/api/sessions/events", get(sessions::get_sessions_events))
+        // The MCP tool endpoint a session's `mcp_servers` attach connects to. The
+        // mind drives output and side-effects by calling tools here; routing is by
+        // the X-HI-Scene/X-HI-Role headers the attach carries.
+        .route("/mcp", post(mcp::post_mcp).get(mcp::get_mcp))
         // A scene's channels, observed live as one merged presence stream — the
         // channel inspector's window onto every in/out channel of one scene.
         .route("/api/scenes/{scene}/channels", get(channels::get_scene_channels))

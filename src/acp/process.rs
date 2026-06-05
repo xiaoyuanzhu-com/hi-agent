@@ -17,7 +17,7 @@ use std::sync::Arc;
 
 use agent_client_protocol as acp;
 use acp::schema::{
-    InitializeRequest, NewSessionRequest, ProtocolVersion, RequestPermissionRequest,
+    InitializeRequest, McpServer, NewSessionRequest, ProtocolVersion, RequestPermissionRequest,
     RequestPermissionResponse, RequestPermissionOutcome, SelectedPermissionOutcome, SessionId,
     SessionNotification,
 };
@@ -164,13 +164,17 @@ impl AcpProcess {
         })
     }
 
-    pub async fn new_session(&self, opts: SessionOpts) -> anyhow::Result<AcpSession> {
+    pub async fn new_session(
+        &self,
+        opts: SessionOpts,
+        mcp_servers: Vec<McpServer>,
+    ) -> anyhow::Result<AcpSession> {
         let cwd = match opts.cwd {
             Some(p) => p,
             None => std::env::current_dir().context("reading current dir for new session")?,
         };
 
-        let req = NewSessionRequest::new(cwd);
+        let req = NewSessionRequest::new(cwd).mcp_servers(mcp_servers);
 
         let resp = self
             .connection

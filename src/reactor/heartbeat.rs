@@ -109,6 +109,8 @@ pub(super) async fn swap(
         .agent
         .session(
             scene,
+            crate::agent::SessionRole::Reactor,
+            None,
             SessionOpts {
                 system_prompt: Some(seeded_system_prompt),
                 cwd: None,

@@ -11,6 +11,7 @@ pub mod capabilities;
 pub mod channel_log;
 pub mod config;
 pub mod llm_proxy;
+pub mod mcp;
 pub mod memory;
 pub mod observatory;
 pub mod runtime;
@@ -53,8 +54,17 @@ pub async fn run(config: Config) -> anyhow::Result<()> {
         "capabilities resolved"
     );
 
-    let (router, seams) =
-        server::build(memory.clone(), config.data_dir.clone(), observatory.clone());
+    // Scene→tool-sink table shared between the HTTP front's `/mcp` handler and the
+    // reactor that registers each scene's sink. The mind drives output and
+    // side-effects by calling tools on `/mcp`; they route here.
+    let tool_registry = reactor::ToolRegistry::new();
+
+    let (router, seams) = server::build(
+        memory.clone(),
+        config.data_dir.clone(),
+        observatory.clone(),
+        tool_registry.clone(),
+    );
 
     // Resolve the runtime: prefer system tools on PATH, else install on first run.
     let runtime = runtime::ensure().await?;
@@ -93,6 +103,7 @@ pub async fn run(config: Config) -> anyhow::Result<()> {
             env: child_env,
         },
         observatory.clone(),
+        format!("http://127.0.0.1:{}", config.port),
     );
     tracing::info!("agent session layer ready (per-scene processes spawn on first contact)");
 
@@ -112,6 +123,7 @@ pub async fn run(config: Config) -> anyhow::Result<()> {
         seams.out_tx,
         observatory,
         view_compiler,
+        tool_registry,
     );
     tracing::info!("reactor started");
 
