@@ -20,8 +20,6 @@ use anyhow::{Context, bail};
 use tokio::io::AsyncWriteExt;
 use tokio::process::Command;
 
-use crate::runtime::ResolvedRuntime;
-
 /// Compiles agent view source to a served ESM module URL. Cheap to clone.
 #[derive(Debug, Clone)]
 pub struct ViewCompiler {
@@ -32,13 +30,11 @@ pub struct ViewCompiler {
 }
 
 impl ViewCompiler {
-    /// Build from the resolved runtime. esbuild lives in the same `node_modules`
-    /// the ACP adapter was installed into; compiled modules go under `data_dir`.
-    pub fn new(runtime: &ResolvedRuntime, data_dir: &Path) -> Self {
-        Self::with_paths(
-            esbuild_binary(&runtime.adapter_entry),
-            data_dir.join("generated").join("views"),
-        )
+    /// Build from a resolved esbuild binary (see [`runtime::ensure_view_esbuild`],
+    /// which guarantees one regardless of where the runtime came from) and a
+    /// `data_dir` under which compiled modules are written.
+    pub fn new(esbuild_bin: PathBuf, data_dir: &Path) -> Self {
+        Self::with_paths(esbuild_bin, data_dir.join("generated").join("views"))
     }
 
     fn with_paths(esbuild_bin: PathBuf, generated_dir: PathBuf) -> Self {
@@ -118,32 +114,6 @@ impl ViewCompiler {
     }
 }
 
-/// Locate the esbuild native binary in the same `node_modules` the adapter was
-/// installed into. Returns a non-existent sentinel if either the layout is
-/// unfamiliar or the host platform is unsupported — `compile` reports it clearly.
-fn esbuild_binary(adapter_entry: &Path) -> PathBuf {
-    let platform = match crate::runtime::node_target() {
-        Ok((os, arch)) => format!("{os}-{arch}"),
-        Err(_) => return PathBuf::from("esbuild-unsupported-platform"),
-    };
-    match node_modules_ancestor(adapter_entry) {
-        Some(nm) => nm.join("@esbuild").join(platform).join("bin").join("esbuild"),
-        None => PathBuf::from("esbuild-unresolved"),
-    }
-}
-
-/// The nearest ancestor of `p` that is a `node_modules` directory.
-fn node_modules_ancestor(p: &Path) -> Option<PathBuf> {
-    let mut cur = p;
-    while let Some(parent) = cur.parent() {
-        if parent.file_name().is_some_and(|n| n == "node_modules") {
-            return Some(parent.to_path_buf());
-        }
-        cur = parent;
-    }
-    None
-}
-
 /// Deterministic content hash + served URL for `source`. A cache key, not a
 /// security boundary: a 64-bit hash is ample for de-duping a few authored views.
 fn module_ref(source: &str) -> (String, String) {
@@ -170,35 +140,44 @@ mod tests {
         assert_ne!(h1, h3, "different source must hash differently");
     }
 
-    #[test]
-    fn finds_node_modules_ancestor() {
-        let entry = Path::new("/r/adapter/node_modules/@scope/pkg/dist/index.js");
-        assert_eq!(
-            node_modules_ancestor(entry),
-            Some(PathBuf::from("/r/adapter/node_modules"))
-        );
-        assert_eq!(node_modules_ancestor(Path::new("/usr/local/bin/tool")), None);
-    }
-
-    /// Locate an esbuild native binary if one is installed on this host (managed
-    /// runtime, or a dev checkout that has run `npm ci`). Returns `None` to skip
-    /// the spawning tests where esbuild isn't provisioned — mirroring how the
-    /// runtime tests avoid requiring a managed install.
+    /// Locate an esbuild native binary if one is installed on this host (the
+    /// standalone view-tool install, or a dev checkout that has run `npm ci`).
+    /// Returns `None` to skip the spawning tests where esbuild isn't provisioned.
     fn esbuild_probe() -> Option<PathBuf> {
         let (os, arch) = crate::runtime::node_target().ok()?;
+        let platform = format!("{os}-{arch}");
+        let cache = directories::ProjectDirs::from("dev", "human-interface", "hi-agent")?
+            .cache_dir()
+            .to_path_buf();
         let candidates = [
-            // Managed runtime under the OS cache dir.
-            directories::ProjectDirs::from("dev", "human-interface", "hi-agent").map(|d| {
-                d.cache_dir()
-                    .join("runtime/adapter/node_modules/@esbuild")
-                    .join(format!("{os}-{arch}"))
-                    .join("bin/esbuild")
-            }),
+            // Standalone view-tool install (what `ensure_view_esbuild` provisions
+            // when the runtime comes from PATH).
+            cache
+                .join("view-tool")
+                .join(format!("esbuild-0.28.0-{platform}"))
+                .join("node_modules/@esbuild")
+                .join(&platform)
+                .join("bin/esbuild"),
+            // Managed runtime under a fingerprinted dir: any `runtime/*/adapter`.
+            cache.join("runtime"),
         ];
-        candidates
-            .into_iter()
-            .flatten()
-            .find(|p| p.exists())
+        // First candidate is a concrete file; the second is a dir to scan.
+        if candidates[0].exists() {
+            return Some(candidates[0].clone());
+        }
+        let runtime_root = &candidates[1];
+        let entries = std::fs::read_dir(runtime_root).ok()?;
+        for entry in entries.flatten() {
+            let bin = entry
+                .path()
+                .join("adapter/node_modules/@esbuild")
+                .join(&platform)
+                .join("bin/esbuild");
+            if bin.exists() {
+                return Some(bin);
+            }
+        }
+        None
     }
 
     #[tokio::test]

@@ -3,8 +3,7 @@
 use chrono::{DateTime, Duration, Utc};
 
 use crate::memory::Memory;
-use crate::memory::journal::entry_ts;
-use crate::types::{JournalEntry, Scene};
+use crate::types::{Channel, JournalEntry, Scene};
 
 pub const RECENT_WINDOW_MIN: i64 = 30;
 pub const RECENT_ENTRY_LIMIT: usize = 200;
@@ -47,15 +46,43 @@ impl Snapshot {
 }
 
 fn render_entry(e: &JournalEntry) -> String {
-    let ts = entry_ts(e).format("%H:%M:%S");
     match e {
-        JournalEntry::SignalIn { channel, scene, body, stream, .. } => {
-            let chan = channel.with_stream(stream.as_deref());
-            format!("[{}] {}\u{2192}agent on /{}: \"{}\"", ts, scene, chan, truncate(body, 200))
+        JournalEntry::SignalIn { channel, body, stream, .. } => {
+            transcript_line(Speaker::Them, &channel.with_stream(stream.as_deref()), &truncate(body, 200))
         }
-        JournalEntry::SignalOut { channel, scene, body, .. } => {
-            format!("[{}] agent\u{2192}{} on /{}: \"{}\"", ts, scene, channel, truncate(body, 200))
+        JournalEntry::SignalOut { channel, body, .. } => {
+            transcript_line(Speaker::You, channel.as_str(), &truncate(body, 200))
         }
+    }
+}
+
+/// Who said a line. Rendered as a single leading glyph — `>` for the person,
+/// `<` for the agent — so the speaker costs one character, not a repeated word.
+/// The glyphs are documented once in the soul (the system prompt), not per line.
+#[derive(Clone, Copy)]
+pub(crate) enum Speaker {
+    /// The person — an inbound signal. Renders as `>`.
+    Them,
+    /// The agent itself — an outbound signal. Renders as `<`.
+    You,
+}
+
+/// Format one transcript line for a prompt: `>body` (or `</chan body` off the
+/// default text channel). No timestamp — within a 30-minute window the wall
+/// clock rarely carries meaning, and the glyph + ordering is the whole signal.
+/// The channel is shown only when it isn't text, so an ordinary text exchange
+/// reads as a bare back-and-forth. This is the single place the line shape is
+/// defined; both the `## Recent` snapshot and the `## New signals` batch render
+/// through it, so they stay identical.
+pub(crate) fn transcript_line(who: Speaker, chan: &str, body: &str) -> String {
+    let mark = match who {
+        Speaker::Them => '>',
+        Speaker::You => '<',
+    };
+    if chan == Channel::Text.as_str() {
+        format!("{mark}{body}")
+    } else {
+        format!("{mark}/{chan} {body}")
     }
 }
 

@@ -45,6 +45,37 @@ function emitImportMap(): Plugin {
   };
 }
 
+// Dev mirror of the import map. In prod the Rust `index()` handler injects a map
+// pointing each shared specifier at its built `/assets/share-*` chunk; in dev
+// there is no build, so we point them at the `src/shared/*` shim modules Vite
+// serves. An agent view fetched raw from the backend then resolves `@hi/ui` /
+// `react` to the very modules the host loaded (Vite dedupes the real dep), so
+// host and view share one instance — exactly as prod. Only `apply: "serve"`:
+// the build path already emits its own map.
+//
+// Why this only affects views: Vite pre-resolves the host's own bare imports at
+// transform time, so they never consult the import map — only the backend-served
+// view modules carry live bare specifiers for the browser to resolve.
+function devImportMap(): Plugin {
+  const imports = Object.fromEntries(
+    Object.entries(SHARED_SPECIFIERS).map(([file, spec]) => [spec, "/" + file]),
+  );
+  return {
+    name: "hi-dev-importmap",
+    apply: "serve",
+    transformIndexHtml() {
+      return [
+        {
+          tag: "script",
+          attrs: { type: "importmap" },
+          children: JSON.stringify({ imports }, null, 2),
+          injectTo: "head-prepend",
+        },
+      ];
+    },
+  };
+}
+
 // During dev, the browser only talks to Vite (:5173). Vite proxies every
 // human-interface channel route — all under `/api/*` — to the Rust server on
 // :8080.
@@ -64,7 +95,11 @@ function emitImportMap(): Plugin {
 // ends the utterance. http-proxy streams by default (selfHandleResponse stays
 // false). We disable timeouts so a quiet long-poll is not killed mid-flight.
 const proxy: Record<string, ProxyOptions> = Object.fromEntries(
-  ["/api"].map((path) => [
+  // `/api/*` — the human-interface channels. `/generated/*` — compiled agent
+  // view modules, which the Rust server emits and serves; the browser fetches
+  // them by URL, so dev must reach the backend the same way prod (same-origin
+  // embed) does, or every `show_view` 404s.
+  ["/api", "/generated"].map((path) => [
     path,
     {
       target: "http://127.0.0.1:8080",
@@ -109,7 +144,7 @@ const proxy: Record<string, ProxyOptions> = Object.fromEntries(
 );
 
 export default defineConfig({
-  plugins: [react(), basicSsl(), emitImportMap()],
+  plugins: [react(), basicSsl(), emitImportMap(), devImportMap()],
   // `@hi/core` (session hooks) and `@hi/ui` (static primitives) are the stable
   // import surface both host chrome and agent-authored views author against.
   resolve: {

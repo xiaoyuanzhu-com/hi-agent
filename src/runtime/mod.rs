@@ -14,9 +14,14 @@
 //!
 //! The pins come from `src/runtime/manifest.toml` + the committed lockfile, so a
 //! managed install stays reproducible — we just fetch at first run instead of at
-//! build time. The install dir is fixed (not version-keyed): bumping a pin does
-//! *not* auto-reinstall today; delete the dir to force a fresh install. Deliberate
-//! version management (auto-update) is a later concern.
+//! build time. The install dir is **content-addressed** by a fingerprint of those
+//! pins ([`runtime_fingerprint`]): the Node version plus the lockfile bytes. Bump
+//! any pin — Node, the adapter, or a transitive dep like esbuild — and the
+//! fingerprint changes, so the next run installs into a fresh subdir instead of
+//! silently reusing a stale one. That is the whole auto-update story for the
+//! managed runtime: an app update that changes the lockfile heals the runtime on
+//! the user's next launch, with no manual cache deletion. Superseded installs from
+//! prior pins are pruned best-effort once the current one is ready.
 //!
 //! Detection is all-or-nothing: a partial system set (e.g. `node` but no
 //! `claude`) falls back to the managed install so we never mix a system tool with
@@ -72,24 +77,230 @@ pub async fn ensure() -> anyhow::Result<ResolvedRuntime> {
 
     let target = runtime_dir()?;
 
-    // Reuse a complete install from a previous run.
-    if target.join(".complete").exists() {
+    // Reuse a complete install from a previous run, otherwise install now. The
+    // target is fingerprinted by the current pins, so a `.complete` here means it
+    // was built from *these* pins — a changed lockfile lands on a different path.
+    let runtime = if target.join(".complete").exists() {
         tracing::debug!(path = %target.display(), "runtime already installed");
-        return resolve(&target);
-    }
+        resolve(&target)?
+    } else {
+        install(&target).await?
+    };
 
-    install(&target).await
+    // Now that a current runtime is ready, prune installs left by older pins so
+    // the cache doesn't accumulate one stale tree per update.
+    gc_stale_runtimes(&target);
+
+    Ok(runtime)
 }
 
-/// The single directory the managed runtime installs into. Override with
-/// `HI_AGENT_RUNTIME_DIR`; otherwise a fixed spot in the OS cache dir.
+/// Remove sibling runtime installs left behind by prior pins. Best-effort and
+/// only for the default cache location — when `HI_AGENT_RUNTIME_DIR` overrides
+/// the path the parent isn't ours to prune, so we leave it untouched. In-flight
+/// temp dirs (`.runtime.tmp.*`, dot-prefixed) are skipped so a concurrent install
+/// is never yanked out from under itself.
+fn gc_stale_runtimes(current: &Path) {
+    if std::env::var_os("HI_AGENT_RUNTIME_DIR").is_some() {
+        return;
+    }
+    let (Some(root), Some(keep)) = (current.parent(), current.file_name()) else {
+        return;
+    };
+    let Ok(entries) = std::fs::read_dir(root) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let name = entry.file_name();
+        if name == keep || name.to_string_lossy().starts_with('.') {
+            continue;
+        }
+        let path = entry.path();
+        if path.is_dir() {
+            tracing::info!(path = %path.display(), "removing stale runtime from a prior pin");
+            let _ = std::fs::remove_dir_all(&path);
+        }
+    }
+}
+
+/// esbuild version for the view toolchain. Keep in sync with the `esbuild` pin
+/// in `src/runtime/package.json` — the managed adapter install carries the same
+/// one; this is the version we install standalone when the runtime came from the
+/// system PATH (and so has no adapter-adjacent esbuild).
+const ESBUILD_VERSION: &str = "0.28.0";
+
+/// Resolve an esbuild native binary for the view compiler, guaranteeing one
+/// exists regardless of where the runtime came from. esbuild is *hi-agent's* own
+/// tool for compiling agent views — it is unrelated to the ACP adapter and must
+/// not be assumed to live next to it. A **managed** runtime happens to carry
+/// esbuild in its `node_modules`, so we reuse that; a **system** runtime (local
+/// dev with node/adapter/claude on PATH) has none, so we install a standalone
+/// copy once into a hi-agent-owned cache dir.
+pub async fn ensure_view_esbuild(runtime: &ResolvedRuntime) -> anyhow::Result<PathBuf> {
+    let adjacent = esbuild_binary(&runtime.adapter_entry);
+    if adjacent.exists() {
+        tracing::debug!(path = %adjacent.display(), "using esbuild bundled with the runtime");
+        return Ok(adjacent);
+    }
+    ensure_standalone_esbuild(&runtime.node_bin).await
+}
+
+/// Install (once) a standalone esbuild into a fingerprinted cache dir and return
+/// its native binary. Content-addressed by esbuild version + host target, so a
+/// version bump installs fresh instead of reusing a stale binary.
+async fn ensure_standalone_esbuild(node_bin: &Path) -> anyhow::Result<PathBuf> {
+    let (os, arch) = node_target()?;
+    let bin_rel = PathBuf::from("node_modules")
+        .join("@esbuild")
+        .join(format!("{os}-{arch}"))
+        .join("bin")
+        .join("esbuild");
+
+    let target = esbuild_dir(os, arch)?;
+    let bin = target.join(&bin_rel);
+    if bin.exists() {
+        return Ok(bin);
+    }
+
+    let parent = target
+        .parent()
+        .ok_or_else(|| anyhow!("esbuild dir {} has no parent", target.display()))?;
+    tokio::fs::create_dir_all(parent)
+        .await
+        .with_context(|| format!("creating {}", parent.display()))?;
+
+    // Build in a sibling temp dir, then atomically rename — same publish pattern
+    // as the runtime install, so a concurrent or interrupted start never sees a
+    // half-installed esbuild.
+    let tmp = parent.join(format!(".esbuild.tmp.{}", std::process::id()));
+    let _ = tokio::fs::remove_dir_all(&tmp).await;
+    tokio::fs::create_dir_all(&tmp)
+        .await
+        .with_context(|| format!("creating {}", tmp.display()))?;
+
+    let pkg = format!(
+        "{{\n  \"name\": \"hi-agent-view-tool\",\n  \"private\": true,\n  \
+         \"dependencies\": {{ \"esbuild\": \"{ESBUILD_VERSION}\" }}\n}}\n"
+    );
+    tokio::fs::write(tmp.join("package.json"), pkg)
+        .await
+        .context("writing view-tool package.json")?;
+
+    let npm_cli = npm_cli_for(node_bin)
+        .with_context(|| format!("locating npm bundled with {}", node_bin.display()))?;
+    hint("preparing the view compiler (installing esbuild)…");
+    let mut cmd = Command::new(node_bin);
+    cmd.arg(&npm_cli)
+        .arg("install")
+        .arg("--omit=dev")
+        .current_dir(&tmp)
+        .env("npm_config_fund", "false")
+        .env("npm_config_audit", "false")
+        .env("npm_config_update_notifier", "false");
+    let out = run_with_heartbeat(cmd, "…still preparing the view compiler")
+        .await
+        .context("running npm install esbuild")?;
+    if !out.status.success() {
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        let _ = tokio::fs::remove_dir_all(&tmp).await;
+        bail!("installing esbuild failed:\n{}", stderr.trim());
+    }
+    if !tmp.join(&bin_rel).exists() {
+        let _ = tokio::fs::remove_dir_all(&tmp).await;
+        bail!(
+            "esbuild installed but its native binary is missing at {} \
+             (unsupported host target {os}-{arch}?)",
+            tmp.join(&bin_rel).display()
+        );
+    }
+
+    let _ = tokio::fs::remove_dir_all(&target).await;
+    match tokio::fs::rename(&tmp, &target).await {
+        Ok(()) => {}
+        Err(_) if target.join(&bin_rel).exists() => {
+            let _ = tokio::fs::remove_dir_all(&tmp).await;
+        }
+        Err(e) => {
+            let _ = tokio::fs::remove_dir_all(&tmp).await;
+            return Err(anyhow!("publishing esbuild to {}: {e}", target.display()));
+        }
+    }
+    tracing::info!(path = %bin.display(), "view compiler esbuild ready");
+    Ok(bin)
+}
+
+/// Locate the esbuild native binary in the same `node_modules` a runtime was
+/// installed into (the managed install carries it). Returns a non-existent
+/// sentinel if the layout is unfamiliar or the host platform is unsupported, so
+/// the caller's `.exists()` check falls through to a standalone install.
+fn esbuild_binary(adapter_entry: &Path) -> PathBuf {
+    let platform = match node_target() {
+        Ok((os, arch)) => format!("{os}-{arch}"),
+        Err(_) => return PathBuf::from("esbuild-unsupported-platform"),
+    };
+    match node_modules_ancestor(adapter_entry) {
+        Some(nm) => nm.join("@esbuild").join(platform).join("bin").join("esbuild"),
+        None => PathBuf::from("esbuild-unresolved"),
+    }
+}
+
+/// The nearest ancestor of `p` that is a `node_modules` directory.
+fn node_modules_ancestor(p: &Path) -> Option<PathBuf> {
+    let mut cur = p;
+    while let Some(parent) = cur.parent() {
+        if parent.file_name().is_some_and(|n| n == "node_modules") {
+            return Some(parent.to_path_buf());
+        }
+        cur = parent;
+    }
+    None
+}
+
+/// Cache dir for the standalone view-toolchain esbuild, keyed by version + host
+/// target so a bump (or a different machine) never reuses the wrong binary.
+fn esbuild_dir(os: &str, arch: &str) -> anyhow::Result<PathBuf> {
+    let dirs = directories::ProjectDirs::from("dev", "human-interface", "hi-agent")
+        .ok_or_else(|| anyhow!("cannot determine OS cache dir"))?;
+    Ok(dirs
+        .cache_dir()
+        .join("view-tool")
+        .join(format!("esbuild-{ESBUILD_VERSION}-{os}-{arch}")))
+}
+
+/// The directory the managed runtime installs into. Override with
+/// `HI_AGENT_RUNTIME_DIR` (used verbatim — a dev escape hatch); otherwise a
+/// fingerprinted subdir under the OS cache dir, so a changed pin installs fresh
+/// instead of reusing a stale tree.
 fn runtime_dir() -> anyhow::Result<PathBuf> {
     if let Ok(dir) = std::env::var("HI_AGENT_RUNTIME_DIR") {
         return Ok(PathBuf::from(dir));
     }
     let dirs = directories::ProjectDirs::from("dev", "human-interface", "hi-agent")
         .ok_or_else(|| anyhow!("cannot determine OS cache dir"))?;
-    Ok(dirs.cache_dir().join("runtime"))
+    Ok(dirs
+        .cache_dir()
+        .join("runtime")
+        .join(runtime_fingerprint()))
+}
+
+/// A short, stable fingerprint of everything that determines the installed tree:
+/// the pinned Node version and the committed lockfile (which captures every npm
+/// dep pin, transitive ones like esbuild included). FNV-1a, not a crypto hash —
+/// this is a cache key for de-duping installs, not a security boundary — but
+/// deterministic across builds and platforms so the same pins always resolve to
+/// the same dir.
+fn runtime_fingerprint() -> String {
+    const OFFSET: u64 = 0xcbf2_9ce4_8422_2325;
+    const PRIME: u64 = 0x0000_0100_0000_01b3;
+    let mut h = OFFSET;
+    // NUL between the parts so a byte can't migrate across the boundary and
+    // collide a different (version, lockfile) split.
+    for part in [NODE_VERSION.as_bytes(), b"\0", PACKAGE_LOCK.as_bytes()] {
+        for &b in part {
+            h ^= b as u64;
+            h = h.wrapping_mul(PRIME);
+        }
+    }
+    format!("{h:016x}")
 }
 
 /// Install the pinned Node + adapter into `target`. Builds in a sibling temp dir
@@ -463,6 +674,47 @@ mod tests {
         )));
         assert!(!is_app_bundle_path(Path::new("/Users/me/.local/bin/claude")));
         assert!(!is_app_bundle_path(Path::new("/opt/homebrew/bin/claude")));
+    }
+
+    #[test]
+    fn finds_node_modules_ancestor() {
+        let entry = Path::new("/r/adapter/node_modules/@scope/pkg/dist/index.js");
+        assert_eq!(
+            node_modules_ancestor(entry),
+            Some(PathBuf::from("/r/adapter/node_modules"))
+        );
+        assert_eq!(node_modules_ancestor(Path::new("/usr/local/bin/tool")), None);
+    }
+
+    #[test]
+    fn runtime_fingerprint_is_stable_and_hex() {
+        let fp = runtime_fingerprint();
+        assert_eq!(fp.len(), 16);
+        assert!(fp.bytes().all(|b| b.is_ascii_hexdigit()));
+        // Deterministic: same pins, same fingerprint within a run.
+        assert_eq!(fp, runtime_fingerprint());
+    }
+
+    #[test]
+    fn fingerprint_reacts_to_lockfile_changes() {
+        // Same hash construction as `runtime_fingerprint`, exercised over two
+        // inputs to prove a changed lockfile yields a different dir.
+        fn fp(node: &str, lock: &str) -> String {
+            const OFFSET: u64 = 0xcbf2_9ce4_8422_2325;
+            const PRIME: u64 = 0x0000_0100_0000_01b3;
+            let mut h = OFFSET;
+            for part in [node.as_bytes(), b"\0", lock.as_bytes()] {
+                for &b in part {
+                    h ^= b as u64;
+                    h = h.wrapping_mul(PRIME);
+                }
+            }
+            format!("{h:016x}")
+        }
+        assert_ne!(fp("22.14.0", "{a}"), fp("22.14.0", "{b}"));
+        assert_ne!(fp("22.14.0", "{a}"), fp("24.0.0", "{a}"));
+        // The NUL boundary makes the split unambiguous.
+        assert_ne!(fp("ab", "c"), fp("a", "bc"));
     }
 
     #[test]

@@ -63,7 +63,7 @@ pub fn swap_budget_chars() -> usize {
     heartbeat::SWAP_AFTER_CHARS
 }
 
-use chrono::{DateTime, Utc};
+use chrono::Utc;
 use tokio::sync::{Mutex, mpsc, oneshot};
 use tokio::time::{Instant, sleep_until, timeout};
 
@@ -177,8 +177,6 @@ enum LoopInput {
 
 /// One fired self-alarm, handed to the mind under "New signals".
 struct AlarmFired {
-    /// Wall-clock time it fired, for rendering alongside other batch entries.
-    at: DateTime<Utc>,
     /// The note the mind left its future self ("check if they're still asleep").
     note: String,
 }
@@ -214,13 +212,12 @@ impl Alarms {
 
     /// Remove and return every alarm whose deadline has passed by `now`.
     fn take_due(&mut self, now: Instant) -> Vec<AlarmFired> {
-        let at = Utc::now();
         let mut fired = Vec::new();
         let mut i = 0;
         while i < self.pending.len() {
             if self.pending[i].fire_at <= now {
                 let a = self.pending.swap_remove(i);
-                fired.push(AlarmFired { at, note: a.note });
+                fired.push(AlarmFired { note: a.note });
             } else {
                 i += 1;
             }
@@ -955,20 +952,15 @@ fn render_batch(batch: &[LoopInput]) -> String {
     for input in batch {
         match input {
             LoopInput::Human(sig) => {
-                let ts = sig.ts.format("%H:%M:%S");
+                use crate::memory::snapshot::{Speaker, transcript_line};
                 let chan = sig.channel.with_stream(sig.stream.as_deref());
-                let _ = writeln!(
-                    s,
-                    "[{}] {} on /{}: \"{}\"",
-                    ts, sig.scene, chan, sig.body
-                );
+                let _ = writeln!(s, "{}", transcript_line(Speaker::Them, &chan, &sig.body));
             }
             LoopInput::Worker(report) => {
                 let _ = writeln!(s, "{}", workers::render_report(report));
             }
             LoopInput::Alarm(a) => {
-                let ts = a.at.format("%H:%M:%S");
-                let _ = writeln!(s, "[{}] (alarm) \"{}\"", ts, a.note);
+                let _ = writeln!(s, "(alarm) \"{}\"", a.note);
             }
         }
     }
@@ -1027,7 +1019,7 @@ async fn emit_view(reactor: &Reactor, scene: &Scene, id: String, op: ViewOp, sou
         match reactor.inner.view_compiler.compile(&source).await {
             Ok(url) => Some(url),
             Err(err) => {
-                tracing::warn!(scene = %scene, id = %id, error = %err, "view compile failed; dropping view");
+                tracing::error!(scene = %scene, id = %id, error = %err, "view compile failed; dropping view");
                 return;
             }
         }

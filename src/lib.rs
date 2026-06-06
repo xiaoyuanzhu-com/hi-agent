@@ -163,9 +163,14 @@ pub async fn run(config: Config) -> anyhow::Result<()> {
     let _proxy = proxy;
 
     let soul = reactor::load_soul(&config.data_dir);
-    // The reactor compiles `[[view]]` source to ESM via esbuild from the resolved
-    // runtime; modules land under data_dir/generated/views.
-    let view_compiler = views::ViewCompiler::new(&runtime, &config.data_dir);
+    // The reactor compiles `[[view]]` source to ESM via esbuild; modules land
+    // under data_dir/generated/views. esbuild is hi-agent's own tool (not the
+    // adapter's) — `ensure_view_esbuild` guarantees one whether the runtime came
+    // from PATH or the managed install, so views aren't silently broken in dev.
+    let esbuild_bin = runtime::ensure_view_esbuild(&runtime)
+        .await
+        .context("resolving esbuild for the view compiler")?;
+    let view_compiler = views::ViewCompiler::new(esbuild_bin, &config.data_dir);
     let _reactor = reactor::start(
         memory,
         agent,
