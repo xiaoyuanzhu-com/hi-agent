@@ -412,6 +412,8 @@ pub fn build(
         // not embedded). Served here, not in the appearance router, because that
         // router is embed-only and stateless.
         .route("/generated/views/{file}", get(generated::generated_view))
+        // Images the agent hosted via the `add_asset` tool, for views to `<img>`.
+        .route("/generated/assets/{file}", get(generated::generated_asset))
         .with_state(state)
         .merge(crate::appearance::router())
         .fallback(not_found)

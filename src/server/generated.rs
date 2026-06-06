@@ -53,9 +53,66 @@ pub async fn generated_view(
     resp
 }
 
+/// A hosted asset filename is `<lowercase-hex>.<ext>` for a known image type —
+/// the same traversal guard as views (hex + a fixed suffix can encode no `/` or
+/// `..`). Returns the `Content-Type` to serve it with, or `None` to 404.
+fn asset_content_type(name: &str) -> Option<&'static str> {
+    let (stem, ext) = name.rsplit_once('.')?;
+    if stem.is_empty() || !stem.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f')) {
+        return None;
+    }
+    match ext {
+        "png" => Some("image/png"),
+        "jpg" | "jpeg" => Some("image/jpeg"),
+        "gif" => Some("image/gif"),
+        "webp" => Some("image/webp"),
+        "svg" => Some("image/svg+xml"),
+        _ => None,
+    }
+}
+
+/// `GET /generated/assets/<hash>.<ext>` — serve an image [`crate::mcp`] downloaded
+/// and stored under `data_dir/generated/assets/` for an agent view to `<img>`.
+/// Content-addressed names make them immutable and safe to cache hard.
+pub async fn generated_asset(
+    State(state): State<Arc<AppState>>,
+    Path(file): Path<String>,
+) -> Response {
+    let Some(content_type) = asset_content_type(&file) else {
+        return (StatusCode::NOT_FOUND, "not found\n").into_response();
+    };
+
+    let path = state.data_dir.join("generated").join("assets").join(&file);
+    let bytes = match tokio::fs::read(&path).await {
+        Ok(bytes) => bytes,
+        Err(_) => return (StatusCode::NOT_FOUND, "not found\n").into_response(),
+    };
+
+    let mut resp = Response::new(Body::from(bytes));
+    resp.headers_mut()
+        .insert(CONTENT_TYPE, HeaderValue::from_static(content_type));
+    resp.headers_mut().insert(
+        CACHE_CONTROL,
+        HeaderValue::from_static("public, max-age=31536000, immutable"),
+    );
+    resp
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn asset_names_validated_and_typed() {
+        assert_eq!(asset_content_type("0a1b2c.png"), Some("image/png"));
+        assert_eq!(asset_content_type("deadbeef.jpg"), Some("image/jpeg"));
+        assert_eq!(asset_content_type("ff.webp"), Some("image/webp"));
+        assert_eq!(asset_content_type("../secret.png"), None, "no traversal");
+        assert_eq!(asset_content_type("a/b.png"), None, "no separators");
+        assert_eq!(asset_content_type("abc.exe"), None, "unknown ext");
+        assert_eq!(asset_content_type("DEADBEEF.png"), None, "uppercase not produced by us");
+        assert_eq!(asset_content_type(".png"), None, "empty stem");
+    }
 
     #[test]
     fn rejects_traversal_and_non_module_names() {

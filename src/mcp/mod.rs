@@ -75,6 +75,20 @@ fn tools_for_role(role: Option<&str>) -> Vec<Value> {
                 }),
             ),
             tool(
+                "add_asset",
+                "Host an image so a view can show it. Pass the `url` of a real image you found \
+                 (search the web with your own tools first); the server downloads it and returns a \
+                 same-origin path like `/generated/assets/<hash>.png`. Put THAT path in an `<img \
+                 src>` inside show_view — never hotlink the original URL (it can fail CORS, be \
+                 hotlink-blocked, or 404). Use this whenever a view wants a real photo, poster, or \
+                 picture; this is how you get one onto the screen.",
+                json!({
+                    "type": "object",
+                    "properties": { "url": { "type": "string", "description": "Direct URL of the source image (jpg/png/webp/gif/svg)." } },
+                    "required": ["url"],
+                }),
+            ),
+            tool(
                 "delegate",
                 "Hand a heavy or long-running task (research, multi-step tool use, writing and \
                  running code) to a background working session, so you stay free to keep talking. \
@@ -112,6 +126,7 @@ fn tool(name: &str, description: &str, input_schema: Value) -> Value {
 /// request headers; `registry` routes tool calls to the owning scene loop.
 pub async fn handle(
     registry: &ToolRegistry,
+    data_dir: &std::path::Path,
     scene: Option<Scene>,
     role: Option<&str>,
     worker_id: Option<u64>,
@@ -148,7 +163,7 @@ pub async fn handle(
             let args = params.get("arguments").cloned().unwrap_or_else(|| json!({}));
             McpReply::Json(result(
                 id,
-                dispatch_tool(registry, scene.as_ref(), worker_id, name, &args).await,
+                dispatch_tool(registry, data_dir, scene.as_ref(), worker_id, name, &args).await,
             ))
         }
         // ping is a no-op request the client may send.
@@ -163,6 +178,7 @@ pub async fn handle(
 /// immediately, never blocking on playback or on the worker a delegate spawns.
 async fn dispatch_tool(
     registry: &ToolRegistry,
+    data_dir: &std::path::Path,
     scene: Option<&Scene>,
     worker_id: Option<u64>,
     name: &str,
@@ -211,6 +227,16 @@ async fn dispatch_tool(
             };
             sink.send(SceneControl::WorkerAsk { id, question: arg_str("question") }).await.map(|()| "question noted")
         }
+        "add_asset" => {
+            let url = arg_str("url");
+            if url.trim().is_empty() {
+                return tool_error("add_asset requires a non-empty `url`");
+            }
+            return match ingest_asset(data_dir, &url).await {
+                Ok(asset_url) => tool_ok(&asset_url),
+                Err(err) => tool_error(&err),
+            };
+        }
         other => return tool_error(&format!("unknown tool: {other}")),
     };
 
@@ -234,4 +260,85 @@ fn tool_ok(text: &str) -> Value {
 
 fn tool_error(text: &str) -> Value {
     json!({ "content": [{ "type": "text", "text": text }], "isError": true })
+}
+
+/// Download a remote image and store it content-addressed under
+/// `data_dir/generated/assets/<hash>.<ext>`, returning the same-origin path the
+/// page serves it from (`GET /generated/assets/...`). The fetch happens here,
+/// server-side, so the view never hotlinks (no CORS, no broken box) and the agent
+/// needn't know where `data_dir` lives on disk. The 64-bit name is a cache key —
+/// identical bytes are written at most once — not a security boundary.
+async fn ingest_asset(data_dir: &std::path::Path, url: &str) -> Result<String, String> {
+    use std::hash::Hasher;
+
+    let resp = reqwest::Client::new()
+        .get(url)
+        // A real UA: some hosts 403 the default reqwest agent for hotlink checks.
+        .header(reqwest::header::USER_AGENT, "Mozilla/5.0 (hi-agent asset fetch)")
+        .send()
+        .await
+        .map_err(|e| format!("fetch failed: {e}"))?;
+    if !resp.status().is_success() {
+        return Err(format!("fetch returned HTTP {}", resp.status()));
+    }
+    let content_type = resp
+        .headers()
+        .get(reqwest::header::CONTENT_TYPE)
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("")
+        .to_owned();
+    let ext = ext_for_content_type(&content_type)
+        .or_else(|| ext_from_url(url))
+        .ok_or_else(|| format!("not a supported image (content-type: {content_type:?})"))?;
+
+    let bytes = resp.bytes().await.map_err(|e| format!("reading body failed: {e}"))?;
+    if bytes.is_empty() {
+        return Err("fetched image was empty".into());
+    }
+
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    h.write(&bytes);
+    let name = format!("{:016x}.{ext}", h.finish());
+
+    let dir = data_dir.join("generated").join("assets");
+    tokio::fs::create_dir_all(&dir)
+        .await
+        .map_err(|e| format!("creating assets dir: {e}"))?;
+    let path = dir.join(&name);
+    if tokio::fs::metadata(&path).await.is_err() {
+        tokio::fs::write(&path, &bytes)
+            .await
+            .map_err(|e| format!("writing asset: {e}"))?;
+    }
+    Ok(format!("/generated/assets/{name}"))
+}
+
+/// Map an HTTP `Content-Type` (which may carry params) to our stored extension.
+fn ext_for_content_type(content_type: &str) -> Option<&'static str> {
+    match content_type.split(';').next().unwrap_or("").trim() {
+        "image/png" => Some("png"),
+        "image/jpeg" => Some("jpg"),
+        "image/gif" => Some("gif"),
+        "image/webp" => Some("webp"),
+        "image/svg+xml" => Some("svg"),
+        _ => None,
+    }
+}
+
+/// Fallback when the server sends no usable `Content-Type`: sniff the URL path.
+fn ext_from_url(url: &str) -> Option<&'static str> {
+    let path = url.split(['?', '#']).next().unwrap_or(url).to_ascii_lowercase();
+    if path.ends_with(".png") {
+        Some("png")
+    } else if path.ends_with(".jpg") || path.ends_with(".jpeg") {
+        Some("jpg")
+    } else if path.ends_with(".gif") {
+        Some("gif")
+    } else if path.ends_with(".webp") {
+        Some("webp")
+    } else if path.ends_with(".svg") {
+        Some("svg")
+    } else {
+        None
+    }
 }
