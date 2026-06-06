@@ -772,64 +772,117 @@ async fn run_turn(
     // session already lived the history and gets only what's new (plus the live
     // worker view). The snapshot is the durable backstop, not per-turn context to
     // re-send.
-    let prompt_text = if *seeded {
-        join_sections(&[&worker_status, &new_signals])
-    } else {
-        let snap = build_for_scene(&reactor.inner.memory, scene).await?;
-        join_sections(&[&snap.render_for_prompt(), &worker_status, &new_signals])
-    };
-    let prompt_chars = prompt_text.chars().count();
-
-    // Get-or-open the scene's persistent reactor session. Opened once, carrying
-    // the system prompt — which the session consumes on its first prompt and
-    // never re-sends. Every later turn prompts this same warm session, so
-    // continuity lives in the session, not in a per-turn rebuild.
-    let session = match reactor_session {
-        Some(s) => s.clone(),
-        None => {
-            let opened = open_session(reactor, scene).await?;
-            *reactor_session = Some(opened.clone());
-            opened
-        }
-    };
-
     // Bracket the turn on the sequencer (it renders say()/show_view() that arrive
-    // out-of-band as tool calls between these two beats).
+    // out-of-band as tool calls between these two beats). Sent once, before the
+    // retry loop, so the whole turn — every attempt — lives inside one bracket and
+    // closes exactly once below, even if every attempt fails.
     let _ = beats.send(sequencer::Beat::TurnStart { turn: turn_id }).await;
 
-    // Drive the prompt to completion. Output rides the tool channel now, so this
-    // stream carries only tool-call notifications and the stop; any plain text the
-    // model emits instead of a say() call is dropped (and warned).
-    let drive: anyhow::Result<Option<String>> = async {
-        let mut run = session.prompt(prompt_text).await?;
-        let mut ended = false;
-        while !ended {
-            match run.next_update().await {
-                Some(SessionUpdate::ToolCall(stub)) => {
-                    tracing::debug!(scene = %scene, variant = stub.raw_variant, "tool call");
+    // Drive the prompt to completion, retrying a failed attempt on a freshly
+    // restarted ACP session with exponential backoff. An LLM-side failure surfaces
+    // as a `session/prompt` that resolves with an error (or never returns a
+    // response); the wedged session is discarded and the next attempt cold-opens a
+    // clean one and re-ingests the journal snapshot. The raw error frames are
+    // already mirrored to the ACP tap (the /inspect window) at the wire, so they
+    // need no extra plumbing here.
+    const MAX_ATTEMPTS: u32 = 3;
+    let mut attempt: u32 = 0;
+    let mut prompt_chars = 0usize;
+    let drive: anyhow::Result<Option<String>> = loop {
+        attempt += 1;
+
+        // Build the prompt and acquire the session *inside* the attempt, so a
+        // failure to open (or to build the snapshot) is itself retriable and the
+        // turn still closes its sequencer bracket below rather than bailing early.
+        // An unseeded session — fresh after a discard — re-seeds with the snapshot.
+        let attempt_result: anyhow::Result<Option<String>> = async {
+            let prompt_text = if *seeded {
+                join_sections(&[&worker_status, &new_signals])
+            } else {
+                let snap = build_for_scene(&reactor.inner.memory, scene).await?;
+                join_sections(&[&snap.render_for_prompt(), &worker_status, &new_signals])
+            };
+            prompt_chars = prompt_text.chars().count();
+
+            let session = match reactor_session {
+                Some(s) => s.clone(),
+                None => {
+                    let opened = open_session(reactor, scene).await?;
+                    *reactor_session = Some(opened.clone());
+                    opened
                 }
-                Some(SessionUpdate::Text(text)) => {
-                    if !text.trim().is_empty() {
-                        tracing::warn!(scene = %scene, "reactor emitted plain text instead of a say() tool call; dropping it");
+            };
+
+            // Output rides the tool channel now, so this stream carries only
+            // tool-call notifications and the stop; any plain text the model emits
+            // instead of a say() call is dropped (and warned).
+            let mut run = session.prompt(prompt_text).await?;
+            let mut ended = false;
+            while !ended {
+                match run.next_update().await {
+                    Some(SessionUpdate::ToolCall(stub)) => {
+                        tracing::debug!(scene = %scene, variant = stub.raw_variant, "tool call");
                     }
+                    Some(SessionUpdate::Text(text)) => {
+                        if !text.trim().is_empty() {
+                            tracing::warn!(scene = %scene, "reactor emitted plain text instead of a say() tool call; dropping it");
+                        }
+                    }
+                    Some(_) => {} // thoughts and unmodelled updates
+                    None => ended = true,
                 }
-                Some(_) => {} // thoughts and unmodelled updates
-                None => ended = true,
+            }
+            let result = run.wait().await?;
+            tracing::debug!(scene = %scene, stop = ?result.stop_reason, "turn finished");
+            Ok(Some(format!("{:?}", result.stop_reason)))
+        }
+        .await;
+
+        match attempt_result {
+            Ok(stop_reason) => break Ok(stop_reason),
+            Err(err) => {
+                tracing::warn!(scene = %scene, attempt, error = %err, "prompt attempt failed");
+                // Discard the possibly-wedged session so the next attempt restarts
+                // the ACP session from cold and rebuilds context from the snapshot.
+                if let Some(dead) = reactor_session.take() {
+                    reactor
+                        .inner
+                        .observatory
+                        .record(
+                            scene,
+                            EventKind::SessionClosed {
+                                kind: SessionKind::Reactor,
+                                id: dead.id().0.to_string(),
+                            },
+                        )
+                        .await;
+                }
+                *seeded = false;
+                budget.reset();
+                reactor.inner.observatory.set_budget(scene, 0).await;
+
+                if attempt >= MAX_ATTEMPTS {
+                    break Err(err);
+                }
+                // Exponential backoff before the restart: 250ms, then 500ms.
+                let backoff = Duration::from_millis(250u64 << (attempt - 1));
+                tracing::info!(scene = %scene, attempt, ?backoff, "restarting ACP session after backoff");
+                tokio::time::sleep(backoff).await;
             }
         }
-        let stop_reason = match run.wait().await {
-            Ok(result) => {
-                tracing::debug!(scene = %scene, stop = ?result.stop_reason, "turn finished");
-                Some(format!("{:?}", result.stop_reason))
-            }
-            Err(err) => {
-                tracing::debug!(scene = %scene, error = %err, "turn run ended with error (likely cancel)");
-                None
-            }
-        };
-        Ok(stop_reason)
+    };
+
+    // On terminal failure (all attempts exhausted), tell the human something went
+    // wrong before closing the turn — otherwise the reply is an unexplained silence.
+    // Routed through the normal say() seam so it reaches the /text channel (and the
+    // long-poll waiting on it) and closes cleanly on TurnEnd.
+    if let Err(err) = &drive {
+        let _ = beats
+            .send(sequencer::Beat::Say(format!(
+                "抱歉，我这边出了点问题，没能完成这次回应。({err})"
+            )))
+            .await;
     }
-    .await;
 
     // Always close the turn on the sequencer, even on error, so any open audio
     // span ends and the /thought utterance closes. It hands back this turn's
@@ -838,9 +891,8 @@ async fn run_turn(
     let _ = beats.send(sequencer::Beat::TurnEnd { done: done_tx }).await;
     let reply = done_rx.await.unwrap_or_default();
 
-    // A prompt that never started (wedged session) is the only error we propagate,
-    // so the caller discards the session. A stream that ended in error is treated
-    // as a (rare) cancel — reported, session kept.
+    // A turn that failed every attempt propagates, so the caller's error arm runs
+    // (the session is already discarded above; it re-resets seeded/budget).
     let stop_reason = drive?;
     reactor
         .inner
