@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useState } from "react";
+import { useEffect, useMemo, useState, type ReactNode } from "react";
 import { selectedUnder, usePath } from "./router";
 import { subscribeAcpFrames, type AcpDir, type RawFrame } from "./api";
 
@@ -26,6 +26,68 @@ function dirLabel(dir: AcpDir): string {
 function preview(raw: string): string {
   const line = raw.replace(/\s+/g, " ").trim();
   return line.length > 160 ? `${line.slice(0, 160)}…` : line;
+}
+
+// A readable view for the Frame column. Some payloads carry content worth
+// reading at a glance: `usage_update` becomes `usage_update 45140 / 200000, 23%`,
+// and a `session/prompt` renders each prompt part as a stacked text block.
+// Everything else falls back to a one-line `preview`.
+function frameSummary(raw: string): ReactNode {
+  try {
+    const msg = JSON.parse(raw);
+    const update = msg?.params?.update;
+    if (update?.sessionUpdate === "usage_update") {
+      const { used, size } = update;
+      if (typeof used === "number" && typeof size === "number") {
+        const pct = size > 0 ? Math.round((used / size) * 100) : 0;
+        return `usage_update: ${used} / ${size}, ${pct}%`;
+      }
+    }
+    if (update?.sessionUpdate === "agent_thought_chunk") {
+      const text = update.content?.text;
+      if (typeof text === "string") return `agent_thought_chunk: "${text}"`;
+    }
+    if (update?.sessionUpdate === "agent_message_chunk") {
+      const text = update.content?.text;
+      if (typeof text === "string") return `agent_message_chunk: "${text}"`;
+    }
+    if (update?.sessionUpdate === "available_commands_update") {
+      return "available_commands_update";
+    }
+    if (update?.sessionUpdate === "tool_call") {
+      const name = update._meta?.claudeCode?.toolName ?? update.title ?? update.kind;
+      return `tool_call: ${name}, ${update.status}`;
+    }
+    if (update?.sessionUpdate === "tool_call_update") {
+      const name = update._meta?.claudeCode?.toolName ?? update.title ?? update.kind;
+      const input = update.rawInput;
+      const detail = typeof input?.text === "string" ? `"${input.text}"` : JSON.stringify(input ?? {});
+      return `tool_call_update: ${name}, ${detail}`;
+    }
+    if (Array.isArray(msg?.result?.configOptions)) {
+      const names = msg.result.configOptions.map((o: { name?: string }) => o?.name).filter(Boolean);
+      return `configOptions: ${names.join(", ")}`;
+    }
+    if (msg?.method === "session/request_permission") {
+      const title = msg.params?.toolCall?.title;
+      if (typeof title === "string") return title;
+    }
+    if (msg?.method === "session/prompt" && Array.isArray(msg?.params?.prompt)) {
+      const parts = msg.params.prompt;
+      return (
+        <div className="frprompt">
+          {parts.map((p: { text?: string }, i: number) => (
+            <div key={i} className="frprompt-block">
+              {typeof p?.text === "string" ? p.text : JSON.stringify(p)}
+            </div>
+          ))}
+        </div>
+      );
+    }
+  } catch {
+    // fall through to the generic preview
+  }
+  return preview(raw);
 }
 
 // Pretty-print the verbatim line as JSON; fall back to the raw string when it
@@ -158,6 +220,7 @@ function FrameLog({ group: g }: { group: Group }) {
               <th>Method</th>
               <th>#</th>
               <th>Frame</th>
+              <th>JSON</th>
             </tr>
           </thead>
           <tbody>
@@ -167,6 +230,7 @@ function FrameLog({ group: g }: { group: Group }) {
                 <td className={`frdir ${f.dir}`}>{dirLabel(f.dir)}</td>
                 <td className="evname">{frameLabel(f)}</td>
                 <td className="evseq">{f.seq}</td>
+                <td className="evframe">{frameSummary(f.raw)}</td>
                 <td className="evraw">
                   <details>
                     <summary>{preview(f.raw)}</summary>

@@ -131,12 +131,23 @@
 .evtable .evraw pre { margin: 0; font-family: var(--mono); color: var(--fg); white-space: pre-wrap; overflow-wrap: anywhere; }
 .evnull { color: var(--dim); font-style: italic; }
 
-/* Raw ACP frame log — five columns (Time, Dir, Method, #, Frame); override the
-   generic four-column widths above. Time is wider for the HH:MM:SS.mmm stamp. */
+/* Raw ACP frame log — six columns (Time, Dir, Method, #, Frame, JSON); override
+   the generic four-column widths above. Time is wider for the HH:MM:SS.mmm stamp. */
 .frtable th:nth-child(1) { width: 108px; }
 .frtable th:nth-child(2) { width: 44px; }
 .frtable th:nth-child(3) { width: 200px; }
 .frtable th:nth-child(4) { width: 56px; }
+/* Human-readable Frame summary — wraps so prompt text and chunks stay legible. */
+.frtable .evframe { white-space: pre-wrap; overflow-wrap: anywhere; }
+.frtable .frprompt { display: flex; flex-direction: column; gap: 6px; }
+.frtable .frprompt-block {
+  padding: 6px 8px;
+  border-left: 2px solid var(--accent);
+  background: var(--panel, rgba(127, 127, 127, .08));
+  border-radius: 3px;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
 .frtable .frdir { font-weight: 700; text-transform: uppercase; font-size: 11px; letter-spacing: .04em; }
 .frtable .frdir.send { color: var(--accent); }
 .frtable .frdir.recv { color: var(--ok); }
