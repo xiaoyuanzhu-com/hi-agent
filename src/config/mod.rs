@@ -1,9 +1,9 @@
-//! Dev-managed cognition config: in-repo `config.toml` → child env + settings.json.
+//! Dev-managed cognition config: all from the environment (`.env`) → child env
+//! + settings.json.
 
 use std::path::Path;
 
 use anyhow::Context;
-use serde::Deserialize;
 
 /// Env var holding the upstream LLM credential (kept out of git; loaded via .env).
 pub const ENV_AI_API_KEY: &str = "AI_API_KEY";
@@ -12,8 +12,13 @@ pub const ENV_AI_API_KEY: &str = "AI_API_KEY";
 pub const ENV_AI_API_BASE: &str = "AI_API_BASE";
 /// Default upstream base URL when `AI_API_BASE` is unset.
 pub const DEFAULT_AI_API_BASE: &str = "https://api.anthropic.com";
-/// Env var overriding the config file path. Defaults to `./config.toml`.
-pub const ENV_CONFIG_PATH: &str = "HI_AGENT_CONFIG";
+/// Env var selecting the model handed to the bundled Claude adapter
+/// (`ANTHROPIC_MODEL`). Unset → the adapter's default.
+pub const ENV_MODEL: &str = "HI_AGENT_MODEL";
+/// Env var setting the adapter's `effortLevel` in its managed settings.json.
+pub const ENV_EFFORT: &str = "HI_AGENT_EFFORT";
+/// Env var setting the adapter's `permissions.defaultMode` in settings.json.
+pub const ENV_PERMISSION_MODE: &str = "HI_AGENT_PERMISSION_MODE";
 /// Env var (set on the cognition subprocess) carrying hi-agent's own HTTP base
 /// URL, so sessions can read input channels and write the overlay over the same
 /// wire the browser uses. See [`AgentConfig::child_env`].
@@ -29,9 +34,8 @@ pub const HEADER_SCENE: &str = "X-HI-Scene";
 pub const HEADER_ROLE: &str = "X-HI-Role";
 pub const HEADER_WORKER_ID: &str = "X-HI-Worker-Id";
 
-/// Dev-managed cognition parameters. Non-secret managed fields come from
-/// `config.toml`; the upstream base URL and key are injected from the
-/// environment so the credential never lives in git.
+/// Dev-managed cognition parameters. Everything comes from the environment
+/// (loaded from `.env` in dev); the upstream credential never lives in git.
 #[derive(Clone)]
 pub struct AgentConfig {
     pub upstream_base_url: String,
@@ -60,33 +64,37 @@ impl std::fmt::Debug for AgentConfig {
     }
 }
 
-#[derive(Debug, Deserialize)]
-struct RawConfig {
-    #[serde(default)]
-    model: Option<String>,
-    #[serde(default)]
-    effort: Option<String>,
-    #[serde(default)]
-    permission_mode: Option<String>,
+/// Read an env var, treating unset *and* blank/whitespace-only as absent.
+fn env_opt(name: &str) -> Option<String> {
+    std::env::var(name)
+        .ok()
+        .map(|v| v.trim().to_string())
+        .filter(|v| !v.is_empty())
 }
 
 impl AgentConfig {
-    /// Load from the path in `HI_AGENT_CONFIG` (default `./config.toml`) and the
-    /// `AI_API_BASE` / `AI_API_KEY` env vars.
+    /// Load everything from the environment: the upstream credential / base URL
+    /// (`AI_API_KEY` / `AI_API_BASE`) and the cognition parameters
+    /// (`HI_AGENT_MODEL` / `HI_AGENT_EFFORT` / `HI_AGENT_PERMISSION_MODE`).
     pub fn load() -> anyhow::Result<Self> {
-        let path = std::env::var(ENV_CONFIG_PATH).unwrap_or_else(|_| "config.toml".to_string());
-        let text = std::fs::read_to_string(&path)
-            .with_context(|| format!("reading config file {path}"))?;
         let base_url = std::env::var(ENV_AI_API_BASE).unwrap_or_default();
         let key = std::env::var(ENV_AI_API_KEY).unwrap_or_default();
-        Self::from_toml_str(&text, base_url, key)
+        Self::new(
+            env_opt(ENV_MODEL),
+            env_opt(ENV_EFFORT),
+            env_opt(ENV_PERMISSION_MODE),
+            base_url,
+            key,
+        )
+        .context("building agent config from environment")
     }
 
-    /// Parse config text and attach the upstream base URL and key (both from the
-    /// environment). Errors if the key is empty; the base URL falls back to
-    /// [`DEFAULT_AI_API_BASE`] when unset.
-    pub fn from_toml_str(
-        text: &str,
+    /// Assemble from explicit parts. Errors if the key is empty; the base URL
+    /// falls back to [`DEFAULT_AI_API_BASE`] when unset.
+    pub fn new(
+        model: Option<String>,
+        effort: Option<String>,
+        permission_mode: Option<String>,
         upstream_base_url: String,
         upstream_key: String,
     ) -> anyhow::Result<Self> {
@@ -100,12 +108,11 @@ impl AgentConfig {
         } else {
             upstream_base_url
         };
-        let raw: RawConfig = toml::from_str(text).context("parsing config.toml")?;
         Ok(Self {
             upstream_base_url,
-            model: raw.model,
-            effort: raw.effort,
-            permission_mode: raw.permission_mode,
+            model,
+            effort,
+            permission_mode,
             upstream_key,
             placeholder_key: format!("sk-{}", uuid::Uuid::now_v7().simple()),
         })
@@ -229,14 +236,11 @@ mod tests {
     use super::*;
 
     #[test]
-    fn parses_toml_and_takes_base_and_key_from_args() {
-        let toml = r#"
-            model = "claude-opus-4-8"
-            effort = "high"
-            permission_mode = "acceptEdits"
-        "#;
-        let cfg = AgentConfig::from_toml_str(
-            toml,
+    fn takes_all_parts_from_args() {
+        let cfg = AgentConfig::new(
+            Some("claude-opus-4-8".to_string()),
+            Some("high".to_string()),
+            Some("acceptEdits".to_string()),
             "https://upstream.example/v1".to_string(),
             "secret-key".to_string(),
         )
@@ -251,14 +255,16 @@ mod tests {
     #[test]
     fn empty_base_url_falls_back_to_default() {
         let cfg =
-            AgentConfig::from_toml_str("", "".to_string(), "k".to_string()).unwrap();
+            AgentConfig::new(None, None, None, "".to_string(), "k".to_string()).unwrap();
         assert_eq!(cfg.upstream_base_url, DEFAULT_AI_API_BASE);
     }
 
     #[test]
     fn debug_redacts_the_upstream_key() {
-        let cfg = AgentConfig::from_toml_str(
-            "",
+        let cfg = AgentConfig::new(
+            None,
+            None,
+            None,
             "https://x/v1".to_string(),
             "super-secret-key".to_string(),
         )
@@ -270,14 +276,14 @@ mod tests {
 
     #[test]
     fn empty_key_is_an_error() {
-        let err = AgentConfig::from_toml_str("", "https://x/v1".to_string(), "".to_string())
+        let err = AgentConfig::new(None, None, None, "https://x/v1".to_string(), "".to_string())
             .unwrap_err();
         assert!(err.to_string().contains("AI_API_KEY"));
     }
 
     #[test]
-    fn minimal_toml_defaults_optionals_to_none() {
-        let cfg = AgentConfig::from_toml_str("", "https://x/v1".to_string(), "k".to_string())
+    fn unset_optionals_default_to_none() {
+        let cfg = AgentConfig::new(None, None, None, "https://x/v1".to_string(), "k".to_string())
             .unwrap();
         assert!(cfg.model.is_none());
         assert!(cfg.effort.is_none());
@@ -287,11 +293,10 @@ mod tests {
     #[test]
     fn renders_settings_json_with_set_fields() {
         let dir = tempfile::tempdir().unwrap();
-        let cfg = AgentConfig::from_toml_str(
-            r#"
-                effort = "high"
-                permission_mode = "acceptEdits"
-            "#,
+        let cfg = AgentConfig::new(
+            None,
+            Some("high".to_string()),
+            Some("acceptEdits".to_string()),
             "https://x/v1".to_string(),
             "k".to_string(),
         )
@@ -307,7 +312,7 @@ mod tests {
     fn omits_unset_fields() {
         let dir = tempfile::tempdir().unwrap();
         let cfg =
-            AgentConfig::from_toml_str("", "https://x/v1".to_string(), "k".to_string()).unwrap();
+            AgentConfig::new(None, None, None, "https://x/v1".to_string(), "k".to_string()).unwrap();
         cfg.render_settings_json(dir.path()).unwrap();
         let v: serde_json::Value =
             serde_json::from_str(&std::fs::read_to_string(dir.path().join("settings.json")).unwrap())
@@ -318,10 +323,10 @@ mod tests {
 
     #[test]
     fn child_env_sets_proxy_and_managed_vars() {
-        let cfg = AgentConfig::from_toml_str(
-            r#"
-                model = "claude-opus-4-8"
-            "#,
+        let cfg = AgentConfig::new(
+            Some("claude-opus-4-8".to_string()),
+            None,
+            None,
             "https://x/v1".to_string(),
             "k".to_string(),
         )
@@ -348,7 +353,7 @@ mod tests {
 
     #[test]
     fn approve_placeholder_key_seeds_fingerprint_and_preserves_other_fields() {
-        let cfg = AgentConfig::from_toml_str("", "https://x/v1".to_string(), "k".to_string())
+        let cfg = AgentConfig::new(None, None, None, "https://x/v1".to_string(), "k".to_string())
             .unwrap();
         let dir = std::env::temp_dir().join(format!("hi-agent-test-{}", uuid::Uuid::now_v7()));
         std::fs::create_dir_all(&dir).unwrap();

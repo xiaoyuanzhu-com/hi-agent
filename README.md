@@ -140,15 +140,19 @@ Env vars consulted at startup:
 |---|---|---|
 | `AI_API_KEY` | — | Upstream LLM credential, injected by the local proxy. Required; read from env only, never written to disk. |
 | `AI_API_BASE` | `https://api.anthropic.com` | Upstream LLM base URL the proxy forwards to. |
-| `HI_AGENT_CONFIG` | `config.toml` | Path to the dev-managed config file (model / effort / permission mode) |
+| `HI_AGENT_MODEL` | adapter default | Model handed to the bundled Claude adapter (`ANTHROPIC_MODEL`) |
+| `HI_AGENT_EFFORT` | unset | Adapter `effortLevel` (e.g. `low` / `medium` / `high`) |
+| `HI_AGENT_PERMISSION_MODE` | unset | Adapter `permissions.defaultMode` (e.g. `acceptEdits`) |
 | `HI_AGENT_RUNTIME_DIR` | OS cache dir | Override the dir the runtime is installed into |
 | `HI_AGENT_MCP_SOCK` | `<data_dir>/mcp.sock` | Unix socket the MCP hub listens on |
 | `HI_AGENT_SHIM_BIN` | `current_exe()` | Program to re-exec as the MCP stdio↔socket shim |
 | `RUST_LOG` | `info` | Standard `tracing-subscriber` env filter |
 
-Managed cognition parameters (model, effort, permission mode) live in
-[`config.toml`](config.toml), not in env vars; the upstream credential and base
-URL come from `AI_API_KEY` / `AI_API_BASE`. To use your own runtime (or to skip
+Managed cognition parameters (model, effort, permission mode) come from the
+`HI_AGENT_MODEL` / `HI_AGENT_EFFORT` / `HI_AGENT_PERMISSION_MODE` env vars,
+alongside the upstream credential and base URL (`AI_API_KEY` / `AI_API_BASE`).
+In dev these load from `.env`; see [`.env.example`](.env.example). To use your
+own runtime (or to skip
 the first-run download), put `node`, `claude-agent-acp`, and `claude` on your
 `PATH` — hi-agent detects and uses them automatically.
 
