@@ -842,8 +842,9 @@ async fn run_turn(
             };
 
             // Output rides the tool channel now, so this stream carries only
-            // tool-call notifications and the stop; any plain text the model emits
-            // instead of a say() call is dropped (and warned).
+            // tool-call notifications and the stop; the model always narrates some
+            // plain text alongside its tool calls — that's not meant for saying, so
+            // we drop it silently.
             let mut run = session.prompt(prompt_text).await?;
             let mut ended = false;
             while !ended {
@@ -851,11 +852,7 @@ async fn run_turn(
                     Some(SessionUpdate::ToolCall(stub)) => {
                         tracing::debug!(scene = %scene, variant = stub.raw_variant, "tool call");
                     }
-                    Some(SessionUpdate::Text(text)) => {
-                        if !text.trim().is_empty() {
-                            tracing::warn!(scene = %scene, "reactor emitted plain text instead of a say() tool call; dropping it");
-                        }
-                    }
+                    Some(SessionUpdate::Text(_)) => {} // narration, not for saying; drop
                     Some(_) => {} // thoughts and unmodelled updates
                     None => ended = true,
                 }
