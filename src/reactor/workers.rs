@@ -37,7 +37,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
-use tokio::sync::{Mutex, mpsc};
+use tokio::sync::{Mutex, Notify, mpsc};
 use tokio::task::JoinHandle;
 use tokio::time::timeout;
 
@@ -58,9 +58,31 @@ pub(super) type WorkerId = u64;
 /// session with full context; a later one falls back to a fresh worker.
 const WORKER_IDLE_TTL: Duration = Duration::from_secs(15 * 60);
 
-/// Per-worker buffer of queued follow-up prompts. Follow-ups are rare and tiny;
-/// this only needs to absorb a quick burst while the worker is mid-prompt.
-const WORKER_FOLLOW_CAPACITY: usize = 16;
+/// A worker's follow-up mailbox: a single pending message the registry merges into
+/// while the worker is busy, drained by the drive loop the moment it goes free. This
+/// is the worker-side analog of the reactor's commit-after-quiet — every follow-up
+/// that lands while the session is occupied is *concatenated* into this one message,
+/// so the worker picks up all of it in a single next prompt rather than running each
+/// as its own round-trip. No LLM-smart merge: the worker's own model parses the
+/// combined text. The `notify` wakes the drive loop when it's idle-waiting; `closed`
+/// (flipped under the same lock the drive loop takes) lets a racing follow-up tell
+/// the worker has shut down and fall back to a fresh spawn.
+#[derive(Default)]
+struct MailboxState {
+    pending: Option<String>,
+    closed: bool,
+}
+
+struct FollowMailbox {
+    state: std::sync::Mutex<MailboxState>,
+    notify: Notify,
+}
+
+impl FollowMailbox {
+    fn new() -> Arc<Self> {
+        Arc::new(Self { state: std::sync::Mutex::new(MailboxState::default()), notify: Notify::new() })
+    }
+}
 
 const WORKER_SYSTEM_PROMPT: &str = "You are a working session spun up by a \
 human-interface agent to carry out one specific delegated task. You have full \
@@ -147,9 +169,10 @@ struct Worker {
     /// The worker's accumulated (channel-stripped) output, grown by its drive
     /// task and read by [`WorkerRegistry::render_status`].
     transcript: Arc<Mutex<String>>,
-    /// Follow-up prompts to the live drive loop. Sending one resumes the warm
-    /// session with full context, queued behind its current prompt if still busy.
-    follow_tx: mpsc::Sender<String>,
+    /// Follow-up mailbox. Merging a task in resumes the warm session with full
+    /// context; if the worker is still mid-prompt, the task is concatenated into the
+    /// pending message and picked up whole when it next goes free.
+    mailbox: Arc<FollowMailbox>,
     /// Whether the drive loop is mid-prompt right now, vs. idle and resumable.
     busy: Arc<AtomicBool>,
     drive: JoinHandle<()>,
@@ -214,7 +237,7 @@ impl WorkerRegistry {
 
         let transcript = Arc::new(Mutex::new(String::new()));
         let busy = Arc::new(AtomicBool::new(true));
-        let (follow_tx, follow_rx) = mpsc::channel::<String>(WORKER_FOLLOW_CAPACITY);
+        let mailbox = FollowMailbox::new();
         let drive = tokio::spawn(drive_worker(
             id,
             task.clone(),
@@ -223,7 +246,7 @@ impl WorkerRegistry {
             self.inbound.clone(),
             observatory,
             self.scene.clone(),
-            follow_rx,
+            mailbox.clone(),
             busy.clone(),
         ));
 
@@ -232,7 +255,7 @@ impl WorkerRegistry {
             Worker {
                 task,
                 transcript,
-                follow_tx,
+                mailbox,
                 busy,
                 drive,
             },
@@ -243,10 +266,12 @@ impl WorkerRegistry {
 
     /// Resume an existing warm worker with a follow-up `task`, so a refinement
     /// continues the SAME session — full context, no clobbering — instead of a cold
-    /// fresh one. If the worker is still mid-prompt the follow-up queues behind it.
-    /// When the target is gone (its idle session already closed, or it exited
-    /// between our check and the send), falls back to spawning a fresh worker so the
-    /// request is never silently lost.
+    /// fresh one. The task is *merged* into the worker's mailbox: if it's still
+    /// mid-prompt the task is concatenated onto whatever else is pending and the
+    /// whole lot is picked up in one go when it next goes free; if it's idle-waiting,
+    /// this wakes it. When the target is gone (its idle session already closed, or it
+    /// shut down between our lookup and the merge), falls back to spawning a fresh
+    /// worker so the request is never silently lost.
     pub(super) async fn follow_up(
         &mut self,
         reactor: &Reactor,
@@ -254,23 +279,35 @@ impl WorkerRegistry {
         task: String,
     ) -> anyhow::Result<WorkerId> {
         if let Some(w) = self.workers.get_mut(&id) {
-            match w.follow_tx.send(task.clone()).await {
-                Ok(()) => {
-                    w.task = task.clone();
-                    reactor
-                        .inner
-                        .observatory
-                        .record(&self.scene, EventKind::WorkerResumed { id, task })
-                        .await;
-                    tracing::info!(scene = %self.scene, worker = id, "resumed working session");
-                    return Ok(id);
+            // Merge under the mailbox lock — the same critical section the drive
+            // loop takes when deciding to close, so we can't lose a task to a
+            // simultaneously-closing worker.
+            let accepted = {
+                let mut st = w.mailbox.state.lock().unwrap();
+                if st.closed {
+                    false
+                } else {
+                    st.pending = Some(match st.pending.take() {
+                        Some(prev) => format!("{prev}\n\n{task}"),
+                        None => task.clone(),
+                    });
+                    true
                 }
-                // The drive loop exited between our lookup and the send; drop the
-                // stale handle and fall through to a fresh spawn.
-                Err(_) => {
-                    self.workers.remove(&id);
-                }
+            };
+            if accepted {
+                w.mailbox.notify.notify_one();
+                w.task = task.clone();
+                reactor
+                    .inner
+                    .observatory
+                    .record(&self.scene, EventKind::WorkerResumed { id, task })
+                    .await;
+                tracing::info!(scene = %self.scene, worker = id, "merged follow-up into working session");
+                return Ok(id);
             }
+            // The worker closed itself (idle past TTL) before we got the lock; drop
+            // the stale handle and fall through to a fresh spawn.
+            self.workers.remove(&id);
         }
         tracing::info!(scene = %self.scene, worker = id, "follow-up target gone; spawning fresh worker");
         self.spawn(reactor, task).await
@@ -310,12 +347,14 @@ impl WorkerRegistry {
         for id in ids {
             let w = &self.workers[id];
             let busy = w.busy.load(Ordering::Relaxed);
+            let queued = w.mailbox.state.lock().unwrap().pending.is_some();
             let tail = {
                 let t = w.transcript.lock().await;
                 tail_chars(&t, 240)
             };
             if busy {
-                let _ = write!(s, "- worker {id} (running): \"{}\"", w.task);
+                let suffix = if queued { "; follow-up queued" } else { "" };
+                let _ = write!(s, "- worker {id} (running{suffix}): \"{}\"", w.task);
             } else {
                 let _ = write!(
                     s,
@@ -359,8 +398,7 @@ pub(super) fn render_report(report: &WorkerReport) -> String {
 /// Drive one worker across one or more tasks, posting a terminal report after each
 /// and staying warm in between so a follow-up can resume the same session with full
 /// context. Runs as its own task so the reactor stays free; the session is closed
-/// (this returns) once the worker sits idle past [`WORKER_IDLE_TTL`], or when the
-/// registry drops its follow-up sender.
+/// (this returns) once the worker sits idle past [`WORKER_IDLE_TTL`].
 async fn drive_worker(
     id: WorkerId,
     initial_task: String,
@@ -369,7 +407,7 @@ async fn drive_worker(
     inbound: mpsc::Sender<LoopInput>,
     observatory: Observatory,
     scene: Scene,
-    mut follow_rx: mpsc::Receiver<String>,
+    mailbox: Arc<FollowMailbox>,
     busy: Arc<AtomicBool>,
 ) {
     let mut task = initial_task;
@@ -396,15 +434,46 @@ async fn drive_worker(
             return;
         }
 
-        // Stay warm for a follow-up that continues this same session. Close (return,
-        // dropping the session) once idle past the TTL, or when the registry's
-        // sender is dropped (scene ending / worker replaced).
-        match timeout(WORKER_IDLE_TTL, follow_rx.recv()).await {
-            Ok(Some(next)) => task = next,
-            Ok(None) => return,
-            Err(_) => {
+        // Stay warm for a follow-up; pick up everything that accumulated in the
+        // mailbox as one merged prompt. Close (return, dropping the session) once
+        // idle past the TTL.
+        match wait_for_followup(&mailbox).await {
+            Some(next) => task = next,
+            None => {
                 tracing::info!(scene = %scene, worker = id, "working session idle past ttl; closing");
                 return;
+            }
+        }
+    }
+}
+
+/// Block until the worker has a follow-up to run, returning the merged pending
+/// message — or `None` if it sat idle past [`WORKER_IDLE_TTL`], in which case the
+/// mailbox is flipped `closed` (under the same lock `follow_up` takes) so a racing
+/// follow-up spawns a fresh worker instead of merging into a dead one.
+async fn wait_for_followup(mailbox: &FollowMailbox) -> Option<String> {
+    loop {
+        // Fast path: take whatever's already merged in.
+        {
+            let mut st = mailbox.state.lock().unwrap();
+            if let Some(task) = st.pending.take() {
+                return Some(task);
+            }
+        }
+        // Nothing pending — wait for a nudge or the idle TTL. `Notify` holds a
+        // permit if `notify_one` raced ahead of this `notified()`, so no wakeup is
+        // lost between the take above and the wait here.
+        match timeout(WORKER_IDLE_TTL, mailbox.notify.notified()).await {
+            Ok(()) => continue, // nudged — loop back to take the pending task
+            Err(_) => {
+                // Idle past the TTL. Decide to close, but yield to a follow-up that
+                // landed in the meantime — both resolved under the one lock.
+                let mut st = mailbox.state.lock().unwrap();
+                if let Some(task) = st.pending.take() {
+                    return Some(task);
+                }
+                st.closed = true;
+                return None;
             }
         }
     }
