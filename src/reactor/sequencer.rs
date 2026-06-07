@@ -44,6 +44,11 @@ pub(super) async fn run_sequencer(reactor: Reactor, scene: Scene, mut beats: mps
     // Per-turn state, reset on each TurnStart. The TTS span is opened lazily on the
     // first `Say` so a silent turn emits no audio span at all.
     let mut turn: u64 = 0;
+    // Stays false until the first TurnStart. Say/Show beats arriving before any turn
+    // is bracketed — i.e. from the warm-up prompt, which pre-sends the system prompt
+    // ahead of the first real turn — are dropped, so warm-up never reaches the user
+    // even if the model emits speech with nothing to act on.
+    let mut armed = false;
     let mut splitter = Segmenter::new(Terminator, Instant::now());
     let mut synth_tx: Option<mpsc::Sender<String>> = None;
     let mut synth_handle: Option<JoinHandle<()>> = None;
@@ -53,13 +58,14 @@ pub(super) async fn run_sequencer(reactor: Reactor, scene: Scene, mut beats: mps
         match beat {
             Beat::TurnStart { turn: t } => {
                 turn = t;
+                armed = true;
                 splitter = Segmenter::new(Terminator, Instant::now());
                 synth_tx = None;
                 synth_handle = None;
                 full_reply.clear();
             }
             Beat::Say(text) => {
-                if text.is_empty() {
+                if !armed || text.is_empty() {
                     continue;
                 }
                 if synth_tx.is_none() {
@@ -73,6 +79,9 @@ pub(super) async fn run_sequencer(reactor: Reactor, scene: Scene, mut beats: mps
                 super::emit_thought_chunk(&reactor, &scene, text).await;
             }
             Beat::Show { id, op, source } => {
+                if !armed {
+                    continue;
+                }
                 let (id, op) = resolve_view(id, &op);
                 for emit in interleave::view_emits(&mut splitter, id, op, source) {
                     super::perform(emit, &synth_tx, &reactor, &scene).await;

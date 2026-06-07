@@ -239,12 +239,6 @@ impl AcpSession {
 
     /// Send a `session/prompt` and return a streaming handle.
     pub async fn prompt(&self, text: String) -> anyhow::Result<SessionRun> {
-        let rx = {
-            let mut slot = self.rx.lock().await;
-            slot.take()
-                .ok_or_else(|| anyhow!("session already has an in-flight prompt"))?
-        };
-
         let mut blocks: Vec<ContentBlock> = Vec::with_capacity(2);
         {
             let mut sp = self.pending_system_prompt.lock().await;
@@ -253,6 +247,34 @@ impl AcpSession {
             }
         }
         blocks.push(ContentBlock::Text(TextContent::new(text)));
+        self.send_blocks(blocks).await
+    }
+
+    /// Pre-send the system prompt on its own, so the backend processes the soul
+    /// (and the upstream prompt cache populates) before the first real turn —
+    /// taking it off that turn's critical path. Consumes the pending system prompt
+    /// exactly as the first [`prompt`] would, so the first real turn then sends
+    /// only its own content. Returns `None` when there is nothing to warm — no
+    /// pending system prompt, e.g. it was already sent.
+    pub async fn warm(&self) -> anyhow::Result<Option<SessionRun>> {
+        let prefix = self.pending_system_prompt.lock().await.take();
+        match prefix {
+            Some(prefix) => {
+                let blocks = vec![ContentBlock::Text(TextContent::new(prefix))];
+                Ok(Some(self.send_blocks(blocks).await?))
+            }
+            None => Ok(None),
+        }
+    }
+
+    /// Dispatch a `session/prompt` carrying `blocks` and wrap its stream in a
+    /// [`SessionRun`]. Shared by [`prompt`] and [`warm`].
+    async fn send_blocks(&self, blocks: Vec<ContentBlock>) -> anyhow::Result<SessionRun> {
+        let rx = {
+            let mut slot = self.rx.lock().await;
+            slot.take()
+                .ok_or_else(|| anyhow!("session already has an in-flight prompt"))?
+        };
 
         let req = PromptRequest::new(self.id.clone(), blocks);
         let connection = self.process.connection().clone();

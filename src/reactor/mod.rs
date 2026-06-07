@@ -543,12 +543,12 @@ async fn per_scene_loop(
     let mut alarms = Alarms::new();
 
     // Warm-up: this loop was just stood up (a scene-presence GET, or the first
-    // utterance). Pull the cold-start forward now — spawn the subprocess and open
-    // the persistent ACP session — so that work is off the first real turn's
-    // critical path. We deliberately do NOT prompt the model here: the soul and
-    // journal snapshot are still delivered by the first real turn (which sees an
-    // open-but-unseeded session). Best-effort; on failure the first turn cold-opens
-    // as before.
+    // utterance). Pull the cold-start forward now — spawn the subprocess, open the
+    // persistent ACP session, and pre-send the system prompt to warm the backend —
+    // so that work is off the first real turn's critical path. The journal snapshot
+    // is still delivered by the first real turn (which sees an open, system-prompted
+    // but unseeded session). Best-effort; on failure the first turn cold-opens as
+    // before.
     warm_up(&reactor, &scene, &mut reactor_session).await;
 
     loop {
@@ -682,16 +682,20 @@ async fn per_scene_loop(
 }
 
 /// One-time scene warm-up, run once before the per-scene loop blocks on its first
-/// input. Opens the scene's persistent reactor session so the subprocess spawn and
-/// ACP `session/new` are off the first reply's critical path — that's the whole
-/// job. It does NOT prompt the model: the soul (system prompt) and journal
-/// snapshot are still delivered by the first real turn, which sees an
-/// open-but-unseeded session. Warming the upstream prompt cache would need a
-/// throwaway round-trip; that is deliberately not done here — unproven benefit,
-/// real cost.
+/// input. Opens the scene's persistent reactor session — so the subprocess spawn
+/// and ACP `session/new` are off the first reply's critical path — then pre-sends
+/// the system prompt (the soul plus memory core) on its own, so the backend
+/// processes it and the upstream prompt cache populates before any user input
+/// arrives. The first real turn then runs against an already-warm session and
+/// delivers only the journal snapshot and new signals.
 ///
-/// Best-effort: any failure is logged and leaves the session unopened, so the
-/// first real turn just cold-opens as it did before.
+/// The warm prompt carries no transcript and no signals, so the model has nothing
+/// to act on; any `say`/`show_view` it might still emit is dropped, since the
+/// sequencer ignores beats until the first `TurnStart`. The journal snapshot is
+/// not sent here — the session stays unseeded, so the first real turn delivers it.
+///
+/// Best-effort: any failure is logged and leaves the session open-but-unseeded (or
+/// unopened), so the first real turn proceeds as it did before.
 async fn warm_up(reactor: &Reactor, scene: &Scene, reactor_session: &mut Option<Arc<AcpSession>>) {
     // Defensive: the prologue runs once on a fresh loop, so the session is always
     // cold here, but never re-open an already-open session.
@@ -700,8 +704,22 @@ async fn warm_up(reactor: &Reactor, scene: &Scene, reactor_session: &mut Option<
     }
     match open_session(reactor, scene).await {
         Ok(session) => {
+            // Drive the warm prompt to completion so the session's prompt slot is
+            // parked back for the first real turn. Best-effort: a failed warm just
+            // leaves the session open-but-unseeded, as before.
+            match session.warm().await {
+                Ok(Some(run)) => {
+                    if let Err(err) = run.wait().await {
+                        tracing::warn!(scene = %scene, error = %err, "reactor warm-up prompt failed");
+                    }
+                }
+                Ok(None) => {}
+                Err(err) => {
+                    tracing::warn!(scene = %scene, error = %err, "reactor warm-up prompt failed");
+                }
+            }
             *reactor_session = Some(session);
-            tracing::info!(scene = %scene, "reactor session warmed up (opened, unseeded)");
+            tracing::info!(scene = %scene, "reactor session warmed up (system prompt pre-sent)");
         }
         Err(err) => {
             tracing::warn!(scene = %scene, error = %err, "scene warm-up failed; first turn will cold-start");
