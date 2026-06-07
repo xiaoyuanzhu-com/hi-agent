@@ -24,8 +24,11 @@ use super::sequencer::Beat;
 /// worker never waits on an answer).
 #[derive(Debug)]
 pub enum SceneControl {
-    /// Spawn a working session for `task` (the `delegate` tool).
-    Delegate { task: String },
+    /// Spawn a working session for `task` (the `delegate` tool). When `worker` is
+    /// set, the task is handed to that still-warm working session to continue —
+    /// resuming it with full context instead of starting a fresh one; an unknown
+    /// or already-closed id falls back to spawning a new worker.
+    Delegate { task: String, worker: Option<u64> },
     /// Schedule a self-wake after `delay` (e.g. `30s`, `20m`, `1h`) carrying
     /// `note` (the `alarm` tool). The delay is parsed loop-side; an unparseable
     /// one is dropped.

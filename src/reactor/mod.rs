@@ -479,9 +479,13 @@ async fn apply_control(
     ctl: SceneControl,
 ) -> Option<LoopInput> {
     match ctl {
-        SceneControl::Delegate { task } => {
-            if let Err(err) = workers.spawn(reactor, task).await {
-                tracing::warn!(scene = %scene, error = %err, "failed to spawn working session");
+        SceneControl::Delegate { task, worker } => {
+            let outcome = match worker {
+                Some(id) => workers.follow_up(reactor, id, task).await,
+                None => workers.spawn(reactor, task).await,
+            };
+            if let Err(err) = outcome {
+                tracing::warn!(scene = %scene, error = %err, "failed to delegate working session");
             }
             None
         }

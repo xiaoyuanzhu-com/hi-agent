@@ -159,6 +159,9 @@ pub enum EventKind {
     TurnFinished { turn: u64, stop_reason: Option<String>, reply_chars: usize, reply: String },
     HotSwap { old_id: String, new_id: String, briefing_chars: usize },
     WorkerSpawned { id: u64, task: String },
+    /// A warm (finished-but-idle) worker was handed a follow-up task and is running
+    /// again on the same session.
+    WorkerResumed { id: u64, task: String },
     WorkerFinished { id: u64, state: WorkerState, summary_chars: usize },
     WorkerQuestion { id: u64, question: String },
     AlarmScheduled { note: String, delay_s: u64 },
@@ -350,6 +353,22 @@ impl Observatory {
                     last_question: None,
                     transcript_tail: String::new(),
                 });
+            }
+            EventKind::WorkerResumed { id, task } => {
+                if let Some(w) = view.workers.iter_mut().find(|w| w.id == *id) {
+                    w.state = WorkerState::Running;
+                    w.task = task.clone();
+                    w.last_question = None;
+                } else {
+                    view.workers.push(WorkerView {
+                        id: *id,
+                        task: task.clone(),
+                        state: WorkerState::Running,
+                        started_at: now,
+                        last_question: None,
+                        transcript_tail: String::new(),
+                    });
+                }
             }
             EventKind::WorkerFinished { id, state, .. } => {
                 if let Some(w) = view.workers.iter_mut().find(|w| w.id == *id) {

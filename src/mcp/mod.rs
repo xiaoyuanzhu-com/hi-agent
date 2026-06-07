@@ -84,10 +84,17 @@ fn tools_for_role(role: Option<&str>) -> Vec<Value> {
                 "Hand a heavy or long-running task (research, multi-step tool use, writing and \
                  running code) to a background working session, so you stay free to keep talking. \
                  It runs with your tools and memory but no voice; it reports back when done or if \
-                 it gets stuck, and you'll see that as a new signal to fold into what you say next.",
+                 it gets stuck, and you'll see that as a new signal to fold into what you say next. \
+                 To refine or build on what a worker just did, pass its `worker` id to continue \
+                 the SAME session — it keeps all its context (the files it wrote, the data it \
+                 gathered) and you avoid two workers clobbering the same work. The id of each \
+                 running worker is shown in your 'Working sessions' status.",
                 json!({
                     "type": "object",
-                    "properties": { "task": { "type": "string", "description": "A self-contained description of the work, with everything the worker needs to start." } },
+                    "properties": {
+                        "task": { "type": "string", "description": "A self-contained description of the work, with everything the worker needs to start." },
+                        "worker": { "type": "integer", "description": "Optional: the id of an existing working session to continue (from your 'Working sessions' status). Omit to spawn a fresh worker; set it to follow up on or refine that worker's own work." },
+                    },
                     "required": ["task"],
                 }),
             ),
@@ -214,7 +221,8 @@ async fn dispatch_tool(
             if task.trim().is_empty() {
                 return tool_error("delegate requires a non-empty `task`");
             }
-            sink.send(SceneControl::Delegate { task }).await.map(|()| "delegated to a working session")
+            let worker = args.get("worker").and_then(Value::as_u64);
+            sink.send(SceneControl::Delegate { task, worker }).await.map(|()| "delegated to a working session")
         }
         "alarm" => {
             let delay = arg_str("delay");

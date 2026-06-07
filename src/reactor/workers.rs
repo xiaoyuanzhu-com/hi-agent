@@ -34,9 +34,12 @@
 use std::collections::HashMap;
 use std::fmt::Write as _;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::time::Duration;
 
 use tokio::sync::{Mutex, mpsc};
 use tokio::task::JoinHandle;
+use tokio::time::timeout;
 
 use crate::acp::{AcpSession, SessionOpts, SessionUpdate};
 use crate::agent::SessionRole;
@@ -48,6 +51,16 @@ use super::{LoopInput, Reactor};
 /// Per-scene-unique handle for a working session. Small and `Copy`; it tags the
 /// worker in status lines and in the reports it posts back.
 pub(super) type WorkerId = u64;
+
+/// How long a finished working session stays warm — its ACP session held open and
+/// resumable via `delegate worker:<id>` — before it closes itself to free the
+/// subprocess context. A refinement arriving within this window continues the same
+/// session with full context; a later one falls back to a fresh worker.
+const WORKER_IDLE_TTL: Duration = Duration::from_secs(15 * 60);
+
+/// Per-worker buffer of queued follow-up prompts. Follow-ups are rare and tiny;
+/// this only needs to absorb a quick burst while the worker is mid-prompt.
+const WORKER_FOLLOW_CAPACITY: usize = 16;
 
 const WORKER_SYSTEM_PROMPT: &str = "You are a working session spun up by a \
 human-interface agent to carry out one specific delegated task. You have full \
@@ -89,7 +102,11 @@ If you hit something genuinely ambiguous, do not stall waiting for an answer. \
 Make the most reasonable assumption, note it, and keep going — the agent can \
 correct course later. If you must surface a question, call the `ask` tool with it \
 and then proceed on your best assumption anyway; the agent sees the question and \
-may steer you, but you never wait. Work to completion.";
+may steer you, but you never wait. Work to completion.\n\
+\n\
+You may be handed a follow-up task later in this same session, building on what you \
+just did — your earlier work, files, and findings are all still here, so extend them \
+rather than starting over or duplicating them.";
 
 /// The worker's system prompt, with its scene interpolated so it can tag every
 /// input-channel request with the right `X-HI-Scene`. The server base URL is
@@ -119,14 +136,22 @@ pub(super) enum WorkerReportKind {
     Question(String),
 }
 
-/// One live working session. The registry holds it only to inspect its
-/// transcript and to know when its drive task has finished; the drive task owns
-/// the session itself and closes it on completion.
+/// One live working session. The registry holds it to inspect its transcript, to
+/// resume it with follow-up tasks, and to know when its drive task has finally
+/// exited; the drive task owns the session itself and closes it once it goes idle
+/// past the TTL (or is told to stop).
 struct Worker {
+    /// The current (or most recent) task — updated on each follow-up — for status
+    /// lines and the reports posted back.
     task: String,
     /// The worker's accumulated (channel-stripped) output, grown by its drive
     /// task and read by [`WorkerRegistry::render_status`].
     transcript: Arc<Mutex<String>>,
+    /// Follow-up prompts to the live drive loop. Sending one resumes the warm
+    /// session with full context, queued behind its current prompt if still busy.
+    follow_tx: mpsc::Sender<String>,
+    /// Whether the drive loop is mid-prompt right now, vs. idle and resumable.
+    busy: Arc<AtomicBool>,
     drive: JoinHandle<()>,
 }
 
@@ -188,6 +213,8 @@ impl WorkerRegistry {
             .await;
 
         let transcript = Arc::new(Mutex::new(String::new()));
+        let busy = Arc::new(AtomicBool::new(true));
+        let (follow_tx, follow_rx) = mpsc::channel::<String>(WORKER_FOLLOW_CAPACITY);
         let drive = tokio::spawn(drive_worker(
             id,
             task.clone(),
@@ -196,6 +223,8 @@ impl WorkerRegistry {
             self.inbound.clone(),
             observatory,
             self.scene.clone(),
+            follow_rx,
+            busy.clone(),
         ));
 
         self.workers.insert(
@@ -203,11 +232,48 @@ impl WorkerRegistry {
             Worker {
                 task,
                 transcript,
+                follow_tx,
+                busy,
                 drive,
             },
         );
         tracing::info!(scene = %self.scene, worker = id, "spawned working session");
         Ok(id)
+    }
+
+    /// Resume an existing warm worker with a follow-up `task`, so a refinement
+    /// continues the SAME session — full context, no clobbering — instead of a cold
+    /// fresh one. If the worker is still mid-prompt the follow-up queues behind it.
+    /// When the target is gone (its idle session already closed, or it exited
+    /// between our check and the send), falls back to spawning a fresh worker so the
+    /// request is never silently lost.
+    pub(super) async fn follow_up(
+        &mut self,
+        reactor: &Reactor,
+        id: WorkerId,
+        task: String,
+    ) -> anyhow::Result<WorkerId> {
+        if let Some(w) = self.workers.get_mut(&id) {
+            match w.follow_tx.send(task.clone()).await {
+                Ok(()) => {
+                    w.task = task.clone();
+                    reactor
+                        .inner
+                        .observatory
+                        .record(&self.scene, EventKind::WorkerResumed { id, task })
+                        .await;
+                    tracing::info!(scene = %self.scene, worker = id, "resumed working session");
+                    return Ok(id);
+                }
+                // The drive loop exited between our lookup and the send; drop the
+                // stale handle and fall through to a fresh spawn.
+                Err(_) => {
+                    self.workers.remove(&id);
+                }
+            }
+        }
+        tracing::info!(scene = %self.scene, worker = id, "follow-up target gone; spawning fresh worker");
+        self.spawn(reactor, task).await
     }
 
     /// Forget workers whose drive task has finished, so the map doesn't grow.
@@ -229,9 +295,10 @@ impl WorkerRegistry {
         WorkerReport { id, task, kind: WorkerReportKind::Question(question) }
     }
 
-    /// A compact, stable-ordered view of every running worker — its task and a
-    /// short tail of its transcript — for injection into the reactor's prompt.
-    /// Empty string when nothing is delegated.
+    /// A compact, stable-ordered view of every live worker — its id, task, whether
+    /// it's running now or idle-and-resumable, and a short tail of its transcript —
+    /// for injection into the reactor's prompt. The id tells the mind which worker
+    /// to continue via `delegate worker:<id>`. Empty string when nothing is live.
     pub(super) async fn render_status(&self) -> String {
         if self.workers.is_empty() {
             return String::new();
@@ -239,14 +306,23 @@ impl WorkerRegistry {
         let mut ids: Vec<&WorkerId> = self.workers.keys().collect();
         ids.sort();
 
-        let mut s = String::from("## Working sessions (delegated, running now)\n");
+        let mut s = String::from("## Working sessions (delegated)\n");
         for id in ids {
             let w = &self.workers[id];
+            let busy = w.busy.load(Ordering::Relaxed);
             let tail = {
                 let t = w.transcript.lock().await;
                 tail_chars(&t, 240)
             };
-            let _ = write!(s, "- worker {id}: \"{}\"", w.task);
+            if busy {
+                let _ = write!(s, "- worker {id} (running): \"{}\"", w.task);
+            } else {
+                let _ = write!(
+                    s,
+                    "- worker {id} (idle — resumable: delegate with worker:{id} to continue it): \"{}\"",
+                    w.task
+                );
+            }
             if !tail.is_empty() {
                 let _ = write!(s, "\n    latest: {tail}");
             }
@@ -280,34 +356,57 @@ pub(super) fn render_report(report: &WorkerReport) -> String {
     }
 }
 
-/// Drive one worker to completion, then post a terminal report. Runs as its own
-/// task so the reactor stays free; the session is closed on the way out.
+/// Drive one worker across one or more tasks, posting a terminal report after each
+/// and staying warm in between so a follow-up can resume the same session with full
+/// context. Runs as its own task so the reactor stays free; the session is closed
+/// (this returns) once the worker sits idle past [`WORKER_IDLE_TTL`], or when the
+/// registry drops its follow-up sender.
 async fn drive_worker(
     id: WorkerId,
-    task: String,
+    initial_task: String,
     session: Arc<AcpSession>,
     transcript: Arc<Mutex<String>>,
     inbound: mpsc::Sender<LoopInput>,
     observatory: Observatory,
     scene: Scene,
+    mut follow_rx: mpsc::Receiver<String>,
+    busy: Arc<AtomicBool>,
 ) {
-    let kind = match run_worker(id, &task, &session, &transcript, &observatory, &scene).await {
-        Ok(answer) => WorkerReportKind::Done(answer),
-        Err(err) => WorkerReportKind::Failed(err.to_string()),
-    };
-    let (state, summary_chars) = match &kind {
-        WorkerReportKind::Done(answer) => (WorkerState::Done, answer.chars().count()),
-        WorkerReportKind::Failed(err) => (WorkerState::Failed, err.chars().count()),
-        // Questions are interim, never terminal — drive_worker only ever ends in
-        // Done or Failed, so this arm is unreachable, but keep it total.
-        WorkerReportKind::Question(_) => (WorkerState::Running, 0),
-    };
-    observatory
-        .record(&scene, EventKind::WorkerFinished { id, state, summary_chars })
-        .await;
-    let report = WorkerReport { id, task, kind };
-    if let Err(err) = inbound.send(LoopInput::Worker(report)).await {
-        tracing::warn!(worker = id, error = %err, "worker report dropped; scene loop gone");
+    let mut task = initial_task;
+    loop {
+        busy.store(true, Ordering::Relaxed);
+        let kind = match run_worker(id, &task, &session, &transcript, &observatory, &scene).await {
+            Ok(answer) => WorkerReportKind::Done(answer),
+            Err(err) => WorkerReportKind::Failed(err.to_string()),
+        };
+        busy.store(false, Ordering::Relaxed);
+        let (state, summary_chars) = match &kind {
+            WorkerReportKind::Done(answer) => (WorkerState::Done, answer.chars().count()),
+            WorkerReportKind::Failed(err) => (WorkerState::Failed, err.chars().count()),
+            // Questions are interim, never terminal — a drive pass only ever ends in
+            // Done or Failed, so this arm is unreachable, but keep it total.
+            WorkerReportKind::Question(_) => (WorkerState::Running, 0),
+        };
+        observatory
+            .record(&scene, EventKind::WorkerFinished { id, state, summary_chars })
+            .await;
+        let report = WorkerReport { id, task: task.clone(), kind };
+        if inbound.send(LoopInput::Worker(report)).await.is_err() {
+            tracing::warn!(worker = id, "worker report dropped; scene loop gone");
+            return;
+        }
+
+        // Stay warm for a follow-up that continues this same session. Close (return,
+        // dropping the session) once idle past the TTL, or when the registry's
+        // sender is dropped (scene ending / worker replaced).
+        match timeout(WORKER_IDLE_TTL, follow_rx.recv()).await {
+            Ok(Some(next)) => task = next,
+            Ok(None) => return,
+            Err(_) => {
+                tracing::info!(scene = %scene, worker = id, "working session idle past ttl; closing");
+                return;
+            }
+        }
     }
 }
 
