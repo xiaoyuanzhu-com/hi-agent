@@ -19,6 +19,9 @@ pub const ENV_MODEL: &str = "HI_AGENT_MODEL";
 pub const ENV_EFFORT: &str = "HI_AGENT_EFFORT";
 /// Env var setting the adapter's `permissions.defaultMode` in settings.json.
 pub const ENV_PERMISSION_MODE: &str = "HI_AGENT_PERMISSION_MODE";
+/// Env var overriding the reactor heartbeat's hot-swap character ceiling
+/// (`HI_AGENT_COMPACT`). Unset / blank / non-positive → the built-in default.
+pub const ENV_COMPACT: &str = "HI_AGENT_COMPACT";
 /// Env var (set on the cognition subprocess) carrying hi-agent's own HTTP base
 /// URL, so sessions can read input channels and write the overlay over the same
 /// wire the browser uses. See [`AgentConfig::child_env`].

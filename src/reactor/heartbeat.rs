@@ -23,22 +23,40 @@ use crate::types::Scene;
 
 use super::Reactor;
 
-/// Soft ceiling on a session's accumulated prompt+reply characters before the
-/// heartbeat swaps it. A coarse proxy for context pressure — we don't see the
-/// model's token count, and an over-estimate just swaps a little early, which
-/// is harmless (the replacement is seeded). Kept well below a typical model
-/// window so the briefing-plus-tail seed always fits with room to grow.
-pub(crate) const SWAP_AFTER_CHARS: usize = 48_000;
+/// Default soft ceiling on a session's accumulated prompt+reply characters
+/// before the heartbeat swaps it. A coarse proxy for context pressure — we
+/// don't see the model's token count, and an over-estimate just swaps a little
+/// early, which is harmless (the replacement is seeded). Kept well below a
+/// typical model window so the briefing-plus-tail seed always fits with room to
+/// grow. Overridable via `HI_AGENT_COMPACT` — see [`swap_after_chars`].
+pub(crate) const DEFAULT_SWAP_AFTER_CHARS: usize = 48_000;
+
+/// Resolve the hot-swap ceiling: `HI_AGENT_COMPACT` if it parses to a positive
+/// integer, else [`DEFAULT_SWAP_AFTER_CHARS`]. Read fresh so the observatory
+/// denominator and a budget opened mid-run agree on the same value.
+pub(crate) fn swap_after_chars() -> usize {
+    std::env::var(crate::config::ENV_COMPACT)
+        .ok()
+        .and_then(|v| v.trim().parse::<usize>().ok())
+        .filter(|&n| n > 0)
+        .unwrap_or(DEFAULT_SWAP_AFTER_CHARS)
+}
 
 /// Tracks how much the live session has accumulated since it was opened, so the
 /// per-scene loop can decide when to hot-swap. Cheap; lives in that loop.
 pub(super) struct ContextBudget {
     chars: usize,
+    /// Ceiling this budget swaps at — captured from [`swap_after_chars`] when
+    /// the budget is opened so it stays stable across the session's turns.
+    limit: usize,
 }
 
 impl ContextBudget {
     pub(super) fn new() -> Self {
-        Self { chars: 0 }
+        Self {
+            chars: 0,
+            limit: swap_after_chars(),
+        }
     }
 
     /// Fold one completed turn's prompt and reply sizes into the running total.
@@ -50,7 +68,7 @@ impl ContextBudget {
     }
 
     pub(super) fn should_swap(&self) -> bool {
-        self.chars >= SWAP_AFTER_CHARS
+        self.chars >= self.limit
     }
 
     /// Current accumulated chars, mirrored into the observatory for display.

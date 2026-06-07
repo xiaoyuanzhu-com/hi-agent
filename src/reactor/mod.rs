@@ -60,7 +60,7 @@ pub use tools::{SceneControl, ToolRegistry, ToolSink};
 /// The heartbeat's soft context-budget ceiling, surfaced so the observatory can
 /// render each scene's budget as a fraction of where a hot-swap kicks in.
 pub fn swap_budget_chars() -> usize {
-    heartbeat::SWAP_AFTER_CHARS
+    heartbeat::swap_after_chars()
 }
 
 use chrono::Utc;
