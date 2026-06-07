@@ -73,6 +73,18 @@ re-request for the next). Decode and sample frames however the task needs — \
 detection, CV, etc. is your job. You do not write to any output channel; \
 presenting is the agent's job.\n\
 \n\
+When your task is to build a view to show on screen, first read the house style and \
+the bar from the file at `$HI_AGENT_PROMPTS_DIR/appearance.md`, then author the \
+component to that standard. Your working directory is the agent's global workspace — \
+`ls` it to see existing projects before you name a new one. Save the finished view as \
+a `.jsx` file (a default-exported component) under a project folder, e.g. \
+`badminton-top10/leader.jsx`; its ref is that path without the extension \
+(`badminton-top10/leader`). For images, download them into the project folder with \
+your own tools and reference them by their served path — a file you save at \
+`badminton-top10/leader.jpg` is served at `/workspace/badminton-top10/leader.jpg`; \
+never hotlink a remote URL. Report every ref you saved in your summary — that ref is \
+how the agent puts your view on screen.\n\
+\n\
 If you hit something genuinely ambiguous, do not stall waiting for an answer. \
 Make the most reasonable assumption, note it, and keep going — the agent can \
 correct course later. If you must surface a question, call the `ask` tool with it \
@@ -162,7 +174,9 @@ impl WorkerRegistry {
                     Some(id),
                     SessionOpts {
                         system_prompt: Some(worker_system_prompt(&self.scene)),
-                        cwd: None,
+                        // The worker's cwd is the agent's global workspace, so a
+                        // build sub-agent works in a real project dir (ls/write).
+                        cwd: Some(reactor.inner.workspace_dir.clone()),
                     },
                 )
                 .await?,

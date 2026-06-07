@@ -220,7 +220,7 @@ pub enum ViewOp {
 }
 
 /// One view event delivered to the browser over GET /api/out/view. `module_url`
-/// points at the compiled ESM module (`/generated/views/<hash>.mjs`) the client
+/// points at the compiled ESM module (`/workspace/.cache/views/<hash>.mjs`) the client
 /// dynamically imports and mounts under `id` in the view slot. For
 /// `op = dismiss` only `id` is meaningful.
 #[derive(Debug, Clone, Serialize, Deserialize)]

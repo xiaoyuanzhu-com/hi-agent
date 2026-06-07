@@ -34,17 +34,19 @@ pub enum McpReply {
 /// drives output and delegation; a worker can only raise a question.
 fn tools_for_role(role: Option<&str>) -> Vec<Value> {
     match role {
-        Some("worker") => vec![tool(
-            "ask",
-            "Raise a non-blocking question for the agent about an ambiguity in your task. \
-             You do NOT wait for an answer — note your best assumption and keep working; \
-             the agent sees the question and may steer you next time it speaks.",
-            json!({
-                "type": "object",
-                "properties": { "question": { "type": "string", "description": "The question to surface." } },
-                "required": ["question"],
-            }),
-        )],
+        Some("worker") => vec![
+            tool(
+                "ask",
+                "Raise a non-blocking question for the agent about an ambiguity in your task. \
+                 You do NOT wait for an answer — note your best assumption and keep working; \
+                 the agent sees the question and may steer you next time it speaks.",
+                json!({
+                    "type": "object",
+                    "properties": { "question": { "type": "string", "description": "The question to surface." } },
+                    "required": ["question"],
+                }),
+            ),
+        ],
         // Default to the reactor surface (the soul describes these).
         _ => vec![
             tool(
@@ -60,32 +62,21 @@ fn tools_for_role(role: Option<&str>) -> Vec<Value> {
             ),
             tool(
                 "show_view",
-                "Put a view on the screen — a small React component you write as JSX. Interleave \
-                 show_view and say calls in the order you want them experienced (say, then show, \
-                 then say) so each view lands as you speak to it. Reuse an `id` with op=replace to \
-                 evolve a view in place; op=dismiss takes one down.",
+                "Put a view on the screen. Normally you show a view a builder made for you: \
+                 delegate the build, then pass the `ref` it reported back (like `project/view`) here. \
+                 Interleave show_view and say calls in the order you want them experienced (say, \
+                 then show) so each view lands as you speak to it. Reuse an `id` with op=replace \
+                 to evolve a view in place; op=dismiss takes one down. For a trivial one-off you \
+                 may pass raw `source` JSX instead of a ref.",
                 json!({
                     "type": "object",
                     "properties": {
                         "op": { "type": "string", "enum": ["show", "replace", "dismiss"], "description": "show mounts; replace swaps the same id in place; dismiss removes it." },
-                        "id": { "type": "string", "description": "A stable name for this view, so replace/dismiss can target it. Omit to auto-generate." },
-                        "source": { "type": "string", "description": "The view's JSX (default-exported component). Omit for dismiss." },
+                        "id": { "type": "string", "description": "A stable name for this on-screen slot, so replace/dismiss can target it. Omit to auto-generate." },
+                        "ref": { "type": "string", "description": "A view ref a builder reported (e.g. `project/view`) — the usual way to show a built view. Omit for dismiss." },
+                        "source": { "type": "string", "description": "Raw JSX (default-exported component) for a trivial inline view, when not using a ref. Omit for dismiss." },
                     },
                     "required": ["op"],
-                }),
-            ),
-            tool(
-                "add_asset",
-                "Host an image so a view can show it. Pass the `url` of a real image you found \
-                 (search the web with your own tools first); the server downloads it and returns a \
-                 same-origin path like `/generated/assets/<hash>.png`. Put THAT path in an `<img \
-                 src>` inside show_view — never hotlink the original URL (it can fail CORS, be \
-                 hotlink-blocked, or 404). Use this whenever a view wants a real photo, poster, or \
-                 picture; this is how you get one onto the screen.",
-                json!({
-                    "type": "object",
-                    "properties": { "url": { "type": "string", "description": "Direct URL of the source image (jpg/png/webp/gif/svg)." } },
-                    "required": ["url"],
                 }),
             ),
             tool(
@@ -121,6 +112,7 @@ fn tools_for_role(role: Option<&str>) -> Vec<Value> {
 fn tool(name: &str, description: &str, input_schema: Value) -> Value {
     json!({ "name": name, "description": description, "inputSchema": input_schema })
 }
+
 
 /// Handle one parsed JSON-RPC message. `scene`/`role`/`worker_id` come from the
 /// request headers; `registry` routes tool calls to the owning scene loop.
@@ -205,7 +197,17 @@ async fn dispatch_tool(
         }
         "show_view" => {
             let op = args.get("op").and_then(Value::as_str).unwrap_or("show").to_string();
-            sink.show_view(arg_opt("id"), op, arg_str("source")).await.map(|()| "shown")
+            // A view is normally shown by ref (one a worker built); resolve it to
+            // source HERE, server-side, so the JSX never enters the mind's context.
+            // Inline `source` stays as a trivial-one-off escape hatch.
+            let source = match arg_opt("ref") {
+                Some(r) if !r.trim().is_empty() => match resolve_view_ref(data_dir, &r).await {
+                    Ok(src) => src,
+                    Err(err) => return tool_error(&format!("show_view ref `{r}`: {err}")),
+                },
+                _ => arg_str("source"),
+            };
+            sink.show_view(arg_opt("id"), op, source).await.map(|()| "shown")
         }
         "delegate" => {
             let task = arg_str("task");
@@ -226,16 +228,6 @@ async fn dispatch_tool(
                 return tool_error("ask is only available to working sessions");
             };
             sink.send(SceneControl::WorkerAsk { id, question: arg_str("question") }).await.map(|()| "question noted")
-        }
-        "add_asset" => {
-            let url = arg_str("url");
-            if url.trim().is_empty() {
-                return tool_error("add_asset requires a non-empty `url`");
-            }
-            return match ingest_asset(data_dir, &url).await {
-                Ok(asset_url) => tool_ok(&asset_url),
-                Err(err) => tool_error(&err),
-            };
         }
         other => return tool_error(&format!("unknown tool: {other}")),
     };
@@ -262,83 +254,66 @@ fn tool_error(text: &str) -> Value {
     json!({ "content": [{ "type": "text", "text": text }], "isError": true })
 }
 
-/// Download a remote image and store it content-addressed under
-/// `data_dir/generated/assets/<hash>.<ext>`, returning the same-origin path the
-/// page serves it from (`GET /generated/assets/...`). The fetch happens here,
-/// server-side, so the view never hotlinks (no CORS, no broken box) and the agent
-/// needn't know where `data_dir` lives on disk. The 64-bit name is a cache key —
-/// identical bytes are written at most once — not a security boundary.
-async fn ingest_asset(data_dir: &std::path::Path, url: &str) -> Result<String, String> {
-    use std::hash::Hasher;
-
-    let resp = reqwest::Client::new()
-        .get(url)
-        // A real UA: some hosts 403 the default reqwest agent for hotlink checks.
-        .header(reqwest::header::USER_AGENT, "Mozilla/5.0 (hi-agent asset fetch)")
-        .send()
-        .await
-        .map_err(|e| format!("fetch failed: {e}"))?;
-    if !resp.status().is_success() {
-        return Err(format!("fetch returned HTTP {}", resp.status()));
-    }
-    let content_type = resp
-        .headers()
-        .get(reqwest::header::CONTENT_TYPE)
-        .and_then(|v| v.to_str().ok())
-        .unwrap_or("")
-        .to_owned();
-    let ext = ext_for_content_type(&content_type)
-        .or_else(|| ext_from_url(url))
-        .ok_or_else(|| format!("not a supported image (content-type: {content_type:?})"))?;
-
-    let bytes = resp.bytes().await.map_err(|e| format!("reading body failed: {e}"))?;
-    if bytes.is_empty() {
-        return Err("fetched image was empty".into());
-    }
-
-    let mut h = std::collections::hash_map::DefaultHasher::new();
-    h.write(&bytes);
-    let name = format!("{:016x}.{ext}", h.finish());
-
-    let dir = data_dir.join("generated").join("assets");
-    tokio::fs::create_dir_all(&dir)
-        .await
-        .map_err(|e| format!("creating assets dir: {e}"))?;
-    let path = dir.join(&name);
-    if tokio::fs::metadata(&path).await.is_err() {
-        tokio::fs::write(&path, &bytes)
-            .await
-            .map_err(|e| format!("writing asset: {e}"))?;
-    }
-    Ok(format!("/generated/assets/{name}"))
+/// A view ref is a relative path under the workspace, naming the view's source file
+/// minus the `.jsx` — e.g. `badminton-top10/leader` → `workspace/badminton-top10/
+/// leader.jsx`. Each `/`-separated segment is a slug (letters, digits, `-`, `_`) —
+/// no dots, no empty segments — so the ref stays inside the workspace and can't
+/// traverse out. The build sub-agent writes `<ref>.jsx` with its own file tools (no
+/// MCP tool needed); this reads it back server-side, so the JSX never enters the
+/// mind's context.
+fn valid_view_ref(view_ref: &str) -> bool {
+    !view_ref.is_empty()
+        && view_ref.len() <= 128
+        && view_ref.split('/').all(|seg| {
+            !seg.is_empty()
+                && seg.bytes().all(|b| matches!(b, b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_'))
+        })
 }
 
-/// Map an HTTP `Content-Type` (which may carry params) to our stored extension.
-fn ext_for_content_type(content_type: &str) -> Option<&'static str> {
-    match content_type.split(';').next().unwrap_or("").trim() {
-        "image/png" => Some("png"),
-        "image/jpeg" => Some("jpg"),
-        "image/gif" => Some("gif"),
-        "image/webp" => Some("webp"),
-        "image/svg+xml" => Some("svg"),
-        _ => None,
+/// Resolve a view ref to its stored JSX source, read from the workspace. The agent
+/// passes only the tiny ref through `show_view`; this reads the component back.
+async fn resolve_view_ref(data_dir: &std::path::Path, view_ref: &str) -> Result<String, String> {
+    let view_ref = view_ref.trim();
+    if !valid_view_ref(view_ref) {
+        return Err(format!("invalid ref `{view_ref}` (names and `/` only, no dots)"));
     }
+    let path = data_dir.join("workspace").join(format!("{view_ref}.jsx"));
+    tokio::fs::read_to_string(&path).await.map_err(|e| format!("no such view ({e})"))
 }
 
-/// Fallback when the server sends no usable `Content-Type`: sniff the URL path.
-fn ext_from_url(url: &str) -> Option<&'static str> {
-    let path = url.split(['?', '#']).next().unwrap_or(url).to_ascii_lowercase();
-    if path.ends_with(".png") {
-        Some("png")
-    } else if path.ends_with(".jpg") || path.ends_with(".jpeg") {
-        Some("jpg")
-    } else if path.ends_with(".gif") {
-        Some("gif")
-    } else if path.ends_with(".webp") {
-        Some("webp")
-    } else if path.ends_with(".svg") {
-        Some("svg")
-    } else {
-        None
+#[cfg(test)]
+mod view_store_tests {
+    use super::*;
+
+    #[test]
+    fn ref_validation_allows_nested_slugs_blocks_traversal() {
+        assert!(valid_view_ref("badminton-top10"));
+        assert!(valid_view_ref("badminton-top10/leader"));
+        assert!(valid_view_ref("a/b/c_2"));
+        assert!(!valid_view_ref(""), "empty");
+        assert!(!valid_view_ref("../etc/passwd"), "dots blocked");
+        assert!(!valid_view_ref("a//b"), "empty segment");
+        assert!(!valid_view_ref("dot.name"), "dot blocked");
+        assert!(!valid_view_ref("/abs"), "leading slash → empty segment");
+        assert!(!valid_view_ref(&"x".repeat(129)), "too long");
+    }
+
+    #[tokio::test]
+    async fn resolve_reads_workspace_source() {
+        let dir = tempfile::tempdir().unwrap();
+        let proj = dir.path().join("workspace").join("deck");
+        tokio::fs::create_dir_all(&proj).await.unwrap();
+        tokio::fs::write(proj.join("leader.jsx"), "export default () => 1").await.unwrap();
+        assert_eq!(
+            resolve_view_ref(dir.path(), "deck/leader").await.unwrap(),
+            "export default () => 1"
+        );
+    }
+
+    #[tokio::test]
+    async fn resolve_rejects_bad_refs() {
+        let dir = tempfile::tempdir().unwrap();
+        assert!(resolve_view_ref(dir.path(), "../secret").await.is_err(), "traversal");
+        assert!(resolve_view_ref(dir.path(), "missing/view").await.is_err(), "no file");
     }
 }

@@ -95,11 +95,11 @@ function devImportMap(): Plugin {
 // ends the utterance. http-proxy streams by default (selfHandleResponse stays
 // false). We disable timeouts so a quiet long-poll is not killed mid-flight.
 const proxy: Record<string, ProxyOptions> = Object.fromEntries(
-  // `/api/*` — the human-interface channels. `/generated/*` — compiled agent
-  // view modules, which the Rust server emits and serves; the browser fetches
-  // them by URL, so dev must reach the backend the same way prod (same-origin
-  // embed) does, or every `show_view` 404s.
-  ["/api", "/generated"].map((path) => [
+  // `/api/*` — the human-interface channels. `/workspace/*` — compiled agent view
+  // modules and images the Rust server serves from disk. The browser fetches these
+  // by URL, so dev must reach the backend the same way prod (same-origin embed)
+  // does, or every `show_view` 404s.
+  ["/api", "/workspace"].map((path) => [
     path,
     {
       target: "http://127.0.0.1:8080",

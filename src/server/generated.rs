@@ -1,10 +1,8 @@
-//! GET /generated/views/<hash>.mjs — serve a compiled agent view module.
-//!
-//! These are the ESM modules [`crate::views::ViewCompiler`] writes under
-//! `data_dir/generated/views/`. Unlike the embedded `/assets/*` bundles, they
-//! are *runtime* artifacts on disk, so they live on the server (where
-//! `AppState.data_dir` is in scope) rather than in the embed-only appearance
-//! router. Content-addressed names make them immutable and safe to cache hard.
+//! `GET /workspace/<path>` — serve a file from the agent's workspace on disk (where
+//! `AppState.data_dir` is in scope, unlike the embed-only appearance router):
+//! compiled view modules ([`crate::views::ViewCompiler`] writes them under
+//! `.cache/views/`), images a build sub-agent downloaded, and anything else it
+//! authored. Single-user and trusted, so served whole, guarded only against `..`.
 
 use std::sync::Arc;
 
@@ -16,85 +14,57 @@ use axum::response::{IntoResponse, Response};
 
 use crate::server::AppState;
 
-/// A compiled view filename is `<lowercase-hex>.mjs` and nothing else. This is
-/// the path-traversal guard: hex + a fixed suffix can encode no `/` or `..`, so
-/// the name can never escape the views directory.
-fn is_valid_module_name(name: &str) -> bool {
-    match name.strip_suffix(".mjs") {
-        Some(stem) => !stem.is_empty() && stem.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f')),
-        None => false,
+/// The only traversal guard for the workspace: reject any empty or `..` segment, so
+/// the joined path can't climb out of the workspace root. Dotfiles like `.cache`
+/// (where compiled modules live) are allowed.
+fn safe_workspace_path(path: &str) -> bool {
+    !path.is_empty() && path.split('/').all(|seg| !seg.is_empty() && seg != "..")
+}
+
+/// Best-effort `Content-Type` by extension for workspace files.
+fn workspace_content_type(path: &str) -> &'static str {
+    match path.rsplit('.').next().unwrap_or("") {
+        "mjs" | "js" => "application/javascript; charset=utf-8",
+        "json" => "application/json; charset=utf-8",
+        "css" => "text/css; charset=utf-8",
+        "png" => "image/png",
+        "jpg" | "jpeg" => "image/jpeg",
+        "gif" => "image/gif",
+        "webp" => "image/webp",
+        "svg" => "image/svg+xml",
+        _ => "text/plain; charset=utf-8",
     }
 }
 
-pub async fn generated_view(
+/// `GET /workspace/<path>` — serve a file from the agent's workspace: a compiled view
+/// module from `.cache/views/`, an image, or any artifact a build sub-agent wrote.
+/// The workspace is single-user and trusted, so it's served whole; the only guard is
+/// against `..` traversal out of the root.
+pub async fn workspace_file(
     State(state): State<Arc<AppState>>,
-    Path(file): Path<String>,
+    Path(path): Path<String>,
 ) -> Response {
-    if !is_valid_module_name(&file) {
+    if !safe_workspace_path(&path) {
         return (StatusCode::NOT_FOUND, "not found\n").into_response();
     }
 
-    let path = state.data_dir.join("generated").join("views").join(&file);
-    let bytes = match tokio::fs::read(&path).await {
-        Ok(bytes) => bytes,
-        Err(_) => return (StatusCode::NOT_FOUND, "not found\n").into_response(),
-    };
-
-    let mut resp = Response::new(Body::from(bytes));
-    resp.headers_mut().insert(
-        CONTENT_TYPE,
-        HeaderValue::from_static("application/javascript; charset=utf-8"),
-    );
-    // Content-addressed by source hash → immutable.
-    resp.headers_mut().insert(
-        CACHE_CONTROL,
-        HeaderValue::from_static("public, max-age=31536000, immutable"),
-    );
-    resp
-}
-
-/// A hosted asset filename is `<lowercase-hex>.<ext>` for a known image type —
-/// the same traversal guard as views (hex + a fixed suffix can encode no `/` or
-/// `..`). Returns the `Content-Type` to serve it with, or `None` to 404.
-fn asset_content_type(name: &str) -> Option<&'static str> {
-    let (stem, ext) = name.rsplit_once('.')?;
-    if stem.is_empty() || !stem.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f')) {
-        return None;
-    }
-    match ext {
-        "png" => Some("image/png"),
-        "jpg" | "jpeg" => Some("image/jpeg"),
-        "gif" => Some("image/gif"),
-        "webp" => Some("image/webp"),
-        "svg" => Some("image/svg+xml"),
-        _ => None,
-    }
-}
-
-/// `GET /generated/assets/<hash>.<ext>` — serve an image [`crate::mcp`] downloaded
-/// and stored under `data_dir/generated/assets/` for an agent view to `<img>`.
-/// Content-addressed names make them immutable and safe to cache hard.
-pub async fn generated_asset(
-    State(state): State<Arc<AppState>>,
-    Path(file): Path<String>,
-) -> Response {
-    let Some(content_type) = asset_content_type(&file) else {
-        return (StatusCode::NOT_FOUND, "not found\n").into_response();
-    };
-
-    let path = state.data_dir.join("generated").join("assets").join(&file);
-    let bytes = match tokio::fs::read(&path).await {
+    let full = state.data_dir.join("workspace").join(&path);
+    let bytes = match tokio::fs::read(&full).await {
         Ok(bytes) => bytes,
         Err(_) => return (StatusCode::NOT_FOUND, "not found\n").into_response(),
     };
 
     let mut resp = Response::new(Body::from(bytes));
     resp.headers_mut()
-        .insert(CONTENT_TYPE, HeaderValue::from_static(content_type));
-    resp.headers_mut().insert(
-        CACHE_CONTROL,
-        HeaderValue::from_static("public, max-age=31536000, immutable"),
-    );
+        .insert(CONTENT_TYPE, HeaderValue::from_static(workspace_content_type(&path)));
+    // Compiled modules under .cache are content-addressed → immutable; source files
+    // change in place, so they must not be cached.
+    let cache = if path.starts_with(".cache/") {
+        "public, max-age=31536000, immutable"
+    } else {
+        "no-store"
+    };
+    resp.headers_mut().insert(CACHE_CONTROL, HeaderValue::from_static(cache));
     resp
 }
 
@@ -103,24 +73,19 @@ mod tests {
     use super::*;
 
     #[test]
-    fn asset_names_validated_and_typed() {
-        assert_eq!(asset_content_type("0a1b2c.png"), Some("image/png"));
-        assert_eq!(asset_content_type("deadbeef.jpg"), Some("image/jpeg"));
-        assert_eq!(asset_content_type("ff.webp"), Some("image/webp"));
-        assert_eq!(asset_content_type("../secret.png"), None, "no traversal");
-        assert_eq!(asset_content_type("a/b.png"), None, "no separators");
-        assert_eq!(asset_content_type("abc.exe"), None, "unknown ext");
-        assert_eq!(asset_content_type("DEADBEEF.png"), None, "uppercase not produced by us");
-        assert_eq!(asset_content_type(".png"), None, "empty stem");
+    fn workspace_path_blocks_traversal_allows_dotcache() {
+        assert!(safe_workspace_path(".cache/views/0a1b.mjs"));
+        assert!(safe_workspace_path("badminton-top10/leader.jsx"));
+        assert!(!safe_workspace_path("../secret"), "no parent traversal");
+        assert!(!safe_workspace_path("a/../b"), "no mid-path traversal");
+        assert!(!safe_workspace_path("a//b"), "no empty segment");
+        assert!(!safe_workspace_path(""), "empty");
     }
 
     #[test]
-    fn rejects_traversal_and_non_module_names() {
-        assert!(is_valid_module_name("0a1b2c3d4e5f6789.mjs"));
-        assert!(!is_valid_module_name("../secret.mjs"), "no parent traversal");
-        assert!(!is_valid_module_name("a/b.mjs"), "no path separators");
-        assert!(!is_valid_module_name("abc.js"), "wrong suffix");
-        assert!(!is_valid_module_name(".mjs"), "empty stem");
-        assert!(!is_valid_module_name("DEADBEEF.mjs"), "uppercase not produced by us");
+    fn workspace_content_types() {
+        assert_eq!(workspace_content_type("x.mjs"), "application/javascript; charset=utf-8");
+        assert_eq!(workspace_content_type("a/b/photo.png"), "image/png");
+        assert_eq!(workspace_content_type("v.jsx"), "text/plain; charset=utf-8");
     }
 }

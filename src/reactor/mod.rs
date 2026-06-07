@@ -42,7 +42,7 @@
 //! mind says.
 
 use std::collections::HashMap;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
@@ -84,49 +84,53 @@ use uuid::Uuid;
 /// follows.
 const RESPONSE_SETTLE: Duration = Duration::from_millis(700);
 
-/// Built-in base soul, embedded at compile time from `default_soul.md`. The
-/// agent's identity — how it speaks, what it values, how it renders surfaces — is
-/// authored here as a tracked asset, so it ships in the binary and updates
-/// transparently with every build. [`load_soul`] always uses this as the base,
-/// layering an optional `<data_dir>/SOUL.md` on top.
-const DEFAULT_SOUL: &str = include_str!("default_soul.md");
+/// Built-in base prompts, embedded at compile time. `core.md` is the *mind's*
+/// system prompt — who it is, how it talks, how it presents (by delegating a build
+/// and showing the result by ref) and delegates. `appearance.md` is the *view
+/// builder's* craft guide — read off disk by a build sub-agent, never loaded into
+/// the mind's context. Both ship in the binary and refresh on every build;
+/// [`install_prompts`] materialises them under `<data_dir>/prompts/`.
+const CORE_BASE: &str = include_str!("core.md");
+const APPEARANCE_BASE: &str = include_str!("appearance.md");
 
 /// Separator that introduces the operator's override layer. Placed after the
 /// bundled base so its instructions take precedence — the model honors the
 /// later, more specific guidance where the two conflict.
 const OVERRIDE_HEADER: &str = "\n\n# Operator overrides\n\nThe operator added the guidance below. It layers on top of everything above; where the two conflict, follow this.\n\n";
 
-/// Load the agent's soul — its identity (voice, values, guardrails, surface
-/// house-style) — used as the system prompt for every scene's persistent reactor
-/// session.
-///
-/// Two layers, composed rather than swapped. The bundled [`DEFAULT_SOUL`] is the
-/// base: compiled into the binary, so every build and deploy carries the current
-/// character automatically with nothing to persist. `<data_dir>/SOUL.md` is an
-/// *optional override layer* — when an admin drops a non-empty file there, its
-/// contents are appended after the base (under [`OVERRIDE_HEADER`]) so later,
-/// more-specific guidance wins. The file holds only the operator's deltas, never
-/// a full copy, so it can neither go stale nor shadow updates to the base — those
-/// always flow through. Read once at startup, so changes take effect on the next
-/// restart.
-pub fn load_soul(data_dir: &Path) -> String {
-    let path = data_dir.join("SOUL.md");
+/// Compose a bundled base prompt with an optional operator override layer. The
+/// base is the embedded current text; `<prompts_dir>/<local_name>` (e.g.
+/// `core.local.md`) holds only the operator's deltas, appended under
+/// [`OVERRIDE_HEADER`] so later, more-specific guidance wins. Missing or empty
+/// override ⇒ the base verbatim, so it can neither go stale nor shadow updates.
+fn compose_prompt(base: &str, prompts_dir: &Path, local_name: &str) -> String {
+    let path = prompts_dir.join(local_name);
     match std::fs::read_to_string(&path) {
-        Ok(text) if !text.trim().is_empty() => {
-            tracing::info!(path = %path.display(), "layering SOUL.md override on top of the bundled base soul");
-            format!("{DEFAULT_SOUL}{OVERRIDE_HEADER}{}", text.trim())
-        }
-        Ok(_) => {
-            tracing::warn!(path = %path.display(), "SOUL.md present but empty; using bundled base soul only");
-            DEFAULT_SOUL.to_string()
-        }
-        // No override file is the common case — use the bundled base silently.
-        Err(err) if err.kind() == std::io::ErrorKind::NotFound => DEFAULT_SOUL.to_string(),
-        Err(err) => {
-            tracing::warn!(path = %path.display(), %err, "could not read SOUL.md override; using bundled base soul only");
-            DEFAULT_SOUL.to_string()
-        }
+        Ok(text) if !text.trim().is_empty() => format!("{base}{OVERRIDE_HEADER}{}", text.trim()),
+        _ => base.to_string(),
     }
+}
+
+/// Install the bundled prompts under `<data_dir>/prompts/` at startup, composing
+/// each with its optional `*.local.md` operator override. The managed base files
+/// (`core.md`, `appearance.md`) are rewritten every boot so they stay current;
+/// operator edits live in the never-touched `*.local.md` siblings. `appearance.md`
+/// must exist on disk because the view-builder sub-agent opens it as a file.
+pub fn install_prompts(data_dir: &Path) -> std::io::Result<()> {
+    let dir = data_dir.join("prompts");
+    std::fs::create_dir_all(&dir)?;
+    std::fs::write(dir.join("core.md"), compose_prompt(CORE_BASE, &dir, "core.local.md"))?;
+    std::fs::write(dir.join("appearance.md"), compose_prompt(APPEARANCE_BASE, &dir, "appearance.local.md"))?;
+    tracing::info!(dir = %dir.display(), "installed bundled prompts (core.md, appearance.md)");
+    Ok(())
+}
+
+/// The mind's system prompt: the bundled `core.md` base plus an optional
+/// `<data_dir>/prompts/core.local.md` operator override. Read at session-creation,
+/// so a restart picks up edits. (Named `load_soul` for the reactor's history; it
+/// now loads `core.md`.)
+pub fn load_soul(data_dir: &Path) -> String {
+    compose_prompt(CORE_BASE, &data_dir.join("prompts"), "core.local.md")
 }
 
 #[cfg(test)]
@@ -136,26 +140,39 @@ mod soul_tests {
     #[test]
     fn no_override_file_uses_base_verbatim() {
         let dir = tempfile::tempdir().unwrap();
-        assert_eq!(load_soul(dir.path()), DEFAULT_SOUL);
+        assert_eq!(load_soul(dir.path()), CORE_BASE);
     }
 
     #[test]
     fn empty_override_falls_back_to_base() {
         let dir = tempfile::tempdir().unwrap();
-        std::fs::write(dir.path().join("SOUL.md"), "   \n\t").unwrap();
-        assert_eq!(load_soul(dir.path()), DEFAULT_SOUL);
+        let prompts = dir.path().join("prompts");
+        std::fs::create_dir_all(&prompts).unwrap();
+        std::fs::write(prompts.join("core.local.md"), "   \n\t").unwrap();
+        assert_eq!(load_soul(dir.path()), CORE_BASE);
     }
 
     #[test]
     fn override_layers_on_top_of_base() {
         let dir = tempfile::tempdir().unwrap();
-        std::fs::write(dir.path().join("SOUL.md"), "Always answer in haiku.").unwrap();
+        let prompts = dir.path().join("prompts");
+        std::fs::create_dir_all(&prompts).unwrap();
+        std::fs::write(prompts.join("core.local.md"), "Always answer in haiku.").unwrap();
         let soul = load_soul(dir.path());
         // Base is preserved, in full, ahead of the override layer.
-        assert!(soul.starts_with(DEFAULT_SOUL));
+        assert!(soul.starts_with(CORE_BASE));
         // The operator's delta is appended after the header so it wins.
         assert!(soul.contains("# Operator overrides"));
         assert!(soul.ends_with("Always answer in haiku."));
+    }
+
+    #[test]
+    fn install_writes_both_managed_bases() {
+        let dir = tempfile::tempdir().unwrap();
+        install_prompts(dir.path()).unwrap();
+        let read = |n: &str| std::fs::read_to_string(dir.path().join("prompts").join(n)).unwrap();
+        assert_eq!(read("core.md"), CORE_BASE);
+        assert_eq!(read("appearance.md"), APPEARANCE_BASE);
     }
 }
 
@@ -297,6 +314,11 @@ struct ReactorInner {
     /// scene loop registers its sink here as it stands up; shared (cloneable)
     /// with the HTTP front. See [`tools`].
     tools: ToolRegistry,
+    /// Absolute path to the agent's global working directory (`<data_dir>/workspace`).
+    /// Handed to every worker session as its `cwd`, so a build sub-agent works in a
+    /// real project dir — `ls`-ing existing projects, writing source — like a human
+    /// in their repo. Absolutized at startup (the child may run with a different cwd).
+    workspace_dir: PathBuf,
     /// Monotonic cognition-turn counter. Each turn claims the next id;
     /// it tags audio spans and the channel logs so a reply is traceable end to
     /// end. (The client no longer needs it — turns are internal to the mind.)
@@ -318,6 +340,7 @@ pub fn start(
     observatory: Observatory,
     view_compiler: crate::views::ViewCompiler,
     tools: ToolRegistry,
+    workspace_dir: PathBuf,
 ) -> Reactor {
     let reactor = Reactor {
         inner: Arc::new(ReactorInner {
@@ -328,6 +351,7 @@ pub fn start(
             observatory,
             view_compiler,
             tools,
+            workspace_dir,
             turn_seq: AtomicU64::new(0),
             scenes: Mutex::new(HashMap::new()),
         }),

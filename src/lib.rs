@@ -38,6 +38,35 @@ pub async fn run(config: Config) -> anyhow::Result<()> {
     let memory = memory::Memory::open(&config.data_dir).await?;
     tracing::info!(data_dir = %config.data_dir.display(), "memory opened");
 
+    // Materialise the bundled prompts under <data_dir>/prompts/ so the mind's
+    // system prompt (core.md) and the view-builder's craft guide (appearance.md,
+    // opened as a file by build sub-agents) are on disk, composed with any
+    // `*.local.md` operator overrides. Absolutize the dir: it rides to the child as
+    // HI_AGENT_PROMPTS_DIR, and the child may run with a different cwd than us.
+    reactor::install_prompts(&config.data_dir).context("installing bundled prompts")?;
+    let prompts_dir = {
+        let d = config.data_dir.join("prompts");
+        if d.is_absolute() {
+            d
+        } else {
+            std::env::current_dir().context("resolving cwd to absolutize prompts dir")?.join(d)
+        }
+    };
+
+    // The agent's global workspace — a human-style project library. It's every
+    // worker's cwd (so a build sub-agent works in a real project dir) and where it
+    // writes view source (`<project>/<name>.jsx`). Absolutized as above; also the
+    // root the server serves at `/workspace/*` (compiled modules land in `.cache`).
+    let workspace_dir = {
+        let d = config.data_dir.join("workspace");
+        if d.is_absolute() {
+            d
+        } else {
+            std::env::current_dir().context("resolving cwd to absolutize workspace dir")?.join(d)
+        }
+    };
+    std::fs::create_dir_all(&workspace_dir).context("creating workspace dir")?;
+
     // Structured visibility into the ACP session lifecycle. The agent layer,
     // reactor, workers and heartbeat feed it; `GET /api/sessions` reads the live
     // mirror and `GET /api/sessions/events` streams the history over SSE.
@@ -106,13 +135,16 @@ pub async fn run(config: Config) -> anyhow::Result<()> {
     // Spawn config for the agent session layer. The subprocess itself is spawned
     // lazily, one per scene, on that scene's first session (Chrome-style isolation);
     // the pinned runtime, managed env, and local LLM proxy are shared by all.
-    let child_env = config.agent.child_env(
+    let mut child_env = config.agent.child_env(
         proxy.port(),
         config.port,
         &claude_config_dir,
         runtime.node_bin_dir(),
         &runtime.claude_bin,
     );
+    // The view-builder sub-agent opens <prompts>/appearance.md as a file; hand it
+    // the absolute dir the same way workers already get HI_AGENT_BASE_URL.
+    child_env.push(("HI_AGENT_PROMPTS_DIR".to_string(), prompts_dir.display().to_string()));
     // Diagnostic: surface exactly what differs between launchers (terminal vs.
     // cmux etc.) — cwd, the resolved runtime binaries, the config dir claude
     // will read, and the placeholder key's fingerprint vs. what we seeded.
@@ -162,8 +194,8 @@ pub async fn run(config: Config) -> anyhow::Result<()> {
     let _proxy = proxy;
 
     let soul = reactor::load_soul(&config.data_dir);
-    // The reactor compiles `[[view]]` source to ESM via esbuild; modules land
-    // under data_dir/generated/views. esbuild is hi-agent's own tool (not the
+    // The reactor compiles view source to ESM via esbuild; modules land under
+    // data_dir/workspace/.cache/views. esbuild is hi-agent's own tool (not the
     // adapter's) — `ensure_view_esbuild` guarantees one whether the runtime came
     // from PATH or the managed install, so views aren't silently broken in dev.
     let esbuild_bin = runtime::ensure_view_esbuild(&runtime)
@@ -180,6 +212,7 @@ pub async fn run(config: Config) -> anyhow::Result<()> {
         observatory,
         view_compiler,
         tool_registry,
+        workspace_dir,
     );
     tracing::info!("reactor started");
 
