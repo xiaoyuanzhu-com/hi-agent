@@ -42,7 +42,6 @@ export interface TurnView {
 
 export interface SceneView {
   scene: string;
-  process_spawned_at: string | null;
   reactor_session: SessionView | null;
   workers: WorkerView[];
   budget_chars: number;
@@ -118,6 +117,7 @@ export type AcpDir = "send" | "recv" | "stderr";
 export interface RawFrame {
   seq: number;
   ts: string;
+  conn: number;
   scene: string;
   dir: AcpDir;
   session_id: string | null;

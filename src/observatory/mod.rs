@@ -1,14 +1,14 @@
 //! Observatory — structured visibility into the ACP session lifecycle.
 //!
-//! ACP sessions are otherwise invisible: a scene's subprocess, its persistent
-//! reactor session, ephemeral worker sessions, in-flight prompts, heartbeat
-//! hot-swaps and self-alarms all live only as scattered `tracing`
+//! ACP sessions are otherwise invisible: a scene's persistent reactor session,
+//! ephemeral worker sessions (each on its own subprocess), in-flight prompts,
+//! heartbeat hot-swaps and self-alarms all live only as scattered `tracing`
 //! lines. The observatory is an additive, cloneable handle (like [`Memory`] or
-//! [`TextBus`]) that the agent layer, reactor, workers and heartbeat feed as
+//! [`TextBus`]) that the reactor, workers and heartbeat feed as
 //! those things happen. It keeps two things:
 //!
-//! - a **live mirror** — the current state per scene (process, reactor session,
-//!   workers, context budget, pending alarms, last turn), for `GET /api/sessions`;
+//! - a **live mirror** — the current state per scene (reactor session, workers,
+//!   context budget, pending alarms, last turn), for `GET /api/sessions`;
 //! - an **event history** — a bounded ring of lifecycle [`SessionEvent`]s plus a
 //!   live `broadcast`, streamed verbatim over SSE on `GET /api/sessions/events`,
 //!   and best-effort appended to `<data_dir>/sessions.jsonl` for durable replay.
@@ -103,7 +103,6 @@ pub struct TurnView {
 #[derive(Debug, Clone, Serialize)]
 pub struct SceneView {
     pub scene: Scene,
-    pub process_spawned_at: Option<DateTime<Utc>>,
     pub reactor_session: Option<SessionView>,
     pub workers: Vec<WorkerView>,
     /// Accumulated prompt+reply chars since the live session was last opened/swapped.
@@ -121,7 +120,6 @@ impl SceneView {
     fn new(scene: Scene, swap_after_chars: usize) -> Self {
         Self {
             scene,
-            process_spawned_at: None,
             reactor_session: None,
             workers: Vec::new(),
             budget_chars: 0,
@@ -151,8 +149,6 @@ pub struct SessionEvent {
 #[derive(Debug, Clone, Serialize)]
 #[serde(tag = "event", rename_all = "snake_case")]
 pub enum EventKind {
-    ProcessSpawned,
-    ProcessRestarted,
     SessionOpened { kind: SessionKind, id: String },
     SessionClosed { kind: SessionKind, id: String },
     /// `input` is the human-readable incoming message(s) for this turn — the new
@@ -284,15 +280,6 @@ impl Observatory {
             .or_insert_with(|| SceneView::new(scene.clone(), self.inner.swap_after_chars));
 
         match kind {
-            EventKind::ProcessSpawned => {
-                view.process_spawned_at = Some(now);
-            }
-            EventKind::ProcessRestarted => {
-                // The old process and everything on it is gone; reset the scene
-                // to a clean slate, the next session re-populates it.
-                let scene_id = view.scene.clone();
-                *view = SceneView::new(scene_id, self.inner.swap_after_chars);
-            }
             EventKind::SessionOpened { kind, id } => match kind {
                 SessionKind::Reactor => {
                     view.reactor_session = Some(SessionView {
@@ -461,10 +448,9 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn mirrors_process_and_reactor_session() {
+    async fn mirrors_reactor_session_and_turn() {
         let obs = Observatory::new(None, 48_000);
         let s = scene();
-        obs.record(&s, EventKind::ProcessSpawned).await;
         obs.record(
             &s,
             EventKind::SessionOpened { kind: SessionKind::Reactor, id: "sess-1".into() },
@@ -475,7 +461,6 @@ mod tests {
         let snap = obs.snapshot().await;
         assert_eq!(snap.len(), 1);
         let v = &snap[0];
-        assert!(v.process_spawned_at.is_some());
         let rs = v.reactor_session.as_ref().unwrap();
         assert_eq!(rs.id, "sess-1");
         assert!(rs.in_flight, "turn in flight");
@@ -542,12 +527,20 @@ mod tests {
     async fn subscribe_replays_then_streams_live_without_dup() {
         let obs = Observatory::new(None, 48_000);
         let s = scene();
-        obs.record(&s, EventKind::ProcessSpawned).await;
+        obs.record(
+            &s,
+            EventKind::SessionOpened { kind: SessionKind::Reactor, id: "sess-1".into() },
+        )
+        .await;
         let (replay, mut rx) = obs.subscribe().await;
         assert_eq!(replay.len(), 1);
         assert_eq!(replay[0].seq, 1);
 
-        obs.record(&s, EventKind::ProcessRestarted).await;
+        obs.record(
+            &s,
+            EventKind::SessionClosed { kind: SessionKind::Reactor, id: "sess-1".into() },
+        )
+        .await;
         let live = rx.recv().await.unwrap();
         assert_eq!(live.seq, 2, "live event follows replay with no gap or dup");
     }

@@ -153,11 +153,10 @@ pub async fn run(config: Config) -> anyhow::Result<()> {
             args: vec![adapter_entry],
             env: child_env,
         },
-        observatory.clone(),
         acp_tap,
         format!("http://127.0.0.1:{}", config.port),
     );
-    tracing::info!("agent session layer ready (per-scene processes spawn on first contact)");
+    tracing::info!("agent session layer ready (one subprocess spawns per session)");
 
     // Keep the proxy alive for the life of the process.
     let _proxy = proxy;

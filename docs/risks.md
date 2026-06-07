@@ -9,28 +9,16 @@ first build.
 
 ## Concurrent ACP sessions
 
-**Status:** unverified.
+**Status:** retired by the per-session process model (2026-06-07).
 
-The architecture assumes one `claude-code` subprocess hosts N concurrent ACP
-sessions: one ephemeral router per active scene and one long-lived session per
-worker, all multiplexed over the same stdio pair. The
-`agent-client-protocol` 0.12 crate documents this support and `src/acp/`
-opens sessions independently, but `claude-code`'s behavior under sustained
-concurrent prompts is not observed.
-
-**Verify with:** drive concurrent load through the running agent — POST
-thoughts from three distinct scenes (`X-HI-Scene: a@x`, `b@x`, `c@x`) at the
-same instant and compare wall-clock. If total latency is roughly
-max-of-three (not sum-of-three), concurrency works. If it's sum-of-three,
-claude-code is serializing — see the fallback. (An earlier standalone
-`acp_spike` probe did this against `src/acp/` directly; it was removed once
-the per-scene reactor made the same check reachable through the live routes.)
-
-**Fallback if no concurrency:** wrap routing-session creation in a
-`tokio::sync::Semaphore` with permits = 1 (or small N). Workers can keep
-their own permit pool. The reactor's dispatch model already serializes one
-turn per scene; adding a global cap is a localized change in `reactor.rs`
-(wrap the `AcpSession::new_prompt(...)` call in `acquire().await`).
+The original architecture multiplexed N concurrent ACP sessions over one
+`claude-code` subprocess (shared stdio), and it was unverified whether
+`claude-code` ran concurrent prompts in parallel or serialized them. That
+question is moot now: each session runs in **its own subprocess**
+(`architecture.md` §6), so cross-session concurrency comes from the OS, not the
+adapter. The per-scene reactor loop still serializes one turn per scene — that is
+a reactor policy, not a subprocess limit. The cost this introduces — a subprocess
+spawn per session — is tracked under "MCP attachment" below.
 
 ## MCP attachment per ephemeral session
 
@@ -50,8 +38,11 @@ The deployed adapter (`@agentclientprotocol/claude-agent-acp` 0.36.1) advertises
 headers to the SDK, so HTTP works; the stdio shim is the fallback only if a
 future adapter drops http support.
 
-**Still to measure:** per-session attach cost (each session's initialize +
-tools/list round-trip) under many concurrent scenes — not yet load-tested.
+**Still to measure (now the live cost):** with one subprocess per session, each
+session pays a full process spawn + ACP `initialize` + MCP `tools/list`
+round-trip — every delegated worker and every heartbeat hot-swap, not just the
+reactor session. Not yet load-tested; this is the main thing to watch when many
+sessions are live at once.
 
 ## Journal-as-context coherence
 

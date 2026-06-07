@@ -6,7 +6,7 @@ Build a reference implementation of the [human-interface](../../human-interface/
 
 The guiding test for every decision is **fidelity to the human metaphor**, not simplicity at the HTTP or implementation level. Where a choice diverges from how a person would do it, that divergence is named and justified.
 
-This document is the **durable design contract** — the architecture as it is meant to be, not the path there. Migration steps live in `impl.md` (disposable).
+This document is the **durable design contract** — the architecture as it is meant to be.
 
 ## Design decisions
 
@@ -18,7 +18,7 @@ The critical decisions, each with its reasoning, in roughly descending importanc
 | **Channels live in the reactor, not in cognition** | An ACP session is a single text duplex with no channel concept; the reactor is what gives it multi-channel reach |
 | **Transport lives in the owner, not the reactor** | Keep the mind aligned to the continuous human model; HTTP is just one batch transport, swappable for WebSocket or local audio |
 | **One persistent reactor session per scene, hot-swapped** | A warm, continuous mind rather than a cold per-turn rebuild; the journal is the durable backstop that makes persistence safe |
-| **One subprocess per scene** (Chrome-style isolation) | Contain blast radius to a single scene; keep intra-scene session spawn cheap |
+| **One subprocess per session** (session-level isolation) | Contain blast radius to a single session; no `session_id` demux. Cost: a fresh spawn + ACP `initialize` per session |
 | **Working sessions are capability peers, but channel-mute** | Single-voice coherence — many sub-minds may think, but one mouth speaks |
 | **Fix-forward, no real cancel** | More human than a hard cancel; fits ACP's one-in-flight-prompt-per-session constraint |
 | **Emission via natural language; action/perception via tools** | "Think, then organize words"; humans don't speak JSON, but do take deliberate, answerable actions |
@@ -69,10 +69,10 @@ Five layers, each with a single responsibility and a clean contract to the layer
  │   │ Working sessions — ephemeral, channel-mute   │    │  deliberate, use tools
  │   └─────────────────────────────────────────────┘    │
  └──────┬───────────────────────────────────────────────┘
-        ▲ │   independent session handles (no demux at this boundary)
+        ▲ │   independent session handles (one subprocess each)
  ┌──────┴───────────────────────────────────────────────┐
- │ Agent session layer                                   │  one subprocess per scene
- │   per-scene process pool; hides session_id demux      │  (Chrome-style isolation)
+ │ Agent session layer                                   │  one subprocess per session
+ │   spawns a process per session; no session_id demux   │  (session-level isolation)
  └──────┬───────────────────────────────────────────────┘
         ▲ │   ACP JSON-RPC over stdio
  ┌──────┴───────────────────────────────────────────────┐
@@ -86,8 +86,8 @@ Each boundary is a clean contract:
 |---|---|---|
 | participant ⇄ adapter | a concrete wire protocol (HTTP today) | everything above |
 | adapter ⇄ reactor | **continuous channel signals**, human-model vocabulary | transport, framing, mime, long-poll |
-| reactor ⇄ session layer | **independent session handles** (prompt / read updates / drop) | subprocesses, the routing table, `session_id` demux |
-| session layer ⇄ subprocess | ACP JSON-RPC | process pooling, per-scene isolation |
+| reactor ⇄ session layer | **independent session handles** (prompt / read updates / drop) | the subprocess each handle owns, ACP `initialize` |
+| session layer ⇄ subprocess | ACP JSON-RPC | per-session spawn, isolation |
 
 The two rules that place responsibility:
 
@@ -181,18 +181,18 @@ There is no true interruption or cancel. New input — including a correction or
 
 ## 6. The agent session layer and the process model
 
-The reactor never sees subprocesses or the routing table. It talks to an **agent session layer** that exposes each ACP session as an **independent handle** — prompt it, read its updates, drop it to close. The `session_id` demux that lets many logical sessions share one stdio pipe is an internal detail of this layer.
+The reactor never sees subprocesses. It talks to an **agent session layer** that exposes each ACP session as an **independent handle** — prompt it, read its updates, drop it to close. Each handle owns one subprocess; dropping the handle tears that process down.
 
-**Pool granularity: one subprocess per scene** (Chrome-style site-isolation, where the *scene* is the isolation unit). All of a scene's sessions — its persistent reactor session and its ephemeral working sessions — multiplex inside that scene's single subprocess. Different scenes get different subprocesses.
+**Granularity: one subprocess per session.** Every session — a scene's persistent reactor session, each ephemeral working session, the throwaway summarizer a hot-swap briefs from — runs in its own subprocess. There is no `session_id` demux: a connection hosts exactly one session, so its notifications flow straight to that handle's stream.
 
 Consequences, all deliberate:
 
-- **Cross-scene isolation.** One scene's crash or OOM cannot touch another.
-- **Within-scene shared fate (accepted).** A worker OOM can take that scene's brain down — recovered by killing and cold-restarting the scene's process and rebuilding the reactor session from the journal. A recoverable hiccup, not data loss.
-- **Intra-scene cancel is cooperative.** You cannot `kill -9` one worker without killing the brain it shares a process with — which is consistent with fix-forward/no-cancel (§5). Hard-cancel exists only at scene granularity (restart the scene's process).
-- The process is spawned lazily on a scene's first session and kept warm; intra-scene session creation is cheap. Process count is bounded by scene count; multi-tenant scale would later add idle/LRU eviction or a bounded pool.
+- **Session-level isolation.** One session's crash or OOM cannot touch another — not a sibling worker, and not the scene's reactor brain. (A scene used to be the isolation unit, with within-scene shared fate accepted; per-session isolation is strictly finer.)
+- **Hard cancel is available.** A session can be force-killed by dropping its handle — its process exits, independent of every other. We still default to fix-forward/no-cancel (§5); the capability simply exists where it didn't.
+- **Cost: a spawn per session.** Each session pays a subprocess spawn + ACP `initialize` + MCP `tools/list` round-trip, where pooled intra-scene `session/new` used to be near-free. That spawn cost is the live risk to watch (`risks.md`); the simpler wire and finer isolation are the accepted return.
+- **The scene stays a *logical* grouping**, not a process boundary: the reactor's per-scene queue, memory slice, and the `X-HI-Scene` tag on each session's MCP attach are unchanged.
 
-ACP permits both one-connection-many-sessions and one-process-per-session; this layer chooses per-scene pooling and keeps the choice swappable behind the handle interface.
+ACP permits both one-connection-many-sessions and one-process-per-session; this layer chooses one process per session, keeping the handle interface unchanged so the choice stays swappable.
 
 ---
 
@@ -241,8 +241,8 @@ Other load-bearing terms:
 - **reactor session** — the persistent per-scene brain.
 - **working session** — an ephemeral, channel-mute, delegated cognition unit.
 - **transport adapter** (a.k.a. the reactor *owner* / host) — binds continuous channel signals to a concrete wire.
-- **agent session layer** — the per-scene process pool exposing independent session handles.
-- **scene** — the situation a signal belongs to (with a person, a group, or alone); the context-isolation unit. One reactor session and one subprocess per scene. Participants — the humans or devices in a scene — are soft, inferred from content, not a structural key.
+- **agent session layer** — spawns one subprocess per session, exposing independent session handles.
+- **scene** — the situation a signal belongs to (with a person, a group, or alone); the context-isolation unit. One reactor session and one memory slice per scene; each session runs in its own subprocess. Participants — the humans or devices in a scene — are soft, inferred from content, not a structural key.
 
 ---
 

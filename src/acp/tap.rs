@@ -1,13 +1,14 @@
 //! Raw ACP wire tap — a business-logic-agnostic mirror of the JSON-RPC frames
-//! flowing between hi-agent and every scene's ACP subprocess.
+//! flowing between hi-agent and every session's ACP subprocess.
 //!
 //! The [`Observatory`](crate::observatory::Observatory) renders the *reactor's*
 //! view of a session (turns, context budget, hot-swaps, alarms). This is the
 //! opposite: the rawest possible window, knowing nothing about the reactor. It
 //! taps the one place every frame transits — the `with_debug` hook on the ACP
 //! connection (see [`crate::acp::process`]) — and records each line verbatim,
-//! tagged only with the scene, direction, and whatever `sessionId`/`method`/`id`
-//! can be parsed out of the JSON for grouping.
+//! tagged with a per-connection id (one subprocess hosts one session, so this
+//! groups a session's frames together), the scene, the direction, and whatever
+//! `sessionId`/`method`/`id` can be parsed out of the JSON.
 //!
 //! It mirrors the observatory's ring+broadcast shape so the SSE handler reads it
 //! the same way (replay-then-live), but its [`record`](AcpTap::record) is
@@ -48,11 +49,15 @@ pub struct RawFrame {
     /// Monotonic, gap-free sequence number assigned at record time.
     pub seq: u64,
     pub ts: DateTime<Utc>,
+    /// Which subprocess/connection emitted this. One subprocess hosts exactly one
+    /// session, so the inspector groups a session's frames by this — including the
+    /// `initialize`/`session/new` frames that precede (and so carry no) `sessionId`.
+    pub conn: u64,
     pub scene: String,
     pub dir: Dir,
-    /// `sessionId` parsed from `params`/`result`, when present. Frames without
-    /// one (the `initialize` handshake, the `session/new` request) carry `None`;
-    /// the inspector groups those under a per-scene handshake bucket.
+    /// `sessionId` parsed from `params`/`result`, when present. The `initialize`
+    /// handshake and the `session/new` request carry `None` (the id doesn't exist
+    /// yet); they still group with the session via `conn`.
     pub session_id: Option<String>,
     /// The JSON-RPC `method`, for requests and notifications.
     pub method: Option<String>,
@@ -92,8 +97,9 @@ impl AcpTap {
     /// Record one raw line. Synchronous and non-blocking: assigns a seq, pushes
     /// to the bounded ring, and broadcasts. Safe to call from the `with_debug`
     /// hook (no await, no IO under the lock). A poisoned lock is ignored — the
-    /// tap is a convenience, never load-bearing.
-    pub fn record(&self, scene: &str, dir: Dir, line: &str) {
+    /// tap is a convenience, never load-bearing. `conn` identifies the emitting
+    /// subprocess so the inspector can group one session's frames together.
+    pub fn record(&self, conn: u64, scene: &str, dir: Dir, line: &str) {
         let (session_id, method, id) = parse_meta(line);
         let mut state = match self.inner.state.lock() {
             Ok(g) => g,
@@ -103,6 +109,7 @@ impl AcpTap {
         let frame = RawFrame {
             seq: state.seq,
             ts: Utc::now(),
+            conn,
             scene: scene.to_string(),
             dir,
             session_id,
@@ -190,13 +197,14 @@ mod tests {
     #[tokio::test]
     async fn subscribe_replays_then_streams_live() {
         let tap = AcpTap::new();
-        tap.record("alice@phone", Dir::Send, r#"{"method":"initialize","id":0}"#);
+        tap.record(0, "alice@phone", Dir::Send, r#"{"method":"initialize","id":0}"#);
         let (replay, mut rx) = tap.subscribe();
         assert_eq!(replay.len(), 1);
         assert_eq!(replay[0].seq, 1);
+        assert_eq!(replay[0].conn, 0);
         assert_eq!(replay[0].dir, Dir::Send);
 
-        tap.record("alice@phone", Dir::Recv, r#"{"id":0,"result":{}}"#);
+        tap.record(0, "alice@phone", Dir::Recv, r#"{"id":0,"result":{}}"#);
         let live = rx.recv().await.unwrap();
         assert_eq!(live.seq, 2, "live frame follows replay with no gap or dup");
         assert_eq!(live.dir, Dir::Recv);

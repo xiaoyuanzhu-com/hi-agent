@@ -110,28 +110,31 @@ function frameLabel(f: RawFrame): string {
   return "—";
 }
 
-// One group of frames the inspector renders as a "session": either a real ACP
-// session (keyed by sessionId) or a per-scene handshake bucket holding the
-// frames that carry no sessionId (`initialize`, the `session/new` request).
+// One group of frames the inspector renders as a "session": all the frames of a
+// single subprocess connection. One subprocess hosts one session, so a group's
+// `initialize`/`session/new` frames (which precede, and so lack, a sessionId)
+// belong to the same session as the rest — there is no separate handshake bucket.
 interface Group {
   key: string; // URL key + dedup key
+  conn: number;
   scene: string;
-  sessionId: string | null; // null → handshake bucket
+  sessionId: string | null; // adopted from the session/new response; null until then
   frames: RawFrame[];
 }
 
-// Fold the flat frame stream into per-session groups, preserving first-seen
-// order. A frame with a sessionId joins that session; one without joins its
-// scene's handshake bucket. Knows nothing about the reactor — pure ACP.
+// Fold the flat frame stream into per-connection groups, preserving first-seen
+// order. Every frame of one subprocess shares its `conn`, so the handshake frames
+// group with their session; the sessionId is adopted as soon as a frame reveals
+// it. Knows nothing about the reactor — pure ACP.
 function group(frames: RawFrame[]): Group[] {
-  const map = new Map<string, Group>();
+  const map = new Map<number, Group>();
   for (const f of frames) {
-    const key = f.session_id ? `s::${f.session_id}` : `h::${f.scene}`;
-    let g = map.get(key);
+    let g = map.get(f.conn);
     if (!g) {
-      g = { key, scene: f.scene, sessionId: f.session_id, frames: [] };
-      map.set(key, g);
+      g = { key: `c::${f.conn}`, conn: f.conn, scene: f.scene, sessionId: f.session_id, frames: [] };
+      map.set(f.conn, g);
     }
+    if (!g.sessionId && f.session_id) g.sessionId = f.session_id;
     g.frames.push(f);
   }
   return [...map.values()];
@@ -177,8 +180,8 @@ export function SessionsView() {
                 className={g.key === selected ? "sel" : ""}
                 onClick={() => navigate(`${BASE}/${encodeURIComponent(g.key)}`)}
               >
-                <span className={`skind ${g.sessionId ? "reactor" : "worker"}`}>{g.sessionId ? "id" : "hs"}</span>
-                <span className="nm">{g.sessionId ? g.sessionId.slice(0, 20) : "handshake"}</span>
+                <span className={`skind ${g.sessionId ? "reactor" : "worker"}`}>{g.sessionId ? "id" : "··"}</span>
+                <span className="nm">{g.sessionId ? g.sessionId.slice(0, 20) : "opening…"}</span>
                 <span className="badges">
                   <span className="mini">{g.scene}</span>
                   <span className="mini">{g.frames.length}</span>
@@ -204,7 +207,7 @@ function FrameLog({ group: g }: { group: Group }) {
   return (
     <div className="detail-head">
       <div className="dh-title">
-        <b>{g.sessionId ? "session" : "handshake"}</b>
+        <b>{g.sessionId ? "session" : "opening…"}</b>
         <span className="muted">
           {g.scene}
           {g.sessionId ? <> · <code>{g.sessionId}</code></> : null} · {g.frames.length} frames

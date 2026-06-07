@@ -11,16 +11,18 @@ use anyhow::anyhow;
 use tokio::sync::{Mutex, mpsc};
 use tokio::task::JoinHandle;
 
-use crate::acp::process::RoutingTable;
+use crate::acp::process::AcpProcess;
 
-/// A single ACP session bound to an [`AcpProcess`].
+/// A single ACP session, owning the [`AcpProcess`] that hosts it.
 ///
-/// Cloneable in spirit only through the shared connection — the receiver and
-/// session-side state are owned. Drop closes the session.
+/// Dropping the session drops the process, which signals shutdown and tears the
+/// child down — the per-session teardown path. There is at most one in-flight
+/// prompt per session.
 pub struct AcpSession {
     id: SessionId,
-    connection: acp::ConnectionTo<acp::Agent>,
-    routing: RoutingTable,
+    /// The child process this session runs on. Owned exclusively, so dropping
+    /// the session closes the process; prompts are driven on its connection.
+    process: AcpProcess,
     /// Wrapped in `Arc<Mutex<...>>` so [`SessionRun`] can grab the receiver
     /// for the duration of a prompt without re-creating the channel on every
     /// call. There is at most one in-flight prompt per session.
@@ -219,15 +221,13 @@ impl SessionRun {
 impl AcpSession {
     pub(crate) fn new(
         id: SessionId,
-        connection: acp::ConnectionTo<acp::Agent>,
-        routing: RoutingTable,
+        process: AcpProcess,
         rx: mpsc::UnboundedReceiver<SessionUpdate>,
         system_prompt: Option<String>,
     ) -> Self {
         Self {
             id,
-            connection,
-            routing,
+            process,
             rx: Arc::new(Mutex::new(Some(rx))),
             pending_system_prompt: Arc::new(Mutex::new(system_prompt)),
         }
@@ -255,7 +255,7 @@ impl AcpSession {
         blocks.push(ContentBlock::Text(TextContent::new(text)));
 
         let req = PromptRequest::new(self.id.clone(), blocks);
-        let connection = self.connection.clone();
+        let connection = self.process.connection().clone();
         let pending: JoinHandle<anyhow::Result<PromptResponse>> = tokio::spawn(async move {
             connection
                 .send_request(req)
@@ -276,37 +276,10 @@ impl AcpSession {
     /// Send `session/cancel`. The in-flight prompt will resolve with
     /// `StopReason::Cancelled` per ACP.
     pub async fn cancel(&self) -> anyhow::Result<()> {
-        self.connection
+        self.process
+            .connection()
             .send_notification(CancelNotification::new(self.id.clone()))
             .map_err(|e| anyhow!("session/cancel failed: {e}"))?;
         Ok(())
-    }
-
-    /// Tear down the session. ACP v1 has no explicit `session/close` request;
-    /// closing is implicit on receiver drop, but we remove our routing entry
-    /// so the next session/update for this id is logged-and-dropped.
-    pub async fn close(self) -> anyhow::Result<()> {
-        let mut table = self.routing.lock().await;
-        table.remove(&self.id);
-        tracing::info!(session_id = %self.id.0, "ACP session closed");
-        Ok(())
-    }
-}
-
-impl Drop for AcpSession {
-    fn drop(&mut self) {
-        // Best-effort cleanup of the routing entry so the global table does
-        // not grow unbounded. We can't await here; spawn a task with cloned
-        // state. Skip silently if there's no runtime — that means the
-        // process is tearing down anyway.
-        if tokio::runtime::Handle::try_current().is_err() {
-            return;
-        }
-        let routing = self.routing.clone();
-        let id = self.id.clone();
-        tokio::spawn(async move {
-            let mut table = routing.lock().await;
-            table.remove(&id);
-        });
     }
 }

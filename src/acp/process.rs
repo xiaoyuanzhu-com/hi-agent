@@ -1,8 +1,11 @@
 //! ACP subprocess lifecycle.
 //!
-//! Owns one child process (e.g. `claude-agent-acp`) and the long-lived
-//! JSON-RPC connection to it. Hands out [`AcpSession`] handles for higher
-//! layers to drive prompts on.
+//! Owns one child process (e.g. `claude-agent-acp`) and the long-lived JSON-RPC
+//! connection to it, hosting exactly **one** ACP session. [`spawn`](AcpProcess::spawn)
+//! returns the process plus the single stream of [`SessionUpdate`]s, and
+//! [`open_session`](AcpProcess::open_session) opens that one session. There is no
+//! `session_id` demux — every notification on the connection belongs to the one
+//! session, so updates flow straight to that stream.
 //!
 //! `session/request_permission` is auto-allowed: without an explicit user
 //! gate (we removed the `/approval` bridge), the agent's native tools would
@@ -11,9 +14,8 @@
 //! responds immediately. If the agent ever needs a human gate, re-wire a
 //! bridge here.
 
-use std::collections::HashMap;
 use std::path::PathBuf;
-use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use agent_client_protocol as acp;
 use acp::schema::{
@@ -22,11 +24,15 @@ use acp::schema::{
     SessionNotification,
 };
 use anyhow::{Context, anyhow};
-use tokio::sync::{Mutex, mpsc, oneshot};
+use tokio::sync::{mpsc, oneshot};
 use tokio::task::JoinHandle;
 
-use crate::acp::session::{AcpSession, SessionUpdate};
+use crate::acp::session::SessionUpdate;
 use crate::acp::tap::{AcpTap, Dir};
+
+/// Allocates the per-connection id the tap uses to group one session's frames
+/// (one subprocess hosts one session). Process-global and monotonic.
+static CONN_SEQ: AtomicU64 = AtomicU64::new(0);
 
 /// Options for opening a new ACP session.
 #[derive(Debug, Default, Clone)]
@@ -41,14 +47,9 @@ pub struct SessionOpts {
     pub cwd: Option<PathBuf>,
 }
 
-/// Shared routing table: per-session sender of [`SessionUpdate`]s.
-pub(crate) type RoutingTable =
-    Arc<Mutex<HashMap<SessionId, mpsc::UnboundedSender<SessionUpdate>>>>;
-
-/// One child-process-hosted ACP connection.
+/// One child-process-hosted ACP connection, hosting a single session.
 pub struct AcpProcess {
     connection: acp::ConnectionTo<acp::Agent>,
-    routing: RoutingTable,
     shutdown_tx: Option<oneshot::Sender<()>>,
     driver: Option<JoinHandle<anyhow::Result<()>>>,
 }
@@ -60,7 +61,7 @@ impl AcpProcess {
         env: Vec<(String, String)>,
         tap: AcpTap,
         scene: String,
-    ) -> anyhow::Result<Self> {
+    ) -> anyhow::Result<(Self, mpsc::UnboundedReceiver<SessionUpdate>)> {
         let program_str = program
             .to_str()
             .ok_or_else(|| anyhow!("program path is not valid UTF-8: {}", program.display()))?
@@ -70,10 +71,15 @@ impl AcpProcess {
         let agent = acp::AcpAgent::from_args(argv.iter())
             .with_context(|| format!("constructing AcpAgent for {}", program.display()))?;
 
+        // One id per subprocess (= per session), so the tap can group this
+        // connection's frames — including its pre-`sessionId` handshake.
+        let conn = CONN_SEQ.fetch_add(1, Ordering::Relaxed);
+
         let agent = agent.with_debug(move |line: &str, direction: acp::LineDirection| {
             // Mirror every frame to the raw ACP tap (the inspector's window),
-            // tagged with this scene, before the existing tracing.
+            // tagged with this connection + scene, before the existing tracing.
             tap.record(
+                conn,
                 &scene,
                 match direction {
                     acp::LineDirection::Stdin => Dir::Send,
@@ -100,8 +106,11 @@ impl AcpProcess {
             }
         });
 
-        let routing: RoutingTable = Arc::new(Mutex::new(HashMap::new()));
-        let routing_for_handler = routing.clone();
+        // The single session's update stream. Created before the connection
+        // handler is wired so it can forward into it; notifications only arrive
+        // after `open_session` + a prompt, so the early channel sees nothing yet.
+        let (update_tx, update_rx) = mpsc::unbounded_channel::<SessionUpdate>();
+        let update_tx_for_handler = update_tx.clone();
         let (conn_tx, conn_rx) = oneshot::channel::<acp::ConnectionTo<acp::Agent>>();
         let (shutdown_tx, shutdown_rx) = oneshot::channel::<()>();
 
@@ -111,9 +120,9 @@ impl AcpProcess {
                 .on_receive_notification(
                     move |notification: SessionNotification,
                           _cx: acp::ConnectionTo<acp::Agent>| {
-                        let routing = routing_for_handler.clone();
+                        let tx = update_tx_for_handler.clone();
                         async move {
-                            dispatch_session_update(routing, notification).await;
+                            dispatch_session_update(&tx, notification);
                             Ok(())
                         }
                     },
@@ -170,19 +179,25 @@ impl AcpProcess {
             }
         };
 
-        Ok(Self {
-            connection,
-            routing,
-            shutdown_tx: Some(shutdown_tx),
-            driver: Some(driver),
-        })
+        Ok((
+            Self {
+                connection,
+                shutdown_tx: Some(shutdown_tx),
+                driver: Some(driver),
+            },
+            update_rx,
+        ))
     }
 
-    pub async fn new_session(
+    /// Open this process's single ACP session and return its id. The id is used
+    /// to address `session/prompt` and `session/cancel`; inbound notifications
+    /// are not routed by it — they all flow to the stream returned by
+    /// [`spawn`](Self::spawn).
+    pub async fn open_session(
         &self,
         opts: SessionOpts,
         mcp_servers: Vec<McpServer>,
-    ) -> anyhow::Result<AcpSession> {
+    ) -> anyhow::Result<SessionId> {
         let cwd = match opts.cwd {
             Some(p) => p,
             None => std::env::current_dir().context("reading current dir for new session")?,
@@ -197,22 +212,13 @@ impl AcpProcess {
             .await
             .map_err(|e| anyhow!("session/new failed: {e}"))?;
 
-        let session_id = resp.session_id;
-        let (tx, rx) = mpsc::unbounded_channel::<SessionUpdate>();
-        {
-            let mut table = self.routing.lock().await;
-            table.insert(session_id.clone(), tx);
-        }
+        tracing::info!(session_id = %resp.session_id.0, "ACP session opened");
+        Ok(resp.session_id)
+    }
 
-        tracing::info!(session_id = %session_id.0, "ACP session opened");
-
-        Ok(AcpSession::new(
-            session_id,
-            self.connection.clone(),
-            self.routing.clone(),
-            rx,
-            opts.system_prompt,
-        ))
+    /// The shared JSON-RPC connection, for the owning session to drive prompts on.
+    pub(crate) fn connection(&self) -> &acp::ConnectionTo<acp::Agent> {
+        &self.connection
     }
 
     pub async fn shutdown(mut self) -> anyhow::Result<()> {
@@ -252,28 +258,18 @@ impl Drop for AcpProcess {
     }
 }
 
-async fn dispatch_session_update(routing: RoutingTable, n: SessionNotification) {
-    let updates = SessionUpdate::from_acp(&n.update);
-    if updates.is_empty() {
-        return;
-    }
-
-    let table = routing.lock().await;
-    if let Some(tx) = table.get(&n.session_id) {
-        for u in updates {
-            if tx.send(u).is_err() {
-                tracing::debug!(
-                    session_id = %n.session_id.0,
-                    "session receiver dropped while update arrived"
-                );
-                break;
-            }
+/// Forward one ACP notification's updates to the process's single session
+/// stream. With one session per connection there is no `session_id` demux —
+/// every notification belongs to that session.
+fn dispatch_session_update(tx: &mpsc::UnboundedSender<SessionUpdate>, n: SessionNotification) {
+    for u in SessionUpdate::from_acp(&n.update) {
+        if tx.send(u).is_err() {
+            tracing::debug!(
+                session_id = %n.session_id.0,
+                "session receiver dropped while update arrived"
+            );
+            break;
         }
-    } else {
-        tracing::debug!(
-            session_id = %n.session_id.0,
-            "no receiver registered for session update"
-        );
     }
 }
 
