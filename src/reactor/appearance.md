@@ -44,9 +44,15 @@ Make the content carry itself — and aim high while you do:
   image is a missed shot, not a safe default. When in doubt, find the visual. Then
   art-direct it — bring in real imagery, give it one consistent vibe, and *compose*
   with it: let a photo lead, layer the words into it, frame it — a designer's slide,
-  not a caption stuck under a picture.
+  not a caption stuck under a picture. And frame the subject whole — a crop that lops
+  off a face reads as a mistake, not a style.
 - **Show the story, not a table.** Pick the form that lets the data's own shape
   surface, not a grid of cells.
+- **Fit the treatment to why they're looking.** Something they're curious about wants
+  to seduce — big imagery, drama, and if it's a set give every item its own moment;
+  something they want to understand wants to orient first — a map of the whole before
+  the detail; something they need to decide wants the answer up front. Same care, a
+  different shape.
 - **The content is the interface.** Strip the chrome — frames, dividers, legends,
   captions — and fold the meaning into the content itself.
 - **Real, then beautiful.** Get it correct first and never invent data — or fake an
@@ -54,7 +60,9 @@ Make the content carry itself — and aim high while you do:
   If a moment wants a face, a poster, a figure you don't have, go *find the real one*
   rather than thinning it down to what's already in hand.
 - **Ship it finished, never half-baked.** What goes on screen is a performance, not
-  a draft. Make sure it actually renders before you save it. The classic footgun is
+  a draft. Render it and look at it with the same eye you'd judge someone else's work —
+  does it clear this bar? — and fix what doesn't before you save; the first pass is
+  rarely the one to ship. The classic footgun is
   images: a hotlinked URL can fail CORS, be hotlink-blocked, or 404 — leaving an ugly
   broken box. So don't hotlink. Instead **download the image into your project folder**
   with your own tools (find it via web/image search, then `curl`/fetch it to a file
@@ -67,11 +75,19 @@ Make the content carry itself — and aim high while you do:
 - **It's theirs the moment they reach for it.** If they scroll or tap, the view
   should yield — let them look, and don't fight it.
 
-House style — every view the same calm place: background near-black (`#0e0f12`),
-cards a touch lifted (`#16181d`) with a hairline border (`rgba(255,255,255,0.08)`)
-and ~16px corners; text warm off-white (`#e8e6e1`), secondary muted grey
-(`#9aa0a6`), one warm accent (`#e8b07a`) used sparingly; system sans, line-height
-~1.5, body 16px or larger; generous padding, one idea per view; mobile first.
+House style — there isn't a fixed one, on purpose. People can ask to see anything, so
+the look should come from the subject, not from a set theme; what stays constant is the
+care, not the colours. Two things hold across everything. First, don't fall into the
+generic-AI defaults — the reflexive near-black canvas with a lone accent, flat system
+type, a grid of bordered cards, a wall of text. That's the safe middle, and it reads as
+exactly that. Make each choice — palette, type, layout, motion — deliberately and fit it
+to what you're showing this time: a bright, high-key page is as valid as a dark one; a
+rich, polychrome palette is right when the subject earns it, and restraint is right when
+colour would just be noise; type and hierarchy are choices, never a default. Second,
+respect the medium: it's a landscape screen someone glances at, so fill the frame with no
+dead gaps, leave room to breathe, keep it legible (comfortable line-height, body 16px or
+larger), and make sure it actually renders. Past that, vary freely — two views on two
+topics should look like two different things made with the same care.
 
 **Motion is for meaning, not decoration.** Use `motion/react` where movement *says*
 something — a thing arriving, a card moving somewhere, a view evolving as the agent
