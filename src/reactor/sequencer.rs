@@ -130,6 +130,13 @@ async fn open_tts(
             let _ = out
                 .send(OutboundSignal::AudioBegin { scene: scene.clone(), turn, codec: mime })
                 .await;
+            // Stamp the voice span so a barge-in can be inferred against it
+            // ("speech arrived while this turn was probably still sounding").
+            reactor
+                .inner
+                .interrupts
+                .audio_began(scene, turn, tokio::time::Instant::now())
+                .await;
             let handle = tokio::spawn(super::forward_frames(frames, out, scene.clone(), turn));
             *synth_tx = Some(text);
             *synth_handle = Some(handle);

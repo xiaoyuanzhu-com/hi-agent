@@ -9,6 +9,14 @@
 //! (fix-forward); the client mutes its own speaker on a hot mic, so an
 //! interruption still feels instant.
 //!
+//! The same holds for a voice barge-in — the human talking over the agent's
+//! playback. Nothing is cancelled and nothing new crosses the wire: the client
+//! ducks its own speaker the moment speech is recognized (the `final:false`
+//! partials on its `/api/in/text` observe stream), the words buffer and fold
+//! into the next turn like any other signal, and the backend infers from its
+//! own clock that its voice was cut — recording a "what went unheard" note the
+//! next prompt carries. See `src/reactor/interrupts.rs` (unit-tested there).
+//!
 //! Driving this for real requires either:
 //!
 //!   (a) A live `claude-code` subprocess responsive to ACP. Tests would

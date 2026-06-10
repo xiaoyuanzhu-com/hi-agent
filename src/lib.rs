@@ -93,6 +93,10 @@ pub async fn run(config: Config) -> anyhow::Result<()> {
     // reactor that registers each scene's sink. The mind drives output and
     // side-effects by calling tools on `/mcp`; they route here.
     let tool_registry = reactor::ToolRegistry::new();
+    // Scene→barge-in table, shared the same way: the server's STT relay reports
+    // recognized speech, the reactor stamps voice spans and folds the inferred
+    // "what went unheard" note into the next prompt. No cancel, no endpoint.
+    let interrupts = reactor::InterruptRegistry::new();
 
     let (router, seams) = server::build(
         memory.clone(),
@@ -100,6 +104,7 @@ pub async fn run(config: Config) -> anyhow::Result<()> {
         observatory.clone(),
         acp_tap.clone(),
         tool_registry.clone(),
+        interrupts.clone(),
     );
 
     // Resolve the runtime: prefer system tools on PATH, else install on first run.
@@ -212,6 +217,7 @@ pub async fn run(config: Config) -> anyhow::Result<()> {
         observatory,
         view_compiler,
         tool_registry,
+        interrupts,
         workspace_dir,
     );
     tracing::info!("reactor started");

@@ -300,10 +300,23 @@ export function useAgentSession(): AgentSession {
     };
   }, [woken, scene]);
 
+  // Reflexive duck: recognized speech (a rolling partial on the observe
+  // stream) lands while the agent's voice is playing → cut playback right
+  // here, like a person stopping mid-word when you start talking. Nothing is
+  // sent anywhere: the words buffer to the mind like any other signal, and the
+  // backend infers from its own clock what went unheard. One-shot per turn:
+  // after stop(), isPlaying() is false, so the partials that follow are no-ops.
+  const duck = useCallback(() => {
+    const voice = voiceRef.current;
+    if (voice?.isPlaying()) voice.stop();
+  }, []);
+
   // ---- GET /in/text observe loop: typed lines (this client or another) ---
   // Every user line lands here: typed input the server echoes back, and speech
   // the server transcribed and posted to the text channel. Both render the same
   // way, so the conversation reads uniformly across every client in the scene.
+  // Rolling partials (`final:false`, live STT) don't render — they're the
+  // duck trigger above.
   useEffect(() => {
     if (!woken) return;
     const ctrl = new AbortController();
@@ -314,7 +327,12 @@ export function useAgentSession(): AgentSession {
           for await (const ev of subscribeInText({ scene, signal: ctrl.signal })) {
             if (cancelled) break;
             setOffline(false);
-            if (ev.final && ev.text.trim().length > 0) finalizeUser(ev.text);
+            if (ev.text.trim().length === 0) continue;
+            if (!ev.final) {
+              duck();
+              continue;
+            }
+            finalizeUser(ev.text);
           }
         } catch {
           if (cancelled || ctrl.signal.aborted) break;
@@ -326,7 +344,7 @@ export function useAgentSession(): AgentSession {
       cancelled = true;
       ctrl.abort();
     };
-  }, [woken, scene, finalizeUser]);
+  }, [woken, scene, finalizeUser, duck]);
 
   // ---- audio-input channel: acquire/release the mic (and vision) ---------
   // Independent of the session itself — text and audio are coequal input

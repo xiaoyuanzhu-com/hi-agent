@@ -137,6 +137,11 @@ export class VoicePlayer {
     if (on) this.stop();
   }
 
+  /** Whether a turn's audio is audibly playing right now. */
+  isPlaying(): boolean {
+    return this.playing;
+  }
+
   /** Stop immediately and drop the current turn (barge-in). */
   stop(): void {
     this.gen++; // invalidate the current turn so late chunks are ignored

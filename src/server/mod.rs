@@ -16,7 +16,7 @@ use tower_http::trace::TraceLayer;
 use crate::memory::Memory;
 use crate::acp::AcpTap;
 use crate::observatory::Observatory;
-use crate::reactor::{OutboundSignal, ToolRegistry};
+use crate::reactor::{InterruptRegistry, OutboundSignal, ToolRegistry};
 use crate::types::{Channel, Scene, Signal, ViewEnvelope};
 
 pub mod acp;
@@ -294,6 +294,12 @@ pub struct AppState {
     /// tool call to its reactor loop; the reactor registers each scene's sink as
     /// it stands the loop up. See [`crate::reactor::ToolRegistry`].
     pub tool_registry: ToolRegistry,
+
+    /// Scene→barge-in state, shared with the reactor. The STT relay reports
+    /// recognized speech here ([`crate::reactor::InterruptRegistry::note_speech`]);
+    /// nothing else on the HTTP side touches it — there is no interrupt
+    /// endpoint, the mind infers interruptions from its own clock.
+    pub interrupts: InterruptRegistry,
 }
 
 impl AppState {
@@ -326,6 +332,7 @@ pub fn build(
     observatory: Observatory,
     acp_tap: AcpTap,
     tool_registry: ToolRegistry,
+    interrupts: InterruptRegistry,
 ) -> (Router, ServerSeams) {
     let (inbound_tx, inbound_rx) = mpsc::channel::<Signal>(1024);
     // Scene warm-up requests: a presence GET asks the reactor to stand a scene up
@@ -374,6 +381,7 @@ pub fn build(
         acp_tap,
         data_dir,
         tool_registry,
+        interrupts,
     });
 
     // Channels are namespaced by boundary: `/api/in/*` is the world→agent side

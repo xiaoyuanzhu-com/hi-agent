@@ -29,6 +29,10 @@
 //!    across several bursts reassembles across turns; the mind corrects course
 //!    rather than being cut off. (The client mutes its own speaker reflexively the
 //!    instant its mic goes hot, so an interruption feels instant regardless.)
+//!    A voice barge-in — the human talking over the agent's playback — is no
+//!    exception: the client ducks on its own, the words buffer like any other
+//!    signal, and the mind merely learns afterwards what went unheard. See
+//!    [`interrupts`].
 //!
 //! ## Heavy work goes to a working session, not onto the floor
 //!
@@ -49,11 +53,13 @@ use std::time::Duration;
 
 mod heartbeat;
 mod interleave;
+mod interrupts;
 pub mod outbound;
 mod sequencer;
 mod tools;
 mod workers;
 
+pub use interrupts::InterruptRegistry;
 pub use outbound::OutboundSignal;
 pub use tools::{SceneControl, ToolRegistry, ToolSink};
 
@@ -314,6 +320,10 @@ struct ReactorInner {
     /// scene loop registers its sink here as it stands up; shared (cloneable)
     /// with the HTTP front. See [`tools`].
     tools: ToolRegistry,
+    /// Scene→barge-in state. The STT relay reports recognized speech here; the
+    /// sequencer stamps each turn's voice span; `run_turn` drains the inferred
+    /// "what went unheard" note into the next prompt. See [`interrupts`].
+    interrupts: InterruptRegistry,
     /// Absolute path to the agent's global working directory (`<data_dir>/workspace`).
     /// Handed to every worker session as its `cwd`, so a build sub-agent works in a
     /// real project dir — `ls`-ing existing projects, writing source — like a human
@@ -340,6 +350,7 @@ pub fn start(
     observatory: Observatory,
     view_compiler: crate::views::ViewCompiler,
     tools: ToolRegistry,
+    interrupts: InterruptRegistry,
     workspace_dir: PathBuf,
 ) -> Reactor {
     let reactor = Reactor {
@@ -351,6 +362,7 @@ pub fn start(
             observatory,
             view_compiler,
             tools,
+            interrupts,
             workspace_dir,
             turn_seq: AtomicU64::new(0),
             scenes: Mutex::new(HashMap::new()),
@@ -814,6 +826,17 @@ async fn run_turn(
     let worker_status = workers.render_status().await;
     let new_signals = format!("## New signals\n{}", render_batch(batch));
 
+    // If the human barged into the previous reply's playback, tell the mind what
+    // went unheard — taken once, ahead of the retry loop, so a retried attempt
+    // doesn't lose it. Facts only; how to fold the tail forward is core.md's job.
+    let interrupted = reactor
+        .inner
+        .interrupts
+        .take_pending(scene)
+        .await
+        .map(|i| interrupts::render_interruption(&i))
+        .unwrap_or_default();
+
     // Seed the journal snapshot only when the session is unseeded; a seeded
     // session already lived the history and gets only what's new (plus the live
     // worker view). The snapshot is the durable backstop, not per-turn context to
@@ -843,10 +866,10 @@ async fn run_turn(
         // An unseeded session — fresh after a discard — re-seeds with the snapshot.
         let attempt_result: anyhow::Result<Option<String>> = async {
             let prompt_text = if *seeded {
-                join_sections(&[&worker_status, &new_signals])
+                join_sections(&[&worker_status, &interrupted, &new_signals])
             } else {
                 let snap = build_for_scene(&reactor.inner.memory, scene).await?;
-                join_sections(&[&snap.render_for_prompt(), &worker_status, &new_signals])
+                join_sections(&[&snap.render_for_prompt(), &worker_status, &interrupted, &new_signals])
             };
             prompt_chars = prompt_text.chars().count();
 
@@ -933,6 +956,10 @@ async fn run_turn(
     let (done_tx, done_rx) = oneshot::channel();
     let _ = beats.send(sequencer::Beat::TurnEnd { done: done_tx }).await;
     let reply = done_rx.await.unwrap_or_default();
+
+    // Close the turn on the interrupt registry: clears the live marker, caches
+    // the reply for barge-in resolution, back-fills an interrupt that hit it.
+    reactor.inner.interrupts.end_turn(scene, turn_id, &reply).await;
 
     // A turn that failed every attempt propagates, so the caller's error arm runs
     // (the session is already discarded above; it re-resets seeded/budget).

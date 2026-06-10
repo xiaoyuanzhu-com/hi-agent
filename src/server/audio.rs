@@ -21,8 +21,11 @@
 //! STT does the endpointing. There is no client-side VAD and nothing is sent back
 //! on the socket — it is upload-only. Each frame is republished on the
 //! inbound-audio broadcast (so `GET /api/in/audio` plays the live mic), and each
-//! finalized sentence is dispatched as a text `SignalIn`. There are no live
-//! partials: a sentence appears once, settled, on the text channel.
+//! finalized sentence is dispatched as a text `SignalIn`. The agent sees no live
+//! partials — a sentence reaches it once, settled — but rolling partials *are*
+//! echoed to scene observers (`GET /api/in/text`, `final:false`): they're the
+//! barge-in trigger, letting a client duck its playback the instant speech is
+//! recognized.
 //!
 //! Observe (`GET /api/in/audio`): the live audio bytes for the scene, one source
 //! (mic stream or posted clip) per chunked response — the inbound mirror of
@@ -256,7 +259,20 @@ async fn stream_audio_in(
         loop {
             let cuts = tokio::select! {
                 msg = tr_rx.recv() => match msg {
-                    Some(t) => seg.observe(&t.text, t.is_final, Instant::now()),
+                    Some(t) => {
+                        // Echo every rolling partial to the scene's observers
+                        // (`final:false`). This is the duck trigger: the client
+                        // stops its own playback the moment speech is
+                        // recognized, hundreds of ms before a sentence settles.
+                        // The same moment is reported to the barge-in registry,
+                        // whose own clock decides whether the agent's voice was
+                        // probably still sounding (→ "what went unheard" note).
+                        if !t.is_final && !t.text.trim().is_empty() {
+                            relay_state.echo_input(&relay_scene, Channel::Text, &t.text, false);
+                            relay_state.interrupts.note_speech(&relay_scene, tokio::time::Instant::now()).await;
+                        }
+                        seg.observe(&t.text, t.is_final, Instant::now())
+                    }
                     None => break, // STT session ended
                 },
                 _ = ticker.tick() => seg.tick(Instant::now()),
