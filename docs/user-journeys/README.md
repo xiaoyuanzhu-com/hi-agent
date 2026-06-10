@@ -44,3 +44,4 @@ What "done" looks like, and how the user knows it worked.
 ## Index
 
 - [01 · 羽毛球男单世界前十](01-badminton-top10.md) — 打招呼 → 异步检索演示前十 → 钻取单个球员 → 切换到天气;确立对话简短、音画结合演示、窗口式轮播、柔和转场等通用原则。
+- [02 · 飞书群消息 → Sprint-Backlog 任务](02-feishu-sprint-backlog.md) — 常驻委托,从零开始:置备工具(装 CLI、建应用、鉴权,老板只做必须的事)→ 对齐 → 试运行 → 长期值守;确立缺工具是任务的一部分、向上沟通最小化、heartbeat 自我注意、重启自恢复等原则。
