@@ -14,7 +14,12 @@
 //! [`init_from_env`] is the composition root — it sequences each capability's
 //! own `init_from_env`, so a misconfigured provider (unknown name, missing key)
 //! fails fast at startup rather than as an error at first use.
+//!
+//! [`desktop_context`] is the one exception to the env-config pattern: its
+//! vendor is the operating system, selected at compile time, so it has no
+//! `init_from_env` and does not appear in the composition root.
 
+pub mod desktop_context;
 pub mod image_gen;
 pub mod stt;
 pub mod tts;

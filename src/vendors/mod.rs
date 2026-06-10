@@ -9,5 +9,7 @@
 pub mod doubao_image_gen;
 pub mod doubao_video_gen;
 pub mod doubao_vision;
+#[cfg(target_os = "macos")]
+pub mod macos_desktop_context;
 pub mod volcengine_stt;
 pub mod volcengine_tts;
