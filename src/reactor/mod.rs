@@ -90,6 +90,51 @@ use uuid::Uuid;
 /// follows.
 const RESPONSE_SETTLE: Duration = Duration::from_millis(700);
 
+/// Ceiling on a between-turns hot-swap. The swap prompts the *live* session for a
+/// self-briefing with unbounded awaits beneath it; if that session is wedged (a
+/// pathological turn can leave the subprocess unresponsive), an un-capped swap
+/// blocks the scene loop forever — signals keep queueing but no turn ever runs,
+/// and the scene goes deaf until a restart. On expiry the session is discarded:
+/// it ignored a prompt for this whole window, so the journal cold-open path is
+/// strictly better than waiting.
+const SWAP_TIMEOUT: Duration = Duration::from_secs(180);
+
+/// Default idle interval between host pulses — the scene's recurring moment of
+/// self-attention. A pulse is not a schedule of work: it injects bare situational
+/// facts ("nothing new for 30m") and core.md tells the mind what such a moment is
+/// for (review commitments, glance at setups it owns); most pulses should
+/// conclude with nothing to do or say. Override via `HI_AGENT_PULSE`; `0`/`off`
+/// disables. Boot is not a special case — the first pulse after the host starts
+/// simply carries that fact.
+const DEFAULT_PULSE: Duration = Duration::from_secs(1800);
+
+/// Resolve the pulse interval: `HI_AGENT_PULSE` in alarm-delay grammar if set
+/// (`None` for `0`/`off` — pulses disabled), else [`DEFAULT_PULSE`].
+fn pulse_interval() -> Option<Duration> {
+    match std::env::var(crate::config::ENV_PULSE) {
+        Ok(v) => {
+            let v = v.trim().to_owned();
+            if v.is_empty() {
+                return Some(DEFAULT_PULSE);
+            }
+            if v.eq_ignore_ascii_case("off") {
+                return None;
+            }
+            match parse_delay(&v) {
+                Some(d) if d.is_zero() => None,
+                Some(d) => Some(d),
+                None => Some(DEFAULT_PULSE),
+            }
+        }
+        Err(_) => Some(DEFAULT_PULSE),
+    }
+}
+
+/// How far back a scene's raw memory may date and still be re-warmed at startup.
+/// Re-warm gives recently-active scenes a live loop again so their pulses can
+/// fire — a standing commitment must not need a client connection to be checked.
+const REWARM_WINDOW: Duration = Duration::from_secs(7 * 24 * 3600);
+
 /// Built-in base prompts, embedded at compile time. `core.md` is the *mind's*
 /// system prompt — who it is, how it talks, how it presents (by delegating a build
 /// and showing the result by ref) and delegates. `appearance.md` is the *view
@@ -196,6 +241,9 @@ enum LoopInput {
     /// `alarm` tool; when its deadline passes the loop injects this so a
     /// turn runs even though no new signal arrived.
     Alarm(AlarmFired),
+    /// A host pulse firing — the recurring moment of self-attention. Carries
+    /// bare situational facts; what to do with such a moment is core.md's job.
+    Pulse { note: String },
 }
 
 /// One fired self-alarm, handed to the mind under "New signals".
@@ -324,6 +372,10 @@ struct ReactorInner {
     /// sequencer stamps each turn's voice span; `run_turn` drains the inferred
     /// "what went unheard" note into the next prompt. See [`interrupts`].
     interrupts: InterruptRegistry,
+    /// Scene→live-subscriber counts, shared with the HTTP front. Rendered into
+    /// each turn as one human-model presence sentence, so the mind knows which
+    /// channels actually reach the person right now.
+    presence: crate::presence::Presence,
     /// Absolute path to the agent's global working directory (`<data_dir>/workspace`).
     /// Handed to every worker session as its `cwd`, so a build sub-agent works in a
     /// real project dir — `ls`-ing existing projects, writing source — like a human
@@ -351,6 +403,7 @@ pub fn start(
     view_compiler: crate::views::ViewCompiler,
     tools: ToolRegistry,
     interrupts: InterruptRegistry,
+    presence: crate::presence::Presence,
     workspace_dir: PathBuf,
 ) -> Reactor {
     let reactor = Reactor {
@@ -363,6 +416,7 @@ pub fn start(
             view_compiler,
             tools,
             interrupts,
+            presence,
             workspace_dir,
             turn_seq: AtomicU64::new(0),
             scenes: Mutex::new(HashMap::new()),
@@ -390,7 +444,54 @@ pub fn start(
         tracing::warn!("reactor warm channel closed; warm-up loop exiting");
     });
 
+    // Re-warm recently-active scenes, so a standing commitment has a live loop —
+    // and therefore pulses — without waiting for a client to connect. Bounded by
+    // [`REWARM_WINDOW`]; a long-idle scene stays cold. Boot is not a special
+    // case: this merely stands the loops up, and each one's first pulse carries
+    // the "host process started Xm ago" fact like any other.
+    let rewarm_reactor = reactor.clone();
+    tokio::spawn(async move {
+        for scene in recent_scenes(rewarm_reactor.inner.memory.data_dir(), REWARM_WINDOW) {
+            tracing::info!(scene = %scene, "re-warming recently-active scene");
+            rewarm_reactor.ensure_scene(scene).await;
+        }
+    });
+
     reactor
+}
+
+/// Scenes whose raw memory saw activity within `window`: the directories under
+/// `<data_dir>/memory/raw/` with a recently-modified day folder. Errors read as
+/// "no scenes" — re-warm is best-effort.
+fn recent_scenes(data_dir: &std::path::Path, window: Duration) -> Vec<Scene> {
+    let raw = data_dir.join("memory").join("raw");
+    let Some(cutoff) = std::time::SystemTime::now().checked_sub(window) else {
+        return Vec::new();
+    };
+    let Ok(entries) = std::fs::read_dir(&raw) else {
+        return Vec::new();
+    };
+    let mut scenes = Vec::new();
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if !path.is_dir() {
+            continue;
+        }
+        let recent = std::fs::read_dir(&path)
+            .map(|days| {
+                days.flatten().any(|d| {
+                    d.metadata()
+                        .and_then(|m| m.modified())
+                        .map(|t| t >= cutoff)
+                        .unwrap_or(false)
+                })
+            })
+            .unwrap_or(false);
+        if recent && let Some(name) = path.file_name().and_then(|n| n.to_str()) {
+            scenes.push(Scene(name.to_owned()));
+        }
+    }
+    scenes
 }
 
 impl Reactor {
@@ -563,15 +664,29 @@ async fn per_scene_loop(
     // before.
     warm_up(&reactor, &scene, &mut reactor_session).await;
 
+    // Pulse bookkeeping: the host's recurring self-attention timer. `last_activity`
+    // resets on every turn, so pulses only fire into genuine quiet; the first pulse
+    // after the loop stands up also carries how long ago the host process started,
+    // which is all "wake on boot" amounts to.
+    let pulse_every = pulse_interval();
+    let loop_started = Instant::now();
+    let mut last_activity = Instant::now();
+    let mut pulsed_once = false;
+
     loop {
-        // Wait for a turn-driving reason: a new signal, a fired alarm, or a worker
-        // question. Tool control commands (delegate/alarm) are pure side-effects —
-        // applied as they arrive without starting a turn; only a worker `ask`
-        // becomes a turn-driving item. When the mind has set alarms, the soonest
-        // also wakes the loop.
+        // Wait for a turn-driving reason: a new signal, a fired alarm, a due host
+        // pulse, or a worker question. Tool control commands (delegate/alarm) are
+        // pure side-effects — applied as they arrive without starting a turn; only
+        // a worker `ask` becomes a turn-driving item. The soonest of the mind's
+        // alarms and the host pulse also wakes the loop.
         let mut batch: Vec<LoopInput> = Vec::new();
         'wait: loop {
-            let woke = match alarms.next_deadline() {
+            let pulse_at = pulse_every.map(|d| last_activity + d);
+            let deadline = match (alarms.next_deadline(), pulse_at) {
+                (Some(a), Some(p)) => Some(a.min(p)),
+                (a, p) => a.or(p),
+            };
+            let woke = match deadline {
                 Some(deadline) => tokio::select! {
                     recvd = inbound.recv() => Woke::Inbound(recvd),
                     ctl = control.recv() => Woke::Control(ctl),
@@ -605,13 +720,32 @@ async fn per_scene_loop(
                     // turn-driving reason rather than running an empty turn.
                 }
                 Woke::Timer => {
-                    for fired in alarms.take_due(Instant::now()) {
+                    let now = Instant::now();
+                    for fired in alarms.take_due(now) {
                         reactor
                             .inner
                             .observatory
                             .record(&scene, EventKind::AlarmFired { note: fired.note.clone() })
                             .await;
                         batch.push(LoopInput::Alarm(fired));
+                    }
+                    if let Some(at) = pulse_at
+                        && at <= now
+                    {
+                        let idle_m = (now - last_activity).as_secs() / 60;
+                        let note = if pulsed_once {
+                            format!("nothing new here for {idle_m}m")
+                        } else {
+                            let up_m = (now - loop_started).as_secs() / 60;
+                            format!(
+                                "nothing new here for {idle_m}m (host process started {up_m}m ago)"
+                            )
+                        };
+                        pulsed_once = true;
+                        // Reset so a swallowed pulse doesn't re-fire in a tight loop.
+                        last_activity = now;
+                        tracing::info!(scene = %scene, "pulse fired");
+                        batch.push(LoopInput::Pulse { note });
                     }
                     if !batch.is_empty() {
                         break 'wait;
@@ -654,14 +788,37 @@ async fn per_scene_loop(
                 // a cold restart. A swap failure leaves the warm session in place.
                 if budget.should_swap() {
                     if let Some(current) = reactor_session.clone() {
-                        match heartbeat::swap(&reactor, &scene, &current).await {
-                            Ok(fresh) => {
+                        match timeout(SWAP_TIMEOUT, heartbeat::swap(&reactor, &scene, &current)).await {
+                            Ok(Ok(fresh)) => {
                                 reactor_session = Some(fresh);
                                 budget.reset();
                                 tracing::info!(scene = %scene, "reactor session hot-swapped");
                             }
-                            Err(err) => {
+                            Ok(Err(err)) => {
                                 tracing::warn!(scene = %scene, error = %err, "hot-swap failed; keeping warm session");
+                            }
+                            Err(_) => {
+                                // The live session ignored the summarize prompt for the
+                                // whole window — treat it as wedged and discard it, the
+                                // same as a failed turn; the next turn cold-opens a fresh
+                                // session from the journal snapshot.
+                                tracing::warn!(scene = %scene, "hot-swap timed out; discarding unresponsive session");
+                                if let Some(dead) = reactor_session.take() {
+                                    reactor
+                                        .inner
+                                        .observatory
+                                        .record(
+                                            &scene,
+                                            EventKind::SessionClosed {
+                                                kind: SessionKind::Reactor,
+                                                id: dead.id().0.to_string(),
+                                            },
+                                        )
+                                        .await;
+                                }
+                                seeded = false;
+                                budget.reset();
+                                reactor.inner.observatory.set_budget(&scene, 0).await;
                             }
                         }
                     }
@@ -690,6 +847,10 @@ async fn per_scene_loop(
                 reactor.inner.observatory.set_budget(&scene, 0).await;
             }
         }
+
+        // Any completed turn is activity: the pulse clock restarts, so pulses
+        // only ever fire into genuine quiet.
+        last_activity = Instant::now();
     }
 }
 
@@ -824,6 +985,8 @@ async fn run_turn(
     // nudge one, wait, or fold a finished result into its reply. Empty when
     // nothing is delegated.
     let worker_status = workers.render_status().await;
+    let presence_note =
+        format!("## Presence\n{}", reactor.inner.presence.render(scene));
     let new_signals = format!("## New signals\n{}", render_batch(batch));
 
     // If the human barged into the previous reply's playback, tell the mind what
@@ -866,10 +1029,10 @@ async fn run_turn(
         // An unseeded session — fresh after a discard — re-seeds with the snapshot.
         let attempt_result: anyhow::Result<Option<String>> = async {
             let prompt_text = if *seeded {
-                join_sections(&[&worker_status, &interrupted, &new_signals])
+                join_sections(&[&worker_status, &presence_note, &interrupted, &new_signals])
             } else {
                 let snap = build_for_scene(&reactor.inner.memory, scene).await?;
-                join_sections(&[&snap.render_for_prompt(), &worker_status, &interrupted, &new_signals])
+                join_sections(&[&snap.render_for_prompt(), &worker_status, &presence_note, &interrupted, &new_signals])
             };
             prompt_chars = prompt_text.chars().count();
 
@@ -1083,6 +1246,9 @@ fn render_batch(batch: &[LoopInput]) -> String {
             }
             LoopInput::Alarm(a) => {
                 let _ = writeln!(s, "(alarm) \"{}\"", a.note);
+            }
+            LoopInput::Pulse { note } => {
+                let _ = writeln!(s, "(pulse) {note}");
             }
         }
     }

@@ -473,6 +473,8 @@ pub async fn get_out_audio(
     AuthBearer(auth): AuthBearer,
 ) -> impl IntoResponse {
     let mut rx = state.audio_out.subscribe();
+    // A held audio long-poll = their ears are on; counted while we wait for a turn.
+    let _presence = state.presence.connect(&scene, crate::presence::OutChannel::Audio);
 
     tracing::info!(scene = %scene, auth = ?auth, "GET /api/out/audio long-poll opened");
 

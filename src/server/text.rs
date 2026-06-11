@@ -26,6 +26,8 @@ use axum::response::{IntoResponse, Response};
 use chrono::Utc;
 use uuid::Uuid;
 
+use futures::StreamExt as _;
+
 use crate::server::observe;
 use crate::server::headers::{AuthBearer, RequiredScene, SceneHeader, StreamHeader};
 use crate::server::AppState;
@@ -99,7 +101,12 @@ pub async fn get_out_text(
     // process + session + upstream cache are hot before the first utterance.
     state.warm_scene(&scene);
 
-    let stream = state.text_bus.subscribe(scene);
+    // Count this reader as live presence for as long as its body stream exists.
+    let presence = state.presence.connect(&scene, crate::presence::OutChannel::Text);
+    let stream = state.text_bus.subscribe(scene).map(move |item| {
+        let _held = &presence;
+        item
+    });
 
     Response::builder()
         .status(StatusCode::OK)

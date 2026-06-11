@@ -15,6 +15,7 @@ pub mod llm_proxy;
 pub mod mcp;
 pub mod memory;
 pub mod observatory;
+pub mod presence;
 pub mod runtime;
 pub mod reactor;
 pub mod segment;
@@ -97,6 +98,10 @@ pub async fn run(config: Config) -> anyhow::Result<()> {
     // recognized speech, the reactor stamps voice spans and folds the inferred
     // "what went unheard" note into the next prompt. No cancel, no endpoint.
     let interrupts = reactor::InterruptRegistry::new();
+    // Scene→live-subscriber counts, shared the same way: the server's out-channel
+    // handlers hold a guard per connection, the reactor renders the counts into
+    // each turn as human-model facts ("no screen is attached").
+    let presence = presence::Presence::new();
 
     let (router, seams) = server::build(
         memory.clone(),
@@ -105,6 +110,7 @@ pub async fn run(config: Config) -> anyhow::Result<()> {
         acp_tap.clone(),
         tool_registry.clone(),
         interrupts.clone(),
+        presence.clone(),
     );
 
     // Resolve the runtime: prefer system tools on PATH, else install on first run.
@@ -218,6 +224,7 @@ pub async fn run(config: Config) -> anyhow::Result<()> {
         view_compiler,
         tool_registry,
         interrupts,
+        presence,
         workspace_dir,
     );
     tracing::info!("reactor started");

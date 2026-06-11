@@ -300,6 +300,11 @@ pub struct AppState {
     /// nothing else on the HTTP side touches it — there is no interrupt
     /// endpoint, the mind infers interruptions from its own clock.
     pub interrupts: InterruptRegistry,
+
+    /// Scene→live-subscriber counts, shared with the reactor. Out-channel
+    /// handlers hold a [`crate::presence::PresenceGuard`] per connection; the
+    /// reactor renders the counts into each turn as human-model facts.
+    pub presence: crate::presence::Presence,
 }
 
 impl AppState {
@@ -333,6 +338,7 @@ pub fn build(
     acp_tap: AcpTap,
     tool_registry: ToolRegistry,
     interrupts: InterruptRegistry,
+    presence: crate::presence::Presence,
 ) -> (Router, ServerSeams) {
     let (inbound_tx, inbound_rx) = mpsc::channel::<Signal>(1024);
     // Scene warm-up requests: a presence GET asks the reactor to stand a scene up
@@ -382,6 +388,7 @@ pub fn build(
         data_dir,
         tool_registry,
         interrupts,
+        presence,
     });
 
     // Channels are namespaced by boundary: `/api/in/*` is the world→agent side

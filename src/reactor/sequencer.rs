@@ -14,7 +14,7 @@
 //! sentence begins, not racing ahead), exactly as the old inline pacing did —
 //! only now driven by tool-call order rather than document order.
 
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use tokio::sync::{mpsc, oneshot};
 use tokio::task::JoinHandle;
@@ -25,6 +25,12 @@ use crate::segment::{Segmenter, Terminator};
 use crate::types::{Channel, Scene, ViewOp};
 
 use super::{OutboundSignal, Reactor, interleave};
+
+/// Quiet window after the last `Say` before the open /thought utterance is
+/// closed. Within-utterance chunk gaps are sub-second; a gap this long means the
+/// mind has moved on to tool work, and holding the reply body open would strand
+/// the polling client.
+const UTTERANCE_QUIET_CLOSE: Duration = Duration::from_secs(3);
 
 /// One ordered unit the sequencer renders. `Say`/`Show` come from the mind's
 /// tool calls (via [`super::ToolSink`]); `TurnStart`/`TurnEnd` bracket a turn and
@@ -53,8 +59,33 @@ pub(super) async fn run_sequencer(reactor: Reactor, scene: Scene, mut beats: mps
     let mut synth_tx: Option<mpsc::Sender<String>> = None;
     let mut synth_handle: Option<JoinHandle<()>> = None;
     let mut full_reply = String::new();
+    // The open /thought utterance, if any, and when speech last landed on it. A
+    // turn is not one utterance: the mind may say a sentence, then work tools for
+    // minutes — leaving the reply body open that whole time strands the client
+    // (its long-poll times out mid-utterance, and the bus then replays the text to
+    // the next poll). A pause ends an utterance, like speech: after
+    // [`UTTERANCE_QUIET_CLOSE`] without a `Say`, close /thought; a later `Say` in
+    // the same turn simply opens the next utterance (the bus auto-opens on push).
+    let mut quiet_deadline: Option<tokio::time::Instant> = None;
 
-    while let Some(beat) = beats.recv().await {
+    loop {
+        let beat = match quiet_deadline {
+            Some(deadline) => tokio::select! {
+                b = beats.recv() => match b {
+                    Some(b) => b,
+                    None => break,
+                },
+                _ = tokio::time::sleep_until(deadline) => {
+                    super::emit_end_of_utterance(&reactor, &scene).await;
+                    quiet_deadline = None;
+                    continue;
+                }
+            },
+            None => match beats.recv().await {
+                Some(b) => b,
+                None => break,
+            },
+        };
         match beat {
             Beat::TurnStart { turn: t } => {
                 turn = t;
@@ -63,6 +94,7 @@ pub(super) async fn run_sequencer(reactor: Reactor, scene: Scene, mut beats: mps
                 synth_tx = None;
                 synth_handle = None;
                 full_reply.clear();
+                quiet_deadline = None;
             }
             Beat::Say(text) => {
                 if !armed || text.is_empty() {
@@ -77,6 +109,7 @@ pub(super) async fn run_sequencer(reactor: Reactor, scene: Scene, mut beats: mps
                 }
                 // /thought gets the raw chunk; TTS gets coalesced sentences (above).
                 super::emit_thought_chunk(&reactor, &scene, text).await;
+                quiet_deadline = Some(tokio::time::Instant::now() + UTTERANCE_QUIET_CLOSE);
             }
             Beat::Show { id, op, source } => {
                 if !armed {
@@ -100,8 +133,11 @@ pub(super) async fn run_sequencer(reactor: Reactor, scene: Scene, mut beats: mps
                 // next turn's span never collides with it.
                 synth_tx = None;
                 synth_handle = None;
-                // Close the /thought utterance for this turn.
-                super::emit_end_of_utterance(&reactor, &scene).await;
+                // Close the /thought utterance for this turn, unless the quiet
+                // timer already did.
+                if quiet_deadline.take().is_some() {
+                    super::emit_end_of_utterance(&reactor, &scene).await;
+                }
                 if !full_reply.trim().is_empty() {
                     crate::channel_log::outbound(Channel::Text, &scene, full_reply.trim());
                 }
