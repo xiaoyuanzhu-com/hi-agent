@@ -65,8 +65,24 @@
 3. **三次把"要老板动手的内容"丢在老板看不到的地方**(指南只在 view 上、命令/URL 说到冒号就断)→ 通道在场感 + core 引导。
 4. **第一版样稿带渲染错误直接发出** → 交付必检进 SOUL。
 5. **被问"要不要我帮你启动"** → 所有权引导。
-6. Host bugs:scene loop 卡死(疑似无人消费的 TTS 背压)、TextBus 同句重复投递。
-7. **agent 自写的 prompt override 无处生效**(core.local.md 躺在 workspace)→ 需要 sanctioned 的自我引导文件(self.md/hot.md)。
+6. Host bugs:scene loop 卡死(swap 无超时阻塞循环)、utterance 跨整个 turn 不关闭(造成 long-poll 超时 + 重放)。
+7. **agent 自写的 prompt override 无处生效**(core.local.md 躺在 workspace;实际上 data/prompts/core.local.md 槽位已存在,agent 没装进去)→ 自我引导落到 self.md。
+
+### 复测(2026-06-11,serving-fixes 之后)
+
+修复并验证通过:
+
+- **pulse 自检是真的**:读 self 笔记 → `pgrep` 真查监听 → 正常则一言不发(转录可证)。
+- **断后自愈全程无人参与**:杀掉监听 + 重启主机 → warm-up/首个 pulse 读到 self.md 里的职责("Must restart on every host process restart")→ 13 秒内自己把监听拉起来。
+- **台账诚实**:被问 smuggled 时真去查台账,承认发送失败,当场补发并回 thread。
+- scene 卡死(swap 超时 + 弃用宕死 session)、utterance 长开(3s quiet-close)、presence 进 prompt,均已修复生效。
+
+复测新发现(待改进):
+
+- **职责需要单一 owner 或幂等启动**:两个 scene 的 warm-up 同时发现监听已死、同时拉起 → 双进程、消息双发(输出靠判断去重兜住,但进程泄漏无人察觉——pulse 的 `pgrep` 看到"有在跑"就满足,没数有几个)。
+- **"空检查结果当健康"出现两次**:`curl`/`ps` 返回空却叙述"一切健康"——证据要读内容,不是读"命令跑完了"。已加 core.md 引导("a liveness probe that returns nothing means the thing is DOWN"),待观察。
+- **职责必须落 self.md 才有恢复**:接受常驻委托的当下就该写;这次是老板提醒一次后才记(记完即生效)。
+- 回复语言偶尔与老板语言不一致(中文问、英文答)——register 细节,SOUL 层打磨。
 
 ## Edge cases & failure modes
 
