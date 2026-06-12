@@ -13,7 +13,7 @@
 //! pending note: which turn was cut, about how far in, and what the full reply
 //! had been. The next turn's prompt carries that note as plain fact; how to fold
 //! the unheard tail forward (drop, revise, mention) is the soul's judgment, not
-//! the mechanism's (see `core.md`).
+//! the mechanism's (see `speaking.md`).
 //!
 //! Everything here is estimate-grade on purpose: playback truth lives only in
 //! the client, and we deliberately don't ask for it. The note says "about Ns

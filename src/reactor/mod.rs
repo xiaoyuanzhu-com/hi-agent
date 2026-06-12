@@ -135,14 +135,17 @@ fn pulse_interval() -> Option<Duration> {
 /// fire — a standing commitment must not need a client connection to be checked.
 const REWARM_WINDOW: Duration = Duration::from_secs(7 * 24 * 3600);
 
-/// Built-in base prompts, embedded at compile time. `core.md` is the *mind's*
-/// system prompt — who it is, how it talks, how it presents (by delegating a build
-/// and showing the result by ref) and delegates. `appearance.md` and `aesthetic.md`
-/// are the *view builder's* guides — the mechanics of authoring/saving a view, and
-/// the taste it has to clear — read off disk by a build sub-agent, never loaded
-/// into the mind's context. All ship in the binary and refresh on every build;
-/// [`install_prompts`] materialises them under `<data_dir>/prompts/`.
+/// Built-in base prompts, embedded at compile time. The *mind's* system prompt is
+/// `core.md` — who it is and the machinery (talking, presenting by ref, delegating)
+/// — followed by `speaking.md`, the rhythm of conversation: when to speak, how
+/// much, and what to say around long-running work. `appearance.md` and
+/// `aesthetic.md` are the *view builder's* guides — the mechanics of
+/// authoring/saving a view, and the taste it has to clear — read off disk by a
+/// build sub-agent, never loaded into the mind's context. All ship in the binary
+/// and refresh on every build; [`install_prompts`] materialises them under
+/// `<data_dir>/prompts/`.
 const CORE_BASE: &str = include_str!("core.md");
+const SPEAKING_BASE: &str = include_str!("speaking.md");
 const APPEARANCE_BASE: &str = include_str!("appearance.md");
 const AESTHETIC_BASE: &str = include_str!("aesthetic.md");
 
@@ -166,36 +169,56 @@ fn compose_prompt(base: &str, prompts_dir: &Path, local_name: &str) -> String {
 
 /// Install the bundled prompts under `<data_dir>/prompts/` at startup, composing
 /// each with its optional `*.local.md` operator override. The managed base files
-/// (`core.md`, `appearance.md`, `aesthetic.md`) are rewritten every boot so they
-/// stay current; operator edits live in the never-touched `*.local.md` siblings.
-/// `appearance.md` and `aesthetic.md` must exist on disk because the view-builder
-/// sub-agent opens them as files.
+/// (`core.md`, `speaking.md`, `appearance.md`, `aesthetic.md`) are rewritten every
+/// boot so they stay current; operator edits live in the never-touched `*.local.md`
+/// siblings. `appearance.md` and `aesthetic.md` must exist on disk because the
+/// view-builder sub-agent opens them as files; the disk copies of `core.md` and
+/// `speaking.md` are for operator visibility ([`load_soul`] composes from the
+/// embedded bases).
 pub fn install_prompts(data_dir: &Path) -> std::io::Result<()> {
     let dir = data_dir.join("prompts");
     std::fs::create_dir_all(&dir)?;
     std::fs::write(dir.join("core.md"), compose_prompt(CORE_BASE, &dir, "core.local.md"))?;
+    std::fs::write(dir.join("speaking.md"), compose_prompt(SPEAKING_BASE, &dir, "speaking.local.md"))?;
     std::fs::write(dir.join("appearance.md"), compose_prompt(APPEARANCE_BASE, &dir, "appearance.local.md"))?;
     std::fs::write(dir.join("aesthetic.md"), compose_prompt(AESTHETIC_BASE, &dir, "aesthetic.local.md"))?;
-    tracing::info!(dir = %dir.display(), "installed bundled prompts (core.md, appearance.md, aesthetic.md)");
+    tracing::info!(dir = %dir.display(), "installed bundled prompts (core.md, speaking.md, appearance.md, aesthetic.md)");
     Ok(())
 }
 
-/// The mind's system prompt: the bundled `core.md` base plus an optional
-/// `<data_dir>/prompts/core.local.md` operator override. Read at session-creation,
-/// so a restart picks up edits. (Named `load_soul` for the reactor's history; it
-/// now loads `core.md`.)
+/// The mind's system prompt: the bundled `core.md` then `speaking.md` bases, plus
+/// any operator overrides from `<data_dir>/prompts/core.local.md` and
+/// `speaking.local.md` — appended after *both* bases so the override layer wins
+/// over everything. Read at session-creation, so a restart picks up edits. (Named
+/// `load_soul` for the reactor's history.)
 pub fn load_soul(data_dir: &Path) -> String {
-    compose_prompt(CORE_BASE, &data_dir.join("prompts"), "core.local.md")
+    let dir = data_dir.join("prompts");
+    let base = format!("{CORE_BASE}\n{SPEAKING_BASE}");
+    let overrides: Vec<String> = ["core.local.md", "speaking.local.md"]
+        .iter()
+        .filter_map(|name| std::fs::read_to_string(dir.join(name)).ok())
+        .map(|text| text.trim().to_owned())
+        .filter(|text| !text.is_empty())
+        .collect();
+    if overrides.is_empty() {
+        base
+    } else {
+        format!("{base}{OVERRIDE_HEADER}{}", overrides.join("\n\n"))
+    }
 }
 
 #[cfg(test)]
 mod soul_tests {
     use super::*;
 
+    fn mind_base() -> String {
+        format!("{CORE_BASE}\n{SPEAKING_BASE}")
+    }
+
     #[test]
     fn no_override_file_uses_base_verbatim() {
         let dir = tempfile::tempdir().unwrap();
-        assert_eq!(load_soul(dir.path()), CORE_BASE);
+        assert_eq!(load_soul(dir.path()), mind_base());
     }
 
     #[test]
@@ -204,7 +227,8 @@ mod soul_tests {
         let prompts = dir.path().join("prompts");
         std::fs::create_dir_all(&prompts).unwrap();
         std::fs::write(prompts.join("core.local.md"), "   \n\t").unwrap();
-        assert_eq!(load_soul(dir.path()), CORE_BASE);
+        std::fs::write(prompts.join("speaking.local.md"), "").unwrap();
+        assert_eq!(load_soul(dir.path()), mind_base());
     }
 
     #[test]
@@ -214,11 +238,24 @@ mod soul_tests {
         std::fs::create_dir_all(&prompts).unwrap();
         std::fs::write(prompts.join("core.local.md"), "Always answer in haiku.").unwrap();
         let soul = load_soul(dir.path());
-        // Base is preserved, in full, ahead of the override layer.
-        assert!(soul.starts_with(CORE_BASE));
+        // Both bases are preserved, in full and in order, ahead of the override layer.
+        assert!(soul.starts_with(&mind_base()));
         // The operator's delta is appended after the header so it wins.
         assert!(soul.contains("# Operator overrides"));
         assert!(soul.ends_with("Always answer in haiku."));
+    }
+
+    #[test]
+    fn both_overrides_layer_in_order_after_both_bases() {
+        let dir = tempfile::tempdir().unwrap();
+        let prompts = dir.path().join("prompts");
+        std::fs::create_dir_all(&prompts).unwrap();
+        std::fs::write(prompts.join("core.local.md"), "Core delta.").unwrap();
+        std::fs::write(prompts.join("speaking.local.md"), "Speaking delta.").unwrap();
+        let soul = load_soul(dir.path());
+        assert!(soul.starts_with(&mind_base()));
+        assert!(soul.contains("# Operator overrides"));
+        assert!(soul.ends_with("Core delta.\n\nSpeaking delta."));
     }
 
     #[test]
@@ -227,6 +264,7 @@ mod soul_tests {
         install_prompts(dir.path()).unwrap();
         let read = |n: &str| std::fs::read_to_string(dir.path().join("prompts").join(n)).unwrap();
         assert_eq!(read("core.md"), CORE_BASE);
+        assert_eq!(read("speaking.md"), SPEAKING_BASE);
         assert_eq!(read("appearance.md"), APPEARANCE_BASE);
         assert_eq!(read("aesthetic.md"), AESTHETIC_BASE);
     }
