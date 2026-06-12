@@ -40,10 +40,10 @@ pub async fn run(config: Config) -> anyhow::Result<()> {
     tracing::info!(data_dir = %config.data_dir.display(), "memory opened");
 
     // Materialise the bundled prompts under <data_dir>/prompts/ so the mind's
-    // system prompt (core.md) and the view-builder's craft guide (appearance.md,
-    // opened as a file by build sub-agents) are on disk, composed with any
-    // `*.local.md` operator overrides. Absolutize the dir: it rides to the child as
-    // HI_AGENT_PROMPTS_DIR, and the child may run with a different cwd than us.
+    // system prompt (core.md) and the view-builder's guides (appearance.md +
+    // aesthetic.md, opened as files by build sub-agents) are on disk, composed with
+    // any `*.local.md` operator overrides. Absolutize the dir: it rides to the child
+    // as HI_AGENT_PROMPTS_DIR, and the child may run with a different cwd than us.
     reactor::install_prompts(&config.data_dir).context("installing bundled prompts")?;
     let prompts_dir = {
         let d = config.data_dir.join("prompts");
@@ -153,8 +153,9 @@ pub async fn run(config: Config) -> anyhow::Result<()> {
         runtime.node_bin_dir(),
         &runtime.claude_bin,
     );
-    // The view-builder sub-agent opens <prompts>/appearance.md as a file; hand it
-    // the absolute dir the same way workers already get HI_AGENT_BASE_URL.
+    // The view-builder sub-agent opens <prompts>/appearance.md and aesthetic.md as
+    // files; hand it the absolute dir the same way workers already get
+    // HI_AGENT_BASE_URL.
     child_env.push(("HI_AGENT_PROMPTS_DIR".to_string(), prompts_dir.display().to_string()));
     // Diagnostic: surface exactly what differs between launchers (terminal vs.
     // cmux etc.) — cwd, the resolved runtime binaries, the config dir claude

@@ -137,12 +137,14 @@ const REWARM_WINDOW: Duration = Duration::from_secs(7 * 24 * 3600);
 
 /// Built-in base prompts, embedded at compile time. `core.md` is the *mind's*
 /// system prompt — who it is, how it talks, how it presents (by delegating a build
-/// and showing the result by ref) and delegates. `appearance.md` is the *view
-/// builder's* craft guide — read off disk by a build sub-agent, never loaded into
-/// the mind's context. Both ship in the binary and refresh on every build;
+/// and showing the result by ref) and delegates. `appearance.md` and `aesthetic.md`
+/// are the *view builder's* guides — the mechanics of authoring/saving a view, and
+/// the taste it has to clear — read off disk by a build sub-agent, never loaded
+/// into the mind's context. All ship in the binary and refresh on every build;
 /// [`install_prompts`] materialises them under `<data_dir>/prompts/`.
 const CORE_BASE: &str = include_str!("core.md");
 const APPEARANCE_BASE: &str = include_str!("appearance.md");
+const AESTHETIC_BASE: &str = include_str!("aesthetic.md");
 
 /// Separator that introduces the operator's override layer. Placed after the
 /// bundled base so its instructions take precedence — the model honors the
@@ -164,15 +166,17 @@ fn compose_prompt(base: &str, prompts_dir: &Path, local_name: &str) -> String {
 
 /// Install the bundled prompts under `<data_dir>/prompts/` at startup, composing
 /// each with its optional `*.local.md` operator override. The managed base files
-/// (`core.md`, `appearance.md`) are rewritten every boot so they stay current;
-/// operator edits live in the never-touched `*.local.md` siblings. `appearance.md`
-/// must exist on disk because the view-builder sub-agent opens it as a file.
+/// (`core.md`, `appearance.md`, `aesthetic.md`) are rewritten every boot so they
+/// stay current; operator edits live in the never-touched `*.local.md` siblings.
+/// `appearance.md` and `aesthetic.md` must exist on disk because the view-builder
+/// sub-agent opens them as files.
 pub fn install_prompts(data_dir: &Path) -> std::io::Result<()> {
     let dir = data_dir.join("prompts");
     std::fs::create_dir_all(&dir)?;
     std::fs::write(dir.join("core.md"), compose_prompt(CORE_BASE, &dir, "core.local.md"))?;
     std::fs::write(dir.join("appearance.md"), compose_prompt(APPEARANCE_BASE, &dir, "appearance.local.md"))?;
-    tracing::info!(dir = %dir.display(), "installed bundled prompts (core.md, appearance.md)");
+    std::fs::write(dir.join("aesthetic.md"), compose_prompt(AESTHETIC_BASE, &dir, "aesthetic.local.md"))?;
+    tracing::info!(dir = %dir.display(), "installed bundled prompts (core.md, appearance.md, aesthetic.md)");
     Ok(())
 }
 
@@ -218,12 +222,13 @@ mod soul_tests {
     }
 
     #[test]
-    fn install_writes_both_managed_bases() {
+    fn install_writes_all_managed_bases() {
         let dir = tempfile::tempdir().unwrap();
         install_prompts(dir.path()).unwrap();
         let read = |n: &str| std::fs::read_to_string(dir.path().join("prompts").join(n)).unwrap();
         assert_eq!(read("core.md"), CORE_BASE);
         assert_eq!(read("appearance.md"), APPEARANCE_BASE);
+        assert_eq!(read("aesthetic.md"), AESTHETIC_BASE);
     }
 }
 
