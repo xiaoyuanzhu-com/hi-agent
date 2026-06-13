@@ -7,6 +7,7 @@ import { ViewSlot } from "./ViewSlot";
 import { WakeGate } from "./WakeGate";
 import { KeyboardFallback } from "./KeyboardFallback";
 import { ChannelControls } from "./ChannelControls";
+import { CameraPreview } from "./CameraPreview";
 
 /**
  * The host chrome — a calm, breathing room — reading the session through
@@ -46,6 +47,10 @@ export function Shell() {
         activity={presence.activity}
         demote={demote}
       />
+
+      {/* The user's self-view while the camera is on — a fullscreen backdrop
+          when nothing leads, shrinking to a corner thumbnail once a view does. */}
+      <CameraPreview stream={ch.visionStream} pip={overlaid} />
 
       {/* While a view holds the stage, the words dock as captions above it
           (only the freshest lines, so the view stays the lead). */}

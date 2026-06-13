@@ -110,6 +110,8 @@ export interface AgentSession {
   videoInput: boolean;
   /** Surfaced if turning the vision channel on failed (denied / no device). */
   videoError: string | null;
+  /** The live camera stream while vision is on (for a self-view), else null. */
+  visionStream: MediaStream | null;
   /** Whether the agent's voice (audio output) channel is on. */
   audioOutput: boolean;
   /** Whether the text input channel is on (the input line is shown). */
@@ -169,6 +171,10 @@ export function useAgentSession(): AgentSession {
   const [audioError, setAudioError] = useState<string | null>(null);
   const [videoInput, setVideoInput] = useState(false);
   const [videoError, setVideoError] = useState<string | null>(null);
+  // The live camera stream while vision is on, so the UI can render a self-view
+  // (the host shows it; null when the camera is off). Held in state alongside
+  // the upload-only `visionRef` so a render is triggered when it appears/clears.
+  const [visionStream, setVisionStream] = useState<MediaStream | null>(null);
   const [audioOutput, setAudioOutput] = useState(prefsRef.current.audioOutput);
   const [textInput, setTextInput] = useState(prefsRef.current.textInput);
   const [agentStreaming, setAgentStreaming] = useState(false);
@@ -472,12 +478,14 @@ export function useAgentSession(): AgentSession {
       const videoStream = await navigator.mediaDevices.getUserMedia({ video: true });
       visionStreamRef.current = videoStream;
       visionRef.current = await VideoStreamer.create(videoStream, { scene });
+      setVisionStream(videoStream);
       setVideoError(null);
       setVideoInput(true);
     } catch (err) {
       // Stop a half-acquired stream so a denied/failed start leaves no camera on.
       visionStreamRef.current?.getTracks().forEach((t) => t.stop());
       visionStreamRef.current = null;
+      setVisionStream(null);
       const msg = (err instanceof Error ? err.message : String(err)).toLowerCase();
       setVideoError(
         msg.includes("denied") || msg.includes("permission") || msg.includes("notallowed")
@@ -493,6 +501,7 @@ export function useAgentSession(): AgentSession {
     visionRef.current = null;
     visionStreamRef.current?.getTracks().forEach((t) => t.stop());
     visionStreamRef.current = null;
+    setVisionStream(null);
     setVideoInput(false);
   }, []);
 
@@ -678,6 +687,7 @@ export function useAgentSession(): AgentSession {
     audioError,
     videoInput,
     videoError,
+    visionStream,
     audioOutput,
     textInput,
     wake,

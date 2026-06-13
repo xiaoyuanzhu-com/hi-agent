@@ -400,6 +400,58 @@ button {
   margin: 0 2px;
 }
 
+/* --- Camera self-view -------------------------------------------------
+   The user's own camera while vision is on. Fullscreen backdrop above the
+   atmosphere (z1) but below the words/controls/views, so the agent still
+   leads; mirrored like a self-view. A soft veil keeps white captions legible
+   over the live feed and keeps it in the calm register (a raw webcam jars).
+   When an agent view takes the stage it shrinks to a corner thumbnail that
+   floats above the view (z55, below captions z60) — same element, just a class
+   swap, so the feed never re-attaches. */
+.hi-selfview {
+  position: fixed;
+  inset: 0;
+  z-index: 2;
+  overflow: hidden;
+  pointer-events: none;
+  background: #0b0d10;
+  box-shadow: none;
+  transition: border-radius 320ms var(--ease), box-shadow 320ms var(--ease);
+}
+
+.hi-selfview video {
+  display: block;
+  width: 100%;
+  height: 100%;
+  object-fit: cover;
+  transform: scaleX(-1); /* mirror — a self-view reads like a mirror */
+}
+
+.hi-selfview::after {
+  content: "";
+  position: absolute;
+  inset: 0;
+  background: radial-gradient(
+    120% 120% at 50% 30%,
+    rgba(246, 248, 251, 0) 42%,
+    rgba(246, 248, 251, 0.34)
+  );
+}
+
+.hi-selfview--pip {
+  inset: auto auto calc(env(safe-area-inset-bottom, 0px) + 20px)
+    max(20px, env(safe-area-inset-left));
+  width: min(200px, 44vw);
+  height: min(150px, 33vw);
+  z-index: 55;
+  border-radius: 14px;
+  box-shadow: 0 10px 34px rgba(20, 28, 40, 0.34);
+}
+
+.hi-selfview--pip::after {
+  display: none;
+}
+
 /* --- Animations ------------------------------------------------------- */
 @keyframes hi-sentence-in {
   from { opacity: 0; transform: translateY(10px); filter: blur(3px); }
