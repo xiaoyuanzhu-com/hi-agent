@@ -190,16 +190,17 @@ Consolidation is a **working session**, not the reactor turn loop — so cost ne
 **Implemented:**
 - **Raw — channel-first layout** (`src/memory/{layout,journal,media}.rs`, `src/types.rs`): per-scene, per-channel, per-day folders with a `<channel>.jsonl` surface log; a uuidv7 `id` per signal; media bytes on the wall-clock grid with `media.file` relative to the channel-day folder. `append` routes by channel; `recent` merges channels by `(ts, id)`. Posted audio clips journal as `channel: Audio`; vision stills journal as `channel: Vision`. `origin` is captured; `turn` is still deferred.
 - **Appearance state channel** (`src/server/view_bus.rs`): each screen mutation appends a whole-state snapshot to `raw/<scene>/appearance/<date>/appearance-<HHMMSSZ>.json`; the newest restores the live screen on boot. No server-side TTL — view lifetime is the reactor's call (the `ttl_ms` envelope field and client/server expiry were removed).
+- **Live mic capture** (`src/server/audio.rs`): the streaming mic's PCM is persisted on the wall-clock-minute grid as `audio/<date>/<HH>/<MM>.wav` (raw 16 kHz mono + a WAV header), flushed at each minute rollover and at close. The bytes are an un-journaled tape; utterance lines correlate to a minute by ts.
+- **Vision capture + placeholder perception** (`src/server/vision.rs`): camera WebM is persisted per minute (`vision/<date>/<HH>/<MM>.webm`, init segment prefixed so each file decodes standalone); stills persist as one-offs. Each is **perceived** — `capabilities::vision::understand` captions it (Image for a still, Video for a camera minute), or a placeholder caption when no `VISION_PROVIDER` is set — and the caption is journaled as the vision signal's `body`. Perception runs detached so capture never blocks.
 - **Core loading** (`src/memory/core.rs`): every reactor session loads `self.md` + `hot.md` on top of the soul — at session open and at each heartbeat hot-swap.
 - **Episodes** (`src/memory/episodes.rs`): the heartbeat persists its conversation briefing as an episode (`episodes/<date>-<short>/episode.md`) — the cheap seed, the only producer today.
 - **hot.md** (`refresh_hot`): regenerated from recent episode gists each heartbeat — a mechanical projection, not yet an agent-curated working set.
 
 **Still to build:**
-- **Save the live mic** — minute-grid WAV under `audio/<date>/<HH>/<MM>.wav`; today the live PCM stream is dropped (only posted clips persist).
-- **Vision capture + perception** — persist camera chunks (`vision/<date>/<HH>/<MM>.webm`) and wire `capabilities::vision::understand` so vision signals carry a caption `body`.
 - **`facets/`** — per-subject understanding; needs subject extraction (a judgment), hence a real reflection session.
 - **Agent-judgment reflection** — today consolidation is mechanical (briefing→episode, episodes→hot.md). The design's "sleep" — a session that segments episodes semantically, derives facets, and curates `self.md`/`hot.md` — is the remaining engine.
 - **Idle trigger** — episodes form only at heartbeat (context-pressure) boundaries; a scene-idle trigger would consolidate sooner and on semantic, not size, boundaries.
+- **Vision attention policy** — perception currently fires on every still and every camera minute; a real cadence/salience policy (when to actually look) is the deliberate placeholder left open.
 - **Workers as raw streams**, **`files/`**, **content index** (§3, §8) — still open.
 
 ## References

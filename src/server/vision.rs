@@ -36,9 +36,10 @@ use futures::StreamExt;
 use serde::Deserialize;
 use tokio::sync::broadcast::error::RecvError;
 
-use chrono::Utc;
+use chrono::{DateTime, Utc};
 use uuid::Uuid;
 
+use crate::capabilities::vision::{self as vision_cap, VisualMedia};
 use crate::memory::layout::MediaSlot;
 use crate::memory::media;
 use crate::server::headers::{AuthBearer, RequiredScene, SceneHeader};
@@ -47,6 +48,9 @@ use crate::types::{Channel, JournalEntry, Media, Origin, Scene};
 
 const DEFAULT_IMAGE_MIME: &str = "image/jpeg";
 const DEFAULT_VIDEO_MIME: &str = "video/webm";
+
+/// The instruction the placeholder perception passes to the vision capability.
+const VISION_PROMPT: &str = "Describe what you see, briefly.";
 
 pub async fn post_vision(
     State(state): State<Arc<AppState>>,
@@ -67,11 +71,11 @@ pub async fn post_vision(
 
     tracing::debug!(scene = %scene, mime = %mime, bytes = body.len(), "POST /api/in/vision");
 
-    // A one-off still: persist the bytes, then journal it as a vision signal so
-    // the frame isn't an orphan blob. `body` is empty — a caption is a derivation
-    // that can come later; the bytes are the truth.
+    // A one-off still: persist the bytes, then perceive it — a caption (the
+    // vision capability, or a placeholder when none is configured) becomes the
+    // signal's text surface. Perception runs in the background so the POST
+    // returns promptly; the journaled signal lands a moment later.
     let ts = Utc::now();
-    let id = Uuid::now_v7().to_string();
     let rel = match media::store_blob(&state.data_dir, &scene, Channel::Vision, ts, MediaSlot::InputOneOff, ext, &body).await {
         Ok(rel) => rel,
         Err(err) => {
@@ -79,20 +83,82 @@ pub async fn post_vision(
             return (StatusCode::INTERNAL_SERVER_ERROR, "vision store failed\n").into_response();
         }
     };
-    let entry = JournalEntry::SignalIn {
-        id,
-        ts,
-        channel: Channel::Vision,
-        scene: scene.clone(),
-        body: String::new(),
-        stream: None,
-        media: Some(Media { file: rel, mime, duration_ms: None, width: None, height: None }),
-        origin: Some(Origin::Human),
-    };
-    if let Err(err) = state.memory.journal.append(entry).await {
-        tracing::error!(error = %err, "journal append failed for vision still; frame is stored");
-    }
+    let visual = VisualMedia::image_bytes(body, mime.clone());
+    spawn_perceive(state.clone(), scene.clone(), visual, rel, mime, ts, None);
     StatusCode::ACCEPTED.into_response()
+}
+
+/// Spawn the perception of one piece of visual media: caption it (via the vision
+/// capability, or a placeholder when unconfigured) and journal a `Vision` signal
+/// whose `body` is that caption and whose `media` points at the stored blob.
+/// Runs detached so capture never blocks on the (possibly remote) understanding.
+fn spawn_perceive(
+    state: Arc<AppState>,
+    scene: Scene,
+    media: VisualMedia,
+    blob_rel: String,
+    mime: String,
+    ts: DateTime<Utc>,
+    duration_ms: Option<u64>,
+) {
+    tokio::spawn(async move {
+        let body = caption(media, &mime).await;
+        let entry = JournalEntry::SignalIn {
+            id: Uuid::now_v7().to_string(),
+            ts,
+            channel: Channel::Vision,
+            scene: scene.clone(),
+            body,
+            stream: None,
+            media: Some(Media { file: blob_rel, mime, duration_ms, width: None, height: None }),
+            origin: Some(Origin::Human),
+        };
+        if let Err(err) = state.memory.journal.append(entry).await {
+            tracing::warn!(scene = %scene, error = %err, "journal append failed for vision perception");
+        }
+    });
+}
+
+/// Caption a piece of visual media. Uses the configured vision capability when
+/// available; otherwise returns a placeholder so the signal still carries a text
+/// surface (the bytes are persisted regardless).
+async fn caption(media: VisualMedia, mime: &str) -> String {
+    if vision_cap::available() {
+        match vision_cap::understand(media, VISION_PROMPT).await {
+            Ok(text) if !text.trim().is_empty() => text,
+            Ok(_) => format!("[vision: empty understanding ({mime})]"),
+            Err(err) => format!("[vision: understanding failed: {err}]"),
+        }
+    } else {
+        format!("[vision capture ({mime}); understanding not configured]")
+    }
+}
+
+/// Persist one wall-clock minute of camera media as
+/// `vision/<date>/<HH>/<MM>.webm`, prefixed with the WebM init segment so the
+/// file decodes standalone, then perceive it (video → caption). Best-effort: a
+/// store failure is logged and perception is skipped.
+async fn flush_video_minute(
+    state: &Arc<AppState>,
+    scene: &Scene,
+    init: Option<Bytes>,
+    media_chunks: &[u8],
+    ts: DateTime<Utc>,
+) {
+    let mut bytes = Vec::with_capacity(init.as_ref().map_or(0, |i| i.len()) + media_chunks.len());
+    if let Some(i) = &init {
+        bytes.extend_from_slice(i);
+    }
+    bytes.extend_from_slice(media_chunks);
+    let rel = match media::store_blob(&state.data_dir, scene, Channel::Vision, ts, MediaSlot::InputStream, "webm", &bytes).await {
+        Ok(rel) => rel,
+        Err(err) => {
+            tracing::warn!(scene = %scene, error = %err, "persisting camera minute failed");
+            return;
+        }
+    };
+    let visual = VisualMedia::video_bytes(Bytes::from(bytes), DEFAULT_VIDEO_MIME);
+    spawn_perceive(state.clone(), scene.clone(), visual, rel, DEFAULT_VIDEO_MIME.to_string(), ts, None);
 }
 
 #[derive(Debug, Deserialize)]
@@ -141,13 +207,27 @@ async fn stream_video_in(
     let turn = state.video_in_turn.fetch_add(1, Ordering::Relaxed);
     let mut started = false;
 
+    // Persist the camera on a wall-clock-minute grid: media chunks accumulate per
+    // minute and flush to `vision/<date>/<HH>/<MM>.webm` at each rollover (and at
+    // close). The WebM init segment (the first chunk) prefixes every minute file
+    // so each is independently decodable. Each flushed minute is also perceived.
+    let mut cap_init: Option<Bytes> = None;
+    let mut cap_minute: Option<String> = None;
+    let mut cap_ts = Utc::now();
+    let mut cap_buf: Vec<u8> = Vec::new();
+
     while let Some(msg) = socket.recv().await {
         match msg {
             Ok(WsMessage::Binary(b)) => {
+                let now = Utc::now();
                 if !started {
                     // The first chunk is the WebM init segment: cache it for
-                    // late-joining observers, then announce the source.
+                    // late-joining observers and for prefixing each minute file,
+                    // then announce the source. It is not buffered as media.
                     started = true;
+                    cap_init = Some(b.clone());
+                    cap_minute = Some(now.format("%Y-%m-%dT%H:%M").to_string());
+                    cap_ts = now;
                     state.video_in_live.lock().unwrap().insert(
                         scene.clone(),
                         VideoSource { turn, mime: mime.clone(), init: b.clone() },
@@ -157,6 +237,17 @@ async fn stream_video_in(
                         turn,
                         mime: mime.clone(),
                     });
+                } else {
+                    let minute = now.format("%Y-%m-%dT%H:%M").to_string();
+                    if cap_minute.as_deref() != Some(minute.as_str()) {
+                        if !cap_buf.is_empty() {
+                            flush_video_minute(&state, &scene, cap_init.clone(), &cap_buf, cap_ts).await;
+                        }
+                        cap_buf.clear();
+                        cap_minute = Some(minute);
+                        cap_ts = now;
+                    }
+                    cap_buf.extend_from_slice(&b);
                 }
                 let _ = state.video_in.send(VideoInEvent::Frame {
                     scene: Some(scene.clone()),
@@ -167,6 +258,11 @@ async fn stream_video_in(
             Ok(WsMessage::Close(_)) | Err(_) => break,
             Ok(_) => {}
         }
+    }
+
+    // Flush the final, partial minute of camera media.
+    if !cap_buf.is_empty() {
+        flush_video_minute(&state, &scene, cap_init.clone(), &cap_buf, cap_ts).await;
     }
 
     if started {

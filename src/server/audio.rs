@@ -293,6 +293,14 @@ async fn stream_audio_in(
     let turn = state.audio_in_turn.fetch_add(1, Ordering::Relaxed);
     let mut started = false;
 
+    // Persist the live mic on a wall-clock-minute grid: PCM accumulates per
+    // minute and flushes to `audio/<date>/<HH>/<MM>.wav` at each rollover (and
+    // at close). The bytes are the raw signal; utterance lines (journaled by
+    // `deliver_transcript`) stay media-less and correlate to a minute by ts.
+    let mut cap_minute: Option<String> = None;
+    let mut cap_ts = Utc::now();
+    let mut cap_buf: Vec<u8> = Vec::new();
+
     // Pump inbound PCM until the client closes or the STT session ends (a send
     // error means `audio_rx` was dropped because `transcribe_streaming` returned).
     while let Some(msg) = socket.recv().await {
@@ -313,6 +321,24 @@ async fn stream_audio_in(
                     turn,
                     bytes: b.clone(),
                 });
+                // Fold the frame into the current minute's WAV buffer, flushing
+                // the completed minute when the wall clock rolls over.
+                let now = Utc::now();
+                let minute = now.format("%Y-%m-%dT%H:%M").to_string();
+                match &cap_minute {
+                    Some(m) if *m != minute => {
+                        flush_mic_minute(&state, &scene, cap_ts, &cap_buf).await;
+                        cap_buf.clear();
+                        cap_minute = Some(minute);
+                        cap_ts = now;
+                    }
+                    None => {
+                        cap_minute = Some(minute);
+                        cap_ts = now;
+                    }
+                    _ => {}
+                }
+                cap_buf.extend_from_slice(&b);
                 if audio_tx.send(b).await.is_err() {
                     break;
                 }
@@ -325,6 +351,10 @@ async fn stream_audio_in(
     // Close the inbound-audio source so listeners end their current response.
     if started {
         let _ = state.audio_in.send(AudioInEvent::End { scene: Some(scene.clone()), turn });
+    }
+    // Flush the final, partial minute of mic audio.
+    if !cap_buf.is_empty() {
+        flush_mic_minute(&state, &scene, cap_ts, &cap_buf).await;
     }
 
     // Closing the audio side lets the STT session flush its last utterance.
@@ -385,6 +415,45 @@ async fn deliver_transcript(
         return false;
     }
     true
+}
+
+/// Persist one wall-clock minute of live mic PCM as a WAV under
+/// `audio/<date>/<HH>/<MM>.wav`. Best-effort: a failure is logged, never fatal.
+async fn flush_mic_minute(state: &AppState, scene: &Scene, ts: DateTime<Utc>, pcm: &[u8]) {
+    let wav = pcm16_mono_16k_to_wav(pcm);
+    if let Err(err) =
+        media::store_blob(&state.data_dir, scene, Channel::Audio, ts, MediaSlot::InputStream, "wav", &wav).await
+    {
+        tracing::warn!(scene = %scene, error = %err, "persisting mic minute failed");
+    }
+}
+
+/// Wrap raw 16 kHz mono signed-16-bit-LE PCM (the live mic format, [`PCM_MIME`])
+/// in a canonical 44-byte WAV header so the minute file is independently
+/// playable.
+fn pcm16_mono_16k_to_wav(pcm: &[u8]) -> Vec<u8> {
+    const SAMPLE_RATE: u32 = 16_000;
+    const CHANNELS: u16 = 1;
+    const BITS: u16 = 16;
+    let byte_rate = SAMPLE_RATE * CHANNELS as u32 * (BITS as u32 / 8);
+    let block_align = CHANNELS * (BITS / 8);
+    let data_len = pcm.len() as u32;
+    let mut w = Vec::with_capacity(44 + pcm.len());
+    w.extend_from_slice(b"RIFF");
+    w.extend_from_slice(&(36 + data_len).to_le_bytes());
+    w.extend_from_slice(b"WAVE");
+    w.extend_from_slice(b"fmt ");
+    w.extend_from_slice(&16u32.to_le_bytes()); // PCM fmt chunk size
+    w.extend_from_slice(&1u16.to_le_bytes()); // audio format = PCM
+    w.extend_from_slice(&CHANNELS.to_le_bytes());
+    w.extend_from_slice(&SAMPLE_RATE.to_le_bytes());
+    w.extend_from_slice(&byte_rate.to_le_bytes());
+    w.extend_from_slice(&block_align.to_le_bytes());
+    w.extend_from_slice(&BITS.to_le_bytes());
+    w.extend_from_slice(b"data");
+    w.extend_from_slice(&data_len.to_le_bytes());
+    w.extend_from_slice(pcm);
+    w
 }
 
 /// Whether an event routed to `target` should reach this `scene` subscriber.
@@ -559,5 +628,31 @@ fn mime_to_ext(mime: &str) -> &'static str {
         "audio/aac" | "audio/x-aac" => "aac",
         "audio/m4a" | "audio/x-m4a" | "audio/mp4" => "m4a",
         _ => "bin",
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn wav_header_is_canonical_16k_mono_16bit() {
+        let pcm = vec![0u8; 320]; // 0.01s of silence
+        let wav = pcm16_mono_16k_to_wav(&pcm);
+        let u16le = |i: usize| u16::from_le_bytes([wav[i], wav[i + 1]]);
+        let u32le = |i: usize| u32::from_le_bytes([wav[i], wav[i + 1], wav[i + 2], wav[i + 3]]);
+
+        assert_eq!(wav.len(), 44 + pcm.len());
+        assert_eq!(&wav[0..4], b"RIFF");
+        assert_eq!(u32le(4), 36 + pcm.len() as u32); // RIFF chunk size
+        assert_eq!(&wav[8..12], b"WAVE");
+        assert_eq!(&wav[12..16], b"fmt ");
+        assert_eq!(u32le(16), 16); // fmt chunk size
+        assert_eq!(u16le(20), 1); // PCM
+        assert_eq!(u16le(22), 1); // mono
+        assert_eq!(u32le(24), 16_000); // sample rate
+        assert_eq!(u16le(34), 16); // bits per sample
+        assert_eq!(&wav[36..40], b"data");
+        assert_eq!(u32le(40), pcm.len() as u32); // data size
     }
 }

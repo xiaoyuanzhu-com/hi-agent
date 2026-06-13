@@ -128,8 +128,9 @@ async fn post_thought_without_scene_header_is_anonymous() {
 #[tokio::test]
 async fn post_vision_journals_and_persists() {
     // A still is accepted (202), persisted as bytes, AND journaled as a vision
-    // signal — `body` empty (a caption is a later derivation; the bytes are the
-    // truth), `media.file` the relative path to the blob.
+    // signal whose `body` is a caption — from the vision capability, or a
+    // placeholder when none is configured (the case here: capabilities are never
+    // initialized in this test). Perception is spawned, so we poll for the line.
     let (base, dir, _seams) = spawn_server().await;
     let client = reqwest::Client::new();
 
@@ -143,14 +144,20 @@ async fn post_vision_journals_and_persists() {
         .expect("send");
     assert_eq!(resp.status(), reqwest::StatusCode::ACCEPTED);
 
-    tokio::time::sleep(Duration::from_millis(50)).await;
-    let entries = read_journal(dir.path());
+    let mut entries = read_journal(dir.path());
+    for _ in 0..40 {
+        if !entries.is_empty() {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        entries = read_journal(dir.path());
+    }
     assert_eq!(entries.len(), 1, "vision still should journal one entry, got {entries:?}");
     match &entries[0] {
         JournalEntry::SignalIn { channel, scene, body, media, .. } => {
             assert_eq!(*channel, Channel::Vision);
             assert_eq!(scene.0, "alice@phone");
-            assert!(body.is_empty(), "caption is deferred; body should be empty");
+            assert!(!body.is_empty(), "vision signal carries a caption (placeholder when no provider)");
             let media = media.as_ref().expect("vision signal carries media");
             assert!(media.file.ends_with(".jpg"), "relative blob path, got {}", media.file);
         }
