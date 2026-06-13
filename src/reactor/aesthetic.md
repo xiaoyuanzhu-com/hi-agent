@@ -53,7 +53,10 @@ rich, polychrome palette is right when the subject earns it, and restraint is ri
 colour would just be noise; type and hierarchy are choices, never a default. Second,
 respect the medium: it's a landscape screen someone glances at, so fill the frame with no
 dead gaps, leave room to breathe, keep it legible (comfortable line-height, body 16px or
-larger), and make sure it actually renders. Past that, vary freely — two views on two
+larger), and make sure it actually renders. The conversation's live words also share that
+screen — they dock as captions over your view (`appearance.md` has the mechanics), so
+compose with them in mind and leave them a quiet region rather than letting them sit on
+your subject. Past that, vary freely — two views on two
 topics should look like two different things made with the same care.
 
 **Motion is for meaning, not decoration.** Use `motion/react` where movement *says*

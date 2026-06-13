@@ -38,6 +38,20 @@ workspace is served at `/workspace/<the same relative path>`, so a file you writ
 `badminton-top10/leader.jpg` is `<img src="/workspace/badminton-top10/leader.jpg">`.
 That path always loads and keeps your source small.
 
+**The live words ride above your view.** While your view is on stage, the host keeps
+showing the conversation's words — the person's transcribed speech and the agent's
+lines — as small caption pills docked bottom-center over your view (you don't render
+them). If your composition's main content lives there, move them aside by exporting a
+placement from the module:
+
+```
+export const captionAside = "top"; // "top" | "bottom" | "left" | "right" | "self"
+```
+
+`"self"` means you fold the words into the composition yourself: render them with
+`useSpeech()` from `@hi/core` and the host's captions stand down. Only declare it if
+you actually render them — otherwise the person's speech goes invisible.
+
 **It's theirs the moment they reach for it.** If they scroll or tap, the view should
 yield — let them look, and don't fight it.
 

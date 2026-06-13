@@ -23,10 +23,18 @@ export function Shell() {
   const { woken, waking, wakeError, wake, startTextOnly } = useWake();
   const ch = useChannels();
   const sendText = useSendText();
-  const { views } = useViews();
+  const { views, meta } = useViews();
 
   // The presence recedes while a view is on stage (the agent's content leads).
-  const demote = views.length > 0 ? 0.72 : 0;
+  const overlaid = views.length > 0;
+  const demote = overlaid ? 0.72 : 0;
+
+  // Caption placement follows the topmost view's module-declared aside (last in
+  // z-order); undeclared docks bottom. "self" = the view renders the words
+  // itself via useSpeech(), so the host's captions stand down.
+  const topmost = overlaid ? views[views.length - 1] : undefined;
+  const aside = (topmost && meta.get(topmost.id)?.captionAside) ?? "bottom";
+  const selfHosted = overlaid && aside === "self";
 
   return (
     <div className="hi-root">
@@ -39,9 +47,16 @@ export function Shell() {
         demote={demote}
       />
 
-      <div className="hi-stage">
-        <SpeechText items={sentences} />
-      </div>
+      {/* While a view holds the stage, the words dock as captions above it
+          (only the freshest lines, so the view stays the lead). */}
+      {!selfHosted && (
+        <div
+          className={overlaid ? "hi-stage hi-stage--captions" : "hi-stage"}
+          data-aside={overlaid ? aside : undefined}
+        >
+          <SpeechText items={overlaid ? sentences.slice(-2) : sentences} />
+        </div>
+      )}
 
       <ViewSlot />
 

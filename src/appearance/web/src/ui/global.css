@@ -194,6 +194,73 @@ button {
   font-style: italic;
 }
 
+/* --- Captions over a view ---------------------------------------------
+   While an agent view fills the stage (ViewSlot, z-index 50), the words dock
+   aside and rise above it — a dark scrim pill keeps them legible over whatever
+   the view paints (the white text-shadow only works on light ground). The dock
+   side follows the topmost view's `export const captionAside` (default bottom;
+   "self" = the view hosts the words and this layer stands down). */
+.hi-stage--captions {
+  top: auto;
+  bottom: calc(env(safe-area-inset-bottom, 0px) + 68px);
+  transform: translateX(-50%);
+  z-index: 60;
+}
+
+.hi-stage--captions .hi-speech {
+  gap: 6px;
+}
+
+.hi-stage--captions .hi-sentence {
+  padding: 7px 16px;
+  border-radius: 14px;
+  background: rgba(17, 21, 28, 0.55);
+  backdrop-filter: blur(10px);
+  -webkit-backdrop-filter: blur(10px);
+  color: rgba(255, 255, 255, 0.96);
+  text-shadow: none;
+  font-size: clamp(15px, 2vw, 20px);
+}
+
+.hi-stage--captions .hi-sentence--prev {
+  opacity: 0.45;
+  color: rgba(255, 255, 255, 0.85);
+}
+
+.hi-stage--captions .hi-sentence--user {
+  color: #b9d2f4;
+}
+
+.hi-stage--captions[data-aside="top"] {
+  top: calc(env(safe-area-inset-top, 0px) + 32px);
+  bottom: auto;
+}
+
+.hi-stage--captions[data-aside="left"],
+.hi-stage--captions[data-aside="right"] {
+  width: min(420px, 38vw);
+  transform: none;
+}
+
+.hi-stage--captions[data-aside="left"] {
+  left: max(28px, env(safe-area-inset-left, 0px) + 16px);
+  text-align: left;
+}
+
+.hi-stage--captions[data-aside="left"] .hi-speech {
+  align-items: flex-start;
+}
+
+.hi-stage--captions[data-aside="right"] {
+  left: auto;
+  right: max(28px, env(safe-area-inset-right, 0px) + 16px);
+  text-align: right;
+}
+
+.hi-stage--captions[data-aside="right"] .hi-speech {
+  align-items: flex-end;
+}
+
 /* --- Wake gate -------------------------------------------------------- */
 .hi-wake {
   position: fixed;
