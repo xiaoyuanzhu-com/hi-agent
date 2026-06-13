@@ -12,8 +12,6 @@ export interface WireView {
   id: string;
   /** URL of the compiled ESM module to import and mount under `id`. */
   module_url: string;
-  /** Remaining lifetime at response time, when the view carries a TTL. */
-  ttl_ms?: number;
 }
 
 /** A scene's full appearance state — one GET /api/out/view response. */

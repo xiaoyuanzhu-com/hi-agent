@@ -1370,7 +1370,7 @@ async fn emit_view(reactor: &Reactor, scene: &Scene, id: String, op: ViewOp, sou
         .out
         .send(OutboundSignal::View {
             scene: scene.clone(),
-            envelope: ViewEnvelope { id, op, module_url, ttl_ms: None },
+            envelope: ViewEnvelope { id, op, module_url },
         })
         .await;
 }

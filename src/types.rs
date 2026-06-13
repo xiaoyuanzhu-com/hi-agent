@@ -224,13 +224,13 @@ pub enum ViewOp {
 /// One view event delivered to the browser over GET /api/out/view. `module_url`
 /// points at the compiled ESM module (`/workspace/.cache/views/<hash>.mjs`) the client
 /// dynamically imports and mounts under `id` in the view slot. For
-/// `op = dismiss` only `id` is meaningful.
+/// `op = dismiss` only `id` is meaningful. A view persists until the agent
+/// dismisses (or replaces) it — there is no auto-expiry; lifetime is the
+/// reactor's decision.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ViewEnvelope {
     pub id: String,
     pub op: ViewOp,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub module_url: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub ttl_ms: Option<u64>,
 }

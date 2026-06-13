@@ -25,7 +25,7 @@ This document is the **durable design contract** for memory, in the spirit of `a
 | **A signal = a text surface (always) + an optional media payload** | Text and multimodal are one record type, not two systems. Every modality has a text surface (words / transcript / caption); bytes are an attachment |
 | **The text surface is permanent; media bytes fade** | The `.jsonl` lines are lossless forever and nearly free; sensory blobs are vividness that degrades with age. This bounds size without losing the memory |
 | **The interleaved timeline is derived, never stored** | A scene is one timeline but stored per-channel; the mind reads a merge built on read (ordered by uuidv7 `id`), so there is no second copy to drift |
-| **`appearance` is retained state, not an utterance stream** | The screen persists until changed, so it is recorded as timestamped whole-state snapshots; `appearance.json` is the live current state, the one mutable file under `raw/` |
+| **`appearance` is retained state, not an utterance stream** | The screen persists until changed, so it is recorded as timestamped whole-state snapshots; the newest is the current screen (no separate current-state file). View lifetime is the reactor's decision — no server-side auto-expiry |
 | **Workers are scenes too — a worker run is its own lossless `raw/` stream** | Uniform ("everything is a scene with a signal stream"), and `architecture.md` §7 already requires worker transcripts to be inspectable |
 | **The always-loaded core = `self.md` (stable identity) + `hot.md` (volatile activation)** | The two heat sources — permanence and recent-significance — kept as two files of different volatility |
 | **`self` is not a facet** | facets model *external* entities; `self` is the core modeling itself. It sits on the selfhood gradient `SOUL → self → hot`, not next to people/locations |
@@ -56,7 +56,6 @@ memory/
 ├── raw/                              ← LOSSLESS TRUTH, per scene — append-only, never edited
 │   └── <scene>/                      ← dir name = path-safe encoding of the scene id
 │       ├── scene.json                ← the true (un-encoded) id + created_at
-│       ├── appearance.json           ← CURRENT screen state (the one mutable file here — §3)
 │       ├── text/
 │       │   └── 2026-06-11/text.jsonl ← the day's messages, both directions
 │       ├── audio/
@@ -69,7 +68,7 @@ memory/
 │       │       ├── vision.jsonl      ← surface log (captions)
 │       │       └── 10/15.mp4         ← camera; output/ holds generated frames
 │       ├── appearance/               ← the one STATE channel: screen-state history
-│       │   └── 2026-06-11/
+│       │   └── 2026-06-11/           ← whole-state snapshots; newest = current screen
 │       │       └── appearance-101502Z.json
 │       └── files/                    ← exchanged/produced artifacts (kept verbatim)
 │           └── 2026-06-11-trip-plan.pdf
@@ -85,7 +84,7 @@ memory/
     └── culture/<topic>.md            ← what it absorbed from the world
 ```
 
-**Truth vs. projection.** Everything under `raw/` is append-only lossless truth — identity, the channel streams, imported artifacts — with one deliberate exception: `appearance.json`, the live current-screen state (§3). Everything else (`episodes/`, `facets/`, `hot.md`, and the interleaved per-scene timeline the mind reads) is a **projection**: regenerable from `raw/`, never a second source of truth, safe to delete and rebuild.
+**Truth vs. projection.** Everything under `raw/` is append-only lossless truth — identity, the channel streams (including the `appearance/` state-snapshot history), imported artifacts. Everything else (`episodes/`, `facets/`, `hot.md`, the current screen, and the interleaved per-scene timeline the mind reads) is a **projection**: regenerable from `raw/`, never a second source of truth, safe to delete and rebuild.
 
 **Format split:** the channel surface logs are JSONL — structured, append-only, machine truth. Everything derived is markdown — prose a mind reads directly.
 
@@ -133,7 +132,7 @@ Two different lifetimes — and this is what bounds size:
 
 ### `appearance` — the one state channel
 
-Every other channel is an **event stream** (utterances). `appearance` is **retained state**: the screen persists until changed, so it is recorded not as deltas but as **timestamped whole-state snapshots** — `appearance/<date>/appearance-<hhmmssZ>.json`, each the full screen as of that moment, valid until the next. `appearance.json` at the scene root is the **current** state (the newest snapshot, TTL-applied) — the single mutable file under `raw/`, kept for a fast live read and reloaded on boot. Showing a view is expression the agent can later cite ("I showed them the itinerary"), so the history feeds reflection like any other channel.
+Every other channel is an **event stream** (utterances). `appearance` is **retained state**: the screen persists until changed, so it is recorded not as deltas but as **timestamped whole-state snapshots** — `appearance/<date>/appearance-<hhmmssZ>.json`, each the full screen as of that moment, valid until the next (a same-second collision bumps to the next free second). The **current** screen is simply the newest snapshot — there is no separate current-state file; the live bus holds it in memory and restores from the newest snapshot on boot. A view persists until the agent dismisses or replaces it: **there is no auto-expiry — view lifetime is the reactor's decision**, not a server-side timer. Showing a view is expression the agent can later cite ("I showed them the itinerary"), so the history feeds reflection like any other channel.
 
 ### Files and workers
 
@@ -188,19 +187,18 @@ Consolidation is a **working session**, not the reactor turn loop — so cost ne
 
 ## 9. Status
 
-> **The §2–3 raw layout is the redesigned target (sealed 2026-06-13); the implementation still lags it.** Today's code writes the older shape — one `signals/<date>/log.jsonl` per scene with co-located `audio-<id>.mp3` blobs (`src/memory/{layout,journal,media}.rs`) — not the per-channel folders, minute-grid bytes, saved-mic, or `appearance` channel described above. Migrating the writers/readers to the channel layout is the next raw-layer task.
-
 **Implemented:**
-- **Raw** (`src/memory/{layout,journal,media}.rs`, `src/types.rs`): per-scene day-folder slices, a uuidv7 `id` per signal, co-located media, `scene.json`. `origin` provenance (human/reactor/worker) is captured; `turn` is still deferred. (Old single-`log.jsonl` shape — see note above.)
-- **Core loading** (`src/memory/core.rs`): every reactor session loads `self.md` (sticky identity) + `hot.md` (working set) on top of the soul — at session open and at each heartbeat hot-swap.
-- **Episodes** (`src/memory/episodes.rs`): the heartbeat persists its conversation briefing as an episode (`episodes/<date>-<short>/episode.md`) — the cheap seed. This is the only producer today.
-- **hot.md** (`refresh_hot`): regenerated from recent episode gists on each heartbeat — a mechanical projection (regenerate, don't patch), not yet an agent-curated working set.
-
-No migration was needed — there was no prior data.
+- **Raw — channel-first layout** (`src/memory/{layout,journal,media}.rs`, `src/types.rs`): per-scene, per-channel, per-day folders with a `<channel>.jsonl` surface log; a uuidv7 `id` per signal; media bytes on the wall-clock grid with `media.file` relative to the channel-day folder. `append` routes by channel; `recent` merges channels by `(ts, id)`. Posted audio clips journal as `channel: Audio`; vision stills journal as `channel: Vision`. `origin` is captured; `turn` is still deferred.
+- **Appearance state channel** (`src/server/view_bus.rs`): each screen mutation appends a whole-state snapshot to `raw/<scene>/appearance/<date>/appearance-<HHMMSSZ>.json`; the newest restores the live screen on boot. No server-side TTL — view lifetime is the reactor's call (the `ttl_ms` envelope field and client/server expiry were removed).
+- **Core loading** (`src/memory/core.rs`): every reactor session loads `self.md` + `hot.md` on top of the soul — at session open and at each heartbeat hot-swap.
+- **Episodes** (`src/memory/episodes.rs`): the heartbeat persists its conversation briefing as an episode (`episodes/<date>-<short>/episode.md`) — the cheap seed, the only producer today.
+- **hot.md** (`refresh_hot`): regenerated from recent episode gists each heartbeat — a mechanical projection, not yet an agent-curated working set.
 
 **Still to build:**
+- **Save the live mic** — minute-grid WAV under `audio/<date>/<HH>/<MM>.wav`; today the live PCM stream is dropped (only posted clips persist).
+- **Vision capture + perception** — persist camera chunks (`vision/<date>/<HH>/<MM>.webm`) and wire `capabilities::vision::understand` so vision signals carry a caption `body`.
 - **`facets/`** — per-subject understanding; needs subject extraction (a judgment), hence a real reflection session.
-- **Agent-judgment reflection** — today consolidation is mechanical (briefing→episode, episodes→hot.md). The design's "sleep" — a working session that segments episodes semantically, derives facets, and curates `self.md`/`hot.md` — is the remaining engine.
+- **Agent-judgment reflection** — today consolidation is mechanical (briefing→episode, episodes→hot.md). The design's "sleep" — a session that segments episodes semantically, derives facets, and curates `self.md`/`hot.md` — is the remaining engine.
 - **Idle trigger** — episodes form only at heartbeat (context-pressure) boundaries; a scene-idle trigger would consolidate sooner and on semantic, not size, boundaries.
 - **Workers as raw streams**, **`files/`**, **content index** (§3, §8) — still open.
 

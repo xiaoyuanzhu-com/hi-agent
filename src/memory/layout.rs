@@ -100,6 +100,17 @@ pub fn channel_log_path(
     channel_day_dir(data_dir, scene, channel, ts).join(format!("{}.jsonl", channel.as_str()))
 }
 
+/// `<scene>/appearance/<YYYY-MM-DD>` — the day-folder for a scene's screen-state
+/// history. Appearance is a state channel, not an event stream: it holds
+/// timestamped whole-state snapshots (`appearance-<HHMMSSZ>.json`), not a
+/// `<channel>.jsonl`, so it is reached through this helper rather than
+/// [`channel_day_dir`] (there is no `Channel::Appearance`).
+pub fn appearance_day_dir(data_dir: &Path, scene: &Scene, ts: DateTime<Utc>) -> PathBuf {
+    scene_dir(data_dir, scene)
+        .join("appearance")
+        .join(day_key(ts))
+}
+
 /// The byte path for a signal's media **relative to its channel-day folder**, by
 /// slot (see [`MediaSlot`]). Stored verbatim in the entry's `media.file`, so a
 /// reader resolves it as `channel_day_dir(..).join(media.file)`.

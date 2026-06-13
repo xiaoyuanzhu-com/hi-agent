@@ -4,7 +4,6 @@ import {
   useContext,
   useEffect,
   useMemo,
-  useRef,
   useState,
   type ReactNode,
 } from "react";
@@ -46,15 +45,14 @@ const ViewsContext = createContext<ViewsValue>({
  * session's channel loops — survives any view swap. Mirrors the server's retained
  * per-scene appearance state: each response is the whole set of active views in
  * z-order, so a fresh page, a second device, or a reconnect all converge on the
- * same screen. TTL timers handle live expiry between snapshots; the server evicts
- * authoritatively and the next snapshot agrees.
+ * same screen. A view persists until the agent dismisses or replaces it — there
+ * is no client-side expiry; the next snapshot is the only lifecycle driver.
  */
 export function ViewsProvider({ children }: { children: ReactNode }) {
   const scene = useScene();
   const { woken } = useWake();
   const [views, setViews] = useState<Map<string, string>>(new Map());
   const [meta, setMeta] = useState<Map<string, ViewMeta>>(new Map());
-  const ttlTimers = useRef<Map<string, number>>(new Map());
 
   const reportMeta = useCallback((id: string, m: ViewMeta) => {
     setMeta((prev) => new Map(prev).set(id, m));
@@ -64,26 +62,6 @@ export function ViewsProvider({ children }: { children: ReactNode }) {
     if (!woken) return;
     const ctrl = new AbortController();
     let cancelled = false;
-    const timers = ttlTimers.current;
-
-    const clearTimers = () => {
-      timers.forEach((t) => window.clearTimeout(t));
-      timers.clear();
-    };
-    const remove = (id: string) => {
-      setViews((prev) => {
-        if (!prev.has(id)) return prev;
-        const next = new Map(prev);
-        next.delete(id);
-        return next;
-      });
-      setMeta((prev) => {
-        if (!prev.has(id)) return prev;
-        const next = new Map(prev);
-        next.delete(id);
-        return next;
-      });
-    };
 
     void (async () => {
       while (!cancelled) {
@@ -98,16 +76,6 @@ export function ViewsProvider({ children }: { children: ReactNode }) {
               if (![...prev.keys()].some((id) => !live.has(id))) return prev;
               return new Map([...prev].filter(([id]) => live.has(id)));
             });
-            clearTimers();
-            for (const v of state.views) {
-              if (v.ttl_ms && v.ttl_ms > 0) {
-                const timer = window.setTimeout(() => {
-                  timers.delete(v.id);
-                  remove(v.id);
-                }, v.ttl_ms);
-                timers.set(v.id, timer);
-              }
-            }
           }
         } catch {
           if (cancelled || ctrl.signal.aborted) break;
@@ -119,7 +87,6 @@ export function ViewsProvider({ children }: { children: ReactNode }) {
     return () => {
       cancelled = true;
       ctrl.abort();
-      clearTimers();
     };
   }, [woken, scene]);
 

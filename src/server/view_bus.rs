@@ -15,21 +15,27 @@
 //! `since` is absent or behind). State is tiny — a few ids and module URLs —
 //! so resending it whole kills the missed-delta bug class outright.
 //!
-//! The state also survives restarts: every mutation rewrites
-//! `<data_dir>/appearance/<scene_enc>.json` (tempfile + rename), and
-//! [`ViewBus::load`] reads those back on boot. Module URLs stay valid across
-//! restarts because compiled views are content-addressed on disk and never
-//! collected (see [`crate::views`]).
+//! A view persists until the agent dismisses or replaces it: there is no
+//! auto-expiry, lifetime is the reactor's decision.
+//!
+//! The state also survives restarts: every mutation appends a whole-state
+//! snapshot to the memory store at
+//! `raw/<scene>/appearance/<date>/appearance-<HHMMSSZ>.json`, and
+//! [`ViewBus::load`] restores each scene from its newest snapshot on boot. The
+//! snapshots double as the scene's appearance history (the screen as
+//! expression, for later reflection). Module URLs stay valid across restarts
+//! because compiled views are content-addressed on disk and never collected
+//! (see [`crate::views`]).
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use chrono::{DateTime, Utc};
+use chrono::{DateTime, Duration, Utc};
 use serde::{Deserialize, Serialize};
 use tokio::sync::{Mutex, Notify};
 
-use crate::memory::layout::encode_scene;
+use crate::memory::layout;
 use crate::types::{Scene, ViewEnvelope, ViewOp};
 
 /// Cap on active views per scene. Bounds growth if the agent keeps showing
@@ -42,8 +48,8 @@ const MAX_ACTIVE_VIEWS_PER_SCENE: usize = 16;
 #[derive(Clone)]
 pub struct ViewBus {
     inner: Arc<Mutex<HashMap<Scene, SceneAppearance>>>,
-    /// `<data_dir>/appearance` — one snapshot file per scene.
-    dir: PathBuf,
+    /// The memory data dir; snapshots live under `raw/<scene>/appearance/`.
+    data_dir: PathBuf,
 }
 
 #[derive(Default)]
@@ -60,29 +66,24 @@ struct SceneAppearance {
 struct RetainedView {
     id: String,
     module_url: String,
-    /// Absolute deadline derived from the envelope's `ttl_ms`, so expiry holds
-    /// across restarts and for clients that connect late.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    expires_at: Option<DateTime<Utc>>,
 }
 
-/// On-disk snapshot of one scene's appearance. Carries the true scene id (the
-/// filename is its percent-encoding, never decoded back).
+/// On-disk whole-state snapshot of one scene's appearance at a moment. Carries
+/// the true scene id (the path is its percent-encoding, never decoded back) and
+/// `as_of` so the history reads as a step-function of what was on screen.
 #[derive(Serialize, Deserialize)]
 struct SceneSnapshot {
     scene: Scene,
     version: u64,
+    as_of: DateTime<Utc>,
     views: Vec<RetainedView>,
 }
 
-/// One active view as delivered to the browser. `ttl_ms` is the *remaining*
-/// lifetime at response time.
+/// One active view as delivered to the browser.
 #[derive(Debug, Clone, Serialize)]
 pub struct WireView {
     pub id: String,
     pub module_url: String,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub ttl_ms: Option<u64>,
 }
 
 /// A scene's full appearance state — the body of one `GET /api/out/view`
@@ -94,52 +95,39 @@ pub struct ViewState {
 }
 
 impl ViewBus {
-    /// Open the bus, reloading every scene's persisted appearance from
-    /// `<data_dir>/appearance/`. Entries already past their TTL are dropped.
+    /// Open the bus, restoring each scene's appearance from its newest snapshot
+    /// under `raw/<scene>/appearance/`.
     pub fn load(data_dir: &Path) -> Self {
-        let dir = data_dir.join("appearance");
         let mut map = HashMap::new();
-        let now = Utc::now();
-        if let Ok(entries) = std::fs::read_dir(&dir) {
-            for entry in entries.flatten() {
-                let path = entry.path();
-                if path.extension().and_then(|e| e.to_str()) != Some("json") {
-                    continue;
+        let raw = layout::raw_root(data_dir);
+        if let Ok(scenes) = std::fs::read_dir(&raw) {
+            for scene_ent in scenes.flatten() {
+                let app_dir = scene_ent.path().join("appearance");
+                if let Some(snap) = newest_snapshot(&app_dir) {
+                    map.insert(
+                        snap.scene,
+                        SceneAppearance {
+                            views: snap.views,
+                            version: snap.version,
+                            notify: Arc::new(Notify::new()),
+                        },
+                    );
                 }
-                let snap: SceneSnapshot = match std::fs::read(&path)
-                    .ok()
-                    .and_then(|bytes| serde_json::from_slice(&bytes).ok())
-                {
-                    Some(snap) => snap,
-                    None => {
-                        tracing::warn!(path = %path.display(), "unreadable appearance snapshot; skipping");
-                        continue;
-                    }
-                };
-                let mut state = SceneAppearance {
-                    views: snap.views,
-                    version: snap.version,
-                    notify: Arc::new(Notify::new()),
-                };
-                evict_expired(&mut state, now);
-                map.insert(snap.scene, state);
             }
         }
         Self {
             inner: Arc::new(Mutex::new(map)),
-            dir,
+            data_dir: data_dir.to_path_buf(),
         }
     }
 
     /// Fold one reactor-emitted envelope into the scene's appearance: `show`
     /// upserts and raises to the top of the z-order, `replace` swaps in place
     /// (falling back to show for an unknown id), `dismiss` removes. Bumps the
-    /// version, persists the snapshot, and wakes parked readers.
+    /// version, appends a snapshot, and wakes parked readers.
     pub async fn apply(&self, scene: &Scene, envelope: ViewEnvelope) {
         let mut map = self.inner.lock().await;
         let entry = map.entry(scene.clone()).or_default();
-        let now = Utc::now();
-        evict_expired(entry, now);
 
         match envelope.op {
             ViewOp::Dismiss => {
@@ -153,9 +141,6 @@ impl ViewBus {
                 let view = RetainedView {
                     id: envelope.id.clone(),
                     module_url,
-                    expires_at: envelope
-                        .ttl_ms
-                        .map(|ms| now + chrono::Duration::milliseconds(ms as i64)),
                 };
                 let pos = entry.views.iter().position(|v| v.id == envelope.id);
                 match (envelope.op, pos) {
@@ -173,24 +158,17 @@ impl ViewBus {
         }
         entry.version += 1;
         entry.notify.notify_waiters();
-        persist(&self.dir, scene, entry).await;
+        persist(&self.data_dir, scene, entry).await;
     }
 
     /// The scene's appearance, as soon as its version exceeds `since`.
     /// `since: None` returns the present state immediately — even when empty —
     /// so a fresh page knows it is synced; passing the last seen version parks
-    /// until the state changes. Expired views are evicted on the way out (a
-    /// version bump of its own, so other parked readers learn too).
+    /// until the state changes.
     pub async fn wait_state(&self, scene: &Scene, since: Option<u64>) -> ViewState {
         loop {
             let mut map = self.inner.lock().await;
             let entry = map.entry(scene.clone()).or_default();
-            let now = Utc::now();
-            if evict_expired(entry, now) {
-                entry.version += 1;
-                entry.notify.notify_waiters();
-                persist(&self.dir, scene, entry).await;
-            }
             if since.is_none_or(|s| entry.version > s) {
                 return ViewState {
                     version: entry.version,
@@ -200,9 +178,6 @@ impl ViewBus {
                         .map(|v| WireView {
                             id: v.id.clone(),
                             module_url: v.module_url.clone(),
-                            ttl_ms: v
-                                .expires_at
-                                .map(|t| (t - now).num_milliseconds().max(0) as u64),
                         })
                         .collect(),
                 };
@@ -220,20 +195,49 @@ impl ViewBus {
     }
 }
 
-/// Drop views past their deadline; `true` when anything was removed.
-fn evict_expired(entry: &mut SceneAppearance, now: DateTime<Utc>) -> bool {
-    let before = entry.views.len();
-    entry.views.retain(|v| v.expires_at.is_none_or(|t| t > now));
-    entry.views.len() != before
+/// The newest parseable snapshot under a scene's `appearance/` dir, or `None`.
+/// Walks day-folders newest-first, then `appearance-*.json` newest-first, so a
+/// torn final write falls back to the prior snapshot.
+fn newest_snapshot(appearance_dir: &Path) -> Option<SceneSnapshot> {
+    let mut days: Vec<String> = std::fs::read_dir(appearance_dir)
+        .ok()?
+        .flatten()
+        .filter(|e| e.path().is_dir())
+        .filter_map(|e| e.file_name().into_string().ok())
+        .collect();
+    days.sort();
+    for day in days.iter().rev() {
+        let day_dir = appearance_dir.join(day);
+        let mut files: Vec<String> = std::fs::read_dir(&day_dir)
+            .into_iter()
+            .flatten()
+            .flatten()
+            .filter_map(|e| e.file_name().into_string().ok())
+            .filter(|n| n.starts_with("appearance-") && n.ends_with(".json"))
+            .collect();
+        files.sort();
+        for f in files.iter().rev() {
+            if let Ok(bytes) = std::fs::read(day_dir.join(f)) {
+                if let Ok(snap) = serde_json::from_slice::<SceneSnapshot>(&bytes) {
+                    return Some(snap);
+                }
+            }
+        }
+    }
+    None
 }
 
-/// Rewrite the scene's snapshot file. Tempfile + rename so a crash mid-write
-/// never leaves a torn snapshot; failures are logged, not fatal — the live
-/// state is authoritative until the next successful write.
-async fn persist(dir: &Path, scene: &Scene, entry: &SceneAppearance) {
+/// Append a whole-state snapshot to `raw/<scene>/appearance/<date>/`. The file
+/// is named for the wall-clock second; on the rare same-second collision the
+/// second is bumped until free, so no snapshot in the history is overwritten.
+/// Tempfile + rename so a crash mid-write never leaves a torn snapshot at a real
+/// name. Failures are logged, not fatal — the live state stays authoritative.
+async fn persist(data_dir: &Path, scene: &Scene, entry: &SceneAppearance) {
+    let now = Utc::now();
     let snap = SceneSnapshot {
         scene: scene.clone(),
         version: entry.version,
+        as_of: now,
         views: entry.views.clone(),
     };
     let bytes = match serde_json::to_vec_pretty(&snap) {
@@ -243,11 +247,21 @@ async fn persist(dir: &Path, scene: &Scene, entry: &SceneAppearance) {
             return;
         }
     };
-    let enc = encode_scene(scene);
-    let path = dir.join(format!("{enc}.json"));
-    let tmp = dir.join(format!("{enc}.json.tmp.{}", std::process::id()));
+    let dir = layout::appearance_day_dir(data_dir, scene, now);
+    if let Err(err) = tokio::fs::create_dir_all(&dir).await {
+        tracing::warn!(scene = %scene, error = %err, "creating appearance dir failed");
+        return;
+    }
+    let mut slot = now;
+    let path = loop {
+        let p = dir.join(format!("appearance-{}.json", slot.format("%H%M%SZ")));
+        if !tokio::fs::try_exists(&p).await.unwrap_or(false) {
+            break p;
+        }
+        slot += Duration::seconds(1);
+    };
+    let tmp = dir.join(format!(".tmp.{}.{}", std::process::id(), slot.format("%H%M%S")));
     let result = async {
-        tokio::fs::create_dir_all(dir).await?;
         tokio::fs::write(&tmp, &bytes).await?;
         tokio::fs::rename(&tmp, &path).await
     }
@@ -270,7 +284,6 @@ mod tests {
             id: id.into(),
             op: ViewOp::Show,
             module_url: Some(url.into()),
-            ttl_ms: None,
         }
     }
 
@@ -338,7 +351,6 @@ mod tests {
                 id: "a".into(),
                 op: ViewOp::Replace,
                 module_url: Some("/m/a2.mjs".into()),
-                ttl_ms: None,
             },
         )
         .await;
@@ -358,7 +370,6 @@ mod tests {
                 id: "d".into(),
                 op: ViewOp::Replace,
                 module_url: Some("/m/d.mjs".into()),
-                ttl_ms: None,
             },
         )
         .await;
@@ -371,7 +382,6 @@ mod tests {
                 id: "b".into(),
                 op: ViewOp::Dismiss,
                 module_url: None,
-                ttl_ms: None,
             },
         )
         .await;
@@ -393,38 +403,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn ttl_expires_server_side_and_reports_remaining() {
-        let tmp = tempfile::tempdir().unwrap();
-        let bus = ViewBus::load(tmp.path());
-        let s = scene();
-        bus.apply(
-            &s,
-            ViewEnvelope {
-                id: "flash".into(),
-                op: ViewOp::Show,
-                module_url: Some("/m/f.mjs".into()),
-                ttl_ms: Some(60_000),
-            },
-        )
-        .await;
-        bus.apply(
-            &s,
-            ViewEnvelope {
-                id: "expired".into(),
-                op: ViewOp::Show,
-                module_url: Some("/m/e.mjs".into()),
-                ttl_ms: Some(0),
-            },
-        )
-        .await;
-
-        let state = bus.wait_state(&s, None).await;
-        assert_eq!(ids(&state), vec!["flash"]);
-        let remaining = state.views[0].ttl_ms.unwrap();
-        assert!(remaining > 0 && remaining <= 60_000);
-    }
-
-    #[tokio::test]
     async fn persists_and_reloads_across_restart() {
         let tmp = tempfile::tempdir().unwrap();
         let s = scene();
@@ -435,7 +413,7 @@ mod tests {
             bus.wait_state(&s, None).await.version
         };
 
-        // "Restart": a fresh bus over the same data dir.
+        // "Restart": a fresh bus over the same data dir restores the newest snapshot.
         let bus = ViewBus::load(tmp.path());
         let state = bus.wait_state(&s, None).await;
         assert_eq!(state.version, version);
@@ -444,23 +422,14 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn reload_drops_expired_and_handles_unsafe_scene_ids() {
+    async fn reload_handles_unsafe_scene_ids() {
         let tmp = tempfile::tempdir().unwrap();
         let s = Scene("alice@phone/1".into());
         {
             let bus = ViewBus::load(tmp.path());
             bus.apply(&s, show("keep", "/m/k.mjs")).await;
-            bus.apply(
-                &s,
-                ViewEnvelope {
-                    id: "gone".into(),
-                    op: ViewOp::Show,
-                    module_url: Some("/m/g.mjs".into()),
-                    ttl_ms: Some(0),
-                },
-            )
-            .await;
         }
+        // A fresh bus restores the path-unsafe scene from its snapshot.
         let bus = ViewBus::load(tmp.path());
         let state = bus.wait_state(&s, None).await;
         assert_eq!(ids(&state), vec!["keep"]);
