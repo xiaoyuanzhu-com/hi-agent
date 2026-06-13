@@ -18,6 +18,16 @@ import type { SpeechItem } from "../ui/SpeechText";
 // length can't scroll the prompt that prompted it off-screen.
 const AGENT_REPLY_WINDOW = 2;
 
+// Stable id for the single rolling-interim line (the user's speech as it's
+// being recognized). One slot per scene by design: partials are cumulative, so
+// each replaces the last, and keying by a constant id lets React patch the
+// same <p> instead of remounting per partial.
+const INTERIM_ID = -1;
+
+// A rolling interim with no follow-up (STT stream died mid-utterance, no final
+// ever lands) is cleared after this long so a ghost italic line can't linger.
+const INTERIM_STALE_MS = 3000;
+
 // Index of the last user line in a timeline, or -1 if the agent has spoken but
 // the user hasn't yet (e.g. an opening greeting). The user line anchors the
 // "current exchange": everything after it is the agent's reply to it.
@@ -165,6 +175,10 @@ export function useAgentSession(): AgentSession {
   const [awaiting, setAwaiting] = useState(false);
   const [ttsPlaying, setTtsPlaying] = useState(false);
   const [offline, setOffline] = useState(false);
+  // The user's speech as it's being recognized (cumulative rolling text), or
+  // null when no utterance is in flight. Server-broadcast on /in/text, so every
+  // client in the scene shows the same live line.
+  const [interim, setInterim] = useState<string | null>(null);
 
   const busRef = useRef<AudioBus | null>(null);
   const micRef = useRef<AudioStreamer | null>(null);
@@ -182,9 +196,30 @@ export function useAgentSession(): AgentSession {
   const visionRef = useRef<VideoStreamer | null>(null);
   const visionStreamRef = useRef<MediaStream | null>(null);
   const sentenceIdRef = useRef(0);
+  // Staleness sweep for the interim line (see INTERIM_STALE_MS).
+  const interimTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   // Live cognition cadence: bumped per streamed chunk, decays between them, so
   // the Presence pulses with the agent's real output rate (not a canned loop).
   const activityRef = useRef(new ActivityMeter());
+
+  const clearInterim = useCallback(() => {
+    if (interimTimerRef.current !== null) {
+      clearTimeout(interimTimerRef.current);
+      interimTimerRef.current = null;
+    }
+    setInterim(null);
+  }, []);
+
+  // Each partial replaces the slot wholesale (the text is cumulative), and
+  // re-arms the staleness sweep.
+  const updateInterim = useCallback(
+    (text: string) => {
+      setInterim(text);
+      if (interimTimerRef.current !== null) clearTimeout(interimTimerRef.current);
+      interimTimerRef.current = setTimeout(() => clearInterim(), INTERIM_STALE_MS);
+    },
+    [clearInterim],
+  );
 
   // Fold a settled user line into the timeline and mark the agent as thinking
   // until its reply streams in. Every user line — typed or transcribed from
@@ -315,8 +350,8 @@ export function useAgentSession(): AgentSession {
   // Every user line lands here: typed input the server echoes back, and speech
   // the server transcribed and posted to the text channel. Both render the same
   // way, so the conversation reads uniformly across every client in the scene.
-  // Rolling partials (`final:false`, live STT) don't render — they're the
-  // duck trigger above.
+  // Rolling partials (`final:false`, live STT) render as a live italic line
+  // (the interim slot) and double as the duck trigger above.
   useEffect(() => {
     if (!woken) return;
     const ctrl = new AbortController();
@@ -330,12 +365,15 @@ export function useAgentSession(): AgentSession {
             if (ev.text.trim().length === 0) continue;
             if (!ev.final) {
               duck();
+              updateInterim(ev.text.trim());
               continue;
             }
+            clearInterim();
             finalizeUser(ev.text);
           }
         } catch {
           if (cancelled || ctrl.signal.aborted) break;
+          clearInterim();
           await new Promise((r) => setTimeout(r, 1500));
         }
       }
@@ -343,8 +381,9 @@ export function useAgentSession(): AgentSession {
     return () => {
       cancelled = true;
       ctrl.abort();
+      clearInterim();
     };
-  }, [woken, scene, finalizeUser, duck]);
+  }, [woken, scene, finalizeUser, duck, updateInterim, clearInterim]);
 
   // ---- audio-input channel: acquire/release the mic (and vision) ---------
   // Independent of the session itself — text and audio are coequal input
@@ -617,11 +656,14 @@ export function useAgentSession(): AgentSession {
   const reactive = state === "speaking" && ttsPlaying;
 
   // Render the current exchange — the user's line pinned, the agent's reply
-  // rolling beneath it.
-  const displaySentences = useMemo<SpeechItem[]>(
-    () => visibleExchange(sentences),
-    [sentences],
-  );
+  // rolling beneath it — with the live interim line (speech still being
+  // recognized) trailing last, so it also lands in the captions window when a
+  // view holds the stage.
+  const displaySentences = useMemo<SpeechItem[]>(() => {
+    const visible = visibleExchange(sentences);
+    if (interim === null) return visible;
+    return [...visible, { id: INTERIM_ID, text: interim, speaker: "user", pending: true }];
+  }, [sentences, interim]);
 
   return {
     state,
