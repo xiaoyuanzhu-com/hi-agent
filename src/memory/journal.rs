@@ -1,11 +1,11 @@
 //! The lossless raw signal store.
 //!
-//! Every signal in and out is appended to its scene's day-log,
-//! `<data_dir>/memory/raw/<scene_enc>/signals/<YYYY-MM-DD>/log.jsonl` (see
-//! [`super::layout`]). One JSON `JournalEntry` per line. The first signal in a
-//! scene also writes `scene.json` recording the true id. Reads scan only the
-//! day-folders a query's time window touches; compaction and indexing are
-//! deferred.
+//! Every signal in and out is appended to its scene's per-channel day-log,
+//! `<data_dir>/memory/raw/<scene_enc>/<channel>/<YYYY-MM-DD>/<channel>.jsonl`
+//! (see [`super::layout`]). One JSON `JournalEntry` per line. The first signal in
+//! a scene also writes `scene.json` recording the true id. A read scans the
+//! channel folders a query's time window touches and merges them by `(ts, id)`;
+//! compaction and indexing are deferred.
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -16,7 +16,7 @@ use tokio::fs::OpenOptions;
 use tokio::io::AsyncWriteExt;
 use tokio::sync::Mutex;
 
-use crate::types::{JournalEntry, Scene};
+use crate::types::{Channel, JournalEntry, Scene};
 
 use super::layout;
 
@@ -57,22 +57,26 @@ impl Journal {
         &self.inner.data_dir
     }
 
-    /// Append one entry to its scene's day-log, fsynced before returning.
+    /// Append one entry to its scene's per-channel day-log, fsynced before
+    /// returning.
     pub async fn append(&self, entry: JournalEntry) -> anyhow::Result<()> {
         let scene = entry_scene(&entry).clone();
+        let channel = entry_channel(&entry);
         let ts = entry_ts(&entry);
-        let day = layout::day_dir(&self.inner.data_dir, &scene, ts);
+        let log_path = layout::channel_log_path(&self.inner.data_dir, &scene, channel, ts);
 
         let mut line = serde_json::to_vec(&entry)?;
         line.push(b'\n');
 
         let _guard = self.inner.write_lock.lock().await;
-        tokio::fs::create_dir_all(&day).await?;
+        if let Some(dir) = log_path.parent() {
+            tokio::fs::create_dir_all(dir).await?;
+        }
         ensure_scene_meta(&self.inner.data_dir, &scene, ts).await?;
         let mut file = OpenOptions::new()
             .create(true)
             .append(true)
-            .open(day.join("log.jsonl"))
+            .open(&log_path)
             .await?;
         file.write_all(&line).await?;
         file.flush().await?;
@@ -81,8 +85,8 @@ impl Journal {
     }
 
     /// The entries at or after `since`, oldest first, capped at the most recent
-    /// `limit`. With a scene, only that scene's day-folders from `since`'s day
-    /// onward are read; without one, every scene's are.
+    /// `limit`. With a scene, only that scene's channel folders are read; without
+    /// one, every scene's are. Entries from all channels are merged by `(ts, id)`.
     pub async fn recent(
         &self,
         scene: Option<&Scene>,
@@ -92,12 +96,12 @@ impl Journal {
         let mut entries = Vec::new();
         match scene {
             Some(s) => {
-                let signals = layout::signals_dir(&self.inner.data_dir, s);
-                read_signals_dir(&signals, since, &mut entries).await?;
+                let dir = layout::scene_dir(&self.inner.data_dir, s);
+                read_scene_dir(&dir, since, &mut entries).await?;
             }
             None => read_all_scenes(&self.inner.data_dir, since, &mut entries).await?,
         }
-        entries.sort_by_key(entry_ts);
+        entries.sort_by(|a, b| (entry_ts(a), entry_id(a)).cmp(&(entry_ts(b), entry_id(b))));
         entries.retain(|e| entry_ts(e) >= since);
         if entries.len() > limit {
             let drop = entries.len() - limit;
@@ -116,6 +120,18 @@ pub fn entry_ts(entry: &JournalEntry) -> DateTime<Utc> {
 pub fn entry_scene(entry: &JournalEntry) -> &Scene {
     match entry {
         JournalEntry::SignalIn { scene, .. } | JournalEntry::SignalOut { scene, .. } => scene,
+    }
+}
+
+pub fn entry_channel(entry: &JournalEntry) -> Channel {
+    match entry {
+        JournalEntry::SignalIn { channel, .. } | JournalEntry::SignalOut { channel, .. } => *channel,
+    }
+}
+
+pub fn entry_id(entry: &JournalEntry) -> &str {
+    match entry {
+        JournalEntry::SignalIn { id, .. } | JournalEntry::SignalOut { id, .. } => id,
     }
 }
 
@@ -138,19 +154,53 @@ async fn ensure_scene_meta(
     Ok(())
 }
 
-/// Read every day-folder of one scene's `signals/` dir whose day is `since`'s or
-/// later, appending parsed entries. A missing dir yields nothing.
-async fn read_signals_dir(
-    signals: &Path,
+/// Walk every channel folder of one scene, appending parsed entries. Each
+/// immediate sub-directory is a channel (`text/`, `audio/`, …); `files/` is
+/// skipped (artifacts, not signals) and `appearance/` self-skips (its day-folders
+/// hold state snapshots, not an `appearance.jsonl`). A missing scene dir yields
+/// nothing.
+async fn read_scene_dir(
+    scene_dir: &Path,
     since: DateTime<Utc>,
     out: &mut Vec<JournalEntry>,
 ) -> anyhow::Result<()> {
-    let since_day = layout::day_key(since);
-    let mut rd = match tokio::fs::read_dir(signals).await {
+    let mut rd = match tokio::fs::read_dir(scene_dir).await {
         Ok(rd) => rd,
         Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(()),
         Err(err) => return Err(err.into()),
     };
+    while let Some(ent) = rd.next_entry().await? {
+        if !ent.file_type().await?.is_dir() {
+            continue;
+        }
+        let name = match ent.file_name().into_string() {
+            Ok(n) => n,
+            Err(_) => continue,
+        };
+        if name == "files" {
+            continue;
+        }
+        read_channel_dir(&ent.path(), &name, since, out).await?;
+    }
+    Ok(())
+}
+
+/// Read one channel folder's day-shards whose day is `since`'s or later, parsing
+/// the `<channel>.jsonl` in each. A channel with no log for a day (e.g.
+/// `appearance/`) simply contributes nothing.
+async fn read_channel_dir(
+    channel_dir: &Path,
+    channel_name: &str,
+    since: DateTime<Utc>,
+    out: &mut Vec<JournalEntry>,
+) -> anyhow::Result<()> {
+    let since_day = layout::day_key(since);
+    let mut rd = match tokio::fs::read_dir(channel_dir).await {
+        Ok(rd) => rd,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(err) => return Err(err.into()),
+    };
+    let log_file = format!("{channel_name}.jsonl");
     let mut days: Vec<String> = Vec::new();
     while let Some(ent) = rd.next_entry().await? {
         if let Ok(name) = ent.file_name().into_string() {
@@ -163,12 +213,12 @@ async fn read_signals_dir(
     }
     days.sort();
     for day in days {
-        read_log_into(&signals.join(day).join("log.jsonl"), out).await?;
+        read_log_into(&channel_dir.join(day).join(&log_file), out).await?;
     }
     Ok(())
 }
 
-/// Read each scene under `raw/` through [`read_signals_dir`].
+/// Walk each scene under `raw/` through [`read_scene_dir`].
 async fn read_all_scenes(
     data_dir: &Path,
     since: DateTime<Utc>,
@@ -182,7 +232,7 @@ async fn read_all_scenes(
     };
     while let Some(ent) = rd.next_entry().await? {
         if ent.file_type().await?.is_dir() {
-            read_signals_dir(&ent.path().join("signals"), since, out).await?;
+            read_scene_dir(&ent.path(), since, out).await?;
         }
     }
     Ok(())

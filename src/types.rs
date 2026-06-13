@@ -146,13 +146,15 @@ pub enum Origin {
 // Media — the multimodal payload a signal carries (audio bytes, image, …)
 // -----------------------------------------------------------------------------
 
-/// A signal's media payload, co-located with the day-log that references it as
-/// `<channel>-<id>.<ext>`. The signal's `body` stays the text surface (an STT
-/// transcript, a caption); this carries the blob plus enough metadata that a
-/// reader needn't open the bytes to know what they are.
+/// A signal's media payload. The bytes live inside the signal's channel-day
+/// folder on a wall-clock grid; this records the path (relative to that folder)
+/// plus enough metadata that a reader needn't open the bytes to know what they
+/// are. The signal's `body` stays the text surface (an STT transcript, a
+/// caption).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Media {
-    /// Blob filename within the signal's day-folder, e.g. `audio-<id>.mp3`.
+    /// Path relative to the signal's channel-date folder, e.g. `09/16-45.mp3`
+    /// (a one-off) or `output/09/11.mp3` (a streamed output minute).
     pub file: String,
     pub mime: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]

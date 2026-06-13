@@ -39,10 +39,11 @@ use tokio::sync::broadcast::error::RecvError;
 use chrono::Utc;
 use uuid::Uuid;
 
+use crate::memory::layout::MediaSlot;
 use crate::memory::media;
 use crate::server::headers::{AuthBearer, RequiredScene, SceneHeader};
 use crate::server::{AppState, VideoInEvent, VideoSource};
-use crate::types::{Channel, Scene};
+use crate::types::{Channel, JournalEntry, Media, Origin, Scene};
 
 const DEFAULT_IMAGE_MIME: &str = "image/jpeg";
 const DEFAULT_VIDEO_MIME: &str = "video/webm";
@@ -66,17 +67,32 @@ pub async fn post_vision(
 
     tracing::debug!(scene = %scene, mime = %mime, bytes = body.len(), "POST /api/in/vision");
 
-    // A one-off still: persist only (the live channel is the video stream). The
-    // frame is a standalone blob with its own id, since vision isn't journaled yet.
+    // A one-off still: persist the bytes, then journal it as a vision signal so
+    // the frame isn't an orphan blob. `body` is empty — a caption is a derivation
+    // that can come later; the bytes are the truth.
     let ts = Utc::now();
     let id = Uuid::now_v7().to_string();
-    match media::store_blob(&state.data_dir, &scene, ts, Channel::Vision, &id, ext, &body).await {
-        Ok(_file) => StatusCode::ACCEPTED.into_response(),
+    let rel = match media::store_blob(&state.data_dir, &scene, Channel::Vision, ts, MediaSlot::InputOneOff, ext, &body).await {
+        Ok(rel) => rel,
         Err(err) => {
             tracing::error!(error = %err, "failed to persist vision frame");
-            (StatusCode::INTERNAL_SERVER_ERROR, "vision store failed\n").into_response()
+            return (StatusCode::INTERNAL_SERVER_ERROR, "vision store failed\n").into_response();
         }
+    };
+    let entry = JournalEntry::SignalIn {
+        id,
+        ts,
+        channel: Channel::Vision,
+        scene: scene.clone(),
+        body: String::new(),
+        stream: None,
+        media: Some(Media { file: rel, mime, duration_ms: None, width: None, height: None }),
+        origin: Some(Origin::Human),
+    };
+    if let Err(err) = state.memory.journal.append(entry).await {
+        tracing::error!(error = %err, "journal append failed for vision still; frame is stored");
     }
+    StatusCode::ACCEPTED.into_response()
 }
 
 #[derive(Debug, Deserialize)]

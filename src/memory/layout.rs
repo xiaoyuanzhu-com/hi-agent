@@ -1,14 +1,18 @@
 //! On-disk paths for the raw memory store.
 //!
-//! Raw is the lossless source of truth, organized by scene (the isolation unit)
-//! and sharded by UTC day so a forever-running scene stays bounded: a day's
-//! everything — its `log.jsonl` and the blobs its signals reference — lives in
-//! one folder, trivial to archive when cold.
+//! Raw is the lossless source of truth, organized by scene (the isolation unit),
+//! then by **channel**, then sharded by UTC day. A channel is that sense's
+//! complete record; the day-folder keeps reads bounded and makes per-channel
+//! fading/archival a single subtree. Each channel-day carries a surface log
+//! named for the channel (`text.jsonl`, `audio.jsonl`, …) plus the bytes its
+//! signals reference, laid out on a wall-clock grid.
 //!
 //! ```text
 //! <data_dir>/memory/raw/<scene_enc>/
 //!   ├── scene.json
-//!   └── signals/<YYYY-MM-DD>/{ log.jsonl, <channel>-<id>.<ext> … }
+//!   ├── text/<YYYY-MM-DD>/text.jsonl
+//!   ├── audio/<YYYY-MM-DD>/{ audio.jsonl, <HH>/<MM>-<SS>.<ext>, output/<HH>/<MM>.<ext> … }
+//!   └── vision/<YYYY-MM-DD>/{ vision.jsonl, <HH>/<MM>-<SS>.<ext> … }
 //! ```
 //!
 //! Scene ids are arbitrary strings (`alice@phone`) and may carry path-unsafe
@@ -19,7 +23,21 @@ use std::path::{Path, PathBuf};
 
 use chrono::{DateTime, Utc};
 
-use crate::types::Scene;
+use crate::types::{Channel, Scene};
+
+/// Where a signal's media bytes sit within its channel-day folder. Input is the
+/// default (bare); output lives under `output/`. A one-off capture (a posted
+/// clip, a still) gets a second-precision name so it never collides with a
+/// streamed minute file; a streamed chunk owns the bare `<HH>/<MM>` minute slot.
+#[derive(Debug, Clone, Copy)]
+pub enum MediaSlot {
+    /// A discrete one-off capture (posted clip / still): `<HH>/<MM>-<SS>.<ext>`.
+    InputOneOff,
+    /// A minute of an open input stream (mic, camera): `<HH>/<MM>.<ext>`.
+    InputStream,
+    /// A minute of an output stream (TTS, generated frames): `output/<HH>/<MM>.<ext>`.
+    OutputStream,
+}
 
 /// `<data_dir>/memory` — the root of the whole memory store (raw + derived).
 pub fn memory_dir(data_dir: &Path) -> PathBuf {
@@ -56,15 +74,43 @@ pub fn scene_dir(data_dir: &Path, scene: &Scene) -> PathBuf {
     raw_root(data_dir).join(encode_scene(scene))
 }
 
-/// `<scene>/signals` — the time-sharded signal stream for a scene.
-pub fn signals_dir(data_dir: &Path, scene: &Scene) -> PathBuf {
-    scene_dir(data_dir, scene).join("signals")
+/// `<scene>/<channel>/<YYYY-MM-DD>` — the channel-day folder a signal at `ts`
+/// belongs to, holding that day's surface log and the bytes its signals
+/// reference. The parent of both the log and the byte grid.
+pub fn channel_day_dir(
+    data_dir: &Path,
+    scene: &Scene,
+    channel: Channel,
+    ts: DateTime<Utc>,
+) -> PathBuf {
+    scene_dir(data_dir, scene)
+        .join(channel.as_str())
+        .join(day_key(ts))
 }
 
-/// `<scene>/signals/<YYYY-MM-DD>` — the day-folder a signal at `ts` belongs to,
-/// holding that day's log and the blobs its signals reference.
-pub fn day_dir(data_dir: &Path, scene: &Scene, ts: DateTime<Utc>) -> PathBuf {
-    signals_dir(data_dir, scene).join(day_key(ts))
+/// `<channel>/<date>/<channel>.jsonl` — the day's surface log for one channel,
+/// named for the channel so the file is self-describing even detached from its
+/// folder.
+pub fn channel_log_path(
+    data_dir: &Path,
+    scene: &Scene,
+    channel: Channel,
+    ts: DateTime<Utc>,
+) -> PathBuf {
+    channel_day_dir(data_dir, scene, channel, ts).join(format!("{}.jsonl", channel.as_str()))
+}
+
+/// The byte path for a signal's media **relative to its channel-day folder**, by
+/// slot (see [`MediaSlot`]). Stored verbatim in the entry's `media.file`, so a
+/// reader resolves it as `channel_day_dir(..).join(media.file)`.
+pub fn media_rel_path(ts: DateTime<Utc>, slot: MediaSlot, ext: &str) -> String {
+    let hh = ts.format("%H");
+    let mm = ts.format("%M");
+    match slot {
+        MediaSlot::InputOneOff => format!("{hh}/{mm}-{}.{ext}", ts.format("%S")),
+        MediaSlot::InputStream => format!("{hh}/{mm}.{ext}"),
+        MediaSlot::OutputStream => format!("output/{hh}/{mm}.{ext}"),
+    }
 }
 
 /// The lexically-sortable day key (`YYYY-MM-DD`, UTC) used as a day-folder name.

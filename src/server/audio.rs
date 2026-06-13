@@ -61,6 +61,7 @@ use tokio::sync::broadcast::error::RecvError;
 use tokio::sync::mpsc;
 
 use crate::capabilities::stt::{self, Transcript};
+use crate::memory::layout::MediaSlot;
 use crate::memory::media;
 use crate::server::headers::{AuthBearer, RequiredScene, SceneHeader, StreamHeader};
 use crate::server::{AppState, AudioEvent, AudioInEvent};
@@ -123,7 +124,7 @@ pub async fn post_audio(
     // 1. Persist the raw bytes so we can replay/audit and so the log has a
     //    stable reference. We do this before STT so a transcription failure
     //    still leaves the audio on disk.
-    let media_path = match media::store_blob(&state.data_dir, &scene, ts, Channel::Audio, &id, ext, &body).await {
+    let media_path = match media::store_blob(&state.data_dir, &scene, Channel::Audio, ts, MediaSlot::InputOneOff, ext, &body).await {
         Ok(f) => f,
         Err(err) => {
             tracing::error!(error = %err, "failed to persist incoming audio");
@@ -337,13 +338,13 @@ async fn stream_audio_in(
     tracing::info!(scene = %scene, "WS /api/in/audio/stream closed");
 }
 
-/// Deliver one finalized transcript onto the **text** channel — journal it, echo
-/// it to scene observers (settled), and hand it to the reactor — exactly as a
-/// typed `POST /api/in/text` line. Returns `false` if the inbound channel is
-/// closed. The agent consumes text either way; for a posted clip, `clip` carries
-/// the `(ts, id, media)` of the stored audio blob so the journal entry shares the
-/// blob's id and day-folder. The mic stream passes `None` — streaming utterances
-/// aren't persisted as discrete media files, so the journal records no `media`.
+/// Deliver one finalized transcript on the **audio** channel — journal it, echo
+/// it to scene observers (settled), and hand it to the reactor. The transcript is
+/// the signal's text surface (`body`); the modality stays `audio` so its bytes,
+/// when present, land under `audio/`. The reactor reads `body` regardless. For a
+/// posted clip, `clip` carries the `(ts, id, media)` of the stored audio blob so
+/// the journal entry references it; the live mic passes `None` for now (its bytes
+/// aren't persisted yet — Phase 2), so the journal records no `media`.
 async fn deliver_transcript(
     state: &AppState,
     scene: &Scene,
@@ -356,17 +357,17 @@ async fn deliver_transcript(
         None => (Utc::now(), Uuid::now_v7().to_string(), None),
     };
     let signal = Signal {
-        channel: Channel::Text,
+        channel: Channel::Audio,
         scene: scene.clone(),
         body: text.to_owned(),
         stream: stream.clone(),
         ts,
     };
-    crate::channel_log::inbound(Channel::Text, scene, text);
+    crate::channel_log::inbound(Channel::Audio, scene, text);
     let entry = JournalEntry::SignalIn {
         id,
         ts,
-        channel: Channel::Text,
+        channel: Channel::Audio,
         scene: scene.clone(),
         body: text.to_owned(),
         stream,
@@ -376,8 +377,8 @@ async fn deliver_transcript(
     if let Err(err) = state.memory.journal.append(entry).await {
         tracing::error!(error = %err, "journal append failed; accepting signal anyway");
     }
-    // Echo before dispatching inward, so the line shows on every client the same
-    // way a typed line does.
+    // Echo before dispatching inward. The caption display rides the text channel
+    // (a display concern), so a spoken line shows the same way a typed line does.
     state.echo_input(scene, Channel::Text, text, true);
     if let Err(err) = state.inbound.send(signal).await {
         tracing::error!(error = %err, "inbound channel closed");

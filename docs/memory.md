@@ -21,8 +21,11 @@ This document is the **durable design contract** for memory, in the spirit of `a
 | **`raw/` is the only source of truth; everything else is a regenerable projection** | Lossless log + lossy views. A wrong summary is never load-bearing because the log can re-derive it |
 | **Regenerate, don't patch; every derived claim cites its source signals** | Projections stay trustworthy and disposable; no drift between a summary and the facts under it |
 | **Capture is mechanical & lossless; episodes/facets are reflection-time judgments** | A topic boundary or a "what I now believe" is a judgment; judgment lives in the mind, not in a Rust filter |
-| **One `raw/` slice per scene** | Realizes the "journal slice per scene" the scene already implies; makes per-scene reads bounded instead of a full-file scan |
+| **One `raw/` slice per scene, stored by channel** | The scene is the isolation unit; within it each modality is its own day-sharded folder, so a channel is a complete, bounded, separately-fadeable record |
 | **A signal = a text surface (always) + an optional media payload** | Text and multimodal are one record type, not two systems. Every modality has a text surface (words / transcript / caption); bytes are an attachment |
+| **The text surface is permanent; media bytes fade** | The `.jsonl` lines are lossless forever and nearly free; sensory blobs are vividness that degrades with age. This bounds size without losing the memory |
+| **The interleaved timeline is derived, never stored** | A scene is one timeline but stored per-channel; the mind reads a merge built on read (ordered by uuidv7 `id`), so there is no second copy to drift |
+| **`appearance` is retained state, not an utterance stream** | The screen persists until changed, so it is recorded as timestamped whole-state snapshots; `appearance.json` is the live current state, the one mutable file under `raw/` |
 | **Workers are scenes too — a worker run is its own lossless `raw/` stream** | Uniform ("everything is a scene with a signal stream"), and `architecture.md` §7 already requires worker transcripts to be inspectable |
 | **The always-loaded core = `self.md` (stable identity) + `hot.md` (volatile activation)** | The two heat sources — permanence and recent-significance — kept as two files of different volatility |
 | **`self` is not a facet** | facets model *external* entities; `self` is the core modeling itself. It sits on the selfhood gradient `SOUL → self → hot`, not next to people/locations |
@@ -43,70 +46,99 @@ The on-disk layout is just this gradient made concrete: `raw/` (the unfiltered f
 
 ## 2. Layout
 
-All paths are under `<data_dir>/memory/`. `SOUL.md` stays at `<data_dir>/SOUL.md` — it is the *birth seed* (authored, shipped in repo as the default), not accumulated memory.
+All paths are under `<data_dir>/memory/`. The soul is *not* here: it ships inside the binary and is materialized to `<data_dir>/prompts/core.md` (composed with an optional `core.local.md` operator override) — the *birth seed*, authored and shipped, not accumulated memory.
 
 ```
 memory/
-├── self.md                          ← the agent's evolving model of itself (core, always loaded)
-├── hot.md                           ← the working set (volatile activation, always loaded)
-├── raw/                             ← LOSSLESS source of truth — JSONL + blobs, append-only
-│   └── <scene>/
-│       ├── scene.json               ← true scene id, display name, created, last_active
-│       └── signals/
-│           ├── 2026-06-04/
-│           │   ├── log.jsonl        ← that day's signals (the text surface lives here)
-│           │   ├── audio-<id>.mp3   ← a signal's media payload, co-located
-│           │   └── vision-<id>.jpg
-│           └── 2026-06-05/
-│               └── log.jsonl
-│       └── files/<name>             ← exchanged/produced artifacts (user-sent docs, worker outputs)
-├── episodes/                        ← DERIVED event bundles (markdown + attachments)
-│   └── 2026-06-04-kyoto-trip-7a3f/
-│       ├── episode.md               ← gist + frontmatter (scene, signal-id range, citations, claims)
-│       └── <attachments>            ← references into raw/ for the salient frames/files
-└── facets/                          ← DERIVED current-understanding (markdown, every claim cites episodes)
+├── self.md                           ← evolving identity (core, always loaded)
+├── hot.md                            ← working set (derived projection, always loaded)
+│
+├── raw/                              ← LOSSLESS TRUTH, per scene — append-only, never edited
+│   └── <scene>/                      ← dir name = path-safe encoding of the scene id
+│       ├── scene.json                ← the true (un-encoded) id + created_at
+│       ├── appearance.json           ← CURRENT screen state (the one mutable file here — §3)
+│       ├── text/
+│       │   └── 2026-06-11/text.jsonl ← the day's messages, both directions
+│       ├── audio/
+│       │   └── 2026-06-11/
+│       │       ├── audio.jsonl       ← surface log (transcripts), both directions
+│       │       ├── 09/16.mp3         ← input stream (mic) — default, bare, minute grid
+│       │       └── output/09/11.mp3  ← output stream (TTS)
+│       ├── vision/
+│       │   └── 2026-06-11/
+│       │       ├── vision.jsonl      ← surface log (captions)
+│       │       └── 10/15.mp4         ← camera; output/ holds generated frames
+│       ├── appearance/               ← the one STATE channel: screen-state history
+│       │   └── 2026-06-11/
+│       │       └── appearance-101502Z.json
+│       └── files/                    ← exchanged/produced artifacts (kept verbatim)
+│           └── 2026-06-11-trip-plan.pdf
+│
+├── episodes/                         ← DERIVED event bundles (markdown + attachments)
+│   └── 2026-06-11-kyoto-trip-7a3f/
+│       ├── episode.md                ← gist + frontmatter (scene, signal-id range, citations)
+│       └── <attachments>             ← refs into raw/ + genuinely-derived artifacts
+└── facets/                           ← DERIVED current-understanding (every claim cites)
     ├── people/<person>.md
     ├── locations/<place>.md
-    ├── projects/<project>.md        ← the durable "task memory": goal, decisions, files, open threads
-    └── culture/<topic>.md           ← the vividness-loop output: what it absorbed from the world
+    ├── projects/<project>.md         ← durable task memory: goal, decisions, open threads
+    └── culture/<topic>.md            ← what it absorbed from the world
 ```
 
-**Format split:** `raw/` is JSONL — structured, append-only, machine truth. Everything else is markdown — derived prose a mind reads directly. Lossless truth is structured; memory-as-read is prose.
+**Truth vs. projection.** Everything under `raw/` is append-only lossless truth — identity, the channel streams, imported artifacts — with one deliberate exception: `appearance.json`, the live current-screen state (§3). Everything else (`episodes/`, `facets/`, `hot.md`, and the interleaved per-scene timeline the mind reads) is a **projection**: regenerable from `raw/`, never a second source of truth, safe to delete and rebuild.
+
+**Format split:** the channel surface logs are JSONL — structured, append-only, machine truth. Everything derived is markdown — prose a mind reads directly.
 
 ## 3. `raw` — the lossless source of truth
 
-`raw/` is organized **by scene**, because the scene is the isolation unit (`architecture.md` §6). A scene runs forever, so its signals are **sharded into day-folders**: a day's everything (log + that day's blobs) is one directory, trivial to archive when cold.
+### Organized by scene, then by channel
 
-Because scene ids are arbitrary strings (`alice@phone`, possibly containing path-unsafe characters), the `<scene>` directory name is a **path-safe encoding** (percent-encode), and the true id lives in `scene.json`.
+`raw/` is sliced **by scene** (the isolation unit, `architecture.md` §6). Scene ids are arbitrary strings (`alice@phone`), so the `<scene>` directory is a **path-safe percent-encoding** and the true id lives in `scene.json`.
+
+Within a scene, each **channel is its own folder** (`text/`, `audio/`, `vision/`, `appearance/`), sharded by UTC day. A channel is that sense's complete record; the day-folder keeps reads bounded and makes per-channel fading/archival a single subtree. Each channel-day carries a **surface log named for the channel** — `text.jsonl`, `audio.jsonl`, `vision.jsonl` — one JSON object per line, both directions interleaved. (The filename is self-describing even detached from its folder — the old generic `log.jsonl` was not.)
+
+A scene is **one timeline**, but it is *stored* per channel. The interleaved timeline the mind reads (and the recent-window snapshot) is a **derived merge** over the channel logs, ordered by the uuidv7 `id` — built on read, never persisted. Splitting storage by channel costs only a cheap merge; persisting the merge would create a second, driftable copy.
 
 ### The signal record
 
-One JSON object per line in `signals/<date>/log.jsonl`:
+One JSON object per line in `<channel>/<date>/<channel>.jsonl`:
 
 | field | type | req | notes |
 |---|---|---|---|
-| `id` | uuidv7 | yes | unique + time-sortable. The cursor and the citation key; resolves ts ties |
-| `kind` | `signal_in` \| `signal_out` | yes | direction |
+| `id` | uuidv7 | yes | unique + time-sortable. The cursor and the citation key; orders the cross-channel merge |
+| `kind` | `signal_in` \| `signal_out` | yes | direction. Mirrored in the byte path (`output/`) |
 | `ts` | RFC3339 | yes | when it happened |
-| `channel` | text·vision·audio·touch·smell·taste | yes | the modality |
-| `stream` | string | no | named stream within a channel (`webcam`, `headset`); absent = default |
+| `channel` | text·audio·vision·appearance·… | yes | the modality. Redundant with the path, kept so a line is self-describing and movable |
+| `stream` | string | no | named stream within a channel (`mic`, `voice`, `webcam`); absent = the default stream |
 | `scene` | string | yes | kept in-line too, so a record is self-describing and movable |
-| `body` | string | yes | **the text surface of any modality** — words / STT transcript / caption. The unifier |
-| `media` | object | no | `{ file, mime, duration_ms?, width?, height? }`; `file` is the co-located blob name. Absent for pure text |
+| `body` | string | yes | **the text surface of any modality** — words / transcript / caption. The unifier. May be `""` (an un-captioned frame) |
+| `media` | object | no | `{ file, mime, duration_ms?, width?, height? }`; `file` is a path **relative to the channel-date folder** (`09/16.mp3`, `output/09/11.mp3`). Absent for pure text |
 | `origin` | `human`·`reactor`·`worker` | no | *which mind* produced it (mechanical). Not speaker identity — that stays soft/inferred |
 | `turn` | int | no | the turn it was batched into; lets stimulus→response grouping be reconstructed without re-running settle |
 
-`body` is always present → text and multimodal are one record type. `media.file` names the blob beside the log (`audio-<id>.mp3`); the metadata travels in the line so the log is self-describing without opening the blob.
+`body` is always present → text and multimodal are one record type. The bytes never enter the log — only `media.file` + metadata — so the log stays small and self-describing without opening a blob.
 
-### Three kinds of raw content
+### Bytes: capture on the minute grid
 
-- **Signals** — channel I/O events. The perception/expression stream. (`signals/<date>/log.jsonl`)
-- **Media** — the sensory blobs a signal references (audio bytes, camera frame). Co-located with the signal that produced them.
-- **Files** — named, human-meaningful artifacts *exchanged or produced* (a user-sent PDF, a worker's deliverable). Not sensory, not events; they outlive any one day, so they sit in `files/`. Code being actively developed stays in its real workspace/repo and is referenced by path + commit — never copied into memory.
+Continuous channels (mic, camera) are **segmented at capture on the wall-clock minute**: while a stream is open it writes one file per minute, `<hh>/<mm>.<ext>`; a closed stream or a silent minute writes nothing (silence costs zero bytes — there is no day-long tape). A one-off capture (a posted clip, a still) is named by second to share the grid without colliding. **Every captured chunk keeps its bytes — the live mic included** (the audio *is* the raw signal; the transcript is a derivation of it).
 
-### Workers are scenes
+Direction and streams: **input is the default** and writes bare under `<channel>/<date>/`; **output writes under `output/`**; when a channel carries more than one of either, the extras get an id-suffixed folder (`input-<id>/`, `output-<id>/`). Direction is also the `kind` field on the line.
 
-A working session's run (its tool calls, intermediate output, deliverable) is recorded as its own `raw/<worker-scene>/` stream — same record type, same lossless treatment. Its report flows back to the parent scene as an ordinary signal. This keeps worker transcripts inspectable, which `architecture.md` §7 requires for progress-checking and seeding one worker with another's history.
+### The text surface is forever; media fades
+
+Two different lifetimes — and this is what bounds size:
+
+- **The surface log is lossless and permanent.** The `.jsonl` lines — what was said, heard, seen-as-caption — are never edited or deleted. They are KBs/day; *the log is the memory.*
+- **Media bytes are vividness, and vividness fades.** Recent days keep full fidelity; with age, blobs degrade (keyframes, compression) and may eventually drop while the line that references them remains. Output bytes (TTS, generated frames) are the most disposable — regenerable from the text/prompt that produced them. Fading and cold-archival operate per channel / direction / day, all of which are directory boundaries.
+
+### `appearance` — the one state channel
+
+Every other channel is an **event stream** (utterances). `appearance` is **retained state**: the screen persists until changed, so it is recorded not as deltas but as **timestamped whole-state snapshots** — `appearance/<date>/appearance-<hhmmssZ>.json`, each the full screen as of that moment, valid until the next. `appearance.json` at the scene root is the **current** state (the newest snapshot, TTL-applied) — the single mutable file under `raw/`, kept for a fast live read and reloaded on boot. Showing a view is expression the agent can later cite ("I showed them the itinerary"), so the history feeds reflection like any other channel.
+
+### Files and workers
+
+- **Files** — named artifacts *exchanged or produced* (a user-sent PDF, a worker's deliverable): flat under `files/`, not date-sharded (they outlive any day), kept in their original format. Code under active development stays in its real workspace/repo and is referenced by path + commit — never copied in.
+- **Workers are scenes** — a worker run is its own `raw/<worker-scene>/` of the same shape; its report flows back to the parent scene as an ordinary signal. This keeps worker transcripts inspectable, which `architecture.md` §7 requires.
 
 ## 4. `episodes` — derived event bundles
 
@@ -134,12 +166,12 @@ Facet dimensions are **open-ended**. people/locations/projects/culture are seeds
 There is a **selfhood gradient by volatility**:
 
 ```
-SOUL.md       ← birth seed. Authored, set once, ships in repo. Deepest, highest inertia.
-memory/self.md ← the EVOLVING core: voice, learned manners, point of view. Slow-changing, sticky.
-memory/hot.md  ← the working set: self + standing commitments + recent significant episode gists.
+prompts/core.md ← birth seed. Authored, ships in the binary, materialized on boot. Deepest, highest inertia.
+memory/self.md  ← the EVOLVING core: voice, learned manners, point of view. Slow-changing, sticky.
+memory/hot.md   ← the working set: self + standing commitments + recent significant episode gists.
 ```
 
-`self` is not a facet (facets model *external* entities; `self` is the subject modeling itself, and its plasticity — corrections as scar tissue — puts it next to SOUL). Both `self.md` and `hot.md` load into every session: `self.md` is the stable identity (permanence-hot), `hot.md` is the recent activation (activation-hot). The **per-scene** activation layer is already handled by the existing recency snapshot (`memory/snapshot.rs`, `build_for_scene`) — so `hot.md` is global and slow; the snapshot stays per-scene and transient. Three tiers, no duplication: `hot.md` (global core, always) → snapshot (per-scene recent, per turn) → episodes/facets (cold, on demand via links).
+`self` is not a facet (facets model *external* entities; `self` is the subject modeling itself, and its plasticity — corrections as scar tissue — puts it next to the soul). Both `self.md` and `hot.md` load into every session: `self.md` is the stable identity (permanence-hot), `hot.md` is the recent activation (activation-hot). The **per-scene** activation layer is already handled by the existing recency snapshot (`memory/snapshot.rs`, `build_for_scene`) — so `hot.md` is global and slow; the snapshot stays per-scene and transient. Three tiers, no duplication: `hot.md` (global core, always) → snapshot (per-scene recent, per turn) → episodes/facets (cold, on demand via links).
 
 ## 7. Reflection — the mind consolidating ("sleep")
 
@@ -152,12 +184,14 @@ Consolidation is a **working session**, not the reactor turn loop — so cost ne
 - **Every derived claim cites source signal ids.** A facet line without a citation is a bug.
 - **Lossy projections are fine** precisely because the log under them is lossless.
 - **No privileged dimensions.** Materialize hot slices on demand; let facet types emerge.
-- **The observatory is not memory.** `sessions.jsonl` (lifecycle/debug events) stays separate; `raw/` is signals only.
+- **The observatory is not memory.** `sessions.jsonl` (lifecycle/debug events) stays separate; `raw/` holds only signals and exchanged artifacts.
 
 ## 9. Status
 
+> **The §2–3 raw layout is the redesigned target (sealed 2026-06-13); the implementation still lags it.** Today's code writes the older shape — one `signals/<date>/log.jsonl` per scene with co-located `audio-<id>.mp3` blobs (`src/memory/{layout,journal,media}.rs`) — not the per-channel folders, minute-grid bytes, saved-mic, or `appearance` channel described above. Migrating the writers/readers to the channel layout is the next raw-layer task.
+
 **Implemented:**
-- **Raw** (`src/memory/{layout,journal,media}.rs`, `src/types.rs`): per-scene day-folder slices, a uuidv7 `id` per signal, co-located media, `scene.json`. `origin` provenance (human/reactor/worker) is captured; `turn` is still deferred.
+- **Raw** (`src/memory/{layout,journal,media}.rs`, `src/types.rs`): per-scene day-folder slices, a uuidv7 `id` per signal, co-located media, `scene.json`. `origin` provenance (human/reactor/worker) is captured; `turn` is still deferred. (Old single-`log.jsonl` shape — see note above.)
 - **Core loading** (`src/memory/core.rs`): every reactor session loads `self.md` (sticky identity) + `hot.md` (working set) on top of the soul — at session open and at each heartbeat hot-swap.
 - **Episodes** (`src/memory/episodes.rs`): the heartbeat persists its conversation briefing as an episode (`episodes/<date>-<short>/episode.md`) — the cheap seed. This is the only producer today.
 - **hot.md** (`refresh_hot`): regenerated from recent episode gists on each heartbeat — a mechanical projection (regenerate, don't patch), not yet an agent-curated working set.

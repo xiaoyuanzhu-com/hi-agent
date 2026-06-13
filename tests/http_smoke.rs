@@ -9,7 +9,7 @@ use std::time::Duration;
 
 use hi_agent::memory::Memory;
 use hi_agent::server::{self, ServerSeams};
-use hi_agent::types::JournalEntry;
+use hi_agent::types::{Channel, JournalEntry};
 use tempfile::tempdir;
 use tokio::net::TcpListener;
 
@@ -39,12 +39,12 @@ async fn spawn_server() -> (String, tempfile::TempDir, ServerSeams) {
     (format!("http://{addr}"), dir, seams)
 }
 
-/// Read every `log.jsonl` under `memory/raw/` into typed entries (across all
-/// scenes and day-folders).
+/// Read every per-channel `*.jsonl` under `memory/raw/` into typed entries
+/// (across all scenes, channels, and day-folders).
 fn read_journal(dir: &std::path::Path) -> Vec<JournalEntry> {
     let mut out = Vec::new();
     for log in walk_files(&dir.join("memory").join("raw")) {
-        if log.file_name().and_then(|n| n.to_str()) != Some("log.jsonl") {
+        if log.extension().and_then(|n| n.to_str()) != Some("jsonl") {
             continue;
         }
         let contents = std::fs::read_to_string(&log).expect("read log");
@@ -126,11 +126,10 @@ async fn post_thought_without_scene_header_is_anonymous() {
 }
 
 #[tokio::test]
-async fn post_vision_accepts_and_persists_without_journaling() {
-    // Vision is a live continuous channel: the frame is accepted (202) and
-    // persisted, but deliberately NOT journaled or dispatched yet — the mind
-    // has no way to perceive an image, and journaling every frame would flood
-    // the cognition snapshot. So the journal stays empty after a frame lands.
+async fn post_vision_journals_and_persists() {
+    // A still is accepted (202), persisted as bytes, AND journaled as a vision
+    // signal — `body` empty (a caption is a later derivation; the bytes are the
+    // truth), `media.file` the relative path to the blob.
     let (base, dir, _seams) = spawn_server().await;
     let client = reqwest::Client::new();
 
@@ -146,18 +145,23 @@ async fn post_vision_accepts_and_persists_without_journaling() {
 
     tokio::time::sleep(Duration::from_millis(50)).await;
     let entries = read_journal(dir.path());
-    assert!(entries.is_empty(), "vision must not journal yet, got {entries:?}");
+    assert_eq!(entries.len(), 1, "vision still should journal one entry, got {entries:?}");
+    match &entries[0] {
+        JournalEntry::SignalIn { channel, scene, body, media, .. } => {
+            assert_eq!(*channel, Channel::Vision);
+            assert_eq!(scene.0, "alice@phone");
+            assert!(body.is_empty(), "caption is deferred; body should be empty");
+            let media = media.as_ref().expect("vision signal carries media");
+            assert!(media.file.ends_with(".jpg"), "relative blob path, got {}", media.file);
+        }
+        other => panic!("expected SignalIn, got {other:?}"),
+    }
 
-    // The frame should have been written as a co-located `vision-<id>.jpg` blob
-    // under memory/raw/<scene>/signals/<day>/, with no journal entry.
+    // The bytes landed as a `.jpg` under the vision channel folder.
     let raw = dir.path().join("memory").join("raw");
     let frames = walk_files(&raw)
         .into_iter()
-        .filter(|p| {
-            p.file_name()
-                .and_then(|n| n.to_str())
-                .is_some_and(|n| n.starts_with("vision-"))
-        })
+        .filter(|p| p.extension().and_then(|n| n.to_str()) == Some("jpg"))
         .count();
     assert_eq!(frames, 1, "expected one persisted vision frame under {raw:?}");
 }

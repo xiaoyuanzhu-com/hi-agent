@@ -29,7 +29,7 @@
 //!
 //! ```sh
 //! # in one terminal, watch the scene's day-log
-//! tail -F data/memory/raw/*/signals/*/log.jsonl
+//! tail -F data/memory/raw/*/text/*/text.jsonl
 //!
 //! # in another, fire two POSTs in rapid succession to the same scene
 //! BASE=http://127.0.0.1:8080
