@@ -1,18 +1,25 @@
-// Client for the outbound view channel (agent-authored view modules).
+// Client for the outbound view channel — a scene's retained appearance state.
 //
-// GET /api/out/view is a long-poll that returns one envelope per response (like
-// /api/out/surface did); we re-subscribe after each. The agent produces these by
-// wrapping JSX in `[[view id= op=]] … [[/view]]`; the reactor compiles the source
-// server-side and routes the resulting module URL here for the client to import.
+// GET /api/out/view serves the scene's whole appearance (active views in
+// z-order, plus a version) and long-polls on `?since=<version>`: the first
+// request returns the current state immediately (even when empty), each
+// following one is held until the state changes. Refresh, a second device, or
+// a server restart all converge on the same screen — the server retains and
+// persists the state; the client just mirrors the latest snapshot.
 
-export type ViewOp = "show" | "replace" | "dismiss";
-
-export interface ViewEnvelope {
+/** One active view in the scene's appearance, in z-order (first = bottom). */
+export interface WireView {
   id: string;
-  op: ViewOp;
-  /** URL of the compiled ESM module to import and mount (absent for dismiss). */
-  module_url?: string;
+  /** URL of the compiled ESM module to import and mount under `id`. */
+  module_url: string;
+  /** Remaining lifetime at response time, when the view carries a TTL. */
   ttl_ms?: number;
+}
+
+/** A scene's full appearance state — one GET /api/out/view response. */
+export interface ViewState {
+  version: number;
+  views: WireView[];
 }
 
 export interface SubscribeViewOpts {
@@ -20,11 +27,13 @@ export interface SubscribeViewOpts {
   signal: AbortSignal;
 }
 
-export async function* subscribeView(
+export async function* subscribeViewState(
   opts: SubscribeViewOpts,
-): AsyncGenerator<ViewEnvelope, void, void> {
+): AsyncGenerator<ViewState, void, void> {
+  let since: number | undefined;
   while (!opts.signal.aborted) {
-    const res = await fetch("/api/out/view", {
+    const query = since === undefined ? "" : `?since=${since}`;
+    const res = await fetch(`/api/out/view${query}`, {
       method: "GET",
       headers: { "X-HI-Scene": opts.scene, Accept: "application/json" },
       signal: opts.signal,
@@ -33,7 +42,9 @@ export async function* subscribeView(
     if (!res.ok) {
       throw new Error(`/api/out/view subscribe failed: ${res.status} ${res.statusText}`);
     }
-    const env = (await res.json()) as ViewEnvelope;
-    if (env && env.id) yield env;
+    const state = (await res.json()) as ViewState;
+    if (!state || !Array.isArray(state.views)) continue;
+    since = state.version;
+    yield state;
   }
 }

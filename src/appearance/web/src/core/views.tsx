@@ -7,7 +7,7 @@ import {
   useState,
   type ReactNode,
 } from "react";
-import { subscribeView } from "../channels/out/view";
+import { subscribeViewState } from "../channels/out/view";
 import { useScene, useWake } from "./session";
 
 /** One mounted agent view: a stable id and the compiled module URL to import. */
@@ -24,9 +24,11 @@ const ViewsContext = createContext<ViewsValue>({ views: [] });
 
 /**
  * Runs the /api/out/view long-poll ABOVE the view slot, so the stream — like the
- * session's channel loops — survives any view swap. Holds the active views keyed
- * by id: show/replace set the module under an id (reusing an id is the continuity
- * lever), dismiss removes it, an optional ttl auto-removes it.
+ * session's channel loops — survives any view swap. Mirrors the server's retained
+ * per-scene appearance state: each response is the whole set of active views in
+ * z-order, so a fresh page, a second device, or a reconnect all converge on the
+ * same screen. TTL timers handle live expiry between snapshots; the server evicts
+ * authoritatively and the next snapshot agrees.
  */
 export function ViewsProvider({ children }: { children: ReactNode }) {
   const scene = useScene();
@@ -40,12 +42,9 @@ export function ViewsProvider({ children }: { children: ReactNode }) {
     let cancelled = false;
     const timers = ttlTimers.current;
 
-    const clearTtl = (id: string) => {
-      const t = timers.get(id);
-      if (t !== undefined) {
-        window.clearTimeout(t);
-        timers.delete(id);
-      }
+    const clearTimers = () => {
+      timers.forEach((t) => window.clearTimeout(t));
+      timers.clear();
     };
     const remove = (id: string) =>
       setViews((prev) => {
@@ -58,27 +57,20 @@ export function ViewsProvider({ children }: { children: ReactNode }) {
     void (async () => {
       while (!cancelled) {
         try {
-          for await (const env of subscribeView({ scene, signal: ctrl.signal })) {
+          for await (const state of subscribeViewState({ scene, signal: ctrl.signal })) {
             if (cancelled) break;
-            if (env.op === "dismiss") {
-              clearTtl(env.id);
-              remove(env.id);
-              continue;
-            }
-            if (!env.module_url) continue;
-            const url = env.module_url;
-            setViews((prev) => {
-              const next = new Map(prev);
-              next.set(env.id, url);
-              return next;
-            });
-            clearTtl(env.id);
-            if (env.ttl_ms && env.ttl_ms > 0) {
-              const timer = window.setTimeout(() => {
-                timers.delete(env.id);
-                remove(env.id);
-              }, env.ttl_ms);
-              timers.set(env.id, timer);
+            // Mirror the snapshot wholesale: array order = z-order. ViewSlot
+            // keys by id, so unchanged views keep their mounted component.
+            setViews(new Map(state.views.map((v) => [v.id, v.module_url])));
+            clearTimers();
+            for (const v of state.views) {
+              if (v.ttl_ms && v.ttl_ms > 0) {
+                const timer = window.setTimeout(() => {
+                  timers.delete(v.id);
+                  remove(v.id);
+                }, v.ttl_ms);
+                timers.set(v.id, timer);
+              }
             }
           }
         } catch {
@@ -91,8 +83,7 @@ export function ViewsProvider({ children }: { children: ReactNode }) {
     return () => {
       cancelled = true;
       ctrl.abort();
-      timers.forEach((t) => window.clearTimeout(t));
-      timers.clear();
+      clearTimers();
     };
   }, [woken, scene]);
 

@@ -66,8 +66,12 @@ fn tools_for_role(role: Option<&str>) -> Vec<Value> {
                  delegate the build, then pass the `ref` it reported back (like `project/view`) here. \
                  Interleave show_view and say calls in the order you want them experienced (say, \
                  then show) so each view lands as you speak to it. Reuse an `id` with op=replace \
-                 to evolve a view in place; op=dismiss takes one down. For a trivial one-off you \
-                 may pass raw `source` JSX instead of a ref.",
+                 to evolve a view in place; op=dismiss takes one down. The screen is persistent \
+                 state: whatever you've shown stays up — across page refreshes, other devices in \
+                 the scene, even restarts — until you dismiss or replace it, so never re-show \
+                 something that's already on screen. Re-showing an existing id raises it above \
+                 the other views. For a trivial one-off you may pass raw `source` JSX instead of \
+                 a ref.",
                 json!({
                     "type": "object",
                     "properties": {

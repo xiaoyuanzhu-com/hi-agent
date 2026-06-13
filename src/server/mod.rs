@@ -32,9 +32,11 @@ pub mod stubs;
 pub mod text;
 pub mod text_bus;
 pub mod view;
+pub mod view_bus;
 pub mod vision;
 
 pub use text_bus::TextBus;
+pub use view_bus::ViewBus;
 
 /// Outbound synthesized-audio event. One turn's speech is a continuous stream:
 /// a `Start` (carrying the mime so GET /audio can set `Content-Type` before the
@@ -233,9 +235,14 @@ pub struct AppState {
     /// this; the reactor produces TTS clips here when a TTS provider is set.
     pub audio_out: broadcast::Sender<AudioEvent>,
 
-    /// Outbound view-module broadcast. GET /api/out/view subscribers receive from
-    /// this; the reactor produces envelopes when the agent emits a `[[view]]` and
-    /// the view compiler has built its module.
+    /// Per-scene retained appearance state. GET /api/out/view serves whole-state
+    /// snapshots from this; the binder folds each reactor-emitted envelope in.
+    /// Unlike a broadcast, a view shown while no client is connected is retained —
+    /// refresh, a second device, or a restart all converge on the same screen.
+    pub views: ViewBus,
+
+    /// Outbound view-event broadcast — the non-draining debug tap of the view
+    /// channel, observed by the channel inspector. Delivery rides `views`.
     pub view_out: broadcast::Sender<ViewEvent>,
 
     /// Inbound audio broadcast — the read side of the audio *input* channel.
@@ -349,6 +356,9 @@ pub fn build(
     // Inbound audio: small, frequent PCM frames, so a larger ring than the others.
     let (audio_in_tx, _) = broadcast::channel::<AudioInEvent>(256);
     let (view_tx, _) = broadcast::channel::<ViewEvent>(64);
+    // Per-scene retained appearance state, reloaded from disk so a scene's
+    // screen survives a restart (see `ViewBus`).
+    let view_bus = ViewBus::load(&data_dir);
     // Inbound video: continuous WebM chunks, so a larger ring like inbound audio.
     let (video_in_tx, _) = broadcast::channel::<VideoInEvent>(256);
     // Input echo: live broadcast, lossy ring, no replay (see `InputEcho`).
@@ -365,6 +375,7 @@ pub fn build(
         out_rx,
         text_bus.clone(),
         audio_tx.clone(),
+        view_bus.clone(),
         view_tx.clone(),
         output_echo_tx.clone(),
     ));
@@ -376,6 +387,7 @@ pub fn build(
         audio_out: audio_tx.clone(),
         audio_in: audio_in_tx.clone(),
         audio_in_turn: AtomicU64::new(0),
+        views: view_bus,
         view_out: view_tx.clone(),
         video_in: video_in_tx.clone(),
         video_in_turn: AtomicU64::new(0),
@@ -401,8 +413,8 @@ pub fn build(
         .route("/api/in/audio", post(audio::post_audio).get(audio::get_in_audio))
         .route("/api/in/audio/stream", get(audio::get_audio_stream))
         .route("/api/out/audio", get(audio::get_out_audio))
-        // The view channel — agent-authored view modules, turn-paced (one
-        // envelope per long-poll response, scene-filtered).
+        // The view channel — a scene's retained appearance, served as versioned
+        // whole-state snapshots (long-poll on `?since=`).
         .route("/api/out/view", get(view::get_out_view))
         // Vision is an input channel that is also observable: the camera streams
         // WebM over the WS, GET plays the live video; POST persists a still frame.
