@@ -476,10 +476,28 @@ export function useAgentSession(): AgentSession {
     if (visionRef.current) return; // already live
     try {
       // `ideal` at 4K asks for the camera's best; the browser clamps down to the
-      // device's true native max rather than failing when 4K isn't available.
+      // device's true native max rather than failing when 4K isn't available. But
+      // `ideal` only steers size, not orientation: the returned mode follows the
+      // camera's native sensor, so a portrait-native camera (a phone front cam,
+      // iPhone Continuity Camera) hands back a vertical frame. Bias the request
+      // toward the viewport's own orientation — landscape on a desktop screen,
+      // portrait on an upright phone — so the feed reads the way the device does.
+      const portrait =
+        typeof window !== "undefined" &&
+        window.matchMedia?.("(orientation: portrait)").matches;
+      const long = { ideal: 3840 };
+      const short = { ideal: 2160 };
+      // The width/height `ideal` only steers size; an `aspectRatio` hint is what
+      // tips the browser off a portrait-native high-res mode toward a landscape
+      // one (when the camera exposes both). Still a hint, not a guarantee.
+      const aspectRatio = { ideal: portrait ? 9 / 16 : 16 / 9 };
       const videoStream = await navigator.mediaDevices.getUserMedia({
-        video: { width: { ideal: 3840 }, height: { ideal: 2160 } },
+        video: portrait
+          ? { width: short, height: long, aspectRatio }
+          : { width: long, height: short, aspectRatio },
       });
+      const got = videoStream.getVideoTracks()[0]?.getSettings();
+      console.debug("[vision] captured", got?.width, "x", got?.height, got);
       visionStreamRef.current = videoStream;
       visionRef.current = await VideoStreamer.create(videoStream, { scene });
       setVisionStream(videoStream);
