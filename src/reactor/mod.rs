@@ -144,15 +144,14 @@ fn reflect_enabled() -> bool {
 /// fire — a standing commitment must not need a client connection to be checked.
 const REWARM_WINDOW: Duration = Duration::from_secs(7 * 24 * 3600);
 
-/// Built-in base prompts, embedded at compile time. The *mind's* system prompt is
-/// `core.md` — who it is and the machinery (talking, presenting by ref, delegating)
-/// — followed by `speaking.md`, the rhythm of conversation: when to speak, how
-/// much, and what to say around long-running work. `appearance.md` and
-/// `aesthetic.md` are the *view builder's* guides — the mechanics of
-/// authoring/saving a view, and the taste it has to clear — read off disk by a
-/// build sub-agent, never loaded into the mind's context. All ship in the binary
-/// and refresh on every build; [`install_prompts`] materialises them under
-/// `<data_dir>/prompts/`.
+/// Built-in base prompts, embedded at compile time and materialised to disk by
+/// [`install_prompts`]. They're authored as files an agent *reads*, not text inlined
+/// into context: the *mind* is handed `core.md` — who it is and the machinery
+/// (talking, presenting by ref, delegating) — and `speaking.md` — the rhythm of
+/// conversation, when to speak and how much — by [`load_soul`]'s seed, and Reads them
+/// itself. `appearance.md` and `aesthetic.md` are the *view builder's* guides — the
+/// mechanics of authoring/saving a view, and the taste it has to clear — read off
+/// disk by a build sub-agent. All ship in the binary and refresh on every build.
 const CORE_BASE: &str = include_str!("core.md");
 const SPEAKING_BASE: &str = include_str!("speaking.md");
 const APPEARANCE_BASE: &str = include_str!("appearance.md");
@@ -180,10 +179,10 @@ fn compose_prompt(base: &str, prompts_dir: &Path, local_name: &str) -> String {
 /// each with its optional `*.local.md` operator override. The managed base files
 /// (`core.md`, `speaking.md`, `appearance.md`, `aesthetic.md`) are rewritten every
 /// boot so they stay current; operator edits live in the never-touched `*.local.md`
-/// siblings. All four are read back from disk at runtime — `appearance.md` and
-/// `aesthetic.md` opened as files by the view-builder sub-agent, `core.md` and
-/// `speaking.md` by [`load_soul`] to form the mind's prompt — so the four follow
-/// one workflow: ship embedded → materialise here → read from disk.
+/// siblings. All four are opened as files at runtime by an agent: `appearance.md`
+/// and `aesthetic.md` by the view-builder sub-agent, `core.md` and `speaking.md` by
+/// the mind itself — [`load_soul`]'s seed hands it their paths to Read. So the four
+/// follow one workflow: ship embedded → materialise here → an agent reads from disk.
 pub fn install_prompts(data_dir: &Path) -> std::io::Result<()> {
     let dir = data_dir.join("prompts");
     std::fs::create_dir_all(&dir)?;
@@ -195,91 +194,58 @@ pub fn install_prompts(data_dir: &Path) -> std::io::Result<()> {
     Ok(())
 }
 
-/// The mind's system prompt: the materialised `core.md` then `speaking.md` from
-/// `<data_dir>/prompts/`, concatenated. Each file is already its embedded base plus
-/// any `*.local.md` operator override — [`install_prompts`] composed them at boot —
-/// so reading them back keeps the override logic in one place and puts each delta
-/// beside its own base. Read at session-creation, so a restart (which rewrites the
-/// files) picks up base updates and operator edits alike. Falls back to the embedded
-/// base if a file is missing or empty, so the soul can neither go stale nor boot
-/// empty. (Named `load_soul` for the reactor's history.)
+/// The mind's system-prompt seed: a short bundled personality plus a manifest that
+/// hands the agent the absolute paths of `core.md` and `speaking.md` to Read for its
+/// fuller self. We send this thin seed rather than inlining the whole character on
+/// every turn — the mind reads the files itself (and most turns will). The paths are
+/// absolutized here (mirroring the caller that exports `HI_AGENT_PROMPTS_DIR`) so the
+/// Read targets resolve regardless of the session's cwd, which is `None`. Built at
+/// startup and reused on each hot-swap. (Named `load_soul` for the reactor's history.)
 pub fn load_soul(data_dir: &Path) -> String {
-    let dir = data_dir.join("prompts");
-    let read = |name: &str, base: &str| {
-        std::fs::read_to_string(dir.join(name))
-            .ok()
-            .filter(|text| !text.trim().is_empty())
-            .unwrap_or_else(|| base.to_string())
+    let base = if data_dir.is_absolute() {
+        data_dir.to_path_buf()
+    } else {
+        std::env::current_dir().unwrap_or_default().join(data_dir)
     };
-    format!("{}\n{}", read("core.md", CORE_BASE), read("speaking.md", SPEAKING_BASE))
+    let prompts = base.join("prompts");
+    let dir = prompts.display();
+    format!(
+        "You're warm, honest, and kind-hearted — easy company. You like being \
+useful, and when there's a hand to lend you're glad to lend it.\n\n\
+You speak only through the `say` tool; anything you type as text is never heard.\n\n\
+Your fuller self lives in files — open them with Read and read both now, before \
+you answer:\n\n\
+- {dir}/core.md — who you are, and how you act.\n\
+- {dir}/speaking.md — how you talk: when to speak, how much, when to stay quiet."
+    )
 }
 
 #[cfg(test)]
 mod soul_tests {
     use super::*;
 
-    fn mind_base() -> String {
-        format!("{CORE_BASE}\n{SPEAKING_BASE}")
-    }
-
     #[test]
-    fn missing_files_fall_back_to_embedded_base() {
-        // No install, empty dir: load_soul still yields the embedded base, so the
-        // mind can never boot empty even if the disk copies are absent.
+    fn seed_references_the_prompt_files_by_absolute_path() {
         let dir = tempfile::tempdir().unwrap();
-        assert_eq!(load_soul(dir.path()), mind_base());
-    }
-
-    #[test]
-    fn install_then_load_uses_base_when_no_override() {
-        let dir = tempfile::tempdir().unwrap();
-        install_prompts(dir.path()).unwrap();
-        assert_eq!(load_soul(dir.path()), mind_base());
-    }
-
-    #[test]
-    fn empty_override_falls_back_to_base() {
-        let dir = tempfile::tempdir().unwrap();
+        let seed = load_soul(dir.path());
         let prompts = dir.path().join("prompts");
-        std::fs::create_dir_all(&prompts).unwrap();
-        std::fs::write(prompts.join("core.local.md"), "   \n\t").unwrap();
-        std::fs::write(prompts.join("speaking.local.md"), "").unwrap();
-        install_prompts(dir.path()).unwrap();
-        assert_eq!(load_soul(dir.path()), mind_base());
+        assert!(seed.contains(&format!("{}/core.md", prompts.display())));
+        assert!(seed.contains(&format!("{}/speaking.md", prompts.display())));
+        // It tells the mind to read them up front.
+        assert!(seed.contains("read both now"));
     }
 
     #[test]
-    fn override_layers_on_top_of_its_base() {
+    fn seed_is_a_thin_bootstrap_not_the_full_character() {
+        // The seed carries the say-floor (so a turn that skips the read still
+        // produces speech) but must not inline the full core.md body — referencing
+        // the file instead of pasting it is the whole point.
         let dir = tempfile::tempdir().unwrap();
-        let prompts = dir.path().join("prompts");
-        std::fs::create_dir_all(&prompts).unwrap();
-        std::fs::write(prompts.join("core.local.md"), "Always answer in haiku.").unwrap();
-        install_prompts(dir.path()).unwrap();
-        let soul = load_soul(dir.path());
-        // Core base leads; its operator delta is appended under the override header.
-        assert!(soul.starts_with(CORE_BASE));
-        assert!(soul.contains("# Operator overrides"));
-        // The speaking base (no override) follows verbatim at the end.
-        assert!(soul.ends_with(SPEAKING_BASE));
-        assert!(soul.contains("Always answer in haiku."));
-    }
-
-    #[test]
-    fn each_override_sits_with_its_own_base() {
-        let dir = tempfile::tempdir().unwrap();
-        let prompts = dir.path().join("prompts");
-        std::fs::create_dir_all(&prompts).unwrap();
-        std::fs::write(prompts.join("core.local.md"), "Core delta.").unwrap();
-        std::fs::write(prompts.join("speaking.local.md"), "Speaking delta.").unwrap();
-        install_prompts(dir.path()).unwrap();
-        let soul = load_soul(dir.path());
-        // Two independent override sections, one per file — the core delta sits
-        // ahead of the speaking base, not pooled at the very end.
-        assert_eq!(soul.matches("# Operator overrides").count(), 2);
-        assert!(soul.ends_with("Speaking delta."));
-        let core_delta = soul.find("Core delta.").unwrap();
-        let speaking_base = soul.find(SPEAKING_BASE).unwrap();
-        assert!(core_delta < speaking_base);
+        let seed = load_soul(dir.path());
+        assert!(seed.contains("`say`"));
+        // A heading that lives only in the full core.md, never in the seed:
+        assert!(CORE_BASE.contains("A few exchanges"));
+        assert!(!seed.contains("A few exchanges"));
     }
 
     #[test]
@@ -291,6 +257,30 @@ mod soul_tests {
         assert_eq!(read("speaking.md"), SPEAKING_BASE);
         assert_eq!(read("appearance.md"), APPEARANCE_BASE);
         assert_eq!(read("aesthetic.md"), AESTHETIC_BASE);
+    }
+
+    #[test]
+    fn install_layers_operator_override_into_the_managed_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let prompts = dir.path().join("prompts");
+        std::fs::create_dir_all(&prompts).unwrap();
+        std::fs::write(prompts.join("core.local.md"), "Always answer in haiku.").unwrap();
+        install_prompts(dir.path()).unwrap();
+        let core = std::fs::read_to_string(prompts.join("core.md")).unwrap();
+        // The managed file is the base, then the operator delta under the header.
+        assert!(core.starts_with(CORE_BASE));
+        assert!(core.contains("# Operator overrides"));
+        assert!(core.ends_with("Always answer in haiku."));
+    }
+
+    #[test]
+    fn empty_override_leaves_the_base_verbatim() {
+        let dir = tempfile::tempdir().unwrap();
+        let prompts = dir.path().join("prompts");
+        std::fs::create_dir_all(&prompts).unwrap();
+        std::fs::write(prompts.join("speaking.local.md"), "   \n\t").unwrap();
+        install_prompts(dir.path()).unwrap();
+        assert_eq!(std::fs::read_to_string(prompts.join("speaking.md")).unwrap(), SPEAKING_BASE);
     }
 }
 
@@ -414,10 +404,11 @@ pub struct Reactor {
 struct ReactorInner {
     memory: Memory,
     agent: AgentLayer,
-    /// The admin-authored identity seeded into every scene's reactor session as
-    /// its system prompt (see [`load_soul`]). Loaded once at startup, shared
-    /// read-only across scenes; the heartbeat re-seeds replacement sessions with
-    /// it too, so a hot-swapped mind keeps the same character.
+    /// The bootstrap seed opening every scene's reactor-session system prompt: a
+    /// short personality plus a manifest pointing the mind at `core.md`/`speaking.md`
+    /// to Read (see [`load_soul`]). Built once at startup, shared read-only across
+    /// scenes; the heartbeat re-seeds replacement sessions with it too, so a
+    /// hot-swapped mind boots the same way.
     soul: String,
     /// The reactor's single outbound seam: every channel signal it produces —
     /// text, synthesized speech, surfaces — goes out here in transport-free form
