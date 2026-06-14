@@ -415,7 +415,7 @@ pub fn build(
         .route("/api/out/audio", get(audio::get_out_audio))
         // The view channel — a scene's retained appearance, served as versioned
         // whole-state snapshots (long-poll on `?since=`).
-        .route("/api/out/view", get(view::get_out_view))
+        .route("/api/out/view", get(view::get_out_view).delete(view::clear_out_view))
         // Vision is an input channel that is also observable: the camera streams
         // WebM over the WS, GET plays the live video; POST persists a still frame.
         .route("/api/in/vision", post(vision::post_vision).get(vision::get_vision))

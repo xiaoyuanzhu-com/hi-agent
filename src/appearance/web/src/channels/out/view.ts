@@ -46,3 +46,16 @@ export async function* subscribeViewState(
     yield state;
   }
 }
+
+/** Clear the scene's appearance — close all views, back to the default room.
+ * The server bumps the version, so every device's long-poll converges on empty
+ * (there is no optimistic local change; the next snapshot drives the UI). */
+export async function clearViewState(scene: string): Promise<void> {
+  const res = await fetch("/api/out/view", {
+    method: "DELETE",
+    headers: { "X-HI-Scene": scene },
+  });
+  if (!res.ok) {
+    throw new Error(`/api/out/view clear failed: ${res.status} ${res.statusText}`);
+  }
+}

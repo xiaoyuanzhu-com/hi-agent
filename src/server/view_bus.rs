@@ -161,6 +161,24 @@ impl ViewBus {
         persist(&self.data_dir, scene, entry).await;
     }
 
+    /// Clear the scene's appearance — remove all views, back to the default
+    /// empty room. A user control: the screen is the agent's presentation, but
+    /// the user can reclaim it. Bumps the version and persists the empty
+    /// snapshot so every device + a refresh converge on the cleared screen (and
+    /// the appearance history records it). No-op when already empty, so it
+    /// doesn't churn the version or write a redundant snapshot.
+    pub async fn clear(&self, scene: &Scene) {
+        let mut map = self.inner.lock().await;
+        let entry = map.entry(scene.clone()).or_default();
+        if entry.views.is_empty() {
+            return;
+        }
+        entry.views.clear();
+        entry.version += 1;
+        entry.notify.notify_waiters();
+        persist(&self.data_dir, scene, entry).await;
+    }
+
     /// The scene's appearance, as soon as its version exceeds `since`.
     /// `since: None` returns the present state immediately — even when empty —
     /// so a fresh page knows it is synced; passing the last seen version parks
@@ -333,6 +351,36 @@ mod tests {
             .unwrap();
         assert_eq!(state.version, v + 1);
         assert_eq!(ids(&state), vec!["a", "b"]);
+    }
+
+    #[tokio::test]
+    async fn clear_empties_and_wakes() {
+        let tmp = tempfile::tempdir().unwrap();
+        let bus = ViewBus::load(tmp.path());
+        let s = scene();
+
+        // Clearing an already-empty scene is a no-op: version stays at 0.
+        bus.clear(&s).await;
+        assert_eq!(bus.wait_state(&s, None).await.version, 0);
+
+        bus.apply(&s, show("a", "/m/a.mjs")).await;
+        bus.apply(&s, show("b", "/m/b.mjs")).await;
+        let v = bus.wait_state(&s, None).await.version;
+
+        // A parked reader wakes on the clear with the empty, version-bumped state.
+        let waiter = {
+            let bus = bus.clone();
+            tokio::spawn(async move { bus.wait_state(&scene(), Some(v)).await })
+        };
+        tokio::task::yield_now().await;
+        bus.clear(&s).await;
+
+        let state = tokio::time::timeout(std::time::Duration::from_secs(1), waiter)
+            .await
+            .expect("waiter should wake")
+            .unwrap();
+        assert_eq!(state.version, v + 1);
+        assert!(state.views.is_empty());
     }
 
     #[tokio::test]

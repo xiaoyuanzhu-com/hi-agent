@@ -7,7 +7,7 @@ import {
   useState,
   type ReactNode,
 } from "react";
-import { subscribeViewState } from "../channels/out/view";
+import { subscribeViewState, clearViewState } from "../channels/out/view";
 import { useScene, useWake } from "./session";
 
 /** One mounted agent view: a stable id and the compiled module URL to import. */
@@ -32,12 +32,17 @@ interface ViewsValue {
   meta: ReadonlyMap<string, ViewMeta>;
   /** Called by the view mount once a module is imported (or re-imported). */
   reportMeta: (id: string, meta: ViewMeta) => void;
+  /** Close all views — clears the scene's appearance back to the default empty
+   * room. Server-side, so every device + a refresh converge on the cleared
+   * screen; the empty state arrives via the same long-poll. */
+  clear: () => void;
 }
 
 const ViewsContext = createContext<ViewsValue>({
   views: [],
   meta: new Map(),
   reportMeta: () => {},
+  clear: () => {},
 });
 
 /**
@@ -57,6 +62,10 @@ export function ViewsProvider({ children }: { children: ReactNode }) {
   const reportMeta = useCallback((id: string, m: ViewMeta) => {
     setMeta((prev) => new Map(prev).set(id, m));
   }, []);
+
+  const clear = useCallback(() => {
+    void clearViewState(scene);
+  }, [scene]);
 
   useEffect(() => {
     if (!woken) return;
@@ -91,8 +100,8 @@ export function ViewsProvider({ children }: { children: ReactNode }) {
   }, [woken, scene]);
 
   const value = useMemo<ViewsValue>(
-    () => ({ views: [...views].map(([id, moduleUrl]) => ({ id, moduleUrl })), meta, reportMeta }),
-    [views, meta, reportMeta],
+    () => ({ views: [...views].map(([id, moduleUrl]) => ({ id, moduleUrl })), meta, reportMeta, clear }),
+    [views, meta, reportMeta, clear],
   );
   return <ViewsContext.Provider value={value}>{children}</ViewsContext.Provider>;
 }

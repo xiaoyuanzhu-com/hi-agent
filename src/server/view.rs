@@ -39,3 +39,17 @@ pub async fn get_out_view(
 
     axum::Json(state.views.wait_state(&scene, query.since).await)
 }
+
+/// DELETE /api/out/view — clear the scene's appearance (close all views, back
+/// to the default empty room). A user control: the screen is the agent's
+/// presentation, but the user can reclaim it. The clear bumps the version, so
+/// every device's long-poll converges on the empty state. Returns 204.
+pub async fn clear_out_view(
+    State(state): State<Arc<AppState>>,
+    RequiredScene(scene): RequiredScene,
+    AuthBearer(auth): AuthBearer,
+) -> impl IntoResponse {
+    tracing::info!(scene = %scene, auth = ?auth, "DELETE /api/out/view — user cleared the screen");
+    state.views.clear(&scene).await;
+    axum::http::StatusCode::NO_CONTENT
+}

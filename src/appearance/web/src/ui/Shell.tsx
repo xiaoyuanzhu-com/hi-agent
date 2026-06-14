@@ -24,7 +24,7 @@ export function Shell() {
   const { woken, waking, wakeError, wake, startTextOnly } = useWake();
   const ch = useChannels();
   const sendText = useSendText();
-  const { views, meta } = useViews();
+  const { views, meta, clear } = useViews();
 
   // The presence recedes while a view is on stage (the agent's content leads).
   const overlaid = views.length > 0;
@@ -90,6 +90,8 @@ export function Shell() {
             onToggleText={() => ch.setTextChannel(!ch.textInput)}
             voiceOn={ch.audioOutput}
             onToggleVoice={ch.toggleAudioOutput}
+            viewsActive={overlaid}
+            onCloseViews={clear}
           />
           <KeyboardFallback
             onSend={sendText}

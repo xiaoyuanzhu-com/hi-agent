@@ -19,6 +19,11 @@ interface ChannelControlsProps {
   voiceOn: boolean;
   /** Mute/unmute the agent's voice. */
   onToggleVoice: () => void;
+  /** Whether any agent view is on stage (the close-views action is shown only
+   * then — there is nothing to close in the default room). */
+  viewsActive: boolean;
+  /** Close all views — clear the screen back to the default empty room. */
+  onCloseViews: () => void;
 }
 
 /**
@@ -39,6 +44,8 @@ export function ChannelControls({
   onToggleText,
   voiceOn,
   onToggleVoice,
+  viewsActive,
+  onCloseViews,
 }: ChannelControlsProps) {
   return (
     <div className="hi-channels" role="group" aria-label="input channels">
@@ -87,6 +94,23 @@ export function ChannelControls({
       >
         <SpeakerGlyph muted={!voiceOn} />
       </button>
+
+      {/* A screen action, not a channel: only present while a view is on stage,
+          set apart by its own separator. Closes everything back to the room. */}
+      {viewsActive && (
+        <>
+          <span className="hi-channel-sep" aria-hidden="true" />
+          <button
+            type="button"
+            className="hi-channel"
+            onClick={onCloseViews}
+            title="close views — back to the calm room"
+            aria-label="close all views"
+          >
+            <CloseViewsGlyph />
+          </button>
+        </>
+      )}
     </div>
   );
 }
@@ -153,6 +177,15 @@ function KeyboardGlyph() {
         strokeWidth="1.6"
         strokeLinecap="round"
       />
+    </svg>
+  );
+}
+
+function CloseViewsGlyph() {
+  return (
+    <svg viewBox="0 0 24 24" width="18" height="18" fill="none" aria-hidden="true">
+      <rect x="4" y="5" width="16" height="14" rx="2.5" stroke="currentColor" strokeWidth="1.6" />
+      <path d="M9 10l6 4M15 10l-6 4" stroke="currentColor" strokeWidth="1.6" strokeLinecap="round" />
     </svg>
   );
 }
