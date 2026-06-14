@@ -180,10 +180,10 @@ fn compose_prompt(base: &str, prompts_dir: &Path, local_name: &str) -> String {
 /// each with its optional `*.local.md` operator override. The managed base files
 /// (`core.md`, `speaking.md`, `appearance.md`, `aesthetic.md`) are rewritten every
 /// boot so they stay current; operator edits live in the never-touched `*.local.md`
-/// siblings. `appearance.md` and `aesthetic.md` must exist on disk because the
-/// view-builder sub-agent opens them as files; the disk copies of `core.md` and
-/// `speaking.md` are for operator visibility ([`load_soul`] composes from the
-/// embedded bases).
+/// siblings. All four are read back from disk at runtime — `appearance.md` and
+/// `aesthetic.md` opened as files by the view-builder sub-agent, `core.md` and
+/// `speaking.md` by [`load_soul`] to form the mind's prompt — so the four follow
+/// one workflow: ship embedded → materialise here → read from disk.
 pub fn install_prompts(data_dir: &Path) -> std::io::Result<()> {
     let dir = data_dir.join("prompts");
     std::fs::create_dir_all(&dir)?;
@@ -195,25 +195,23 @@ pub fn install_prompts(data_dir: &Path) -> std::io::Result<()> {
     Ok(())
 }
 
-/// The mind's system prompt: the bundled `core.md` then `speaking.md` bases, plus
-/// any operator overrides from `<data_dir>/prompts/core.local.md` and
-/// `speaking.local.md` — appended after *both* bases so the override layer wins
-/// over everything. Read at session-creation, so a restart picks up edits. (Named
-/// `load_soul` for the reactor's history.)
+/// The mind's system prompt: the materialised `core.md` then `speaking.md` from
+/// `<data_dir>/prompts/`, concatenated. Each file is already its embedded base plus
+/// any `*.local.md` operator override — [`install_prompts`] composed them at boot —
+/// so reading them back keeps the override logic in one place and puts each delta
+/// beside its own base. Read at session-creation, so a restart (which rewrites the
+/// files) picks up base updates and operator edits alike. Falls back to the embedded
+/// base if a file is missing or empty, so the soul can neither go stale nor boot
+/// empty. (Named `load_soul` for the reactor's history.)
 pub fn load_soul(data_dir: &Path) -> String {
     let dir = data_dir.join("prompts");
-    let base = format!("{CORE_BASE}\n{SPEAKING_BASE}");
-    let overrides: Vec<String> = ["core.local.md", "speaking.local.md"]
-        .iter()
-        .filter_map(|name| std::fs::read_to_string(dir.join(name)).ok())
-        .map(|text| text.trim().to_owned())
-        .filter(|text| !text.is_empty())
-        .collect();
-    if overrides.is_empty() {
-        base
-    } else {
-        format!("{base}{OVERRIDE_HEADER}{}", overrides.join("\n\n"))
-    }
+    let read = |name: &str, base: &str| {
+        std::fs::read_to_string(dir.join(name))
+            .ok()
+            .filter(|text| !text.trim().is_empty())
+            .unwrap_or_else(|| base.to_string())
+    };
+    format!("{}\n{}", read("core.md", CORE_BASE), read("speaking.md", SPEAKING_BASE))
 }
 
 #[cfg(test)]
@@ -225,8 +223,17 @@ mod soul_tests {
     }
 
     #[test]
-    fn no_override_file_uses_base_verbatim() {
+    fn missing_files_fall_back_to_embedded_base() {
+        // No install, empty dir: load_soul still yields the embedded base, so the
+        // mind can never boot empty even if the disk copies are absent.
         let dir = tempfile::tempdir().unwrap();
+        assert_eq!(load_soul(dir.path()), mind_base());
+    }
+
+    #[test]
+    fn install_then_load_uses_base_when_no_override() {
+        let dir = tempfile::tempdir().unwrap();
+        install_prompts(dir.path()).unwrap();
         assert_eq!(load_soul(dir.path()), mind_base());
     }
 
@@ -237,34 +244,42 @@ mod soul_tests {
         std::fs::create_dir_all(&prompts).unwrap();
         std::fs::write(prompts.join("core.local.md"), "   \n\t").unwrap();
         std::fs::write(prompts.join("speaking.local.md"), "").unwrap();
+        install_prompts(dir.path()).unwrap();
         assert_eq!(load_soul(dir.path()), mind_base());
     }
 
     #[test]
-    fn override_layers_on_top_of_base() {
+    fn override_layers_on_top_of_its_base() {
         let dir = tempfile::tempdir().unwrap();
         let prompts = dir.path().join("prompts");
         std::fs::create_dir_all(&prompts).unwrap();
         std::fs::write(prompts.join("core.local.md"), "Always answer in haiku.").unwrap();
+        install_prompts(dir.path()).unwrap();
         let soul = load_soul(dir.path());
-        // Both bases are preserved, in full and in order, ahead of the override layer.
-        assert!(soul.starts_with(&mind_base()));
-        // The operator's delta is appended after the header so it wins.
+        // Core base leads; its operator delta is appended under the override header.
+        assert!(soul.starts_with(CORE_BASE));
         assert!(soul.contains("# Operator overrides"));
-        assert!(soul.ends_with("Always answer in haiku."));
+        // The speaking base (no override) follows verbatim at the end.
+        assert!(soul.ends_with(SPEAKING_BASE));
+        assert!(soul.contains("Always answer in haiku."));
     }
 
     #[test]
-    fn both_overrides_layer_in_order_after_both_bases() {
+    fn each_override_sits_with_its_own_base() {
         let dir = tempfile::tempdir().unwrap();
         let prompts = dir.path().join("prompts");
         std::fs::create_dir_all(&prompts).unwrap();
         std::fs::write(prompts.join("core.local.md"), "Core delta.").unwrap();
         std::fs::write(prompts.join("speaking.local.md"), "Speaking delta.").unwrap();
+        install_prompts(dir.path()).unwrap();
         let soul = load_soul(dir.path());
-        assert!(soul.starts_with(&mind_base()));
-        assert!(soul.contains("# Operator overrides"));
-        assert!(soul.ends_with("Core delta.\n\nSpeaking delta."));
+        // Two independent override sections, one per file — the core delta sits
+        // ahead of the speaking base, not pooled at the very end.
+        assert_eq!(soul.matches("# Operator overrides").count(), 2);
+        assert!(soul.ends_with("Speaking delta."));
+        let core_delta = soul.find("Core delta.").unwrap();
+        let speaking_base = soul.find(SPEAKING_BASE).unwrap();
+        assert!(core_delta < speaking_base);
     }
 
     #[test]
