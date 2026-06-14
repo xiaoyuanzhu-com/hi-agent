@@ -26,10 +26,16 @@ pub const ENV_COMPACT: &str = "HI_AGENT_COMPACT";
 /// Accepts the alarm-delay grammar (`90s`, `30m`, `1h`; bare integer = seconds);
 /// `0` or `off` disables pulses. Unset / unparseable → the built-in default.
 pub const ENV_PULSE: &str = "HI_AGENT_PULSE";
-/// Env var to disable the reflection ("sleep") pass (`HI_AGENT_REFLECT=off`).
-/// Any other value (or unset) leaves it on; reflection otherwise rides every
-/// heartbeat, consolidating the raw frontier into episodes/facets.
+/// Env var to disable the reflection ("sleep") pass entirely
+/// (`HI_AGENT_REFLECT=off`). Any other value (or unset) leaves it on; reflection
+/// then runs on its own periodic clock (see [`ENV_REFLECT_EVERY`]),
+/// consolidating the raw frontier into episodes/facets.
 pub const ENV_REFLECT: &str = "HI_AGENT_REFLECT";
+/// Env var overriding the interval between periodic reflection passes
+/// (`HI_AGENT_REFLECT_EVERY`). Accepts the alarm-delay grammar (`90s`, `30m`,
+/// `1h`; bare integer = seconds); `0` or `off` disables periodic reflection.
+/// Unset / unparseable → the built-in default (hourly).
+pub const ENV_REFLECT_EVERY: &str = "HI_AGENT_REFLECT_EVERY";
 /// Env var (set on the cognition subprocess) carrying hi-agent's own HTTP base
 /// URL, so sessions can read input channels and write the overlay over the same
 /// wire the browser uses. See [`AgentConfig::child_env`].

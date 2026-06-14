@@ -103,7 +103,7 @@ pub(super) async fn swap(
     // never emitted or spoken — it seeds the new session so the conversation
     // continues across the swap without a visible seam. (Episodes/facets are NOT
     // written here: consolidation reads the raw log, not this lossy self-summary —
-    // see [`reflect`], kicked off in parallel at the same heartbeat.)
+    // see [`reflect`], which runs on its own periodic clock, not at this swap.)
     let briefing = {
         let run = current.prompt(SUMMARIZE_PROMPT.to_string()).await?;
         run.wait().await?.text
@@ -170,49 +170,17 @@ pub(super) async fn swap(
 
 /// Below this many unconsolidated signals, a reflection round is skipped — not
 /// worth a whole session (and its subprocess spawn) to file a handful of lines;
-/// they wait on the frontier for the next heartbeat.
+/// they wait on the frontier for the next reflection tick.
 const MIN_REFLECT_SIGNALS: usize = 4;
-
-/// The reflection session's identity — the agent's memory settling after activity,
-/// the way sleep files a day. No voice, no screen; its only output is derived
-/// memory (episodes + facets) written through its tools. Mirrors the worker
-/// system-prompt pattern in [`super::workers`].
-const REFLECTION_SYSTEM_PROMPT: &str = "You are the consolidation pass of a \
-human-interface agent — its memory settling after activity, the way sleep files a \
-day into longer-term memory. You have no voice and you are not talking to anyone: \
-you neither speak nor show anything. Your only job is to turn the raw signal log \
-into durable, derived memory, using your tools.\n\
-\n\
-You are given the signals that have happened in this scene since you last \
-consolidated it, oldest first, as a numbered list. Do two things, in order:\n\
-\n\
-1. SEGMENT into episodes. Walk the list front to back and cut it into coherent \
-events. For each event call `record_episode` with `count` = how many signals from \
-the FRONT of what's left it covers, and a `gist` that captures what happened and \
-what mattered, in your own prose. Each call consumes that many signals from the \
-front, so your next `count` continues after them. A boundary is a judgment (the \
-topic or event changed), never a clock tick. If the most recent signals are an \
-event still unfolding, leave them — stop before them, and they'll come back to you \
-next time.\n\
-\n\
-2. UPDATE facets. For every subject your episodes were about (people, places, \
-projects, cultural topics — the dimensions are open-ended), `read_facet` its \
-current understanding, fold in what these episodes add, and `update_facet` with \
-the WHOLE regenerated text — don't patch, write it all. Every claim should cite \
-the episode ref(s) it came from (each `record_episode` returns one). Reuse an \
-existing dimension/subject when one fits rather than coining a near-duplicate.\n\
-\n\
-Be terse and faithful — you are recording what actually happened, not embellishing. \
-When everything is filed, stop.";
 
 /// Consolidate a scene's unconsolidated frontier into episodes and facets — the
 /// "sleep" pass. Reads the raw log after the [`episodes::scene_cursor`], opens a
 /// dedicated reflection session (its own subprocess; never the reactor's live
 /// session), and drives it to completion; the session writes derived memory
-/// through its tools. Best-effort and run **detached** at the heartbeat, so it
-/// never blocks the floor — the cursor makes it idempotent across runs and a crash
-/// just leaves the frontier for the next heartbeat. A no-op when too little is
-/// unconsolidated to be worth a session.
+/// through its tools. Best-effort and run **detached** on the scene's periodic
+/// reflection timer, so it never blocks the floor — the cursor makes it idempotent
+/// across runs and a crash just leaves the frontier for the next tick. A no-op when
+/// too little is unconsolidated to be worth a session.
 pub(super) async fn reflect(reactor: &Reactor, scene: &Scene) {
     if let Err(err) = run_reflection(reactor, scene).await {
         tracing::warn!(scene = %scene, error = %err, "reflection failed");
@@ -238,6 +206,7 @@ async fn run_reflection(reactor: &Reactor, scene: &Scene) -> anyhow::Result<()> 
     let subjects = facets::facet_subject_index(data_dir).await.unwrap_or_default();
 
     let prompt = build_reflection_prompt(&tail, &prior, &subjects);
+    let system_prompt = super::reflection_prompt(data_dir).await;
 
     let session = reactor
         .inner
@@ -246,7 +215,7 @@ async fn run_reflection(reactor: &Reactor, scene: &Scene) -> anyhow::Result<()> 
             scene,
             SessionRole::Reflection,
             None,
-            SessionOpts { system_prompt: Some(REFLECTION_SYSTEM_PROMPT.to_string()), cwd: None },
+            SessionOpts { system_prompt: Some(system_prompt), cwd: None },
         )
         .await?;
     reactor

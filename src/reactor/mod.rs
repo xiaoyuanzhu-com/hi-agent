@@ -130,13 +130,47 @@ fn pulse_interval() -> Option<Duration> {
     }
 }
 
-/// Whether the reflection ("sleep") pass runs at heartbeats. On unless
-/// `HI_AGENT_REFLECT` is `off` — an escape hatch to disable consolidation without
-/// touching anything else.
+/// Whether the reflection ("sleep") pass runs at all. On unless `HI_AGENT_REFLECT`
+/// is `off` — a master escape hatch to disable consolidation without touching the
+/// cadence (see [`reflect_interval`]).
 fn reflect_enabled() -> bool {
     !std::env::var(crate::config::ENV_REFLECT)
         .map(|v| v.trim().eq_ignore_ascii_case("off"))
         .unwrap_or(false)
+}
+
+/// Default interval between periodic reflection ("sleep") passes — the scene's
+/// recurring memory-consolidation moment, on its own clock rather than riding the
+/// compact heartbeat. Hourly keeps the raw frontier from piling up; a pass with too
+/// little on the frontier is a fast no-op (it reads the cursor and bails before
+/// spawning a session). Override via `HI_AGENT_REFLECT_EVERY`; `0`/`off` disables.
+const DEFAULT_REFLECT_EVERY: Duration = Duration::from_secs(3600);
+
+/// Resolve the periodic reflection interval, or `None` if reflection is off:
+/// disabled when `HI_AGENT_REFLECT=off` or `HI_AGENT_REFLECT_EVERY` is `0`/`off`;
+/// otherwise `HI_AGENT_REFLECT_EVERY` in alarm-delay grammar, else
+/// [`DEFAULT_REFLECT_EVERY`].
+fn reflect_interval() -> Option<Duration> {
+    if !reflect_enabled() {
+        return None;
+    }
+    match std::env::var(crate::config::ENV_REFLECT_EVERY) {
+        Ok(v) => {
+            let v = v.trim().to_owned();
+            if v.is_empty() {
+                return Some(DEFAULT_REFLECT_EVERY);
+            }
+            if v.eq_ignore_ascii_case("off") {
+                return None;
+            }
+            match parse_delay(&v) {
+                Some(d) if d.is_zero() => None,
+                Some(d) => Some(d),
+                None => Some(DEFAULT_REFLECT_EVERY),
+            }
+        }
+        Err(_) => Some(DEFAULT_REFLECT_EVERY),
+    }
 }
 
 /// How far back a scene's raw memory may date and still be re-warmed at startup.
@@ -145,17 +179,22 @@ fn reflect_enabled() -> bool {
 const REWARM_WINDOW: Duration = Duration::from_secs(7 * 24 * 3600);
 
 /// Built-in base prompts, embedded at compile time and materialised to disk by
-/// [`install_prompts`]. They're authored as files an agent *reads*, not text inlined
+/// [`install_prompts`]. Most are authored as files an agent *reads*, not text inlined
 /// into context: the *mind* is handed `core.md` — who it is and the machinery
 /// (talking, presenting by ref, delegating) — and `speaking.md` — the rhythm of
 /// conversation, when to speak and how much — by [`load_soul`]'s seed, and Reads them
 /// itself. `appearance.md` and `aesthetic.md` are the *view builder's* guides — the
 /// mechanics of authoring/saving a view, and the taste it has to clear — read off
-/// disk by a build sub-agent. All ship in the binary and refresh on every build.
+/// disk by a build sub-agent. `reflection.md` is the exception: it is the
+/// consolidation session's whole instruction set, so it is **inlined** as that
+/// session's system prompt (see [`reflection_prompt`]) rather than Read — the session
+/// needs it to know what to do at all. All ship in the binary and refresh on every
+/// build.
 const CORE_BASE: &str = include_str!("core.md");
 const SPEAKING_BASE: &str = include_str!("speaking.md");
 const APPEARANCE_BASE: &str = include_str!("appearance.md");
 const AESTHETIC_BASE: &str = include_str!("aesthetic.md");
+const REFLECTION_BASE: &str = include_str!("reflection.md");
 
 /// Separator that introduces the operator's override layer. Placed after the
 /// bundled base so its instructions take precedence — the model honors the
@@ -177,12 +216,13 @@ fn compose_prompt(base: &str, prompts_dir: &Path, local_name: &str) -> String {
 
 /// Install the bundled prompts under `<data_dir>/prompts/` at startup, composing
 /// each with its optional `*.local.md` operator override. The managed base files
-/// (`core.md`, `speaking.md`, `appearance.md`, `aesthetic.md`) are rewritten every
-/// boot so they stay current; operator edits live in the never-touched `*.local.md`
-/// siblings. All four are opened as files at runtime by an agent: `appearance.md`
-/// and `aesthetic.md` by the view-builder sub-agent, `core.md` and `speaking.md` by
-/// the mind itself — [`load_soul`]'s seed hands it their paths to Read. So the four
-/// follow one workflow: ship embedded → materialise here → an agent reads from disk.
+/// (`core.md`, `speaking.md`, `appearance.md`, `aesthetic.md`, `reflection.md`) are
+/// rewritten every boot so they stay current; operator edits live in the
+/// never-touched `*.local.md` siblings. `core.md`/`speaking.md` (the mind, via
+/// [`load_soul`]'s seed) and `appearance.md`/`aesthetic.md` (the view-builder
+/// sub-agent) are Read off disk by an agent; `reflection.md` is instead inlined as
+/// the reflection session's system prompt ([`reflection_prompt`]). So each follows
+/// one workflow: ship embedded → materialise here → consumed from disk at runtime.
 pub fn install_prompts(data_dir: &Path) -> std::io::Result<()> {
     let dir = data_dir.join("prompts");
     std::fs::create_dir_all(&dir)?;
@@ -190,8 +230,24 @@ pub fn install_prompts(data_dir: &Path) -> std::io::Result<()> {
     std::fs::write(dir.join("speaking.md"), compose_prompt(SPEAKING_BASE, &dir, "speaking.local.md"))?;
     std::fs::write(dir.join("appearance.md"), compose_prompt(APPEARANCE_BASE, &dir, "appearance.local.md"))?;
     std::fs::write(dir.join("aesthetic.md"), compose_prompt(AESTHETIC_BASE, &dir, "aesthetic.local.md"))?;
-    tracing::info!(dir = %dir.display(), "installed bundled prompts (core.md, speaking.md, appearance.md, aesthetic.md)");
+    std::fs::write(dir.join("reflection.md"), compose_prompt(REFLECTION_BASE, &dir, "reflection.local.md"))?;
+    tracing::info!(dir = %dir.display(), "installed bundled prompts (core.md, speaking.md, appearance.md, aesthetic.md, reflection.md)");
     Ok(())
+}
+
+/// The reflection ("sleep") session's system prompt: the materialised
+/// `<data_dir>/prompts/reflection.md` (operator-overridable via `reflection.local.md`),
+/// or the embedded [`REFLECTION_BASE`] when that file is missing or empty. Unlike
+/// `core.md`/`speaking.md`, this is **inlined** as the reflection session's system
+/// prompt rather than Read by the agent — it *is* the task's instructions, so it must
+/// be present before the session can act. Read fresh each round, so an operator edit
+/// takes effect without a restart.
+pub(super) async fn reflection_prompt(data_dir: &Path) -> String {
+    let path = data_dir.join("prompts").join("reflection.md");
+    match tokio::fs::read_to_string(&path).await {
+        Ok(s) if !s.trim().is_empty() => s,
+        _ => REFLECTION_BASE.to_string(),
+    }
 }
 
 /// The mind's system-prompt seed: a short bundled personality plus a manifest that
@@ -260,6 +316,7 @@ mod soul_tests {
         assert_eq!(read("speaking.md"), SPEAKING_BASE);
         assert_eq!(read("appearance.md"), APPEARANCE_BASE);
         assert_eq!(read("aesthetic.md"), AESTHETIC_BASE);
+        assert_eq!(read("reflection.md"), REFLECTION_BASE);
     }
 
     #[test]
@@ -284,6 +341,26 @@ mod soul_tests {
         std::fs::write(prompts.join("speaking.local.md"), "   \n\t").unwrap();
         install_prompts(dir.path()).unwrap();
         assert_eq!(std::fs::read_to_string(prompts.join("speaking.md")).unwrap(), SPEAKING_BASE);
+    }
+
+    #[tokio::test]
+    async fn reflection_prompt_falls_back_then_reads_installed_override() {
+        let dir = tempfile::tempdir().unwrap();
+        // Nothing installed yet → the embedded base.
+        assert_eq!(reflection_prompt(dir.path()).await, REFLECTION_BASE);
+        // After install (no override) → the materialised file equals the base.
+        install_prompts(dir.path()).unwrap();
+        assert_eq!(reflection_prompt(dir.path()).await, REFLECTION_BASE);
+        // An operator override is layered into what the reflection session loads.
+        std::fs::write(
+            dir.path().join("prompts").join("reflection.local.md"),
+            "Prefer fewer, larger episodes.",
+        )
+        .unwrap();
+        install_prompts(dir.path()).unwrap();
+        let loaded = reflection_prompt(dir.path()).await;
+        assert!(loaded.starts_with(REFLECTION_BASE));
+        assert!(loaded.contains("Prefer fewer, larger episodes."));
     }
 }
 
@@ -716,8 +793,8 @@ async fn per_scene_loop(
     // wake — time passing — on top of an incoming signal; see the `select!` below.
     let mut alarms = Alarms::new();
     // The scene's in-flight reflection ("sleep") pass, if one is running. Kicked
-    // off detached at a heartbeat (see below); kept only to skip starting a second
-    // while the previous is still going — the cursor lets the next heartbeat's
+    // off detached on the periodic reflection timer (see below); kept only to skip
+    // starting a second while the previous is still going — the cursor lets the next
     // round consolidate whatever this one didn't reach.
     let mut reflection: Option<tokio::task::JoinHandle<()>> = None;
 
@@ -735,8 +812,13 @@ async fn per_scene_loop(
     // after the loop stands up also carries how long ago the host process started,
     // which is all "wake on boot" amounts to.
     let pulse_every = pulse_interval();
+    // The periodic reflection clock, independent of activity and of the compact
+    // heartbeat: `last_reflection` advances only when a reflection tick is consumed,
+    // so a busy scene and an idle one both consolidate on the same cadence.
+    let reflect_every = reflect_interval();
     let loop_started = Instant::now();
     let mut last_activity = Instant::now();
+    let mut last_reflection = Instant::now();
     let mut pulsed_once = false;
 
     loop {
@@ -748,10 +830,11 @@ async fn per_scene_loop(
         let mut batch: Vec<LoopInput> = Vec::new();
         'wait: loop {
             let pulse_at = pulse_every.map(|d| last_activity + d);
-            let deadline = match (alarms.next_deadline(), pulse_at) {
-                (Some(a), Some(p)) => Some(a.min(p)),
-                (a, p) => a.or(p),
-            };
+            let reflect_at = reflect_every.map(|d| last_reflection + d);
+            let deadline = [alarms.next_deadline(), pulse_at, reflect_at]
+                .into_iter()
+                .flatten()
+                .min();
             let woke = match deadline {
                 Some(deadline) => tokio::select! {
                     recvd = inbound.recv() => Woke::Inbound(recvd),
@@ -813,6 +896,26 @@ async fn per_scene_loop(
                         tracing::info!(scene = %scene, "pulse fired");
                         batch.push(LoopInput::Pulse { note });
                     }
+                    // Periodic reflection ("sleep"): its own clock, decoupled from the
+                    // compact heartbeat. Spawned detached so it never blocks the floor;
+                    // the cursor makes it idempotent and a pass with too little on the
+                    // frontier is a fast no-op. It drives no turn, so it never joins
+                    // `batch` — the loop just re-waits on the next deadline.
+                    if let Some(at) = reflect_at
+                        && at <= now
+                    {
+                        // Consume the tick whether or not we spawn, so a busy guard
+                        // can't hot-spin the wait loop on an already-past deadline.
+                        last_reflection = now;
+                        if reflection.as_ref().is_none_or(|h| h.is_finished()) {
+                            let r = reactor.clone();
+                            let s = scene.clone();
+                            reflection = Some(tokio::spawn(async move {
+                                heartbeat::reflect(&r, &s).await;
+                            }));
+                            tracing::info!(scene = %scene, "reflection fired (periodic)");
+                        }
+                    }
                     if !batch.is_empty() {
                         break 'wait;
                     }
@@ -852,20 +955,9 @@ async fn per_scene_loop(
                 // it now. The human is consuming the reply just delivered, so the
                 // summarize-and-reopen happens in that natural gap — invisible, never
                 // a cold restart. A swap failure leaves the warm session in place.
+                // (Reflection is no longer kicked off here — it runs on its own
+                // periodic clock in the wait loop above, decoupled from compaction.)
                 if budget.should_swap() {
-                    // The heartbeat is also the "sleep" moment: kick off reflection
-                    // (detached) to consolidate the raw frontier into episodes/facets.
-                    // It must never block the floor, so it is NOT awaited; the cursor
-                    // makes it idempotent across runs, and a still-running prior round
-                    // is left to finish — the next heartbeat picks up whatever it
-                    // didn't reach.
-                    if reflect_enabled() && reflection.as_ref().is_none_or(|h| h.is_finished()) {
-                        let r = reactor.clone();
-                        let s = scene.clone();
-                        reflection = Some(tokio::spawn(async move {
-                            heartbeat::reflect(&r, &s).await;
-                        }));
-                    }
                     if let Some(current) = reactor_session.clone() {
                         match timeout(SWAP_TIMEOUT, heartbeat::swap(&reactor, &scene, &current)).await {
                             Ok(Ok(fresh)) => {
