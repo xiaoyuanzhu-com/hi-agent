@@ -19,19 +19,17 @@ interface ChannelControlsProps {
   voiceOn: boolean;
   /** Mute/unmute the agent's voice. */
   onToggleVoice: () => void;
-  /** Whether any agent view is on stage (the close-views action is shown only
-   * then — there is nothing to close in the default room). */
-  viewsActive: boolean;
-  /** Close all views — clear the screen back to the default empty room. */
+  /** Reset the screen — close all views, back to the default empty room. */
   onCloseViews: () => void;
 }
 
 /**
  * The channel controls — a quiet cluster in the corner. The input channels (mic,
  * camera, text) and the output channel (voice) are all independent: each can be
- * on or off at any time, and they don't conflict. Kept deliberately minimal to
- * preserve the calm room (no chrome by default), but always present so a user
- * who can't (or won't) use a given channel still has a clear way in or out.
+ * on or off at any time, and they don't conflict. Every control is always
+ * present (no state-gated chrome) so a user who can't (or won't) use a given
+ * channel still has a clear way in or out; the trailing reset clears any views
+ * back to the calm room. Order: mic · speaker · keyboard · camera · reset.
  */
 export function ChannelControls({
   audioOn,
@@ -44,11 +42,10 @@ export function ChannelControls({
   onToggleText,
   voiceOn,
   onToggleVoice,
-  viewsActive,
   onCloseViews,
 }: ChannelControlsProps) {
   return (
-    <div className="hi-channels" role="group" aria-label="input channels">
+    <div className="hi-channels" role="group" aria-label="channels">
       <button
         type="button"
         className={`hi-channel${audioOn ? " is-on" : ""}`}
@@ -58,6 +55,28 @@ export function ChannelControls({
         aria-label={audioOn ? "turn microphone off" : "turn microphone on"}
       >
         <MicGlyph muted={!audioOn} />
+      </button>
+
+      <button
+        type="button"
+        className={`hi-channel${voiceOn ? " is-on" : ""}`}
+        onClick={onToggleVoice}
+        title={voiceOn ? "voice on — tap to mute" : "voice muted — tap to unmute"}
+        aria-pressed={voiceOn}
+        aria-label={voiceOn ? "mute the agent's voice" : "unmute the agent's voice"}
+      >
+        <SpeakerGlyph muted={!voiceOn} />
+      </button>
+
+      <button
+        type="button"
+        className={`hi-channel${textOn ? " is-on" : ""}`}
+        onClick={onToggleText}
+        title={textOn ? "text on — tap to hide" : "text off — tap to type"}
+        aria-pressed={textOn}
+        aria-label={textOn ? "hide the text input" : "show the text input"}
+      >
+        <KeyboardGlyph />
       </button>
 
       <button
@@ -73,44 +92,13 @@ export function ChannelControls({
 
       <button
         type="button"
-        className={`hi-channel${textOn ? " is-on" : ""}`}
-        onClick={onToggleText}
-        title={textOn ? "text on — tap to hide" : "text off — tap to type"}
-        aria-pressed={textOn}
-        aria-label={textOn ? "hide the text input" : "show the text input"}
+        className="hi-channel"
+        onClick={onCloseViews}
+        title="reset — close views, back to the calm room"
+        aria-label="reset the screen"
       >
-        <KeyboardGlyph />
+        <ResetGlyph />
       </button>
-
-      <span className="hi-channel-sep" aria-hidden="true" />
-
-      <button
-        type="button"
-        className={`hi-channel${voiceOn ? " is-on" : ""}`}
-        onClick={onToggleVoice}
-        title={voiceOn ? "voice on — tap to mute" : "voice muted — tap to unmute"}
-        aria-pressed={voiceOn}
-        aria-label={voiceOn ? "mute the agent's voice" : "unmute the agent's voice"}
-      >
-        <SpeakerGlyph muted={!voiceOn} />
-      </button>
-
-      {/* A screen action, not a channel: only present while a view is on stage,
-          set apart by its own separator. Closes everything back to the room. */}
-      {viewsActive && (
-        <>
-          <span className="hi-channel-sep" aria-hidden="true" />
-          <button
-            type="button"
-            className="hi-channel"
-            onClick={onCloseViews}
-            title="close views — back to the calm room"
-            aria-label="close all views"
-          >
-            <CloseViewsGlyph />
-          </button>
-        </>
-      )}
     </div>
   );
 }
@@ -181,7 +169,7 @@ function KeyboardGlyph() {
   );
 }
 
-function CloseViewsGlyph() {
+function ResetGlyph() {
   return (
     <svg viewBox="0 0 24 24" width="18" height="18" fill="none" aria-hidden="true">
       <rect x="4" y="5" width="16" height="14" rx="2.5" stroke="currentColor" strokeWidth="1.6" />

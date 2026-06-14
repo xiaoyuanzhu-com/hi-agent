@@ -142,7 +142,7 @@ button {
   left: 50%;
   top: 54%;
   transform: translate(-50%, -50%);
-  width: min(720px, 86vw);
+  width: min(1100px, 90vw);
   z-index: 2;
   pointer-events: none;
   text-align: center;
@@ -395,15 +395,6 @@ button {
   box-shadow: 0 0 0 1px rgba(91, 135, 200, 0.22), 0 6px 22px rgba(40, 52, 74, 0.1);
 }
 
-/* Separates the input channels (mic/camera/text) from the output (voice). */
-.hi-channel-sep {
-  align-self: center;
-  width: 1px;
-  height: 20px;
-  background: var(--line-strong);
-  margin: 0 2px;
-}
-
 /* --- Camera self-view -------------------------------------------------
    The user's own camera while vision is on. Fullscreen backdrop above the
    atmosphere (z1) but below the words/controls/views, so the agent still
@@ -445,8 +436,9 @@ button {
 .hi-selfview--pip {
   inset: auto auto calc(env(safe-area-inset-bottom, 0px) + 20px)
     max(20px, env(safe-area-inset-left));
-  width: min(200px, 44vw);
-  height: min(150px, 33vw);
+  width: clamp(180px, 24vw, 520px);
+  height: auto;
+  aspect-ratio: 4 / 3;
   z-index: 55;
   border-radius: 14px;
   box-shadow: 0 10px 34px rgba(20, 28, 40, 0.34);

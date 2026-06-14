@@ -15,8 +15,10 @@ import type { SpeechItem } from "../ui/SpeechText";
 // How many of the agent's reply lines stay on screen at once. The reply rolls
 // as a calm caption (newest last), but it's windowed *on top of* the pinned
 // user line — never instead of it (see `visibleExchange`), so an answer of any
-// length can't scroll the prompt that prompted it off-screen.
-const AGENT_REPLY_WINDOW = 2;
+// length can't scroll the prompt that prompted it off-screen. Three lines (not
+// two) gives a viewer time to read each before it rolls, since the text streams
+// ahead of the spoken voice.
+const AGENT_REPLY_WINDOW = 3;
 
 // Stable id for the single rolling-interim line (the user's speech as it's
 // being recognized). One slot per scene by design: partials are cumulative, so

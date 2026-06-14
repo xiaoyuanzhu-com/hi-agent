@@ -69,7 +69,7 @@ export function Shell() {
           className={docked ? "hi-stage hi-stage--captions" : "hi-stage"}
           data-aside={docked ? aside : undefined}
         >
-          <SpeechText items={docked ? sentences.slice(-2) : sentences} />
+          <SpeechText items={docked ? sentences.slice(-3) : sentences} />
         </div>
       )}
 
@@ -90,7 +90,6 @@ export function Shell() {
             onToggleText={() => ch.setTextChannel(!ch.textInput)}
             voiceOn={ch.audioOutput}
             onToggleVoice={ch.toggleAudioOutput}
-            viewsActive={overlaid}
             onCloseViews={clear}
           />
           <KeyboardFallback
