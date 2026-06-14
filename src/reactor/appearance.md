@@ -55,6 +55,20 @@ you actually render them — otherwise the person's speech goes invisible.
 **It's theirs the moment they reach for it.** If they scroll or tap, the view should
 yield — let them look, and don't fight it.
 
+**See it before you hand it back.** You have no screen of your own, so a view you
+never render is one you're shipping blind — and `aesthetic.md` holds you to *looking*
+at it with the eye you'd use on someone else's work. You can: the running server (its
+base URL is in `HI_AGENT_BASE_URL`) already serves, same-origin, everything a faithful
+render needs — the import map injected into `GET /`, the `@hi/ui` / `@hi/core` /
+`motion/react` shims it points at under `/assets/`, and any image you saved under
+`/workspace/`. So the harness is small: compile your JSX to ESM (esbuild, bare imports
+left intact, the way the host does), mount it in a headless browser — install one on
+first run; it caches — against that import map, stub the live session (`@hi/core`'s
+hooks: return a sample `useSpeech` line so the caption pills show), and screenshot to a
+file. Then **`Read` the PNG** and fix what doesn't clear the bar before you save. Set
+the harness up once in a workspace tool dir (say `.cache/preview/`) and every later view
+reuses it — like the browser, it resolves the first time and is ready after.
+
 # Saving it and handing it back
 
 When a view is ready, save it as a `.jsx` file in your workspace (your working

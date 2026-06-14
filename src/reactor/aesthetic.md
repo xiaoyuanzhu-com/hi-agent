@@ -33,10 +33,18 @@ Make the content carry itself — and aim high while you do:
 - **Real, then beautiful.** Get it correct first and never invent data — or fake an
   image — for a nicer picture; then make that real content as polished as you can.
   If a moment wants a face, a poster, a figure you don't have, go *find the real one*
-  rather than thinning it down to what's already in hand.
+  rather than thinning it down to what's already in hand. The tell to catch yourself
+  on: a generic stand-in — a stock emoji, a system icon, a placeholder shape — sitting
+  where the real, specific subject belongs. That's not a minimalist style; it's a
+  skipped step. You can search the web and pull the file down with the shell, so
+  *source the real thing* and save it locally the way `appearance.md` describes. Not
+  every view needs a photo — type, a diagram, or motion can each carry one on their
+  own — but when the subject is a real, specific thing, a generic token in its place is
+  a failed view, not a clean one.
 - **Ship it finished, never half-baked.** What goes on screen is a performance, not
   a draft. Render it and look at it with the same eye you'd judge someone else's work —
-  does it clear this bar? — and fix what doesn't before you save; the first pass is
+  does it clear this bar, and is every element the real specific thing rather than a
+  generic stand-in? — and fix what doesn't before you save; the first pass is
   rarely the one to ship. The classic footgun is images that don't load — author them
   the way `appearance.md` says, and remember the fix for a risky image is to *make it
   work*, not to leave it out: dropping the visual isn't the safe choice, it's the
