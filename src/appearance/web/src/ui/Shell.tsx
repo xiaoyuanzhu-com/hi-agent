@@ -31,15 +31,20 @@ export function Shell() {
   const demote = overlaid ? 0.72 : 0;
 
   // The live camera fills the stage as a fullscreen backdrop only when no view
-  // leads (otherwise it shrinks to a pip). Over that video feed the words need a
-  // scrim pill too — the white text-shadow can't carry over a busy/dark feed.
+  // leads (otherwise it shrinks to a pip).
   const cameraBackdrop = !!ch.visionStream && !overlaid;
 
-  // Caption placement follows the topmost view's module-declared aside (last in
-  // z-order); undeclared docks bottom. "self" = the view renders the words
-  // itself via useSpeech(), so the host's captions stand down.
+  // The words dock as a caption pill whenever something fills the stage behind
+  // them — an agent view or the live camera — so they don't sit on top of it.
+  // Over a view the side follows the module's declared aside (undeclared docks
+  // bottom); over the camera they tuck into the lower-left, clear of a centred
+  // face. "self" = the view renders the words itself via useSpeech(), so the
+  // host's captions stand down.
+  const docked = overlaid || cameraBackdrop;
   const topmost = overlaid ? views[views.length - 1] : undefined;
-  const aside = (topmost && meta.get(topmost.id)?.captionAside) ?? "bottom";
+  const aside = overlaid
+    ? (meta.get(topmost!.id)?.captionAside ?? "bottom")
+    : "left";
   const selfHosted = overlaid && aside === "self";
 
   return (
@@ -61,16 +66,10 @@ export function Shell() {
           (only the freshest lines, so the view stays the lead). */}
       {!selfHosted && (
         <div
-          className={
-            overlaid
-              ? "hi-stage hi-stage--captions"
-              : cameraBackdrop
-                ? "hi-stage hi-stage--over-camera"
-                : "hi-stage"
-          }
-          data-aside={overlaid ? aside : undefined}
+          className={docked ? "hi-stage hi-stage--captions" : "hi-stage"}
+          data-aside={docked ? aside : undefined}
         >
-          <SpeechText items={overlaid ? sentences.slice(-2) : sentences} />
+          <SpeechText items={docked ? sentences.slice(-2) : sentences} />
         </div>
       )}
 
