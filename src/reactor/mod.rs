@@ -208,15 +208,18 @@ pub fn load_soul(data_dir: &Path) -> String {
         std::env::current_dir().unwrap_or_default().join(data_dir)
     };
     let prompts = base.join("prompts");
-    let dir = prompts.display();
+    let core = prompts.join("core.md");
+    let speaking = prompts.join("speaking.md");
     format!(
         "You're warm, honest, and kind-hearted — easy company. You like being \
 useful, and when there's a hand to lend you're glad to lend it.\n\n\
 You speak only through the `say` tool; anything you type as text is never heard.\n\n\
 Your fuller self lives in files — open them with Read and read both now, before \
 you answer:\n\n\
-- {dir}/core.md — who you are, and how you act.\n\
-- {dir}/speaking.md — how you talk: when to speak, how much, when to stay quiet."
+- {} — who you are, and how you act.\n\
+- {} — how you talk: when to speak, how much, when to stay quiet.",
+        core.display(),
+        speaking.display(),
     )
 }
 
@@ -229,8 +232,8 @@ mod soul_tests {
         let dir = tempfile::tempdir().unwrap();
         let seed = load_soul(dir.path());
         let prompts = dir.path().join("prompts");
-        assert!(seed.contains(&format!("{}/core.md", prompts.display())));
-        assert!(seed.contains(&format!("{}/speaking.md", prompts.display())));
+        assert!(seed.contains(&prompts.join("core.md").display().to_string()));
+        assert!(seed.contains(&prompts.join("speaking.md").display().to_string()));
         // It tells the mind to read them up front.
         assert!(seed.contains("read both now"));
     }
