@@ -326,7 +326,9 @@ button {
   bottom: max(24px, env(safe-area-inset-bottom));
   transform: translateX(-50%);
   width: min(640px, 88vw);
-  z-index: 10;
+  /* Stays above the view stage like the other channel controls, so a typing
+     user can still reach the input while a view leads. */
+  z-index: 60;
 }
 
 .hi-kbd input {
@@ -360,7 +362,9 @@ button {
   position: fixed;
   right: max(20px, env(safe-area-inset-right));
   bottom: max(20px, env(safe-area-inset-bottom));
-  z-index: 11;
+  /* Above the view stage (50) and camera pip (55), like the captions — the way
+     in/out stays reachable even while a view or the camera leads. */
+  z-index: 60;
   display: flex;
   gap: 10px;
 }
