@@ -130,6 +130,15 @@ fn pulse_interval() -> Option<Duration> {
     }
 }
 
+/// Whether the reflection ("sleep") pass runs at heartbeats. On unless
+/// `HI_AGENT_REFLECT` is `off` — an escape hatch to disable consolidation without
+/// touching anything else.
+fn reflect_enabled() -> bool {
+    !std::env::var(crate::config::ENV_REFLECT)
+        .map(|v| v.trim().eq_ignore_ascii_case("off"))
+        .unwrap_or(false)
+}
+
 /// How far back a scene's raw memory may date and still be re-warmed at startup.
 /// Re-warm gives recently-active scenes a live loop again so their pulses can
 /// fire — a standing commitment must not need a client connection to be checked.
@@ -697,6 +706,11 @@ async fn per_scene_loop(
     // Self-alarms the mind has scheduled. They give the loop a second reason to
     // wake — time passing — on top of an incoming signal; see the `select!` below.
     let mut alarms = Alarms::new();
+    // The scene's in-flight reflection ("sleep") pass, if one is running. Kicked
+    // off detached at a heartbeat (see below); kept only to skip starting a second
+    // while the previous is still going — the cursor lets the next heartbeat's
+    // round consolidate whatever this one didn't reach.
+    let mut reflection: Option<tokio::task::JoinHandle<()>> = None;
 
     // Warm-up: this loop was just stood up (a scene-presence GET, or the first
     // utterance). Pull the cold-start forward now — spawn the subprocess, open the
@@ -830,6 +844,19 @@ async fn per_scene_loop(
                 // summarize-and-reopen happens in that natural gap — invisible, never
                 // a cold restart. A swap failure leaves the warm session in place.
                 if budget.should_swap() {
+                    // The heartbeat is also the "sleep" moment: kick off reflection
+                    // (detached) to consolidate the raw frontier into episodes/facets.
+                    // It must never block the floor, so it is NOT awaited; the cursor
+                    // makes it idempotent across runs, and a still-running prior round
+                    // is left to finish — the next heartbeat picks up whatever it
+                    // didn't reach.
+                    if reflect_enabled() && reflection.as_ref().is_none_or(|h| h.is_finished()) {
+                        let r = reactor.clone();
+                        let s = scene.clone();
+                        reflection = Some(tokio::spawn(async move {
+                            heartbeat::reflect(&r, &s).await;
+                        }));
+                    }
                     if let Some(current) = reactor_session.clone() {
                         match timeout(SWAP_TIMEOUT, heartbeat::swap(&reactor, &scene, &current)).await {
                             Ok(Ok(fresh)) => {

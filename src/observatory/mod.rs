@@ -40,13 +40,15 @@ const BROADCAST_CAP: usize = 512;
 const TRANSCRIPT_TAIL: usize = 240;
 
 /// Which kind of ACP session this is — the reactor's persistent mind, an
-/// ephemeral worker, or the throwaway summarizer a hot-swap briefs from.
+/// ephemeral worker, the throwaway summarizer a hot-swap briefs from, or the
+/// reflection ("sleep") pass that consolidates raw into episodes/facets.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum SessionKind {
     Reactor,
     Worker,
     Summarizer,
+    Reflection,
 }
 
 /// Live state of one ACP session in the mirror.
@@ -293,9 +295,10 @@ impl Observatory {
                         turns: 0,
                     });
                 }
-                // Worker open is mirrored by WorkerSpawned; the summarizer is a
-                // throwaway we don't surface as a standing session.
-                SessionKind::Worker | SessionKind::Summarizer => {}
+                // Worker open is mirrored by WorkerSpawned; the summarizer and
+                // reflection passes are throwaways we don't surface as standing
+                // sessions.
+                SessionKind::Worker | SessionKind::Summarizer | SessionKind::Reflection => {}
             },
             EventKind::SessionClosed { .. } => {
                 // Reactor close is rare (only error teardown); workers are removed

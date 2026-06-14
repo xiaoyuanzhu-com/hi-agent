@@ -148,17 +148,21 @@ Scene  ⊃  Episode  ⊃  Turn  ⊃  Signal
 (where)   (an event)  (a beat)  (an utterance)
 ```
 
-An episode is a **directory**, not a single file: a gist (`episode.md` with frontmatter — scene, the signal-id range it covers, citations, extracted claims) plus the attachments that make it vivid (a key vision frame, the deliverable). Attachments are **references into `raw/`**, not copies — single-source-of-truth holds; only genuinely derived artifacts (a thumbnail, the final deliverable) are materialized in the bundle. Scene lives in frontmatter, not as a directory level, so episodes browse chronologically across scenes; a short id suffix (`-7a3f`) keeps same-day same-slug names unique.
+An episode is a **directory**, not a single file: a gist (`episode.md` with frontmatter — scene, the `from_id`/`to_id` signal range it covers, the subjects it touched) plus, eventually, the attachments that make it vivid (a key vision frame, the deliverable). Attachments are **references into `raw/`**, not copies — single-source-of-truth holds; only genuinely derived artifacts (a thumbnail, the final deliverable) are materialized in the bundle. *(Attachments are not yet produced — today an episode is just its `episode.md`.)* Scene lives in frontmatter, not as a directory level, so episodes browse chronologically across scenes; a short id suffix (`-7a3f`) keeps same-day same-slug names unique.
 
-**Episodes are derived, not captured.** A boundary ("is this still the same event?") is a topic judgment, so it is made by a cognition session at reflection time — never by a time-gap heuristic in Rust. A time-gap is a legitimate *mechanical hint* (a long silence is a fact, not an opinion) that pre-segments candidate boundaries for the mind to accept or split.
+**Episodes are derived, not captured.** A boundary ("is this still the same event?") is a topic judgment, so it is made by a cognition session at reflection time — never by a time-gap heuristic in Rust.
 
-**The cursor is the frontier of formed episodes.** Reflection consumes "signals in scene S after the last episode's end," then advances. The anchor is therefore not a separate cursor file to keep in sync — it is `max(episode end signal-id)` for the scene, which means deleting `episodes/` resets it to genesis and re-running rebuilds everything (regenerate-don't-patch). The heartbeat briefing (`reactor/heartbeat.rs`) is already a mind-authored, scene-scoped gist that today seeds a replacement session and is discarded; persisting it is the cheap first episode seed.
+**Sequential cuts, by count.** Reflection sees the scene's unconsolidated signals as a numbered, oldest-first list and cuts them front to back: each `record_episode(count, …)` files the next `count` signals as one episode, so the mind chooses *boundaries* and never handles a raw signal id. The range (`from_id`/`to_id`) is filled from the covered signals — that range **is** the episode's citation back into `raw/`. The mind stops early to leave an event still in progress unconsolidated; it returns next round.
+
+**The cursor is the frontier of formed episodes.** Reflection consumes "signals in scene S after the last episode's end," then advances. The anchor is therefore not a separate cursor file to keep in sync — it is `max(episode to_id)` for the scene, which means deleting `episodes/` resets it to genesis and re-running rebuilds everything (regenerate-don't-patch). Each `record_episode` advances the cursor by exactly its `count`, so within one round consecutive calls cut a clean, gapless sequence.
 
 ## 5. `facets` — derived current-understanding
 
-A facet is the agent's best current understanding of one subject, **regenerated from episodes**, with every claim citing the source episodes/signals. `projects/<project>.md` is the durable task memory — the rolling state of a piece of work (goal, decisions, files touched, open threads) — distinct from the episodes that record the *sessions* of work and from the code that lives in the workspace.
+A facet is the agent's best current understanding of one subject, **regenerated from episodes**, with every claim citing the source **episodes** (by their refs — episodes in turn cite the raw signal range, so the chain to ground truth holds while facet prose stays readable). `projects/<project>.md` is the durable task memory — the rolling state of a piece of work (goal, decisions, files touched, open threads) — distinct from the episodes that record the *sessions* of work and from the code that lives in the workspace.
 
 Facet dimensions are **open-ended**. people/locations/projects/culture are seeds; new subject types are created as structure emerges, never baked into an enum.
+
+A facet is regenerated whole, never patched: reflection reads the current file, folds in the new episodes, and writes the entire understanding back. Facets are **global** (one `people/alice.md`, not one per scene), so two scenes can touch the same file; the write is atomic (temp + rename) so a reader never sees a torn file, but a cross-scene read-modify-write is deliberately **last-writer-wins** — a facet is a regenerable cache whose truth lives in the episodes, so the next reflection re-derives anything a racing write dropped.
 
 ## 6. `self` and `hot` — the always-loaded core
 
@@ -174,7 +178,11 @@ memory/hot.md   ← the working set: self + standing commitments + recent signif
 
 ## 7. Reflection — the mind consolidating ("sleep")
 
-Consolidation is a **working session**, not the reactor turn loop — so cost never blocks speech. It is seeded like the heartbeat (`unconsolidated signal tail + the gist of the last episode or two for continue-vs-new judgment`), reads a scene's signals after the cursor, and writes episodes and updated facets. It is triggered on **scene-idle** (a silence gap is the natural "the event ended, file it" moment), which also keeps the unconsolidated tail small. *When* it runs is the only knob, and it is a cost/cadence choice (every wake is a paid cognition turn) — not a judgment problem.
+Consolidation is a **dedicated session of its own**, not the reactor turn loop and not the live mind — so cost never blocks speech and the reactor's context is never polluted. It **reads `raw/` directly** (not the conversation, not the swap briefing — those are lossy self-summaries; truth is the log): the scene's signals after the cursor, seeded into the session alongside the gist of the last episode or two (for continue-vs-new judgment) and the index of subjects already modeled (so it reuses a subject rather than coining a near-duplicate). It then segments by `record_episode` and regenerates facets by `read_facet`/`update_facet`.
+
+It is **triggered at the heartbeat** — the same context-pressure moment the live session hot-swaps. That moment is already "sleep," and piggybacking avoids a second timer. It runs **detached**: the swap is not held on it, so a slow consolidation never stalls the floor; the cursor makes it idempotent, and a heartbeat that fires while a prior round is still running simply skips (the next one's frontier catches up). One consequence is accepted: the replacement session a swap opens may seed from a `hot.md`/facets one cycle behind — fine, since those are projections. *When* it runs is the only knob, and it is a cost/cadence choice (every round is a paid cognition turn, plus a subprocess spawn) — not a judgment problem. A tiny frontier is skipped rather than spending a session to file a handful of lines.
+
+*(A scene-idle trigger — consolidating on a silence gap, the natural "the event ended, file it" moment — remains a sensible future addition on top of the heartbeat trigger; it would need the per-scene reflection guard promoted from a loop-local handle to a shared lock.)*
 
 ## 8. Invariants
 
@@ -193,13 +201,14 @@ Consolidation is a **working session**, not the reactor turn loop — so cost ne
 - **Live mic capture** (`src/server/audio.rs`): the streaming mic's PCM is persisted on the wall-clock-minute grid as `audio/<date>/<HH>/<MM>.wav` (raw 16 kHz mono + a WAV header), flushed at each minute rollover and at close. The bytes are an un-journaled tape; utterance lines correlate to a minute by ts.
 - **Vision capture + placeholder perception** (`src/server/vision.rs`): camera WebM is persisted per minute (`vision/<date>/<HH>/<MM>.webm`, init segment prefixed so each file decodes standalone); stills persist as one-offs. Each is **perceived** — `capabilities::vision::understand` captions it (Image for a still, Video for a camera minute), or a placeholder caption when no `VISION_PROVIDER` is set — and the caption is journaled as the vision signal's `body`. Perception runs detached so capture never blocks.
 - **Core loading** (`src/memory/core.rs`): every reactor session loads `self.md` + `hot.md` on top of the soul — at session open and at each heartbeat hot-swap.
-- **Episodes** (`src/memory/episodes.rs`): the heartbeat persists its conversation briefing as an episode (`episodes/<date>-<short>/episode.md`) — the cheap seed, the only producer today.
-- **hot.md** (`refresh_hot`): regenerated from recent episode gists each heartbeat — a mechanical projection, not yet an agent-curated working set.
+- **Reflection — episodes + facets** (`src/reactor/heartbeat.rs::reflect`, `src/memory/{episodes,facets,journal}.rs`, `src/mcp/mod.rs`): at each heartbeat a **detached reflection session** (`SessionRole::Reflection`, its own subprocess, never the live mind) reads `raw/` after the per-scene cursor (`journal::after_cursor` + `episodes::scene_cursor` = `max(to_id)`), and through reflection-only tools segments the frontier into episodes (`record_episode(count, …)` — sequential count-cuts, range auto-filled) and regenerates the facets they touch (`read_facet`/`update_facet`, atomic, last-writer-wins). Facets cite episode refs; episodes cite the raw range. The swap no longer writes episodes (the briefing is now only the replacement seed); `hot.md` refreshes at the end of each reflection.
+- **hot.md** (`refresh_hot`): regenerated from recent episode gists after each reflection — a mechanical projection, not yet an agent-curated working set.
 
 **Still to build:**
-- **`facets/`** — per-subject understanding; needs subject extraction (a judgment), hence a real reflection session.
-- **Agent-judgment reflection** — today consolidation is mechanical (briefing→episode, episodes→hot.md). The design's "sleep" — a session that segments episodes semantically, derives facets, and curates `self.md`/`hot.md` — is the remaining engine.
-- **Idle trigger** — episodes form only at heartbeat (context-pressure) boundaries; a scene-idle trigger would consolidate sooner and on semantic, not size, boundaries.
+- **`self.md` curation** — reflection writes episodes and facets but does not yet evolve the identity core; that (corrections as "scar tissue") is the deepest, most plasticity-resistant layer, deferred.
+- **Agent-curated `hot.md`** — still a mechanical projection of recent gists, not a working set the mind shapes.
+- **Idle trigger** — episodes form only at heartbeat (context-pressure) boundaries; a scene-idle trigger would consolidate sooner and on semantic, not size, boundaries (needs the per-scene reflection guard promoted from a loop-local handle to a shared lock).
+- **Episode attachments + per-claim citations** — an episode is just its `episode.md` today (no materialized thumbnails/deliverables); claims cite at episode granularity, not per-signal.
 - **Vision attention policy** — perception currently fires on every still and every camera minute; a real cadence/salience policy (when to actually look) is the deliberate placeholder left open.
 - **Workers as raw streams**, **`files/`**, **content index** (§3, §8) — still open.
 

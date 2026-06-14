@@ -47,6 +47,63 @@ fn tools_for_role(role: Option<&str>) -> Vec<Value> {
                 }),
             ),
         ],
+        // The reflection ("sleep") surface: a voice-less session that consolidates
+        // the raw log into derived memory. It segments the scene's unconsolidated
+        // signals into episodes and regenerates the facets they touch.
+        Some("reflection") => vec![
+            tool(
+                "record_episode",
+                "File one coherent event as an episode. You are shown the scene's still-unconsolidated \
+                 signals as a numbered list, oldest first; `count` is how many signals from the TOP of \
+                 that list this one episode covers. Call it in order, front to back — each call consumes \
+                 that many signals from the front, so the next call's `count` starts after them. STOP \
+                 early (just don't cover the last few) when the most recent signals are an event still in \
+                 progress; they'll come back next time. `gist` is the consolidated event in your own \
+                 prose. `subjects` are the `dimension/subject` refs this episode is about (e.g. \
+                 `people/alice`, `projects/kyoto-trip`) — list every subject you'll want to update a facet \
+                 for. The call returns the episode's ref; cite it when you update a facet.",
+                json!({
+                    "type": "object",
+                    "properties": {
+                        "count": { "type": "integer", "minimum": 1, "description": "How many signals from the top of the unconsolidated list this episode covers." },
+                        "gist": { "type": "string", "description": "The consolidated event, in prose — what happened, what mattered." },
+                        "subjects": { "type": "array", "items": { "type": "string" }, "description": "The dimension/subject refs this episode touches, e.g. [\"people/alice\", \"projects/kyoto-trip\"]." },
+                    },
+                    "required": ["count", "gist"],
+                }),
+            ),
+            tool(
+                "read_facet",
+                "Read your current understanding of one subject before you rewrite it, so you fold new \
+                 episodes into what you already know instead of starting blank. Returns the facet's \
+                 current text, or a note that none exists yet.",
+                json!({
+                    "type": "object",
+                    "properties": {
+                        "dimension": { "type": "string", "description": "The subject's dimension, e.g. people, locations, projects, culture." },
+                        "subject": { "type": "string", "description": "The subject's name, e.g. alice, kyoto-trip." },
+                    },
+                    "required": ["dimension", "subject"],
+                }),
+            ),
+            tool(
+                "update_facet",
+                "Write your whole current understanding of one subject — regenerate the file, don't patch \
+                 it: pass the complete text (old understanding folded together with the new), not just a \
+                 delta. Every claim should cite the episode(s) it came from by their refs (the values \
+                 record_episode returned). Dimensions are open-ended; reuse an existing dimension/subject \
+                 when one fits rather than coining a near-duplicate.",
+                json!({
+                    "type": "object",
+                    "properties": {
+                        "dimension": { "type": "string", "description": "The subject's dimension, e.g. people, locations, projects, culture." },
+                        "subject": { "type": "string", "description": "The subject's name, e.g. alice, kyoto-trip." },
+                        "content": { "type": "string", "description": "The full regenerated understanding (markdown), every claim citing its source episode refs." },
+                    },
+                    "required": ["dimension", "subject", "content"],
+                }),
+            ),
+        ],
         // Default to the reactor surface (the soul describes these).
         _ => vec![
             tool(
@@ -190,6 +247,16 @@ async fn dispatch_tool(
     let Some(scene) = scene else {
         return tool_error("missing X-HI-Scene header");
     };
+
+    // Reflection tools are pure derived-memory IO over `data_dir` + `scene`; they
+    // don't touch the scene loop (no sink), so handle them before the sink lookup.
+    match name {
+        "record_episode" => return reflection_record_episode(data_dir, scene, args).await,
+        "read_facet" => return reflection_read_facet(data_dir, args).await,
+        "update_facet" => return reflection_update_facet(data_dir, args).await,
+        _ => {}
+    }
+
     let Some(sink) = registry.get(scene).await else {
         return tool_error(&format!("no active scene loop for {}", scene.0));
     };
@@ -246,6 +313,67 @@ async fn dispatch_tool(
 
     match outcome {
         Ok(ack) => tool_ok(ack),
+        Err(err) => tool_error(&err.to_string()),
+    }
+}
+
+/// `record_episode`: file the first `count` of the scene's unconsolidated signals
+/// as one episode (see [`crate::memory::episodes::record_episode`]). Returns the
+/// episode ref for the session to cite when it updates a facet.
+async fn reflection_record_episode(
+    data_dir: &std::path::Path,
+    scene: &Scene,
+    args: &Value,
+) -> Value {
+    let Some(count) = args.get("count").and_then(Value::as_u64) else {
+        return tool_error("record_episode requires an integer `count` >= 1");
+    };
+    let gist = args.get("gist").and_then(Value::as_str).unwrap_or_default();
+    if gist.trim().is_empty() {
+        return tool_error("record_episode requires a non-empty `gist`");
+    }
+    let subjects: Vec<String> = args
+        .get("subjects")
+        .and_then(Value::as_array)
+        .map(|a| a.iter().filter_map(|v| v.as_str().map(str::to_owned)).collect())
+        .unwrap_or_default();
+    match crate::memory::episodes::record_episode(data_dir, scene, count as usize, gist, &subjects)
+        .await
+    {
+        Ok(name) => tool_ok(&format!("recorded episode {name}")),
+        Err(err) => tool_error(&err.to_string()),
+    }
+}
+
+/// `read_facet`: return the current understanding of a subject, or a note that
+/// none exists yet, so the session regenerates from the old rather than blank.
+async fn reflection_read_facet(data_dir: &std::path::Path, args: &Value) -> Value {
+    let dim = args.get("dimension").and_then(Value::as_str).unwrap_or_default();
+    let subject = args.get("subject").and_then(Value::as_str).unwrap_or_default();
+    if dim.trim().is_empty() || subject.trim().is_empty() {
+        return tool_error("read_facet requires `dimension` and `subject`");
+    }
+    match crate::memory::facets::read_facet(data_dir, dim, subject).await {
+        Ok(Some(content)) => tool_ok(&content),
+        Ok(None) => tool_ok("(no facet yet — this subject has no recorded understanding)"),
+        Err(err) => tool_error(&err.to_string()),
+    }
+}
+
+/// `update_facet`: write the whole regenerated understanding of a subject (see
+/// [`crate::memory::facets::update_facet`]). Returns the `<dim>/<subject>` ref.
+async fn reflection_update_facet(data_dir: &std::path::Path, args: &Value) -> Value {
+    let dim = args.get("dimension").and_then(Value::as_str).unwrap_or_default();
+    let subject = args.get("subject").and_then(Value::as_str).unwrap_or_default();
+    let content = args.get("content").and_then(Value::as_str).unwrap_or_default();
+    if dim.trim().is_empty() || subject.trim().is_empty() {
+        return tool_error("update_facet requires `dimension` and `subject`");
+    }
+    if content.trim().is_empty() {
+        return tool_error("update_facet requires non-empty `content`");
+    }
+    match crate::memory::facets::update_facet(data_dir, dim, subject, content).await {
+        Ok(refname) => tool_ok(&format!("updated facet {refname}")),
         Err(err) => tool_error(&err.to_string()),
     }
 }

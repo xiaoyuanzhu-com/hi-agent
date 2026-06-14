@@ -23,12 +23,15 @@ use crate::types::Scene;
 
 /// Which tool surface a session gets, carried as `X-HI-Role` on its MCP attach so
 /// the `/mcp` server exposes the right tools (see [`crate::mcp`]). A reactor
-/// session drives output and delegation; a worker can only raise a question.
+/// session drives output and delegation; a worker can only raise a question; a
+/// reflection session ("sleep") only reads/writes derived memory (episodes,
+/// facets) and has no voice.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum SessionRole {
     #[default]
     Reactor,
     Worker,
+    Reflection,
 }
 
 impl SessionRole {
@@ -36,6 +39,7 @@ impl SessionRole {
         match self {
             SessionRole::Reactor => "reactor",
             SessionRole::Worker => "worker",
+            SessionRole::Reflection => "reflection",
         }
     }
 }

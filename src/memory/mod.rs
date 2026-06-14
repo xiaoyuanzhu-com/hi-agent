@@ -9,6 +9,7 @@ use std::path::Path;
 
 pub mod core;
 pub mod episodes;
+pub mod facets;
 pub mod journal;
 pub mod layout;
 pub mod media;

@@ -15,6 +15,7 @@ use serde::Serialize;
 use tokio::fs::OpenOptions;
 use tokio::io::AsyncWriteExt;
 use tokio::sync::Mutex;
+use uuid::Uuid;
 
 use crate::types::{Channel, JournalEntry, Scene};
 
@@ -109,6 +110,47 @@ impl Journal {
         }
         Ok(entries)
     }
+}
+
+/// The scene's signals with `id` strictly greater than `cursor`, oldest first,
+/// capped at the first `limit` past it — the unconsolidated frontier a reflection
+/// consumes. `cursor` is an episode's `to_id`; `None` reads from the scene's
+/// genesis. The cap takes the OLDEST `limit` (not the most recent), so a large
+/// backlog drains forward over several reflections rather than flooding one and
+/// stranding the frontier.
+///
+/// A free function over `data_dir` (not a `Journal` method) so the stateless
+/// `/mcp` tool handler — which holds only `data_dir` — can resolve the same
+/// frontier the reflection orchestration seeded from. Reuses [`read_scene_dir`];
+/// the since-day is derived from the cursor's uuidv7 timestamp so only the
+/// touched day-folders are scanned. Ordering and the cursor compare both key on
+/// the uuidv7 `id` (the citation key), consistent with the cross-channel merge.
+pub async fn after_cursor(
+    data_dir: &Path,
+    scene: &Scene,
+    cursor: Option<&str>,
+    limit: usize,
+) -> anyhow::Result<Vec<JournalEntry>> {
+    let since = cursor
+        .and_then(uuidv7_ts)
+        .unwrap_or_else(|| DateTime::from_timestamp(0, 0).expect("unix epoch is valid"));
+    let mut entries = Vec::new();
+    let dir = layout::scene_dir(data_dir, scene);
+    read_scene_dir(&dir, since, &mut entries).await?;
+    entries.sort_by(|a, b| (entry_ts(a), entry_id(a)).cmp(&(entry_ts(b), entry_id(b))));
+    if let Some(cur) = cursor {
+        entries.retain(|e| entry_id(e) > cur);
+    }
+    entries.truncate(limit);
+    Ok(entries)
+}
+
+/// The wall-clock timestamp embedded in a uuidv7 string, or `None` if it doesn't
+/// parse / isn't a v7. Used to pick the first day-folder [`after_cursor`] must
+/// scan — an id greater than the cursor cannot predate the cursor's millisecond.
+fn uuidv7_ts(id: &str) -> Option<DateTime<Utc>> {
+    let (secs, nanos) = Uuid::parse_str(id).ok()?.get_timestamp()?.to_unix();
+    DateTime::from_timestamp(secs as i64, nanos)
 }
 
 pub fn entry_ts(entry: &JournalEntry) -> DateTime<Utc> {
@@ -259,4 +301,95 @@ async fn read_log_into(path: &Path, out: &mut Vec<JournalEntry>) -> anyhow::Resu
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod after_cursor_tests {
+    use super::*;
+
+    async fn append_text(j: &Journal, scene: &Scene, id: &str, ts: DateTime<Utc>) {
+        j.append(JournalEntry::SignalIn {
+            id: id.to_string(),
+            ts,
+            channel: Channel::Text,
+            scene: scene.clone(),
+            body: "x".into(),
+            stream: None,
+            media: None,
+            origin: None,
+        })
+        .await
+        .unwrap();
+    }
+
+    /// Append `n` text signals with strictly increasing uuidv7 ids. A 2ms gap
+    /// between appends puts each in its own millisecond, so `now_v7` ids are
+    /// monotonic (their trailing random bits only matter within one ms). Returns
+    /// the ids in insertion (== sort) order.
+    async fn seed(j: &Journal, scene: &Scene, n: usize) -> Vec<String> {
+        let mut ids = Vec::new();
+        for _ in 0..n {
+            let id = Uuid::now_v7().to_string();
+            append_text(j, scene, &id, Utc::now()).await;
+            ids.push(id);
+            tokio::time::sleep(std::time::Duration::from_millis(2)).await;
+        }
+        ids
+    }
+
+    fn id_strings(entries: &[JournalEntry]) -> Vec<String> {
+        entries.iter().map(|e| entry_id(e).to_string()).collect()
+    }
+
+    #[tokio::test]
+    async fn genesis_returns_all_oldest_first() {
+        let dir = tempfile::tempdir().unwrap();
+        let j = Journal::open(dir.path().to_path_buf()).await.unwrap();
+        let scene = Scene("s".into());
+        let ids = seed(&j, &scene, 3).await;
+        let got = after_cursor(dir.path(), &scene, None, 10).await.unwrap();
+        assert_eq!(id_strings(&got), ids);
+    }
+
+    #[tokio::test]
+    async fn cursor_excludes_itself_and_earlier() {
+        let dir = tempfile::tempdir().unwrap();
+        let j = Journal::open(dir.path().to_path_buf()).await.unwrap();
+        let scene = Scene("s".into());
+        let ids = seed(&j, &scene, 4).await;
+        let got = after_cursor(dir.path(), &scene, Some(&ids[1]), 10).await.unwrap();
+        assert_eq!(id_strings(&got), vec![ids[2].clone(), ids[3].clone()]);
+    }
+
+    #[tokio::test]
+    async fn cap_takes_the_oldest_frontier() {
+        let dir = tempfile::tempdir().unwrap();
+        let j = Journal::open(dir.path().to_path_buf()).await.unwrap();
+        let scene = Scene("s".into());
+        let ids = seed(&j, &scene, 5).await;
+        let got = after_cursor(dir.path(), &scene, None, 2).await.unwrap();
+        assert_eq!(id_strings(&got), vec![ids[0].clone(), ids[1].clone()]);
+    }
+
+    #[tokio::test]
+    async fn empty_when_cursor_at_tail() {
+        let dir = tempfile::tempdir().unwrap();
+        let j = Journal::open(dir.path().to_path_buf()).await.unwrap();
+        let scene = Scene("s".into());
+        let ids = seed(&j, &scene, 3).await;
+        let got = after_cursor(dir.path(), &scene, Some(ids.last().unwrap()), 10)
+            .await
+            .unwrap();
+        assert!(got.is_empty());
+    }
+
+    #[tokio::test]
+    async fn unknown_scene_yields_nothing() {
+        let dir = tempfile::tempdir().unwrap();
+        let _j = Journal::open(dir.path().to_path_buf()).await.unwrap();
+        let got = after_cursor(dir.path(), &Scene("missing".into()), None, 10)
+            .await
+            .unwrap();
+        assert!(got.is_empty());
+    }
 }

@@ -35,7 +35,7 @@ pub async fn load_core(memory: &Memory) -> String {
 /// rewrites it wholesale (regenerate, don't patch). A no-op while there are no
 /// episodes, so a fresh install doesn't get an empty file.
 pub async fn refresh_hot(memory: &Memory) -> anyhow::Result<()> {
-    let gists = episodes::recent_gists(memory, HOT_EPISODE_COUNT).await?;
+    let gists = episodes::recent_gists(memory, None, HOT_EPISODE_COUNT).await?;
     if gists.is_empty() {
         return Ok(());
     }
