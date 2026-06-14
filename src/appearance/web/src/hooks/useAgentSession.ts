@@ -475,7 +475,11 @@ export function useAgentSession(): AgentSession {
   const enableVision = useCallback(async () => {
     if (visionRef.current) return; // already live
     try {
-      const videoStream = await navigator.mediaDevices.getUserMedia({ video: true });
+      // `ideal` at 4K asks for the camera's best; the browser clamps down to the
+      // device's true native max rather than failing when 4K isn't available.
+      const videoStream = await navigator.mediaDevices.getUserMedia({
+        video: { width: { ideal: 3840 }, height: { ideal: 2160 } },
+      });
       visionStreamRef.current = videoStream;
       visionRef.current = await VideoStreamer.create(videoStream, { scene });
       setVisionStream(videoStream);

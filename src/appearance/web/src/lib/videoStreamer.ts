@@ -49,7 +49,15 @@ export class VideoStreamer {
   }
 
   private constructor(stream: MediaStream, mime: string, opts: VideoStreamerOptions) {
-    this.recorder = new MediaRecorder(stream, { mimeType: mime });
+    // Scale the encoder bitrate to the real captured resolution. MediaRecorder's
+    // default (~2.5 Mbps) would re-blur a high-res frame, so derive a target from
+    // the track's actual pixels at ~0.1 bits/pixel/frame.
+    const s = stream.getVideoTracks()[0]?.getSettings() ?? {};
+    const w = s.width ?? 1280;
+    const h = s.height ?? 720;
+    const fps = s.frameRate ?? 30;
+    const videoBitsPerSecond = Math.round(w * h * fps * 0.1);
+    this.recorder = new MediaRecorder(stream, { mimeType: mime, videoBitsPerSecond });
     // The recorder may refine the mime (e.g. add the real codec string); send the
     // exact value so the observer opens a matching MediaSource buffer.
     const actualMime = this.recorder.mimeType || mime;
