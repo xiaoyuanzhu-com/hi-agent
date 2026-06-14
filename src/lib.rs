@@ -1,6 +1,6 @@
 //! hi-agent — reference implementation of the human-interface spec.
 
-use std::path::PathBuf;
+use std::path::{Component, Path, PathBuf};
 
 use anyhow::Context;
 use tokio::net::TcpListener;
@@ -31,9 +31,39 @@ pub struct Config {
     pub agent: config::AgentConfig,
 }
 
+/// Absolutize `dir` against the current working directory (if relative) and
+/// lexically strip `.`/`..` components so it reads as a clean absolute path.
+/// Purely lexical — it does not touch the filesystem or resolve symlinks.
+fn normalize_dir(dir: &Path) -> anyhow::Result<PathBuf> {
+    let abs = if dir.is_absolute() {
+        dir.to_path_buf()
+    } else {
+        std::env::current_dir()?.join(dir)
+    };
+    let mut out = PathBuf::new();
+    for comp in abs.components() {
+        match comp {
+            Component::CurDir => {}
+            Component::ParentDir => {
+                out.pop();
+            }
+            other => out.push(other),
+        }
+    }
+    Ok(out)
+}
+
 /// Build the axum app, spawn the ACP subprocess + reactor, bind, and serve
 /// until the process is terminated.
 pub async fn run(config: Config) -> anyhow::Result<()> {
+    // Normalize the data dir once, up front: absolutize it (it rides to child
+    // processes via env, which may run with a different cwd) and strip `.`/`..`
+    // components so the paths we hand the mind read as clean absolutes —
+    // `.../hi-agent/data/prompts/core.md`, not `.../hi-agent/./data/prompts/core.md`.
+    // Every downstream consumer (load_soul, prompts_dir, workspace_dir, …) inherits this.
+    let mut config = config;
+    config.data_dir = normalize_dir(&config.data_dir)
+        .context("resolving cwd to absolutize data dir")?;
     tracing::debug!(?config, "starting hi-agent");
 
     let memory = memory::Memory::open(&config.data_dir).await?;
