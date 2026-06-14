@@ -211,7 +211,13 @@ button {
   gap: 6px;
 }
 
-.hi-stage--captions .hi-sentence {
+/* The scrim pill — shared by docked over-a-view captions and the centered
+   words floating over the live camera backdrop (`hi-stage--over-camera`),
+   since the white text-shadow can't carry over a busy/dark video feed. The
+   over-camera words keep the default centered position and full font; only the
+   pill treatment is borrowed. */
+.hi-stage--captions .hi-sentence,
+.hi-stage--over-camera .hi-sentence {
   padding: 7px 16px;
   border-radius: 14px;
   background: rgba(17, 21, 28, 0.55);
@@ -219,15 +225,20 @@ button {
   -webkit-backdrop-filter: blur(10px);
   color: rgba(255, 255, 255, 0.96);
   text-shadow: none;
+}
+
+.hi-stage--captions .hi-sentence {
   font-size: clamp(15px, 2vw, 38px);
 }
 
-.hi-stage--captions .hi-sentence--prev {
+.hi-stage--captions .hi-sentence--prev,
+.hi-stage--over-camera .hi-sentence--prev {
   opacity: 0.45;
   color: rgba(255, 255, 255, 0.85);
 }
 
-.hi-stage--captions .hi-sentence--user {
+.hi-stage--captions .hi-sentence--user,
+.hi-stage--over-camera .hi-sentence--user {
   color: #b9d2f4;
 }
 
