@@ -36,6 +36,17 @@ pub const ENV_REFLECT: &str = "HI_AGENT_REFLECT";
 /// `1h`; bare integer = seconds); `0` or `off` disables periodic reflection.
 /// Unset / unparseable → the built-in default (hourly).
 pub const ENV_REFLECT_EVERY: &str = "HI_AGENT_REFLECT_EVERY";
+/// Env var setting how long a scene must be idle (no turns) before an idle
+/// reflection fires (`HI_AGENT_REFLECT_IDLE`) — the "consolidate once the event
+/// ends" trigger that complements the periodic backstop. Alarm-delay grammar;
+/// `0`/`off` disables just the idle trigger. Unset / unparseable → default (5m).
+pub const ENV_REFLECT_IDLE: &str = "HI_AGENT_REFLECT_IDLE";
+/// Env var setting the minimum gap between reflection passes
+/// (`HI_AGENT_REFLECT_COOLDOWN`): any trigger within this window of the last
+/// reflection is skipped, so frequent short lulls don't spawn back-to-back passes.
+/// Alarm-delay grammar; `0`/`off` removes the rate limit. Unset / unparseable →
+/// default (30m).
+pub const ENV_REFLECT_COOLDOWN: &str = "HI_AGENT_REFLECT_COOLDOWN";
 /// Env var (set on the cognition subprocess) carrying hi-agent's own HTTP base
 /// URL, so sessions can read input channels and write the overlay over the same
 /// wire the browser uses. See [`AgentConfig::child_env`].
