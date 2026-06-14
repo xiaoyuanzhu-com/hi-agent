@@ -40,7 +40,7 @@ pub async fn run(config: Config) -> anyhow::Result<()> {
     tracing::info!(data_dir = %config.data_dir.display(), "memory opened");
 
     // Materialise the bundled prompts under <data_dir>/prompts/ so the mind's
-    // system prompt (core.md + speaking.md) and the view-builder's guides
+    // system prompt (core.md + speaking.md + meaning.md) and the view-builder's guides
     // (appearance.md + aesthetic.md, opened as files by build sub-agents) are on
     // disk, composed with any `*.local.md` operator overrides. Absolutize the dir:
     // it rides to the child as HI_AGENT_PROMPTS_DIR, and the child may run with a

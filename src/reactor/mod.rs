@@ -282,17 +282,18 @@ const REWARM_WINDOW: Duration = Duration::from_secs(7 * 24 * 3600);
 /// Built-in base prompts, embedded at compile time and materialised to disk by
 /// [`install_prompts`]. Most are authored as files an agent *reads*, not text inlined
 /// into context: the *mind* is handed `core.md` — who it is and the machinery
-/// (talking, presenting by ref, delegating) — and `speaking.md` — the rhythm of
-/// conversation, when to speak and how much — by [`load_soul`]'s seed, and Reads them
-/// itself. `appearance.md` and `aesthetic.md` are the *view builder's* guides — the
-/// mechanics of authoring/saving a view, and the taste it has to clear — read off
-/// disk by a build sub-agent. `reflection.md` is the exception: it is the
-/// consolidation session's whole instruction set, so it is **inlined** as that
-/// session's system prompt (see [`reflection_prompt`]) rather than Read — the session
-/// needs it to know what to do at all. All ship in the binary and refresh on every
-/// build.
+/// (talking, presenting by ref, delegating) — `speaking.md` — the rhythm of
+/// conversation, when to speak and how much — and `meaning.md` — that its purpose is
+/// its own to find — by [`load_soul`]'s seed, and Reads them itself. `appearance.md`
+/// and `aesthetic.md` are the *view builder's* guides — the mechanics of
+/// authoring/saving a view, and the taste it has to clear — read off disk by a build
+/// sub-agent. `reflection.md` is the exception: it is the consolidation session's
+/// whole instruction set, so it is **inlined** as that session's system prompt (see
+/// [`reflection_prompt`]) rather than Read — the session needs it to know what to do
+/// at all. All ship in the binary and refresh on every build.
 const CORE_BASE: &str = include_str!("core.md");
 const SPEAKING_BASE: &str = include_str!("speaking.md");
+const MEANING_BASE: &str = include_str!("meaning.md");
 const APPEARANCE_BASE: &str = include_str!("appearance.md");
 const AESTHETIC_BASE: &str = include_str!("aesthetic.md");
 const REFLECTION_BASE: &str = include_str!("reflection.md");
@@ -317,22 +318,23 @@ fn compose_prompt(base: &str, prompts_dir: &Path, local_name: &str) -> String {
 
 /// Install the bundled prompts under `<data_dir>/prompts/` at startup, composing
 /// each with its optional `*.local.md` operator override. The managed base files
-/// (`core.md`, `speaking.md`, `appearance.md`, `aesthetic.md`, `reflection.md`) are
-/// rewritten every boot so they stay current; operator edits live in the
-/// never-touched `*.local.md` siblings. `core.md`/`speaking.md` (the mind, via
-/// [`load_soul`]'s seed) and `appearance.md`/`aesthetic.md` (the view-builder
-/// sub-agent) are Read off disk by an agent; `reflection.md` is instead inlined as
-/// the reflection session's system prompt ([`reflection_prompt`]). So each follows
-/// one workflow: ship embedded → materialise here → consumed from disk at runtime.
+/// (`core.md`, `speaking.md`, `meaning.md`, `appearance.md`, `aesthetic.md`,
+/// `reflection.md`) are rewritten every boot so they stay current; operator edits
+/// live in the never-touched `*.local.md` siblings. `core.md`/`speaking.md`/`meaning.md`
+/// (the mind, via [`load_soul`]'s seed) and `appearance.md`/`aesthetic.md` (the
+/// view-builder sub-agent) are Read off disk by an agent; `reflection.md` is instead
+/// inlined as the reflection session's system prompt ([`reflection_prompt`]). So each
+/// follows one workflow: ship embedded → materialise here → consumed from disk at runtime.
 pub fn install_prompts(data_dir: &Path) -> std::io::Result<()> {
     let dir = data_dir.join("prompts");
     std::fs::create_dir_all(&dir)?;
     std::fs::write(dir.join("core.md"), compose_prompt(CORE_BASE, &dir, "core.local.md"))?;
     std::fs::write(dir.join("speaking.md"), compose_prompt(SPEAKING_BASE, &dir, "speaking.local.md"))?;
+    std::fs::write(dir.join("meaning.md"), compose_prompt(MEANING_BASE, &dir, "meaning.local.md"))?;
     std::fs::write(dir.join("appearance.md"), compose_prompt(APPEARANCE_BASE, &dir, "appearance.local.md"))?;
     std::fs::write(dir.join("aesthetic.md"), compose_prompt(AESTHETIC_BASE, &dir, "aesthetic.local.md"))?;
     std::fs::write(dir.join("reflection.md"), compose_prompt(REFLECTION_BASE, &dir, "reflection.local.md"))?;
-    tracing::info!(dir = %dir.display(), "installed bundled prompts (core.md, speaking.md, appearance.md, aesthetic.md, reflection.md)");
+    tracing::info!(dir = %dir.display(), "installed bundled prompts (core.md, speaking.md, meaning.md, appearance.md, aesthetic.md, reflection.md)");
     Ok(())
 }
 
@@ -352,11 +354,11 @@ pub(super) async fn reflection_prompt(data_dir: &Path) -> String {
 }
 
 /// The mind's system-prompt seed: a short bundled personality plus a manifest that
-/// hands the agent the absolute paths of `core.md` and `speaking.md` to Read for its
-/// fuller self. We send this thin seed rather than inlining the whole character on
-/// every turn — the mind reads the files itself (and most turns will). The paths are
-/// absolutized here (mirroring the caller that exports `HI_AGENT_PROMPTS_DIR`) so the
-/// Read targets resolve regardless of the session's cwd, which is `None`. Built at
+/// hands the agent the absolute paths of `core.md`, `speaking.md`, and `meaning.md` to
+/// Read for its fuller self. We send this thin seed rather than inlining the whole
+/// character on every turn — the mind reads the files itself (and most turns will). The
+/// paths are absolutized here (mirroring the caller that exports `HI_AGENT_PROMPTS_DIR`)
+/// so the Read targets resolve regardless of the session's cwd, which is `None`. Built at
 /// startup and reused on each hot-swap. (Named `load_soul` for the reactor's history.)
 pub fn load_soul(data_dir: &Path) -> String {
     let base = if data_dir.is_absolute() {
@@ -367,16 +369,19 @@ pub fn load_soul(data_dir: &Path) -> String {
     let prompts = base.join("prompts");
     let core = prompts.join("core.md");
     let speaking = prompts.join("speaking.md");
+    let meaning = prompts.join("meaning.md");
     format!(
         "You're warm, honest, and kind-hearted — easy company. You like being \
 useful, and when there's a hand to lend you're glad to lend it.\n\n\
 You speak only through the `say` tool; anything you type as text is never heard.\n\n\
-Your fuller self lives in files — open them with Read and read both now, before \
+Your fuller self lives in files — open them with Read and read them all now, before \
 you answer:\n\n\
 - {} — who you are, and how you act.\n\
-- {} — how you talk: when to speak, how much, when to stay quiet.",
+- {} — how you talk: when to speak, how much, when to stay quiet.\n\
+- {} — what you're for, and that finding it is yours to do.",
         core.display(),
         speaking.display(),
+        meaning.display(),
     )
 }
 
@@ -391,8 +396,9 @@ mod soul_tests {
         let prompts = dir.path().join("prompts");
         assert!(seed.contains(&prompts.join("core.md").display().to_string()));
         assert!(seed.contains(&prompts.join("speaking.md").display().to_string()));
+        assert!(seed.contains(&prompts.join("meaning.md").display().to_string()));
         // It tells the mind to read them up front.
-        assert!(seed.contains("read both now"));
+        assert!(seed.contains("read them all now"));
     }
 
     #[test]
@@ -415,6 +421,7 @@ mod soul_tests {
         let read = |n: &str| std::fs::read_to_string(dir.path().join("prompts").join(n)).unwrap();
         assert_eq!(read("core.md"), CORE_BASE);
         assert_eq!(read("speaking.md"), SPEAKING_BASE);
+        assert_eq!(read("meaning.md"), MEANING_BASE);
         assert_eq!(read("appearance.md"), APPEARANCE_BASE);
         assert_eq!(read("aesthetic.md"), AESTHETIC_BASE);
         assert_eq!(read("reflection.md"), REFLECTION_BASE);
