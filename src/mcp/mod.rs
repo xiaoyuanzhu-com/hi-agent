@@ -59,17 +59,20 @@ fn tools_for_role(role: Option<&str>) -> Vec<Value> {
                  that many signals from the front, so the next call's `count` starts after them. STOP \
                  early (just don't cover the last few) when the most recent signals are an event still in \
                  progress; they'll come back next time. `gist` is the consolidated event in your own \
-                 prose. `subjects` are the `dimension/subject` refs this episode is about (e.g. \
-                 `people/alice`, `projects/kyoto-trip`) — list every subject you'll want to update a facet \
-                 for. The call returns the episode's ref; cite it when you update a facet.",
+                 prose. `title` is a short handle for this event (a few words) — it becomes the episode's \
+                 directory name, so make it specific and human-readable (e.g. \"Lunch plan with Alice\", \
+                 \"Kyoto flights booked\"). `subjects` are the `dimension/subject` refs this episode is about \
+                 (e.g. `people/alice`, `projects/kyoto-trip`) — list every subject you'll want to update a \
+                 facet for. The call returns the episode's ref; cite it when you update a facet.",
                 json!({
                     "type": "object",
                     "properties": {
                         "count": { "type": "integer", "minimum": 1, "description": "How many signals from the top of the unconsolidated list this episode covers." },
+                        "title": { "type": "string", "description": "A short, specific handle for this event (a few words); becomes the episode's directory name, e.g. \"Lunch plan with Alice\"." },
                         "gist": { "type": "string", "description": "The consolidated event, in prose — what happened, what mattered." },
                         "subjects": { "type": "array", "items": { "type": "string" }, "description": "The dimension/subject refs this episode touches, e.g. [\"people/alice\", \"projects/kyoto-trip\"]." },
                     },
-                    "required": ["count", "gist"],
+                    "required": ["count", "title", "gist"],
                 }),
             ),
             tool(
@@ -332,12 +335,16 @@ async fn reflection_record_episode(
     if gist.trim().is_empty() {
         return tool_error("record_episode requires a non-empty `gist`");
     }
+    let title = args.get("title").and_then(Value::as_str).unwrap_or_default();
+    if title.trim().is_empty() {
+        return tool_error("record_episode requires a non-empty `title`");
+    }
     let subjects: Vec<String> = args
         .get("subjects")
         .and_then(Value::as_array)
         .map(|a| a.iter().filter_map(|v| v.as_str().map(str::to_owned)).collect())
         .unwrap_or_default();
-    match crate::memory::episodes::record_episode(data_dir, scene, count as usize, gist, &subjects)
+    match crate::memory::episodes::record_episode(data_dir, scene, count as usize, title, gist, &subjects)
         .await
     {
         Ok(name) => tool_ok(&format!("recorded episode {name}")),

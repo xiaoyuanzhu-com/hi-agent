@@ -1,4 +1,4 @@
-//! Derived event bundles — `memory/episodes/<date>-<short>/episode.md`.
+//! Derived event bundles — `memory/episodes/<date>-<slug>/episode.md`.
 //!
 //! An episode is a coherent event within a scene, a **derived projection** over
 //! the raw log: regenerable, never the source of truth. Reflection (the "sleep"
@@ -77,6 +77,7 @@ pub async fn record_episode(
     data_dir: &Path,
     scene: &Scene,
     count: usize,
+    title: &str,
     gist: &str,
     subjects: &[String],
 ) -> anyhow::Result<String> {
@@ -102,21 +103,47 @@ pub async fn record_episode(
     let from_ts = journal::entry_ts(&covered[0]);
     let to_ts = journal::entry_ts(&covered[count - 1]);
 
-    // Suffix from the uuid's RANDOM tail, not its head: a uuidv7's leading hex is
-    // the millisecond timestamp, identical for ids minted within the same ~65s, so
-    // a head suffix collides when one reflection writes several episodes at once —
-    // and a colliding dir name silently overwrites the prior episode. The trailing
-    // hex is random, so it stays unique within a round.
-    let short = Uuid::now_v7().simple().to_string();
-    let name = format!("{}-{}", to_ts.format("%Y-%m-%d"), &short[short.len() - 8..]);
-    let dir = layout::episodes_dir(data_dir).join(&name);
-    tokio::fs::create_dir_all(&dir).await?;
+    // The dir name is `<date>-<slug>`, a human-readable handle the mind can scan.
+    // The slug is the model's `title`, slugified; an empty/symbol-only title falls
+    // back to the gist's opening words, and a still-empty result to a uuid tail so
+    // a name always exists. Within one reflection round several episodes can share
+    // a date and even a slug, and `create_dir_all` would silently reuse a colliding
+    // dir (overwriting the prior episode), so we create the leaf exclusively and
+    // append `-2`, `-3`, … until one is fresh.
+    let base = {
+        let s = slugify(title);
+        let s = if s.is_empty() { slugify(gist) } else { s };
+        if s.is_empty() {
+            let short = Uuid::now_v7().simple().to_string();
+            short[short.len() - 8..].to_string()
+        } else {
+            s
+        }
+    };
+    let parent = layout::episodes_dir(data_dir);
+    tokio::fs::create_dir_all(&parent).await?;
+    let date = to_ts.format("%Y-%m-%d").to_string();
+    let mut name = format!("{date}-{base}");
+    let mut dir = parent.join(&name);
+    let mut n = 2;
+    loop {
+        match tokio::fs::create_dir(&dir).await {
+            Ok(()) => break,
+            Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => {
+                name = format!("{date}-{base}-{n}");
+                dir = parent.join(&name);
+                n += 1;
+            }
+            Err(err) => return Err(err.into()),
+        }
+    }
 
     // Frontmatter values are emitted as JSON (a subset of YAML), so a scene id,
     // signal id, or subject with a colon/quote/newline can never break the block.
     let body = format!(
-        "---\nscene: {}\nfrom_id: {}\nto_id: {}\nfrom_ts: {}\nto_ts: {}\nsubjects: {}\nkind: reflection\n---\n\n{}\n",
+        "---\nscene: {}\ntitle: {}\nfrom_id: {}\nto_id: {}\nfrom_ts: {}\nto_ts: {}\nsubjects: {}\nkind: reflection\n---\n\n{}\n",
         jstr(&scene.0),
+        jstr(title.trim()),
         jstr(&from_id),
         jstr(&to_id),
         jstr(&from_ts.to_rfc3339()),
@@ -209,6 +236,28 @@ fn strip_frontmatter(content: &str) -> &str {
     }
 }
 
+/// A filesystem-safe slug for an episode dir: lowercase ASCII alphanumerics, every
+/// other run collapsed to a single `-`, trimmed of leading/trailing `-`, and capped
+/// to a few words so the handle stays short. Non-ASCII (e.g. CJK) carries no ASCII
+/// letters, so such a title slugs to empty and the caller falls back.
+fn slugify(s: &str) -> String {
+    let mut out = String::new();
+    let mut words = 0;
+    for ch in s.chars() {
+        if ch.is_ascii_alphanumeric() {
+            out.push(ch.to_ascii_lowercase());
+        } else if !out.ends_with('-') && !out.is_empty() {
+            out.push('-');
+            words += 1;
+            if words >= 6 {
+                break;
+            }
+        }
+    }
+    let trimmed = out.trim_matches('-');
+    trimmed.chars().take(60).collect()
+}
+
 /// A string as a JSON (⊂ YAML) scalar; falls back to an empty string literal.
 fn jstr(s: &str) -> String {
     serde_json::to_string(s).unwrap_or_else(|_| "\"\"".into())
@@ -263,16 +312,18 @@ mod reflection_tests {
         let scene = Scene("s".into());
         let ids = append(&j, &scene, 5).await;
 
-        let name = record_episode(dir.path(), &scene, 2, "first event", &["people/alice".into()])
-            .await
-            .unwrap();
+        let name =
+            record_episode(dir.path(), &scene, 2, "Lunch with Alice", "first event", &["people/alice".into()])
+                .await
+                .unwrap();
         assert!(name.contains('-'));
+        assert!(name.ends_with("-lunch-with-alice"));
         assert_eq!(
             scene_cursor(dir.path(), &scene).await.unwrap().as_deref(),
             Some(ids[1].as_str())
         );
 
-        record_episode(dir.path(), &scene, 2, "second event", &[]).await.unwrap();
+        record_episode(dir.path(), &scene, 2, "Second thing", "second event", &[]).await.unwrap();
         assert_eq!(
             scene_cursor(dir.path(), &scene).await.unwrap().as_deref(),
             Some(ids[3].as_str())
@@ -284,9 +335,8 @@ mod reflection_tests {
             .unwrap();
         assert_eq!(tail.len(), 1);
 
-        // Two distinct episode dirs — the suffix must stay unique within one round.
-        // (A uuidv7's leading hex is its millisecond timestamp and collides for ids
-        // minted seconds apart; the trailing hex is random and does not.)
+        // Two distinct episode dirs — distinct titles slug to distinct names. (Same
+        // title in one round would still get a unique name via the `-2`/`-3` suffix.)
         let mut rd = tokio::fs::read_dir(layout::episodes_dir(dir.path())).await.unwrap();
         let mut dirs = 0;
         while rd.next_entry().await.unwrap().is_some() {
@@ -301,8 +351,8 @@ mod reflection_tests {
         let j = Journal::open(dir.path().to_path_buf()).await.unwrap();
         let scene = Scene("s".into());
         append(&j, &scene, 2).await;
-        assert!(record_episode(dir.path(), &scene, 5, "too many", &[]).await.is_err());
-        assert!(record_episode(dir.path(), &scene, 0, "zero", &[]).await.is_err());
+        assert!(record_episode(dir.path(), &scene, 5, "Too many", "too many", &[]).await.is_err());
+        assert!(record_episode(dir.path(), &scene, 0, "Zero", "zero", &[]).await.is_err());
     }
 
     #[tokio::test]
@@ -313,7 +363,7 @@ mod reflection_tests {
         let b = Scene("b".into());
         let a_ids = append(&j, &a, 2).await;
         append(&j, &b, 2).await;
-        record_episode(dir.path(), &a, 2, "a event", &[]).await.unwrap();
+        record_episode(dir.path(), &a, 2, "A event", "a event", &[]).await.unwrap();
         assert_eq!(
             scene_cursor(dir.path(), &a).await.unwrap().as_deref(),
             Some(a_ids[1].as_str())
