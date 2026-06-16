@@ -91,7 +91,7 @@ Each boundary is a clean contract:
 
 The two rules that place responsibility:
 
-- **Channels live in the reactor, not in cognition.** An ACP session is a single text duplex with no notion of audio/vision/surface. The reactor is the mux/demux that gives cognition multi-channel reach.
+- **Channels live in the reactor, not in cognition.** An ACP session is a single text duplex with no notion of audio/vision/view. The reactor is the mux/demux that gives cognition multi-channel reach.
 - **Transport lives in the owner, not in the reactor.** The reactor knows only continuous signals; the adapter binds them to a wire.
 
 ---
@@ -102,7 +102,7 @@ The two rules that place responsibility:
 
 Two decisions place its boundaries:
 
-- **Channels live here, not in cognition.** Cognition is a single text duplex with no notion of audio/vision/surface; the reactor is what gives it multi-channel reach.
+- **Channels live here, not in cognition.** Cognition is a single text duplex with no notion of audio/vision/view; the reactor is what gives it multi-channel reach.
 - **Transport does not live here.** The reactor's interface is **N continuous input signal streams in + N continuous output signal streams out**, in the human-model vocabulary of senses and expressions — with zero knowledge of HTTP, long-poll, chunked bodies, or mime. The transport adapter owns the wire. So artifacts like *utterance = HTTP body-close*, the mime that sets `Content-Type`, and per-turn frame binding (so one turn's audio never bleeds into another response) live in the adapter, not the mind. Swap HTTP for a continuous transport and the adapter shrinks toward passthrough; the reactor is unchanged.
 
 **Reasoning — why deciding concentrates here.** A person's presence and deliberation share one locus: you perceive, decide, and speak as one self. Splitting "what to say" from "how and when to say it" across modules would fragment that. The reactor is that single locus; cognition is the slow sub-faculty it consults.

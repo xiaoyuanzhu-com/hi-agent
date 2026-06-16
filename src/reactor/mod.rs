@@ -599,7 +599,7 @@ struct ReactorInner {
     /// hot-swapped mind boots the same way.
     soul: String,
     /// The reactor's single outbound seam: every channel signal it produces —
-    /// text, synthesized speech, surfaces — goes out here in transport-free form
+    /// text, synthesized speech, views — goes out here in transport-free form
     /// (see [`outbound`]). A transport adapter binds these to a wire. The reactor
     /// has no knowledge of HTTP, `Content-Type`, or response framing.
     out: mpsc::Sender<OutboundSignal>,
@@ -1469,8 +1469,8 @@ async fn emit_thought_chunk(reactor: &Reactor, scene: &Scene, text: String) {
         .await;
 }
 
-/// Carry one release action to its wire carrier: speech to TTS, a surface to
-/// /surface. Thought mirroring and the once-per-turn reply log are handled inline
+/// Carry one release action to its wire carrier: speech to TTS, a view to
+/// /view. Thought mirroring and the once-per-turn reply log are handled inline
 /// by the caller, since they track the raw spoken chunk rather than the paced
 /// emits.
 async fn perform(

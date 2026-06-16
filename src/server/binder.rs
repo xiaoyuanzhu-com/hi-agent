@@ -2,10 +2,10 @@
 //! vocabulary to the HTTP wire.
 //!
 //! The reactor is the mind; it emits [`OutboundSignal`]s in human-channel terms
-//! ("said this text", "this span of speech", "show this surface") and knows
+//! ("said this text", "this span of speech", "show this view") and knows
 //! nothing about HTTP. Everything HTTP-shaped lives on this side of the seam:
 //! the utterance→response framing of /out/text, the `Content-Type` and turn
-//! binding of /out/audio, the broadcast of /out/surface. This binder is the one place
+//! binding of /out/audio, the broadcast of /out/view. This binder is the one place
 //! that translates between the two, so swapping HTTP for another wire touches
 //! only this file — the reactor and its vocabulary are untouched.
 //!

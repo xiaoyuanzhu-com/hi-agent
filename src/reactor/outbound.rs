@@ -3,7 +3,7 @@
 //! The reactor is the mind; it must stay aligned to the human-channel model and
 //! know nothing about whichever wire happens to carry it. So instead of building
 //! HTTP-shaped events, it emits [`OutboundSignal`]s: "said this text", "this span
-//! of speech", "show this surface". A transport adapter (today the HTTP server)
+//! of speech", "show this view". A transport adapter (today the HTTP server)
 //! binds these to a wire — assigns `Content-Type`, frames one utterance into one
 //! response, closes the body at an utterance boundary. Swap HTTP for WebSocket
 //! and only the adapter changes; this vocabulary and the reactor are untouched.
