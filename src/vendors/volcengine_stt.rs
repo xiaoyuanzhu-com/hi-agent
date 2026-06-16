@@ -75,6 +75,7 @@ const ENV_API_KEY: &str = "VOLCENGINE_STT_API_KEY";
 const ENV_MODEL: &str = "VOLCENGINE_STT_MODEL";
 const ENV_RESOURCE_ID: &str = "VOLCENGINE_STT_RESOURCE_ID";
 const ENV_ENDPOINT: &str = "VOLCENGINE_STT_ENDPOINT";
+const ENV_SPEAKER_INFO: &str = "VOLCENGINE_STT_SPEAKER_INFO";
 
 const DEFAULT_MODEL: &str = "bigmodel";
 
@@ -110,6 +111,7 @@ pub struct Config {
     model: String,
     resource_id: String,
     endpoint: String,
+    speaker_info: bool,
 }
 
 impl Config {
@@ -122,11 +124,20 @@ impl Config {
             std::env::var(ENV_RESOURCE_ID).unwrap_or_else(|_| DEFAULT_RESOURCE_ID.to_string());
         let endpoint =
             std::env::var(ENV_ENDPOINT).unwrap_or_else(|_| DEFAULT_ENDPOINT.to_string());
+        // Speaker clustering is on by default; set the env to 0/false/off to disable.
+        let speaker_info = match std::env::var(ENV_SPEAKER_INFO) {
+            Ok(v) => {
+                let v = v.trim();
+                !(v == "0" || v.eq_ignore_ascii_case("false") || v.eq_ignore_ascii_case("off"))
+            }
+            Err(_) => true,
+        };
         Ok(Self {
             api_key,
             model,
             resource_id,
             endpoint,
+            speaker_info,
         })
     }
 }
@@ -176,7 +187,12 @@ async fn connect(cfg: &Config) -> anyhow::Result<WebSocketStream<MaybeTlsStream<
 /// when set we also request server-side VAD segmentation via
 /// `end_window_size` so utterances finalize mid-stream (after a short pause)
 /// rather than only at connection close.
-fn config_frame(cfg: &Config, show_utterances: bool) -> anyhow::Result<Vec<u8>> {
+///
+/// `speaker` requests speaker clustering. It's deliberately decoupled from
+/// `cfg.speaker_info` at the call site: only the batch path opts in, because the
+/// feature forces `enable_nonstream` (see below) which would defeat the live
+/// stream's low-latency partials.
+fn config_frame(cfg: &Config, show_utterances: bool, speaker: bool) -> anyhow::Result<Vec<u8>> {
     let mut request = json!({
         "model_name": cfg.model,
         "enable_itn": true,
@@ -186,6 +202,17 @@ fn config_frame(cfg: &Config, show_utterances: bool) -> anyhow::Result<Vec<u8>> 
     });
     if show_utterances {
         request["end_window_size"] = json!(STREAM_END_WINDOW_MS);
+    }
+    if speaker {
+        // Speaker clustering/diarization. On the optimized async endpoint it's
+        // gated on enable_nonstream=true (which buffers for a post-processed
+        // result instead of streaming low-latency partials) and ssd_version=200
+        // (the ASR 2.0 model). All three must be set together or the upstream
+        // ignores the speaker request. The labels then ride the post-processed
+        // `definite` utterances as `additions.speaker_id`.
+        request["enable_speaker_info"] = json!(true);
+        request["enable_nonstream"] = json!(true);
+        request["ssd_version"] = json!("200");
     }
     let config = json!({
         "user": { "uid": "hi-agent" },
@@ -205,8 +232,9 @@ async fn transcribe_inner(cfg: &Config, audio: Bytes, mime: &str) -> anyhow::Res
     let pcm = extract_pcm(&audio, mime)?;
     let (mut tx, mut rx) = connect(cfg).await?.split();
 
-    // 1. FULL_CLIENT_REQUEST — JSON config.
-    tx.send(Message::Binary(config_frame(cfg, false)?)).await?;
+    // 1. FULL_CLIENT_REQUEST — JSON config. Request utterances + speaker
+    //    clustering when configured so a multi-speaker clip comes back labeled.
+    tx.send(Message::Binary(config_frame(cfg, cfg.speaker_info, cfg.speaker_info)?)).await?;
 
     // 2. Audio chunks.
     let mut offset = 0;
@@ -239,6 +267,9 @@ async fn transcribe_inner(cfg: &Config, audio: Bytes, mime: &str) -> anyhow::Res
     // 3. Drain responses until we see a `final` result or an error.
     let mut final_text = String::new();
     let mut last_text = String::new();
+    // When speaker clustering labels ≥2 voices, the post-processed final frame
+    // carries a multi-speaker transcript we prefer over the flat `text`.
+    let mut last_labeled: Option<String> = None;
     while let Some(msg) = rx.next().await {
         let msg = msg.map_err(|e| anyhow::anyhow!("volcengine STT WS recv: {e}"))?;
         let bytes = match msg {
@@ -250,7 +281,7 @@ async fn transcribe_inner(cfg: &Config, audio: Bytes, mime: &str) -> anyhow::Res
                 // silence from un-transcribable sound, and neither path is an
                 // error; the caller treats an empty transcript as a no-op.
                 if final_text.is_empty() {
-                    final_text = last_text.clone();
+                    final_text = last_labeled.clone().unwrap_or_else(|| last_text.clone());
                 }
                 break;
             }
@@ -285,14 +316,19 @@ async fn transcribe_inner(cfg: &Config, audio: Bytes, mime: &str) -> anyhow::Res
                     }
                 }
 
-                if let Some(text) = parsed.result.as_ref().and_then(|r| r.first_text()) {
-                    if !text.is_empty() {
-                        last_text = text;
+                if let Some(result) = parsed.result.as_ref() {
+                    if let Some(text) = result.first_text() {
+                        if !text.is_empty() {
+                            last_text = text;
+                        }
+                    }
+                    if let Some(labeled) = result.labeled_transcript() {
+                        last_labeled = Some(labeled);
                     }
                 }
 
                 if parsed.kind.as_deref() == Some("final") {
-                    final_text = last_text.clone();
+                    final_text = last_labeled.clone().unwrap_or_else(|| last_text.clone());
                     break;
                 }
             }
@@ -323,7 +359,7 @@ async fn transcribe_streaming_inner(
     out: mpsc::Sender<Transcript>,
 ) -> anyhow::Result<String> {
     let (mut tx, mut rx) = connect(cfg).await?.split();
-    tx.send(Message::Binary(config_frame(cfg, true)?)).await?;
+    tx.send(Message::Binary(config_frame(cfg, true, false)?)).await?;
 
     // Sender task: stream PCM chunks until the input closes, then mark the
     // last chunk so the upstream finalizes.
@@ -559,6 +595,16 @@ struct Utterance {
     /// and will not change.
     #[serde(default)]
     definite: bool,
+    #[serde(default)]
+    additions: UtteranceAdditions,
+}
+
+/// Per-utterance extras. We only read `speaker_id` (present on post-processed
+/// `two_pass` utterances when speaker clustering is on); the rest is ignored.
+#[derive(Debug, Default, Deserialize, Serialize)]
+struct UtteranceAdditions {
+    #[serde(default)]
+    speaker_id: Option<String>,
 }
 
 impl ServerResult {
@@ -584,6 +630,34 @@ impl ServerResult {
             .filter(|s| !s.is_empty())
             .next_back()
             .or_else(|| self.first_text())
+    }
+
+    /// Render the definite utterances as a speaker-labeled transcript, but only
+    /// when speaker clustering actually distinguished ≥2 voices. Each line is
+    /// `说话人{id}：{text}`, in utterance order. Returns `None` for a single
+    /// speaker (or no speaker info) so the caller keeps the flat transcript —
+    /// a 1:1 conversation reads exactly as before.
+    fn labeled_transcript(&self) -> Option<String> {
+        let labeled: Vec<(&str, String)> = self
+            .utterances
+            .iter()
+            .filter(|u| u.definite)
+            .filter_map(|u| {
+                let id = u.additions.speaker_id.as_deref()?;
+                let text = u.text.as_deref()?.trim();
+                (!text.is_empty()).then(|| (id, text.to_owned()))
+            })
+            .collect();
+        let distinct = labeled.iter().map(|(id, _)| *id).collect::<std::collections::HashSet<_>>();
+        if distinct.len() < 2 {
+            return None;
+        }
+        let transcript = labeled
+            .iter()
+            .map(|(id, text)| format!("说话人{id}：{text}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        Some(transcript)
     }
 }
 
@@ -649,5 +723,49 @@ mod tests {
         frame.extend_from_slice(&999u32.to_be_bytes());
         frame.extend_from_slice(b"{}");
         assert_eq!(server_payload(&frame), Some(&b"{}"[..]));
+    }
+
+    // Shape pinned from a real `two_pass` post-processed frame (two voices, one
+    // clip): the speaker id lives at `result.utterances[].additions.speaker_id`
+    // (a string) on `definite` utterances. A ≥2-speaker clip renders as a
+    // labeled transcript, one `说话人{id}：` line per utterance, in order.
+    #[test]
+    fn multi_speaker_renders_labeled_transcript() {
+        let json = r#"{"result":{"utterances":[
+            {"definite":true,"text":"你好，我是张经理，明天上午10点的会议还照常进行吗？","additions":{"source":"two_pass","speaker_id":"1"}},
+            {"definite":true,"text":"照常进行，我已经通知了所有人，会议室也订好了。","additions":{"source":"two_pass","speaker_id":"0"}}
+        ]}}"#;
+        let frame = result_frame(true, json.as_bytes());
+        let payload = server_payload(&frame).expect("payload");
+        let parsed: ServerResponse = serde_json::from_slice(payload).expect("valid JSON");
+        let labeled = parsed.result.as_ref().and_then(|r| r.labeled_transcript());
+        assert_eq!(
+            labeled.as_deref(),
+            Some(
+                "说话人1：你好，我是张经理，明天上午10点的会议还照常进行吗？\n\
+                 说话人0：照常进行，我已经通知了所有人，会议室也订好了。"
+            )
+        );
+    }
+
+    // A single speaker (or no speaker info) stays a flat transcript — the
+    // caller falls back to `text`, so 1:1 conversations are untouched.
+    #[test]
+    fn single_speaker_is_not_labeled() {
+        let one = r#"{"result":{"utterances":[
+            {"definite":true,"text":"你好。","additions":{"speaker_id":"0"}},
+            {"definite":true,"text":"在的。","additions":{"speaker_id":"0"}}
+        ]}}"#;
+        let frame = result_frame(true, one.as_bytes());
+        let payload = server_payload(&frame).expect("payload");
+        let parsed: ServerResponse = serde_json::from_slice(payload).expect("valid JSON");
+        assert_eq!(parsed.result.as_ref().and_then(|r| r.labeled_transcript()), None);
+
+        // No speaker_id at all → also flat.
+        let none = r#"{"result":{"utterances":[{"definite":true,"text":"你好。","additions":{}}]}}"#;
+        let frame = result_frame(true, none.as_bytes());
+        let payload = server_payload(&frame).expect("payload");
+        let parsed: ServerResponse = serde_json::from_slice(payload).expect("valid JSON");
+        assert_eq!(parsed.result.as_ref().and_then(|r| r.labeled_transcript()), None);
     }
 }
