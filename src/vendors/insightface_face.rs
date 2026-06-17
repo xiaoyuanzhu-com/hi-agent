@@ -1,16 +1,20 @@
-//! SCRFD + EdgeFace vendor — local ONNX face detection and embedding, no network.
+//! InsightFace face vendor — local ONNX face detection and embedding, no network.
 //!
 //! One vendor owns the whole face pipeline so the capability surface stays
-//! "image in → faces out" with no cross-capability reference:
+//! "image in → faces out" with no cross-capability reference. It runs the
+//! InsightFace `buffalo_l` pair (the same models Immich uses):
 //!
 //!   decode image → SCRFD detect (bbox + 5 landmarks) → 5-point align to
-//!   112×112 → EdgeFace embed → L2-normalized 512-d vector, per face
+//!   112×112 → ArcFace embed → L2-normalized 512-d vector, per face
 //!
 //! Preprocessing follows InsightFace exactly, because the models were trained on
 //! it: SCRFD takes a letter-boxed 640×640 RGB image normalized `(x−127.5)/128`,
 //! emits per-stride (8/16/32) score/bbox/keypoint maps with 2 anchors per cell,
-//! decoded via distance-to-box/point and merged with NMS. EdgeFace takes the
-//! aligned crop normalized `(x−127.5)/127.5` and emits a 512-d embedding.
+//! decoded via distance-to-box/point and merged with NMS. The ArcFace recognizer
+//! takes the aligned crop normalized `(x−127.5)/127.5` and emits a 512-d
+//! embedding. The recognizer is swappable for any InsightFace 112×112→512 model
+//! (e.g. `w600k_r50` for buffalo_l, `w600k_mbf` for buffalo_s) via env — the
+//! pipeline is model-agnostic.
 //!
 //! Both [`ort::session::Session`]s sit behind a [`Mutex`] (run needs `&mut`);
 //! inference is synchronous CPU work the capability layer runs on a blocking
@@ -27,7 +31,7 @@ use ort::value::Tensor;
 use crate::capabilities::face::DetectedFace;
 
 const ENV_SCRFD: &str = "SCRFD_MODEL";
-const ENV_EDGEFACE: &str = "EDGEFACE_MODEL";
+const ENV_ARCFACE: &str = "ARCFACE_MODEL";
 
 /// SCRFD square input edge. InsightFace's standard detector input.
 const DET_SIZE: usize = 640;
@@ -35,14 +39,14 @@ const DET_SIZE: usize = 640;
 const STRIDES: [usize; 3] = [8, 16, 32];
 /// Anchors per feature-map cell (SCRFD `_bnkps` models).
 const NUM_ANCHORS: usize = 2;
-/// EdgeFace input edge.
+/// ArcFace recognizer input edge.
 const REC_SIZE: usize = 112;
 /// Default detection score floor and NMS IoU.
 const SCORE_THRESH: f32 = 0.5;
 const NMS_THRESH: f32 = 0.4;
 
 /// ArcFace reference 5-point landmark template for a 112×112 crop (left eye,
-/// right eye, nose, left mouth, right mouth). EdgeFace inherits it.
+/// right eye, nose, left mouth, right mouth) — what the recognizer expects.
 const REF_LANDMARKS: [[f32; 2]; 5] = [
     [38.2946, 51.6963],
     [73.5318, 51.5014],
@@ -53,38 +57,37 @@ const REF_LANDMARKS: [[f32; 2]; 5] = [
 
 pub struct Config {
     scrfd: Mutex<Session>,
-    edgeface: Mutex<Session>,
+    arcface: Mutex<Session>,
     #[allow(dead_code)]
     scrfd_path: PathBuf,
     #[allow(dead_code)]
-    edgeface_path: PathBuf,
+    arcface_path: PathBuf,
 }
 
 impl Config {
-    /// Load both ONNX models named by `SCRFD_MODEL` and `EDGEFACE_MODEL`. Fails
-    /// fast if either var is unset or the file can't be opened as a model.
+    /// Load both ONNX models named by `SCRFD_MODEL` (detector) and
+    /// `ARCFACE_MODEL` (recognizer). Fails fast if either var is unset or the
+    /// file can't be opened as a model.
     pub fn from_env() -> anyhow::Result<Self> {
         let scrfd_path: PathBuf = std::env::var(ENV_SCRFD)
-            .map_err(|_| anyhow::anyhow!("{ENV_SCRFD} is required when FACE_PROVIDER=scrfd_edgeface"))?
+            .map_err(|_| anyhow::anyhow!("{ENV_SCRFD} is required when FACE_PROVIDER=insightface"))?
             .into();
-        let edgeface_path: PathBuf = std::env::var(ENV_EDGEFACE)
-            .map_err(|_| {
-                anyhow::anyhow!("{ENV_EDGEFACE} is required when FACE_PROVIDER=scrfd_edgeface")
-            })?
+        let arcface_path: PathBuf = std::env::var(ENV_ARCFACE)
+            .map_err(|_| anyhow::anyhow!("{ENV_ARCFACE} is required when FACE_PROVIDER=insightface"))?
             .into();
         let scrfd = Session::builder()
             .context("creating ORT session builder")?
             .commit_from_file(&scrfd_path)
             .with_context(|| format!("loading SCRFD model from {}", scrfd_path.display()))?;
-        let edgeface = Session::builder()
+        let arcface = Session::builder()
             .context("creating ORT session builder")?
-            .commit_from_file(&edgeface_path)
-            .with_context(|| format!("loading EdgeFace model from {}", edgeface_path.display()))?;
+            .commit_from_file(&arcface_path)
+            .with_context(|| format!("loading ArcFace recognizer from {}", arcface_path.display()))?;
         Ok(Self {
             scrfd: Mutex::new(scrfd),
-            edgeface: Mutex::new(edgeface),
+            arcface: Mutex::new(arcface),
             scrfd_path,
-            edgeface_path,
+            arcface_path,
         })
     }
 }
@@ -301,7 +304,7 @@ fn iou(a: &[f32; 4], b: &[f32; 4]) -> f32 {
 
 /// Warp the face into a 112×112 RGB crop using the similarity transform that
 /// best maps its 5 landmarks onto the ArcFace reference template. Returns the
-/// crop as NCHW f32 normalized `(x−127.5)/127.5`, ready for EdgeFace.
+/// crop as NCHW f32 normalized `(x−127.5)/127.5`, ready for the recognizer.
 fn align_to_crop(img: &RgbImage, landmarks: &[[f32; 2]; 5]) -> Vec<f32> {
     // Forward maps source landmarks → reference; invert it to sample the source
     // for each destination pixel.
@@ -330,12 +333,12 @@ fn embed_crop(cfg: &Config, crop_nchw: &[f32]) -> anyhow::Result<Vec<f32>> {
         vec![1_i64, 3, REC_SIZE as i64, REC_SIZE as i64],
         crop_nchw.to_vec(),
     ))
-    .context("building EdgeFace input tensor")?;
-    let mut session = cfg.edgeface.lock().expect("EdgeFace session mutex poisoned");
-    let outputs = session.run(ort::inputs![tensor]).context("EdgeFace inference")?;
+    .context("building recognizer input tensor")?;
+    let mut session = cfg.arcface.lock().expect("ArcFace session mutex poisoned");
+    let outputs = session.run(ort::inputs![tensor]).context("ArcFace inference")?;
     let (_shape, emb) = outputs[0]
         .try_extract_tensor::<f32>()
-        .context("extracting EdgeFace embedding")?;
+        .context("extracting face embedding")?;
     Ok(l2_normalize(emb))
 }
 

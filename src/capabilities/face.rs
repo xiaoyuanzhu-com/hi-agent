@@ -12,8 +12,9 @@
 //! same way `vision` is one capability). Like the others it is a module of free
 //! functions over a process-global, once-initialized config: [`init_from_env`]
 //! reads `FACE_PROVIDER`, [`available`] reports configuration, and
-//! [`detect_and_embed`] dispatches. The vendor is a local ONNX pair, so
-//! inference is CPU-bound and runs on a blocking thread.
+//! [`detect_and_embed`] dispatches. The vendor is a local ONNX pair (InsightFace
+//! SCRFD + ArcFace, the `buffalo_l` models Immich uses), so inference is
+//! CPU-bound and runs on a blocking thread.
 //!
 //! **No caller wires this in yet.** A future perception path (e.g. sampling
 //! video frames into faces) is the caller; wiring it in later is purely additive.
@@ -23,7 +24,7 @@ use std::sync::OnceLock;
 use anyhow::Context;
 use bytes::Bytes;
 
-use crate::vendors::scrfd_edgeface;
+use crate::vendors::insightface_face;
 
 /// One detected face: bounding box and 5 landmarks in **original-image pixels**,
 /// the detector's confidence, and an L2-normalized 512-d identity embedding.
@@ -41,7 +42,7 @@ pub struct DetectedFace {
 
 enum Backend {
     Disabled,
-    ScrfdEdgeface(scrfd_edgeface::Config),
+    Insightface(insightface_face::Config),
 }
 
 static BACKEND: OnceLock<Backend> = OnceLock::new();
@@ -54,7 +55,7 @@ const ENV_PROVIDER: &str = "FACE_PROVIDER";
 pub fn init_from_env() -> anyhow::Result<()> {
     let backend = match std::env::var(ENV_PROVIDER).unwrap_or_default().as_str() {
         "" | "none" => Backend::Disabled,
-        "scrfd_edgeface" => Backend::ScrfdEdgeface(scrfd_edgeface::Config::from_env()?),
+        "insightface" => Backend::Insightface(insightface_face::Config::from_env()?),
         other => anyhow::bail!("unknown {ENV_PROVIDER}: {other}"),
     };
     let _ = BACKEND.set(backend);
@@ -63,7 +64,7 @@ pub fn init_from_env() -> anyhow::Result<()> {
 
 /// Whether a provider is configured.
 pub fn available() -> bool {
-    matches!(BACKEND.get(), Some(Backend::ScrfdEdgeface(_)))
+    matches!(BACKEND.get(), Some(Backend::Insightface(_)))
 }
 
 /// Detect and embed every face in `image` (raw encoded bytes — JPEG/PNG/etc.,
@@ -72,7 +73,7 @@ pub fn available() -> bool {
 /// thread so the async runtime is never stalled.
 pub async fn detect_and_embed(image: Bytes) -> anyhow::Result<Vec<DetectedFace>> {
     tokio::task::spawn_blocking(move || match BACKEND.get() {
-        Some(Backend::ScrfdEdgeface(cfg)) => scrfd_edgeface::detect_and_embed(cfg, &image),
+        Some(Backend::Insightface(cfg)) => insightface_face::detect_and_embed(cfg, &image),
         _ => anyhow::bail!("face not configured (set {ENV_PROVIDER})"),
     })
     .await
