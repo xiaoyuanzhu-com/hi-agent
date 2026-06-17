@@ -20,11 +20,13 @@
 //! `init_from_env` and does not appear in the composition root.
 
 pub mod desktop_context;
+pub mod face;
 pub mod image_gen;
 pub mod stt;
 pub mod tts;
 pub mod video_gen;
 pub mod vision;
+pub mod voiceprint;
 
 /// Initialize every capability from the environment. Fails fast if any
 /// configured provider is missing a required credential or names an unknown
@@ -35,5 +37,7 @@ pub fn init_from_env() -> anyhow::Result<()> {
     vision::init_from_env()?;
     image_gen::init_from_env()?;
     video_gen::init_from_env()?;
+    voiceprint::init_from_env()?;
+    face::init_from_env()?;
     Ok(())
 }

@@ -118,6 +118,8 @@ pub async fn run(config: Config) -> anyhow::Result<()> {
     tracing::info!(
         stt = capabilities::stt::available(),
         tts = capabilities::tts::available(),
+        voiceprint = capabilities::voiceprint::available(),
+        face = capabilities::face::available(),
         "capabilities resolved"
     );
 

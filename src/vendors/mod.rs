@@ -6,10 +6,12 @@
 //! parameter, so they stay pure and unit-testable without touching any global.
 //! The matching `crate::capabilities` module selects and dispatches to them.
 
+pub mod campplus;
 pub mod doubao_image_gen;
 pub mod doubao_video_gen;
 pub mod doubao_vision;
 #[cfg(target_os = "macos")]
 pub mod macos_desktop_context;
+pub mod scrfd_edgeface;
 pub mod volcengine_stt;
 pub mod volcengine_tts;

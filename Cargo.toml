@@ -46,6 +46,20 @@ base64 = "0.22"
 
 directories = "5"
 
+# Local ONNX capabilities (voiceprint, face): on-device inference, no network.
+# `ort` is the ONNX Runtime; its default `download-binaries` feature fetches the
+# native onnxruntime, so no system install is needed (consistent with the
+# managed-runtime philosophy). `knf-rs` is kaldi-native-fbank — it hardcodes
+# exactly CAM++'s front-end (16 kHz, 80 mel bins, no dither, per-utterance CMN),
+# so features bit-match training. `image` decodes frames; `nalgebra` solves the
+# 5-point similarity transform that aligns a face crop before EdgeFace.
+# `ndarray` is pinned to 0.16 to match knf-rs's return type (ort uses its own).
+ort = "2.0.0-rc.12"
+ndarray = "0.16"
+image = "0.25"
+knf-rs = "0.3.2"
+nalgebra = "0.33"
+
 [dev-dependencies]
 # tempfile is used by integration tests for throwaway data dirs.
 tempfile = "3"
