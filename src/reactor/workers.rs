@@ -111,7 +111,7 @@ presenting is the agent's job.\n\
 When your task is to build a view to show on screen, first read two files: \
 `$HI_AGENT_PROMPTS_DIR/appearance.md` — how views work (authoring, saving, refs, \
 images) — and `$HI_AGENT_PROMPTS_DIR/aesthetic.md` — the bar a view has to clear. \
-Author to both. Your working directory is the agent's global workspace. Report every \
+Author to both. Your working directory is the agent's view workshop (`views/`). Report every \
 ref you saved in your summary — that ref is how the agent puts your view on screen.\n\
 \n\
 If you hit something genuinely ambiguous, do not stall waiting for an answer. \
@@ -216,9 +216,9 @@ impl WorkerRegistry {
                     Some(id),
                     SessionOpts {
                         system_prompt: Some(worker_system_prompt(&self.scene)),
-                        // The worker's cwd is the agent's global workspace, so a
+                        // The worker's cwd is the agent's view workshop, so a
                         // build sub-agent works in a real project dir (ls/write).
-                        cwd: Some(reactor.inner.workspace_dir.clone()),
+                        cwd: Some(reactor.inner.views_dir.clone()),
                     },
                 )
                 .await?,

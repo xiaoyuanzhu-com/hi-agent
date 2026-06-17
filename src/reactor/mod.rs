@@ -622,11 +622,11 @@ struct ReactorInner {
     /// each turn as one human-model presence sentence, so the mind knows which
     /// channels actually reach the person right now.
     presence: crate::presence::Presence,
-    /// Absolute path to the agent's global working directory (`<data_dir>/workspace`).
+    /// Absolute path to the agent's view workshop (`<data_dir>/views`).
     /// Handed to every worker session as its `cwd`, so a build sub-agent works in a
     /// real project dir — `ls`-ing existing projects, writing source — like a human
     /// in their repo. Absolutized at startup (the child may run with a different cwd).
-    workspace_dir: PathBuf,
+    views_dir: PathBuf,
     /// Monotonic cognition-turn counter. Each turn claims the next id;
     /// it tags audio spans and the channel logs so a reply is traceable end to
     /// end. (The client no longer needs it — turns are internal to the mind.)
@@ -650,7 +650,7 @@ pub fn start(
     tools: ToolRegistry,
     interrupts: InterruptRegistry,
     presence: crate::presence::Presence,
-    workspace_dir: PathBuf,
+    views_dir: PathBuf,
 ) -> Reactor {
     let reactor = Reactor {
         inner: Arc::new(ReactorInner {
@@ -663,7 +663,7 @@ pub fn start(
             tools,
             interrupts,
             presence,
-            workspace_dir,
+            views_dir,
             turn_seq: AtomicU64::new(0),
             scenes: Mutex::new(HashMap::new()),
         }),

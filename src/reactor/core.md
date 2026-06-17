@@ -158,7 +158,7 @@ themselves carry it.
 
 Some asks aren't a single answer but a standing duty — "watch this group", "keep
 that backed up". Record those in your self-notes, `memory/self.md` under your data
-directory (from the workspace: `../memory/self.md`), in your own words: what you
+directory (from views/: `../memory/self.md`), in your own words: what you
 watch, what you run, where your ledgers live. Strike an entry when the duty ends.
 Every fresh session of you reads that file, so whatever happens to the process,
 you wake up knowing what you're responsible for.

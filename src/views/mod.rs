@@ -5,10 +5,10 @@
 //! single-file *transform* (not a bundle): JSX/TS → ESM, with every bare import
 //! (`react`, `react/jsx-runtime`, `@hi/core`, `motion/react`) left untouched so
 //! the page's import map resolves them to the host's shared instances. Output is a
-//! disposable, content-addressed cache under `data_dir/workspace/.cache/views/<hash>.mjs`
-//! (a tool dir inside the workspace, like node_modules), served from `/workspace/`;
+//! disposable, content-addressed cache under `data_dir/views/_compiled/<hash>.mjs`
+//! (a tool dir inside the views tree, like node_modules), served from `/views/`;
 //! identical source compiles at most once. The agent-authored *source* sediments
-//! separately as `workspace/<project>/<name>.jsx`.
+//! separately as `views/<project>/<name>.jsx`.
 //!
 //! esbuild ships as a native binary in the `@esbuild/<os>-<arch>` package, which
 //! the managed runtime installs alongside the ACP adapter (see
@@ -27,7 +27,7 @@ use tokio::process::Command;
 pub struct ViewCompiler {
     /// The esbuild native binary (`@esbuild/<os>-<arch>/bin/esbuild`).
     esbuild_bin: PathBuf,
-    /// Where compiled modules are written (`data_dir/workspace/.cache/views`).
+    /// Where compiled modules are written (`data_dir/views/_compiled`).
     generated_dir: PathBuf,
 }
 
@@ -37,8 +37,8 @@ impl ViewCompiler {
     /// `data_dir` under which compiled modules are written.
     pub fn new(esbuild_bin: PathBuf, data_dir: &Path) -> Self {
         // Compiled modules are a disposable, content-addressed cache living under the
-        // workspace (a tool dir like node_modules), served at /workspace/.cache/views.
-        Self::with_paths(esbuild_bin, data_dir.join("workspace").join(".cache").join("views"))
+        // views tree (a tool dir like node_modules), served at /views/_compiled.
+        Self::with_paths(esbuild_bin, data_dir.join("views").join("_compiled"))
     }
 
     fn with_paths(esbuild_bin: PathBuf, generated_dir: PathBuf) -> Self {
@@ -46,7 +46,7 @@ impl ViewCompiler {
     }
 
     /// Compile `source` to an ESM module and return its served URL
-    /// (`/workspace/.cache/views/<hash>.mjs`). Content-addressed: identical source
+    /// (`/views/_compiled/<hash>.mjs`). Content-addressed: identical source
     /// yields the same URL and is compiled at most once (a cache hit never
     /// spawns esbuild).
     pub async fn compile(&self, source: &str) -> anyhow::Result<String> {
@@ -124,7 +124,7 @@ fn module_ref(source: &str) -> (String, String) {
     let mut h = std::collections::hash_map::DefaultHasher::new();
     source.hash(&mut h);
     let hash = format!("{:016x}", h.finish());
-    let url = format!("/workspace/.cache/views/{hash}.mjs");
+    let url = format!("/views/_compiled/{hash}.mjs");
     (hash, url)
 }
 
@@ -138,7 +138,7 @@ mod tests {
         let (h2, u2) = module_ref("export default () => null");
         assert_eq!(h1, h2);
         assert_eq!(u1, u2);
-        assert_eq!(u1, format!("/workspace/.cache/views/{h1}.mjs"));
+        assert_eq!(u1, format!("/views/_compiled/{h1}.mjs"));
         assert!(h1.chars().all(|c| c.is_ascii_hexdigit()));
         let (h3, _) = module_ref("a different view");
         assert_ne!(h1, h3, "different source must hash differently");
@@ -202,7 +202,7 @@ mod tests {
             }
         "#;
         let url = compiler.compile(source).await.expect("compile succeeds");
-        assert!(url.starts_with("/workspace/.cache/views/") && url.ends_with(".mjs"));
+        assert!(url.starts_with("/views/_compiled/") && url.ends_with(".mjs"));
 
         let file = tmp.join(url.rsplit('/').next().unwrap());
         let js = std::fs::read_to_string(&file).expect("module written");

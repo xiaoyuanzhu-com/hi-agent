@@ -222,7 +222,7 @@ pub enum ViewOp {
 }
 
 /// One view event delivered to the browser over GET /api/out/view. `module_url`
-/// points at the compiled ESM module (`/workspace/.cache/views/<hash>.mjs`) the client
+/// points at the compiled ESM module (`/views/_compiled/<hash>.mjs`) the client
 /// dynamically imports and mounts under `id` in the view slot. For
 /// `op = dismiss` only `id` is meaningful. A view persists until the agent
 /// dismisses (or replaces) it — there is no auto-expiry; lifetime is the

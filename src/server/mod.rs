@@ -435,10 +435,10 @@ pub fn build(
         // A scene's channels, observed live as one merged presence stream — the
         // channel inspector's window onto every in/out channel of one scene.
         .route("/api/scenes/{scene}/channels", get(channels::get_scene_channels))
-        // The agent's workspace on disk (under data_dir) — compiled view modules,
+        // The agent's view workshop on disk (under data_dir) — compiled view modules,
         // images, and build-agent artifacts. Served here, not in the appearance
         // router, because that router is embed-only and stateless.
-        .route("/workspace/{*path}", get(generated::workspace_file))
+        .route("/views/{*path}", get(generated::views_file))
         .with_state(state)
         .merge(crate::appearance::router())
         .fallback(not_found)

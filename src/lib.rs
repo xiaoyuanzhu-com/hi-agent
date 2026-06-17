@@ -60,7 +60,7 @@ pub async fn run(config: Config) -> anyhow::Result<()> {
     // processes via env, which may run with a different cwd) and strip `.`/`..`
     // components so the paths we hand the mind read as clean absolutes —
     // `.../hi-agent/data/prompts/core.md`, not `.../hi-agent/./data/prompts/core.md`.
-    // Every downstream consumer (load_soul, prompts_dir, workspace_dir, …) inherits this.
+    // Every downstream consumer (load_soul, prompts_dir, views_dir, …) inherits this.
     let mut config = config;
     config.data_dir = normalize_dir(&config.data_dir)
         .context("resolving cwd to absolutize data dir")?;
@@ -85,19 +85,19 @@ pub async fn run(config: Config) -> anyhow::Result<()> {
         }
     };
 
-    // The agent's global workspace — a human-style project library. It's every
-    // worker's cwd (so a build sub-agent works in a real project dir) and where it
-    // writes view source (`<project>/<name>.jsx`). Absolutized as above; also the
-    // root the server serves at `/workspace/*` (compiled modules land in `.cache`).
-    let workspace_dir = {
-        let d = config.data_dir.join("workspace");
+    // The agent's view workshop — the disposable tree where views are built. It's
+    // every worker's cwd (so a build sub-agent works in a real project dir) and where
+    // it writes view source (`<project>/<name>.jsx`). Absolutized as above; also the
+    // root the server serves at `/views/*` (compiled modules land in `_compiled`).
+    let views_dir = {
+        let d = config.data_dir.join("views");
         if d.is_absolute() {
             d
         } else {
-            std::env::current_dir().context("resolving cwd to absolutize workspace dir")?.join(d)
+            std::env::current_dir().context("resolving cwd to absolutize views dir")?.join(d)
         }
     };
-    std::fs::create_dir_all(&workspace_dir).context("creating workspace dir")?;
+    std::fs::create_dir_all(&views_dir).context("creating views dir")?;
 
     // Structured visibility into the ACP session lifecycle. The agent layer,
     // reactor, workers and heartbeat feed it; `GET /api/sessions` reads the live
@@ -240,7 +240,7 @@ pub async fn run(config: Config) -> anyhow::Result<()> {
 
     let soul = reactor::load_soul(&config.data_dir);
     // The reactor compiles view source to ESM via esbuild; modules land under
-    // data_dir/workspace/.cache/views. esbuild is hi-agent's own tool (not the
+    // data_dir/views/_compiled. esbuild is hi-agent's own tool (not the
     // adapter's) — `ensure_view_esbuild` guarantees one whether the runtime came
     // from PATH or the managed install, so views aren't silently broken in dev.
     let esbuild_bin = runtime::ensure_view_esbuild(&runtime)
@@ -259,7 +259,7 @@ pub async fn run(config: Config) -> anyhow::Result<()> {
         tool_registry,
         interrupts,
         presence,
-        workspace_dir,
+        views_dir,
     );
     tracing::info!("reactor started");
 

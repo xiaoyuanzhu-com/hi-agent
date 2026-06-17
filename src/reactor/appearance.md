@@ -34,8 +34,8 @@ time; give each its own id.
 leaving an ugly broken box. Instead **download the image into your project folder**
 with your own tools (find it via web/image search, then `curl`/fetch it to a file
 next to your view), and reference it by its served path: anything you save in the
-workspace is served at `/workspace/<the same relative path>`, so a file you write to
-`badminton-top10/leader.jpg` is `<img src="/workspace/badminton-top10/leader.jpg">`.
+views tree is served at `/views/<the same relative path>`, so a file you write to
+`badminton-top10/leader.jpg` is `<img src="/views/badminton-top10/leader.jpg">`.
 That path always loads and keeps your source small.
 
 **The live words ride above your view.** While your view is on stage, the host keeps
@@ -61,20 +61,20 @@ at it with the eye you'd use on someone else's work. You can: the running server
 base URL is in `HI_AGENT_BASE_URL`) already serves, same-origin, everything a faithful
 render needs — the import map injected into `GET /`, the `@hi/ui` / `@hi/core` /
 `motion/react` shims it points at under `/assets/`, and any image you saved under
-`/workspace/`. So the harness is small: compile your JSX to ESM (esbuild, bare imports
+`/views/`. So the harness is small: compile your JSX to ESM (esbuild, bare imports
 left intact, the way the host does), mount it in a headless browser — install one on
 first run; it caches — against that import map, stub the live session (`@hi/core`'s
 hooks: return a sample `useSpeech` line so the caption pills show), and screenshot to a
 file. Then **`Read` the PNG** and fix what doesn't clear the bar before you save. Set
-the harness up once in a workspace tool dir (say `.cache/preview/`) and every later view
+the harness up once in a views tool dir (say `_preview/`) and every later view
 reuses it — like the browser, it resolves the first time and is ready after.
 
 # Saving it and handing it back
 
-When a view is ready, save it as a `.jsx` file in your workspace (your working
+When a view is ready, save it as a `.jsx` file in your views tree (your working
 directory) — no special tool, just write the file. Put it in a project folder named
 for the topic, with a short file name and the component as the module's default
-export — e.g. `badminton-top10/leader.jsx`. Glance at the workspace (`ls`) first so
+export — e.g. `badminton-top10/leader.jsx`. Glance at the views tree (`ls`) first so
 you don't collide with an existing project.
 
 The view's *ref* is that path without the `.jsx` — `badminton-top10/leader`. Report

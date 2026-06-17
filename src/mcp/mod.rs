@@ -401,10 +401,10 @@ fn tool_error(text: &str) -> Value {
     json!({ "content": [{ "type": "text", "text": text }], "isError": true })
 }
 
-/// A view ref is a relative path under the workspace, naming the view's source file
-/// minus the `.jsx` — e.g. `badminton-top10/leader` → `workspace/badminton-top10/
+/// A view ref is a relative path under the views tree, naming the view's source file
+/// minus the `.jsx` — e.g. `badminton-top10/leader` → `views/badminton-top10/
 /// leader.jsx`. Each `/`-separated segment is a slug (letters, digits, `-`, `_`) —
-/// no dots, no empty segments — so the ref stays inside the workspace and can't
+/// no dots, no empty segments — so the ref stays inside the views tree and can't
 /// traverse out. The build sub-agent writes `<ref>.jsx` with its own file tools (no
 /// MCP tool needed); this reads it back server-side, so the JSX never enters the
 /// mind's context.
@@ -417,14 +417,14 @@ fn valid_view_ref(view_ref: &str) -> bool {
         })
 }
 
-/// Resolve a view ref to its stored JSX source, read from the workspace. The agent
+/// Resolve a view ref to its stored JSX source, read from the views tree. The agent
 /// passes only the tiny ref through `show_view`; this reads the component back.
 async fn resolve_view_ref(data_dir: &std::path::Path, view_ref: &str) -> Result<String, String> {
     let view_ref = view_ref.trim();
     if !valid_view_ref(view_ref) {
         return Err(format!("invalid ref `{view_ref}` (names and `/` only, no dots)"));
     }
-    let path = data_dir.join("workspace").join(format!("{view_ref}.jsx"));
+    let path = data_dir.join("views").join(format!("{view_ref}.jsx"));
     tokio::fs::read_to_string(&path).await.map_err(|e| format!("no such view ({e})"))
 }
 
@@ -446,9 +446,9 @@ mod view_store_tests {
     }
 
     #[tokio::test]
-    async fn resolve_reads_workspace_source() {
+    async fn resolve_reads_views_source() {
         let dir = tempfile::tempdir().unwrap();
-        let proj = dir.path().join("workspace").join("deck");
+        let proj = dir.path().join("views").join("deck");
         tokio::fs::create_dir_all(&proj).await.unwrap();
         tokio::fs::write(proj.join("leader.jsx"), "export default () => 1").await.unwrap();
         assert_eq!(
