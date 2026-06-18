@@ -11,10 +11,24 @@
 // This replaces the old VisionCapture, which sampled one JPEG every couple
 // seconds client-side — hard-coding perception fidelity the backend should own.
 
-// Candidate recorder formats, best first. Each must be playable via MediaSource
-// on the observer side, so we stick to WebM (VP9/VP8) — broadly supported on
-// Chromium/Firefox for both MediaRecorder and MSE.
-const CANDIDATE_MIMES = ["video/webm;codecs=vp9", "video/webm;codecs=vp8", "video/webm"];
+// Candidate recorder formats, best first — picked at runtime via
+// `MediaRecorder.isTypeSupported` (no build-time codec choice). The ordering is
+// the energy story: prefer fragmented-MP4 with a codec the platform encodes in
+// hardware — HEVC first (best efficiency on Apple Silicon's VideoToolbox), then
+// H.264 — because software VP8/VP9 (libvpx, no hardware encoder on Apple
+// Silicon) is what makes the machine run hot. Fall back to WebM for browsers
+// without an MP4 MediaRecorder (e.g. Firefox); VP8 before VP9 since VP9 software
+// encode is the heavier of the two. Each must also be playable via MediaSource
+// on the observer side — fMP4 and WebM both stream as init-segment-then-chunks,
+// so the backend relay is codec-agnostic (it forwards the exact mime).
+const CANDIDATE_MIMES = [
+  "video/mp4;codecs=hvc1.1.6.L123.B0",
+  "video/mp4;codecs=avc1.640028",
+  "video/mp4;codecs=avc1.42E01F",
+  "video/webm;codecs=vp8",
+  "video/webm;codecs=vp9",
+  "video/webm",
+];
 
 // How often MediaRecorder emits a chunk. Small enough to feel live, large enough
 // that each chunk is a usable media segment.

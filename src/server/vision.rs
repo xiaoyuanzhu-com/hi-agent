@@ -8,11 +8,13 @@
 //! to `video_in` and applies its own sample rate.
 //!
 //! Stream (`WS /api/in/vision/stream`): the client runs a `MediaRecorder` and
-//! ships WebM chunks as binary frames for the whole time the camera is open;
-//! upload-only, nothing comes back on the socket. Each chunk is republished on
-//! the `video_in` broadcast. A WebM stream is only decodable from its first
-//! chunk (the initialization segment), so that chunk is cached per scene
-//! ([`VideoSource`]) to let an observer join mid-stream.
+//! ships encoded chunks as binary frames for the whole time the camera is open;
+//! upload-only, nothing comes back on the socket. The container is negotiated
+//! client-side — fragmented MP4 (hardware HEVC/H.264) where available, else WebM
+//! (software VP8/VP9) — and rides through as the source mime. Each chunk is
+//! republished on the `video_in` broadcast. Such a stream is only decodable from
+//! its first chunk (the initialization segment), so that chunk is cached per
+//! scene ([`VideoSource`]) to let an observer join mid-stream.
 //!
 //! Observe (`GET /api/in/vision`): the live video for the scene, one camera
 //! session per chunked response — the visual twin of `GET /api/in/audio`. If a
@@ -135,12 +137,14 @@ async fn caption(media: VisualMedia, mime: &str) -> String {
 }
 
 /// Persist one wall-clock minute of camera media as
-/// `vision/<date>/<HH>/<MM>.webm`, prefixed with the WebM init segment so the
-/// file decodes standalone, then perceive it (video → caption). Best-effort: a
-/// store failure is logged and perception is skipped.
+/// `vision/<date>/<HH>/<MM>.<ext>` (ext follows the stream's container —
+/// `mp4`/`webm`), prefixed with the init segment so the file decodes standalone,
+/// then perceive it (video → caption). Best-effort: a store failure is logged
+/// and perception is skipped.
 async fn flush_video_minute(
     state: &Arc<AppState>,
     scene: &Scene,
+    mime: &str,
     init: Option<Bytes>,
     media_chunks: &[u8],
     ts: DateTime<Utc>,
@@ -150,15 +154,16 @@ async fn flush_video_minute(
         bytes.extend_from_slice(i);
     }
     bytes.extend_from_slice(media_chunks);
-    let rel = match media::store_blob(&state.data_dir, scene, Channel::Vision, ts, MediaSlot::InputStream, "webm", &bytes).await {
+    let ext = video_mime_to_ext(mime);
+    let rel = match media::store_blob(&state.data_dir, scene, Channel::Vision, ts, MediaSlot::InputStream, ext, &bytes).await {
         Ok(rel) => rel,
         Err(err) => {
             tracing::warn!(scene = %scene, error = %err, "persisting camera minute failed");
             return;
         }
     };
-    let visual = VisualMedia::video_bytes(Bytes::from(bytes), DEFAULT_VIDEO_MIME);
-    spawn_perceive(state.clone(), scene.clone(), visual, rel, DEFAULT_VIDEO_MIME.to_string(), ts, None);
+    let visual = VisualMedia::video_bytes(Bytes::from(bytes), mime);
+    spawn_perceive(state.clone(), scene.clone(), visual, rel, mime.to_string(), ts, None);
 }
 
 #[derive(Debug, Deserialize)]
@@ -208,9 +213,9 @@ async fn stream_video_in(
     let mut started = false;
 
     // Persist the camera on a wall-clock-minute grid: media chunks accumulate per
-    // minute and flush to `vision/<date>/<HH>/<MM>.webm` at each rollover (and at
-    // close). The WebM init segment (the first chunk) prefixes every minute file
-    // so each is independently decodable. Each flushed minute is also perceived.
+    // minute and flush to `vision/<date>/<HH>/<MM>.<ext>` at each rollover (and at
+    // close). The init segment (the first chunk) prefixes every minute file so
+    // each is independently decodable. Each flushed minute is also perceived.
     let mut cap_init: Option<Bytes> = None;
     let mut cap_minute: Option<String> = None;
     let mut cap_ts = Utc::now();
@@ -221,7 +226,7 @@ async fn stream_video_in(
             Ok(WsMessage::Binary(b)) => {
                 let now = Utc::now();
                 if !started {
-                    // The first chunk is the WebM init segment: cache it for
+                    // The first chunk is the init segment: cache it for
                     // late-joining observers and for prefixing each minute file,
                     // then announce the source. It is not buffered as media.
                     started = true;
@@ -241,7 +246,7 @@ async fn stream_video_in(
                     let minute = now.format("%Y-%m-%dT%H:%M").to_string();
                     if cap_minute.as_deref() != Some(minute.as_str()) {
                         if !cap_buf.is_empty() {
-                            flush_video_minute(&state, &scene, cap_init.clone(), &cap_buf, cap_ts).await;
+                            flush_video_minute(&state, &scene, &mime, cap_init.clone(), &cap_buf, cap_ts).await;
                         }
                         cap_buf.clear();
                         cap_minute = Some(minute);
@@ -262,7 +267,7 @@ async fn stream_video_in(
 
     // Flush the final, partial minute of camera media.
     if !cap_buf.is_empty() {
-        flush_video_minute(&state, &scene, cap_init.clone(), &cap_buf, cap_ts).await;
+        flush_video_minute(&state, &scene, &mime, cap_init.clone(), &cap_buf, cap_ts).await;
     }
 
     if started {
@@ -375,6 +380,17 @@ fn mime_to_ext(mime: &str) -> &'static str {
         "image/png" => "png",
         "image/webp" => "webp",
         "image/gif" => "gif",
+        _ => "bin",
+    }
+}
+
+/// Map a streaming video mime to a file extension for the persisted minute file.
+/// The client negotiates the container at runtime (fragmented MP4 for hardware
+/// HEVC/H.264, else WebM), so the extension must follow the actual stream.
+fn video_mime_to_ext(mime: &str) -> &'static str {
+    match mime.split(';').next().unwrap_or("").trim().to_ascii_lowercase().as_str() {
+        "video/mp4" => "mp4",
+        "video/webm" => "webm",
         _ => "bin",
     }
 }
