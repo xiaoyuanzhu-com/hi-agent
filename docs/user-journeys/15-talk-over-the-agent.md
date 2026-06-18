@@ -46,3 +46,8 @@
 - **"说到哪"的精度**:现在按时钟估算"约 N 秒 / 约多少字",而非真实播放回执——够用吗?
 
 _机制:嘴串行 + 字按语速逐句揭示;识别到人声即停声并清空待说的尾巴;打断折进下一轮,带"说到哪 / 没说出口的是什么"的估算级提示,如何收尾交给 speaking.md 的判断。成熟度:已实现并通过单测;**实测(真打断演练)待补**。_
+
+## 实测 2026-06-18 · origin/main 0f68aaf
+
+- ✅ 机制已实现,**8 条单测全过**(`no_barge_in_no_skip` / `first_barge_in_wins` / `barge_in_marks_its_turn_for_skip` / `speech_after_reply_finished_is_not_a_barge_in` 等)。
+- 🧱 **真打断演练仍待补**:barge-in 只走音频/STT 路径(`note_speech` 由 STT 识别触发、`audio_began` 由 TTS span 触发),纯文字 POST 不触发;真测需合成语音卡在 TTS 播放窗口内打断,curl/文字 harness 无法忠实驱动——与本文"实测待补"一致。

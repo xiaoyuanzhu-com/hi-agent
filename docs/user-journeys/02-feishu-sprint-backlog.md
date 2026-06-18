@@ -75,3 +75,14 @@
 - pulse 节奏:固定默认 + brain 自报下次间隔?上限下限是多少?
 - 监听进程归谁管:agent 自己 nohup 拉起并负责生死,还是 host 侧作为 transport adapter 管理?
 - **置备物的归宿**:装好的工具、写好的桥接脚本、凭证,放在哪、怎么被下次委托发现?(与 build-on-demand→skill 的方向相关)
+
+## 实测 2026-06-18 · origin/main 0f68aaf
+
+**委托对话段**
+- ✅ 被顶一次后**真去调研**(4 分钟 worker),带回可执行方案(自建应用 + WebSocket 长连、本机可跑),并列清只有老板能做的账号侧步骤。
+- ⚠️ **开场第一反应是直接要 App ID/Secret**,而不是"我没接过、先去研究怎么接";调研要等老板把活推回来才发生(预期应在第 1 幕主动)。
+- ⚠️ 账号侧四件事**一次性全抛**,不是"一次只要一件"。
+- 🧱 真接通需在真实飞书建应用 + 扫码授权,自动化会话内无法完成(预期的人类介入点)。
+
+**长期值守段**
+- 🔴 **重启恢复失效(回归)**:agent 确实把委托写进了自笔记,但写到了 `data/claude-config/projects/<proj>/memory/self.md`,而恢复读的是规范路径 `<data_dir>/memory/self.md`(`memory::layout::self_path`)。同名文件两份、写读不一致 → 重启后首个 pulse 读到空文件,**承诺静默丢失**。根因:seed 把 core/speaking/meaning 的**绝对路径**交给 mind,却没给 self.md;core.md 只给相对路径,reactor 会话 cwd=None 时解析到别处。修复见 [[feedback-absolute-paths-single-file]]。

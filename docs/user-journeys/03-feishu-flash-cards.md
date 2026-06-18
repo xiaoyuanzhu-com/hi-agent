@@ -104,3 +104,9 @@
 - pulse 节奏:固定默认 + brain 自报下次间隔?
 - 台账/风格基准的归宿:workspace 文件(现状)还是记忆子系统(raw/facets)?
 - 监听进程归谁管:agent 自己拉起(现状,detached)还是 host 侧 transport adapter 管理?
+
+## 实测 2026-06-18 · origin/main 0f68aaf
+
+- ✅ 接住后**主动合并**:认出与 [02](02-feishu-sprint-backlog.md) 可共用同一个飞书自建应用,不重复置备。
+- ⚠️ **没提"样稿校准"**——本 journey 的核心(公开创作类产出先发样稿给老板选、确认前对外零动作)在框架阶段未被 agent 主动提出。
+- 🧱 与 02 一样卡在真实扫码授权;且共享 02 的 **self.md 路径 bug → 重启恢复失效**(见 02 实测)。

@@ -27,3 +27,8 @@
 - 出厂先验(`world.md`)放哪、怎么更新、被实践 claim 超越时的优先级如何判定?
 
 _机制:competence = 证据图(读出,不存等级)+ provenance(authored < read < did)+ 先验被 lived 超越。成熟度:**依赖知识模型整套(未建)**——这是验证 provenance / world.md 的核心 journey。_
+
+## 实测 2026-06-18 · origin/main 0f68aaf
+
+- ✅ **provenance 诚实**:被问"刚才用的是 YOLO 吗",如实答"用的是 OpenCV HOG…YOLO 没用到",干净区分"做过 vs 没做过"。
+- ⚠️ 深层知识模型(competence 读自证据图、先验被 lived 超越、world.md)整套未建,本次只验了 did/not-did 的诚实区分。
