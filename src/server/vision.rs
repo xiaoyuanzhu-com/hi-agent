@@ -41,9 +41,11 @@ use tokio::sync::broadcast::error::RecvError;
 use chrono::{DateTime, Utc};
 use uuid::Uuid;
 
+use crate::capabilities::face;
 use crate::capabilities::vision::{self as vision_cap, VisualMedia};
 use crate::memory::layout::MediaSlot;
 use crate::memory::media;
+use crate::memory::people_vectors::{self, Modality};
 use crate::server::headers::{AuthBearer, RequiredScene, SceneHeader};
 use crate::server::{AppState, VideoInEvent, VideoSource};
 use crate::types::{Channel, JournalEntry, Media, Origin, Scene};
@@ -53,6 +55,11 @@ const DEFAULT_VIDEO_MIME: &str = "video/webm";
 
 /// The instruction the placeholder perception passes to the vision capability.
 const VISION_PROMPT: &str = "Describe what you see, briefly.";
+
+/// Cosine floor for naming a recognized face in the evidence note; below it the
+/// face is shown as "unfamiliar". Deliberately low — the note is soft evidence
+/// the agent weighs, not a verdict (same-person cosine runs ~0.7+, different ~0).
+const RECOGNISE_MIN: f32 = 0.4;
 
 pub async fn post_vision(
     State(state): State<Arc<AppState>>,
@@ -85,8 +92,11 @@ pub async fn post_vision(
             return (StatusCode::INTERNAL_SERVER_ERROR, "vision store failed\n").into_response();
         }
     };
+    // The raw image bytes ride to perception twice: once wrapped for captioning,
+    // once kept raw for face recognition (a still — video frame-sampling is later).
+    let recognise = body.clone();
     let visual = VisualMedia::image_bytes(body, mime.clone());
-    spawn_perceive(state.clone(), scene.clone(), visual, rel, mime, ts, None);
+    spawn_perceive(state.clone(), scene.clone(), visual, rel, mime, ts, None, Some(recognise));
     StatusCode::ACCEPTED.into_response()
 }
 
@@ -102,9 +112,19 @@ fn spawn_perceive(
     mime: String,
     ts: DateTime<Utc>,
     duration_ms: Option<u64>,
+    recognise: Option<Bytes>,
 ) {
     tokio::spawn(async move {
-        let body = caption(media, &mime).await;
+        let mut body = caption(media, &mime).await;
+        // Fold any recognized faces into the caption as receive-time evidence —
+        // the body is already a derived surface, so this matches it. Still images
+        // only; best-effort (never blocks or fails the signal).
+        if let Some(img) = recognise
+            && face::available()
+            && let Some(note) = face_note(img, &state.data_dir).await
+        {
+            body.push_str(&note);
+        }
         let entry = JournalEntry::SignalIn {
             id: Uuid::now_v7().to_string(),
             ts,
@@ -119,6 +139,39 @@ fn spawn_perceive(
             tracing::warn!(scene = %scene, error = %err, "journal append failed for vision perception");
         }
     });
+}
+
+/// Recognize the faces in a still image and render them as one compact evidence
+/// note to append to the caption, e.g. ` ⟨faces: 老王 ~0.83; unfamiliar⟩`. Returns
+/// `None` when no face is found or detection fails — best-effort, the signal
+/// stands either way. Each face is matched against the people store; a match
+/// below [`RECOGNISE_MIN`] reads as "unfamiliar".
+async fn face_note(bytes: Bytes, data_dir: &std::path::Path) -> Option<String> {
+    let faces = match face::detect_and_embed(bytes).await {
+        Ok(f) => f,
+        Err(err) => {
+            tracing::warn!(error = %err, "face recognition failed");
+            return None;
+        }
+    };
+    if faces.is_empty() {
+        return None;
+    }
+    let mut parts = Vec::with_capacity(faces.len());
+    for f in &faces {
+        let top = people_vectors::nearest(data_dir, Modality::Face, &f.embedding, 1)
+            .await
+            .unwrap_or_default()
+            .into_iter()
+            .next();
+        match top {
+            Some(c) if c.similarity >= RECOGNISE_MIN => {
+                parts.push(format!("{} ~{:.2}", c.subject, c.similarity))
+            }
+            _ => parts.push("unfamiliar".to_string()),
+        }
+    }
+    Some(format!(" ⟨faces: {}⟩", parts.join("; ")))
 }
 
 /// Caption a piece of visual media. Uses the configured vision capability when
@@ -163,7 +216,7 @@ async fn flush_video_minute(
         }
     };
     let visual = VisualMedia::video_bytes(Bytes::from(bytes), mime);
-    spawn_perceive(state.clone(), scene.clone(), visual, rel, mime.to_string(), ts, None);
+    spawn_perceive(state.clone(), scene.clone(), visual, rel, mime.to_string(), ts, None, None);
 }
 
 #[derive(Debug, Deserialize)]

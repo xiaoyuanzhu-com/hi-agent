@@ -272,8 +272,15 @@ fn build_reflection_prompt(tail: &[JournalEntry], prior: &[String], subjects: &[
 fn render_signal(e: &JournalEntry) -> String {
     use crate::memory::snapshot::{Speaker, transcript_line};
     match e {
-        JournalEntry::SignalIn { channel, body, stream, .. } => {
-            transcript_line(Speaker::Them, &channel.with_stream(stream.as_deref()), body.as_str())
+        JournalEntry::SignalIn { channel, body, stream, media, .. } => {
+            let line =
+                transcript_line(Speaker::Them, &channel.with_stream(stream.as_deref()), body.as_str());
+            // Mark signals carrying a still image so the mind knows which ones it
+            // can `enroll_person` a face from.
+            match media {
+                Some(m) if m.mime.starts_with("image/") => format!("{line} ⟨image⟩"),
+                _ => line,
+            }
         }
         JournalEntry::SignalOut { channel, body, .. } => {
             transcript_line(Speaker::You, channel.as_str(), body.as_str())

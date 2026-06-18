@@ -31,6 +31,13 @@ use super::{facets, layout};
 /// The facet dimension these sidecars attach to.
 const DIM: &str = "people";
 
+/// Cap on samples kept per subject per modality. A gallery is a *bounded,
+/// diverse* set, not a log of every observation — without this, one long call
+/// would dump hundreds of near-identical samples and let a single session
+/// dominate. First cut keeps the most-recent N (drop oldest); diversity-aware
+/// pruning is a later refinement.
+const MAX_SAMPLES: usize = 32;
+
 /// Which embedding space a sample lives in. Voice and face occupy different
 /// spaces and are never compared to each other, so each is its own sidecar file.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -91,6 +98,12 @@ pub async fn enroll(
         );
     }
     bytes.extend(sample.iter().flat_map(|f| f.to_le_bytes()));
+
+    // Bound the gallery: keep the most recent MAX_SAMPLES, dropping oldest first.
+    let max_bytes = MAX_SAMPLES * stride;
+    if bytes.len() > max_bytes {
+        bytes.drain(..bytes.len() - max_bytes);
+    }
 
     let tmp = dir.join(format!(".{subj}.{}.f32.tmp-{}", modality.tag(), Uuid::now_v7().simple()));
     tokio::fs::write(&tmp, &bytes).await?;
@@ -268,5 +281,16 @@ mod tests {
         let dir = td();
         assert!(enroll(dir.path(), "??", Modality::Voice, &[1.0]).await.is_err());
         assert!(enroll(dir.path(), "Alice", Modality::Voice, &[]).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn enroll_caps_the_gallery_dropping_oldest() {
+        let dir = td();
+        for i in 0..(MAX_SAMPLES + 5) {
+            enroll(dir.path(), "Alice", Modality::Voice, &[i as f32, 1.0, 0.0, 0.0]).await.unwrap();
+        }
+        let path = layout::facets_dir(dir.path()).join("people").join("alice.voice.f32");
+        let len = std::fs::metadata(&path).unwrap().len() as usize;
+        assert_eq!(len, MAX_SAMPLES * 4 * std::mem::size_of::<f32>(), "file holds exactly MAX_SAMPLES");
     }
 }
