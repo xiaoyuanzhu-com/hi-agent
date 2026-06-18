@@ -110,8 +110,9 @@ fn facet_path(data_dir: &Path, dim: &str, subject: &str) -> PathBuf {
 /// so this is not ASCII-only. Leading/trailing `.`/`-` are trimmed, so a slug is
 /// never a hidden file, a traversal (`.`/`..`), or dash-padded. Idempotent —
 /// `slug(slug(x)) == slug(x)` — so a ref round-trips through the subject index
-/// unchanged.
-fn slug(s: &str) -> String {
+/// unchanged. Shared with [`super::people_vectors`] so a person's embedding
+/// sidecars land on the exact same subject name as their `.md` facet.
+pub(crate) fn slug(s: &str) -> String {
     let mut out = String::new();
     let mut prev_dash = false;
     for ch in s.trim().chars() {

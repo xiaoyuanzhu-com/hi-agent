@@ -13,6 +13,7 @@ pub mod facets;
 pub mod journal;
 pub mod layout;
 pub mod media;
+pub mod people_vectors;
 pub mod snapshot;
 
 pub use self::core::{load_core, refresh_hot};
