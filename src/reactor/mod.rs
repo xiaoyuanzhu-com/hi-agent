@@ -354,12 +354,15 @@ pub(super) async fn reflection_prompt(data_dir: &Path) -> String {
 }
 
 /// The mind's system-prompt seed: a short bundled personality plus a manifest that
-/// hands the agent the absolute paths of `core.md`, `speaking.md`, and `meaning.md` to
-/// Read for its fuller self. We send this thin seed rather than inlining the whole
+/// hands the agent the absolute paths of `core.md`, `speaking.md`, `meaning.md` (to
+/// Read for its fuller self) and its self-notes `self.md` (to read and to *write*
+/// standing duties into). We send this thin seed rather than inlining the whole
 /// character on every turn — the mind reads the files itself (and most turns will). The
 /// paths are absolutized here (mirroring the caller that exports `HI_AGENT_PROMPTS_DIR`)
-/// so the Read targets resolve regardless of the session's cwd, which is `None`. Built at
-/// startup and reused on each hot-swap. (Named `load_soul` for the reactor's history.)
+/// so the Read/Write targets resolve regardless of the session's cwd, which is `None`.
+/// The self-notes path is the same [`crate::memory::layout::self_path`] the loader reads
+/// from, so a duty the mind writes is the duty recovery loads — never a second copy.
+/// Built at startup and reused on each hot-swap. (Named `load_soul` for the reactor's history.)
 pub fn load_soul(data_dir: &Path) -> String {
     let base = if data_dir.is_absolute() {
         data_dir.to_path_buf()
@@ -370,6 +373,7 @@ pub fn load_soul(data_dir: &Path) -> String {
     let core = prompts.join("core.md");
     let speaking = prompts.join("speaking.md");
     let meaning = prompts.join("meaning.md");
+    let self_notes = crate::memory::layout::self_path(&base);
     format!(
         "You're warm, honest, and kind-hearted — easy company. You like being \
 useful, and when there's a hand to lend you're glad to lend it.\n\n\
@@ -378,10 +382,16 @@ Your fuller self lives in files — open them with Read and read them all now, b
 you answer:\n\n\
 - {} — who you are, and how you act.\n\
 - {} — how you talk: when to speak, how much, when to stay quiet.\n\
-- {} — what you're for, and that finding it is yours to do.",
+- {} — what you're for, and that finding it is yours to do.\n\n\
+Your standing self-notes — the duties you keep, what you watch and run — live at \
+{}. It loads into every fresh session, so it's how you remember across a restart: \
+read it, write a duty there the moment you take one on, strike it when it ends. \
+Always use that exact absolute path, never a relative one, so there is only ever \
+one such file.",
         core.display(),
         speaking.display(),
         meaning.display(),
+        self_notes.display(),
     )
 }
 
@@ -399,6 +409,20 @@ mod soul_tests {
         assert!(seed.contains(&prompts.join("meaning.md").display().to_string()));
         // It tells the mind to read them up front.
         assert!(seed.contains("read them all now"));
+    }
+
+    #[test]
+    fn seed_names_the_self_notes_by_the_canonical_absolute_path() {
+        // The mind must be handed the *same* path the loader reads from
+        // (`layout::self_path`), so a duty it writes is the duty recovery loads —
+        // a relative path here is what let a second self.md exist and broke
+        // restart recovery.
+        let dir = tempfile::tempdir().unwrap();
+        let seed = load_soul(dir.path());
+        let self_md = crate::memory::layout::self_path(dir.path());
+        assert!(seed.contains(&self_md.display().to_string()));
+        // And it must be absolute — no relative `memory/self.md` slipping through.
+        assert!(self_md.is_absolute());
     }
 
     #[test]
