@@ -57,3 +57,4 @@ What "done" looks like, and how the user knows it worked.
 - [12 · 陪孩子:讲故事/教认数字/做图](12-play-with-child.md) — register 适配 + 适龄 + 安全边界;够精致的图走 views/。
 - [13 · 配一个外部能力(API + 凭证)](13-equip-a-capability.md) — 能力分流:认识进记忆/技能,凭证逐字进 drive 笔记本,密钥不进脑子。
 - [14 · 你对 YOLO 的了解随用而长、被实践修正](14-knowledge-grows.md) — competence 读自证据图(不存等级)+ provenance + 先验被 lived 超越;验证知识模型的核心 journey。
+- [15 · 打断:我一开口,它就让路](15-talk-over-the-agent.md) — 语音对话的底座:嘴串行、字跟嘴走不抢跑;我插话它当场停声并清掉没说出口的尾巴,下一轮带"说到哪 / 我说了啥"重新组织,不复读。
