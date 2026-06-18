@@ -13,7 +13,9 @@
 //! pending note: which turn was cut, about how far in, and what the full reply
 //! had been. The next turn's prompt carries that note as plain fact; how to fold
 //! the unheard tail forward (drop, revise, mention) is the soul's judgment, not
-//! the mechanism's (see `speaking.md`).
+//! the mechanism's (see `speaking.md`). The same barge-in also marks the cut turn
+//! for flush ([`InterruptRegistry::should_skip`]) so the output sequencer stops
+//! speaking and typing its unheard tail rather than draining it over the human.
 //!
 //! Everything here is estimate-grade on purpose: playback truth lives only in
 //! the client, and we deliberately don't ask for it. The note says "about Ns
@@ -68,6 +70,11 @@ struct SceneState {
     recent: VecDeque<(u64, String)>,
     /// The unconsumed barge-in note, if any. First wins; duplicates are noise.
     pending: Option<Interruption>,
+    /// Turn marked for flush by a barge-in: the sequencer drops this turn's
+    /// remaining `say`/`show` output so the unheard tail isn't spoken or typed
+    /// out. Monotonic turn ids mean a stale value never matches a later turn, so
+    /// it's simply overwritten by the next barge-in — no explicit reset.
+    flush_turn: Option<u64>,
 }
 
 /// Shared scene→barge-in state. Created once in `lib.rs`, cloned into the HTTP
@@ -142,6 +149,7 @@ impl InterruptRegistry {
         if let Some(d) = est {
             heard = heard.min(d);
         }
+        state.flush_turn = Some(turn);
         state.pending = Some(Interruption { turn, heard_ms: heard.as_millis() as u64, reply });
         tracing::info!(scene = %scene, turn, heard_ms = heard.as_millis() as u64, "barge-in inferred (speech while voice sounding)");
     }
@@ -149,6 +157,14 @@ impl InterruptRegistry {
     /// Take (and clear) the scene's pending note, for the next prompt.
     pub async fn take_pending(&self, scene: &Scene) -> Option<Interruption> {
         self.inner.lock().await.get_mut(scene)?.pending.take()
+    }
+
+    /// Whether the sequencer should abandon `turn`'s remaining output — a
+    /// barge-in landed on it. Unlike [`take_pending`] (consumed once by the next
+    /// prompt), this stays set so every trailing beat of the cut turn is skipped.
+    pub async fn should_skip(&self, scene: &Scene, turn: u64) -> bool {
+        let inner = self.inner.lock().await;
+        inner.get(scene).and_then(|s| s.flush_turn) == Some(turn)
     }
 }
 
@@ -254,5 +270,27 @@ mod tests {
         reg.note_speech(&scene(), t0 + secs(3)).await;
         let p = reg.take_pending(&scene()).await.expect("note recorded");
         assert!(p.heard_ms <= 2_000, "heard_ms = {}", p.heard_ms);
+    }
+
+    #[tokio::test]
+    async fn barge_in_marks_its_turn_for_skip() {
+        let reg = InterruptRegistry::new();
+        let t0 = Instant::now();
+        reg.audio_began(&scene(), 4, t0).await;
+        reg.note_speech(&scene(), t0 + secs(1)).await;
+        assert!(reg.should_skip(&scene(), 4).await);
+        // A later turn is unaffected — monotonic ids never collide with a stale flag.
+        assert!(!reg.should_skip(&scene(), 5).await);
+        // Draining the note for the prompt does not un-flush the turn.
+        let _ = reg.take_pending(&scene()).await;
+        assert!(reg.should_skip(&scene(), 4).await);
+    }
+
+    #[tokio::test]
+    async fn no_barge_in_no_skip() {
+        let reg = InterruptRegistry::new();
+        let t0 = Instant::now();
+        reg.audio_began(&scene(), 4, t0).await;
+        assert!(!reg.should_skip(&scene(), 4).await);
     }
 }

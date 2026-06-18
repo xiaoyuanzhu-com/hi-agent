@@ -16,8 +16,7 @@ import type { SpeechItem } from "../ui/SpeechText";
 // as a calm caption (newest last), but it's windowed *on top of* the pinned
 // user line — never instead of it (see `visibleExchange`), so an answer of any
 // length can't scroll the prompt that prompted it off-screen. Three lines (not
-// two) gives a viewer time to read each before it rolls, since the text streams
-// ahead of the spoken voice.
+// two) give a viewer time to read each line before it rolls out of view.
 const AGENT_REPLY_WINDOW = 3;
 
 // Stable id for the single rolling-interim line (the user's speech as it's
@@ -29,6 +28,15 @@ const INTERIM_ID = -1;
 // A rolling interim with no follow-up (STT stream died mid-utterance, no final
 // ever lands) is cleared after this long so a ghost italic line can't linger.
 const INTERIM_STALE_MS = 3000;
+
+// Agent reply sentences are revealed paced to roughly speaking rate, not dumped
+// the instant they arrive, so the transcript tracks the voice instead of racing
+// ahead of it. Estimate-grade on purpose (we don't read real playback position);
+// a barge-in clears whatever is still queued. See `pumpAgent` / `duck`. The rate
+// sits just under the backend's ~200ms/char Mandarin speech model (interrupts.rs)
+// so text leads the voice by a hair rather than lagging it; tune live by ear.
+const REVEAL_MS_PER_CHAR = 170;
+const MIN_REVEAL_MS = 450;
 
 // Index of the last user line in a timeline, or -1 if the agent has spoken but
 // the user hasn't yet (e.g. an opening greeting). The user line anchors the
@@ -204,6 +212,10 @@ export function useAgentSession(): AgentSession {
   const visionRef = useRef<VideoStreamer | null>(null);
   const visionStreamRef = useRef<MediaStream | null>(null);
   const sentenceIdRef = useRef(0);
+  // Agent reply sentences awaiting reveal, and the timer pacing them onto screen
+  // (see `pumpAgent`). A barge-in empties the queue so unheard lines never show.
+  const pendingAgentRef = useRef<string[]>([]);
+  const paceTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   // Staleness sweep for the interim line (see INTERIM_STALE_MS).
   const interimTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   // Live cognition cadence: bumped per streamed chunk, decays between them, so
@@ -229,6 +241,44 @@ export function useAgentSession(): AgentSession {
     [clearInterim],
   );
 
+  // Reveal queued agent sentences one at a time, paced to ~speaking rate, so the
+  // words track the voice instead of all landing at once. Reschedules itself
+  // until the queue drains.
+  const pumpAgent = useCallback(() => {
+    const text = pendingAgentRef.current.shift();
+    if (text === undefined) {
+      paceTimerRef.current = null;
+      return;
+    }
+    sentenceIdRef.current += 1;
+    const id = sentenceIdRef.current;
+    setSentences((prev) => dropPriorTurns([...prev, { id, text, speaker: "agent" }]));
+    const ms = Math.max(MIN_REVEAL_MS, text.length * REVEAL_MS_PER_CHAR);
+    paceTimerRef.current = setTimeout(pumpAgent, ms);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+
+  // Queue freshly-arrived reply sentences. An idle pacer reveals the first at
+  // once, then paces the rest itself.
+  const enqueueAgent = useCallback(
+    (list: string[]) => {
+      if (list.length === 0) return;
+      pendingAgentRef.current.push(...list);
+      if (paceTimerRef.current === null) pumpAgent();
+    },
+    [pumpAgent],
+  );
+
+  // Drop everything still queued to reveal and stop the pacer — used when the
+  // human takes the floor (barge-in) or a new exchange begins.
+  const clearAgentQueue = useCallback(() => {
+    pendingAgentRef.current = [];
+    if (paceTimerRef.current !== null) {
+      clearTimeout(paceTimerRef.current);
+      paceTimerRef.current = null;
+    }
+  }, []);
+
   // Fold a settled user line into the timeline and mark the agent as thinking
   // until its reply streams in. Every user line — typed or transcribed from
   // speech — arrives settled on the /in/text observe loop and funnels here, so
@@ -236,13 +286,15 @@ export function useAgentSession(): AgentSession {
   const finalizeUser = useCallback((text: string) => {
     const trimmed = text.trim();
     if (!trimmed) return;
+    // A new user line supersedes any reply still queued to reveal.
+    clearAgentQueue();
     sentenceIdRef.current += 1;
     const item: SpeechItem = { id: sentenceIdRef.current, text: trimmed, speaker: "user" };
     // A new user line opens a new exchange — drop the prior turn so this line
     // (and the reply about to stream) is what stays on screen.
     setSentences((prev) => dropPriorTurns([...prev, item]));
     setAwaiting(true);
-  }, []);
+  }, [clearAgentQueue]);
 
   // ---- GET /out/text subscription loop (after wake) ----------------------
   useEffect(() => {
@@ -250,20 +302,6 @@ export function useAgentSession(): AgentSession {
     const ctrl = new AbortController();
     let cancelled = false;
     const buffer = new SentenceBuffer();
-
-    const pushSentences = (list: string[]) => {
-      if (list.length === 0) return;
-      setSentences((prev) => {
-        let next = prev;
-        for (const text of list) {
-          sentenceIdRef.current += 1;
-          next = [...next, { id: sentenceIdRef.current, text, speaker: "agent" }];
-        }
-        // Keep the whole reply in state (display windows it); just stay anchored
-        // to the current user turn so the prompt is never dropped.
-        return dropPriorTurns(next);
-      });
-    };
 
     void (async () => {
       while (!cancelled) {
@@ -282,9 +320,9 @@ export function useAgentSession(): AgentSession {
             }
             // Pulse the field with this chunk; larger bursts lift it more.
             activityRef.current.bump(Math.min(1, chunk.text.length / 40));
-            pushSentences(buffer.push(chunk.text));
+            enqueueAgent(buffer.push(chunk.text));
           }
-          pushSentences(buffer.flush()); // body closed → utterance complete
+          enqueueAgent(buffer.flush()); // body closed → utterance complete
           buffer.reset();
           setAgentStreaming(false);
         } catch {
@@ -299,8 +337,9 @@ export function useAgentSession(): AgentSession {
     return () => {
       cancelled = true;
       ctrl.abort();
+      clearAgentQueue();
     };
-  }, [woken, scene]);
+  }, [woken, scene, enqueueAgent, clearAgentQueue]);
 
   // ---- GET /out/audio subscription loop (TTS playback) -------------------
   // Pure render: each response is one turn's continuous audio. Stream its body
@@ -352,7 +391,10 @@ export function useAgentSession(): AgentSession {
   const duck = useCallback(() => {
     const voice = voiceRef.current;
     if (voice?.isPlaying()) voice.stop();
-  }, []);
+    // Drop any reply lines still queued to reveal — the human took the floor, so
+    // the unheard tail shouldn't keep typing itself out after the voice stops.
+    clearAgentQueue();
+  }, [clearAgentQueue]);
 
   // ---- GET /in/text observe loop: typed lines (this client or another) ---
   // Every user line lands here: typed input the server echoes back, and speech

@@ -100,6 +100,21 @@ pub(super) async fn run_sequencer(reactor: Reactor, scene: Scene, mut beats: mps
                 if !armed || text.is_empty() {
                     continue;
                 }
+                // A barge-in landed on this turn: abandon the rest of what we were
+                // going to say. Tear the voice span down (trailing frames cease)
+                // and emit no more text — the mind re-forms its reply next turn
+                // with the interruption note in hand. The cut turn keeps streaming
+                // beats (fix-forward never cancels the prompt), so every trailing
+                // one is dropped here until the next TurnStart clears the flag.
+                if reactor.inner.interrupts.should_skip(&scene, turn).await {
+                    if synth_tx.take().is_some() {
+                        synth_handle = None;
+                    }
+                    if quiet_deadline.take().is_some() {
+                        super::emit_end_of_utterance(&reactor, &scene).await;
+                    }
+                    continue;
+                }
                 if synth_tx.is_none() {
                     open_tts(&reactor, &scene, turn, &mut synth_tx, &mut synth_handle).await;
                 }
@@ -113,6 +128,9 @@ pub(super) async fn run_sequencer(reactor: Reactor, scene: Scene, mut beats: mps
             }
             Beat::Show { id, op, source } => {
                 if !armed {
+                    continue;
+                }
+                if reactor.inner.interrupts.should_skip(&scene, turn).await {
                     continue;
                 }
                 let (id, op) = resolve_view(id, &op);
