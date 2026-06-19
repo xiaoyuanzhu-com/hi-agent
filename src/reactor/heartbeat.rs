@@ -16,7 +16,7 @@ use std::sync::Arc;
 use crate::acp::{AcpSession, SessionOpts};
 use crate::agent::SessionRole;
 use crate::memory::journal::after_cursor;
-use crate::memory::{Snapshot, build_for_scene, episodes, facets, load_core, refresh_hot};
+use crate::memory::{Snapshot, build_for_scene, episodes, facets, refresh_hot};
 use crate::observatory::EventKind;
 use crate::types::{JournalEntry, Scene};
 
@@ -119,21 +119,12 @@ pub(super) async fn swap(
         .map(Snapshot::render_for_prompt)
         .unwrap_or_default();
 
-    // Seed the replacement with the current core (self.md + hot.md) plus the
-    // briefing and recent tail, so it continues without a visible seam. The core
-    // is whatever the last completed reflection wrote — a swap that fires before
-    // its own parallel reflection finishes seeds from the previous cycle's hot.md,
-    // which is fine: hot.md is a projection, eventual consistency is acceptable.
-    let core = load_core(&reactor.inner.memory).await;
-    let core_block = if core.trim().is_empty() {
-        String::new()
-    } else {
-        format!("{}\n\n", core.trim())
-    };
+    // Seed the replacement with the soul plus the briefing and recent tail, so it
+    // continues without a visible seam. self.md and hot.md are referenced by the
+    // soul, so the fresh session re-reads whatever the last reflection wrote.
     let seeded_system_prompt = format!(
-        "{}\n\n{}## Briefing from your earlier conversation\n{}\n\n{}",
+        "{}\n\n## Briefing from your earlier conversation\n{}\n\n{}",
         reactor.inner.soul,
-        core_block,
         briefing.trim(),
         tail.trim(),
     );

@@ -354,15 +354,19 @@ pub(super) async fn reflection_prompt(data_dir: &Path) -> String {
 }
 
 /// The mind's system-prompt seed: a short bundled personality plus a manifest that
-/// hands the agent the absolute paths of `core.md`, `speaking.md`, `meaning.md` (to
-/// Read for its fuller self) and its self-notes `self.md` (to read and to *write*
-/// standing duties into). We send this thin seed rather than inlining the whole
-/// character on every turn — the mind reads the files itself (and most turns will). The
-/// paths are absolutized here (mirroring the caller that exports `HI_AGENT_PROMPTS_DIR`)
-/// so the Read/Write targets resolve regardless of the session's cwd, which is `None`.
-/// The self-notes path is the same [`crate::memory::layout::self_path`] the loader reads
-/// from, so a duty the mind writes is the duty recovery loads — never a second copy.
-/// Built at startup and reused on each hot-swap. (Named `load_soul` for the reactor's history.)
+/// hands the agent the absolute paths of every file that holds its fuller self —
+/// the static manual (`core.md`, `speaking.md`, `meaning.md`), its self-notes
+/// `self.md` (to read and to *write* standing duties into), and its recency digest
+/// `hot.md` (to read for what's lately been on its mind) — and tells it to Read them
+/// all up front. We send this thin seed rather than inlining the character *or* the
+/// memory core on every turn: every file, including `self.md`/`hot.md`, is a ref the
+/// mind reads itself, so the prompt stays a clean manifest with no inline/ref split.
+/// The paths are absolutized here (mirroring the caller that exports
+/// `HI_AGENT_PROMPTS_DIR`) so the Read/Write targets resolve regardless of the
+/// session's cwd, which is `None`. The self-notes path is the same
+/// [`crate::memory::layout::self_path`] the seed names everywhere, so a duty the mind
+/// writes is the duty recovery loads — never a second copy. Built at startup and
+/// reused on each hot-swap. (Named `load_soul` for the reactor's history.)
 pub fn load_soul(data_dir: &Path) -> String {
     let base = if data_dir.is_absolute() {
         data_dir.to_path_buf()
@@ -374,6 +378,7 @@ pub fn load_soul(data_dir: &Path) -> String {
     let speaking = prompts.join("speaking.md");
     let meaning = prompts.join("meaning.md");
     let self_notes = crate::memory::layout::self_path(&base);
+    let hot = crate::memory::layout::hot_path(&base);
     format!(
         "You're warm, honest, and kind-hearted — easy company. You like being \
 useful, and when there's a hand to lend you're glad to lend it.\n\n\
@@ -383,15 +388,18 @@ you answer:\n\n\
 - {} — who you are, and how you act.\n\
 - {} — how you talk: when to speak, how much, when to stay quiet.\n\
 - {} — what you're for, and that finding it is yours to do.\n\n\
-Your standing self-notes — the duties you keep, what you watch and run — live at \
-{}. It loads into every fresh session, so it's how you remember across a restart: \
-read it, write a duty there the moment you take one on, strike it when it ends. \
-Always use that exact absolute path, never a relative one, so there is only ever \
-one such file.",
+Two more files hold not how you were made but who you've become — read them too:\n\n\
+- {} — your standing self-notes: the duties you keep, what you watch and run. It \
+loads into every fresh session, so it's how you remember across a restart. It's yours \
+to write: note a duty there the moment you take one on, strike it when it ends. Always \
+use that exact absolute path, never a relative one, so there is only ever one such file.\n\
+- {} — a rolling digest of what's lately been on your mind, refreshed as you reflect. \
+It may not exist yet; that's fine.",
         core.display(),
         speaking.display(),
         meaning.display(),
         self_notes.display(),
+        hot.display(),
     )
 }
 
@@ -407,6 +415,9 @@ mod soul_tests {
         assert!(seed.contains(&prompts.join("core.md").display().to_string()));
         assert!(seed.contains(&prompts.join("speaking.md").display().to_string()));
         assert!(seed.contains(&prompts.join("meaning.md").display().to_string()));
+        // The recency digest is referenced by path too, never inlined.
+        let hot = crate::memory::layout::hot_path(dir.path());
+        assert!(seed.contains(&hot.display().to_string()));
         // It tells the mind to read them up front.
         assert!(seed.contains("read them all now"));
     }
@@ -1217,25 +1228,13 @@ async fn warm_up(reactor: &Reactor, scene: &Scene, reactor_session: &mut Option<
     }
 }
 
-/// Compose a session's system prompt: the soul, plus the always-loaded memory
-/// core (`self.md` + `hot.md`) when it exists. Loaded at session-creation, so a
-/// hot-swap picks up whatever the last reflection wrote.
-pub(super) fn system_prompt_with_core(soul: &str, core: &str) -> String {
-    let core = core.trim();
-    if core.is_empty() {
-        soul.to_owned()
-    } else {
-        format!("{soul}\n\n{core}")
-    }
-}
-
-/// Open a fresh persistent reactor session for `scene`, carrying the soul (plus
-/// the memory core) as its system prompt, and record the lifecycle event. The
+/// Open a fresh persistent reactor session for `scene`, carrying the soul as its
+/// system prompt, and record the lifecycle event. The soul references `self.md` and
+/// `hot.md` by path, so the session reads whatever the last reflection wrote. The
 /// session consumes the system prompt on its first `prompt()` and never re-sends
 /// it. Shared by the warm-up prologue and the cold path of [`run_turn`].
 async fn open_session(reactor: &Reactor, scene: &Scene) -> anyhow::Result<Arc<AcpSession>> {
-    let core = crate::memory::load_core(&reactor.inner.memory).await;
-    let system_prompt = system_prompt_with_core(&reactor.inner.soul, &core);
+    let system_prompt = reactor.inner.soul.clone();
     let session = Arc::new(
         reactor
             .inner
