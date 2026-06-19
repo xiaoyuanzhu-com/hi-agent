@@ -14,13 +14,11 @@
 //! HTTP glue lives in `crate::server::mcp`. Tool calls are forwarded to the right
 //! scene loop through the [`ToolRegistry`]; see [`crate::reactor::tools`].
 
-use chrono::{DateTime, Utc};
 use serde_json::{Value, json};
 
-use crate::capabilities::face;
-use crate::memory::{episodes, journal, layout, people_vectors};
+use crate::memory::people_vectors;
 use crate::reactor::{SceneControl, ToolRegistry};
-use crate::types::{Channel, JournalEntry, Media, Scene};
+use crate::types::Scene;
 
 /// MCP protocol version we advertise when the client doesn't pin one. We echo the
 /// client's requested version when present, so this is only the fallback.
@@ -110,21 +108,35 @@ fn tools_for_role(role: Option<&str>) -> Vec<Value> {
                 }),
             ),
             tool(
-                "enroll_person",
-                "Remember a person's FACE so you recognize them next time. When you are confident who \
-                 is in an ⟨image⟩ signal, call this with `subject` = the person's name (the same ref \
-                 you use for their facet, e.g. `alice`) and `signal` = that image signal's number in \
-                 the unconsolidated list, counted from the current FRONT (the same relative counting \
-                 record_episode uses). It reads that image, takes the largest face, and adds it to the \
-                 person's gallery. Enroll before you consolidate the signal away. Only still ⟨image⟩ \
-                 signals carry a face; skip signals without one.",
+                "name_person",
+                "Attach a name to a person you've recognized. Faces in ⟨image⟩ signals are clustered \
+                 automatically and shown as `⟨faces: <id>⟩` — an opaque id like `ff32ce3w` for someone \
+                 not yet named. When a signal tells you who that id is (e.g. the person says their name, \
+                 or someone introduces them), call this with `id` = that face id and `name` = the name \
+                 (the `people/<name>` ref you'd use for their facet). It renames the whole cluster from \
+                 the id to the name, so you recognize them by name next time. If the name already \
+                 exists, the two are merged.",
                 json!({
                     "type": "object",
                     "properties": {
-                        "subject": { "type": "string", "description": "The person's name/ref, matching their facet subject (e.g. alice)." },
-                        "signal": { "type": "integer", "minimum": 1, "description": "The image signal's number in the current unconsolidated list, counted from the front (like record_episode's count)." },
+                        "id": { "type": "string", "description": "The face cluster's current key — the `⟨faces: …⟩` id (e.g. ff32ce3w), or an existing name to re-key." },
+                        "name": { "type": "string", "description": "The person's name to key them under (e.g. 赵力, alice)." },
                     },
-                    "required": ["subject", "signal"],
+                    "required": ["id", "name"],
+                }),
+            ),
+            tool(
+                "merge_people",
+                "Collapse two clusters that are the same person into one — when you realize a face id \
+                 (or a name) actually refers to someone you already model. Folds `from`'s face/voice \
+                 gallery into `into` and drops `from`.",
+                json!({
+                    "type": "object",
+                    "properties": {
+                        "from": { "type": "string", "description": "The duplicate cluster's key (an id or name) to fold away." },
+                        "into": { "type": "string", "description": "The cluster's key (an id or name) to keep." },
+                    },
+                    "required": ["from", "into"],
                 }),
             ),
         ],
@@ -278,7 +290,8 @@ async fn dispatch_tool(
         "record_episode" => return reflection_record_episode(data_dir, scene, args).await,
         "read_facet" => return reflection_read_facet(data_dir, args).await,
         "update_facet" => return reflection_update_facet(data_dir, args).await,
-        "enroll_person" => return reflection_enroll_person(data_dir, scene, args).await,
+        "name_person" => return reflection_name_person(data_dir, args).await,
+        "merge_people" => return reflection_merge_people(data_dir, args).await,
         _ => {}
     }
 
@@ -407,89 +420,33 @@ async fn reflection_update_facet(data_dir: &std::path::Path, args: &Value) -> Va
     }
 }
 
-/// `enroll_person`: add the face in image signal N (1-based, counted from the
-/// current unconsolidated front) to `subject`'s gallery, so the hear-time path
-/// recognizes them next time. Re-reads the same frontier the reflection prompt
-/// was built from, resolves the signal's stored still image, embeds the largest
-/// face, and enrolls it onto `people/<subject>`.
-async fn reflection_enroll_person(data_dir: &std::path::Path, scene: &Scene, args: &Value) -> Value {
-    let subject = args.get("subject").and_then(Value::as_str).unwrap_or_default();
-    if subject.trim().is_empty() {
-        return tool_error("enroll_person requires a non-empty `subject`");
+/// `name_person`: rename a face cluster from its `id` (or current key) to a
+/// learned `name` — the structural side of "we now know who this is". Merges if
+/// the name already exists. See [`people_vectors::rename`].
+async fn reflection_name_person(data_dir: &std::path::Path, args: &Value) -> Value {
+    let id = args.get("id").and_then(Value::as_str).unwrap_or_default();
+    let name = args.get("name").and_then(Value::as_str).unwrap_or_default();
+    if id.trim().is_empty() || name.trim().is_empty() {
+        return tool_error("name_person requires `id` and `name`");
     }
-    let Some(signal) = args.get("signal").and_then(Value::as_u64) else {
-        return tool_error("enroll_person requires an integer `signal` >= 1");
-    };
-    if !face::available() {
-        return tool_error("face capability not configured (set FACE_PROVIDER)");
-    }
-
-    // Re-read the current unconsolidated front, same cursor + limit as the prompt.
-    let cursor = match episodes::scene_cursor(data_dir, scene).await {
-        Ok(c) => c,
-        Err(err) => return tool_error(&err.to_string()),
-    };
-    let tail = match journal::after_cursor(
-        data_dir,
-        scene,
-        cursor.as_deref(),
-        episodes::REFLECTION_TAIL_LIMIT,
-    )
-    .await
-    {
-        Ok(t) => t,
-        Err(err) => return tool_error(&err.to_string()),
-    };
-    let (ts, sig_scene, media) = match image_signal(&tail, signal as usize) {
-        Ok(m) => m,
-        Err(err) => return tool_error(&err),
-    };
-
-    // Resolve the stored blob (relative to its channel-day folder) and embed.
-    let path = layout::channel_day_dir(data_dir, sig_scene, Channel::Vision, ts).join(&media.file);
-    let bytes = match tokio::fs::read(&path).await {
-        Ok(b) => b,
-        Err(err) => return tool_error(&format!("reading image for signal {signal}: {err}")),
-    };
-    let faces = match face::detect_and_embed(bytes.into()).await {
-        Ok(f) => f,
-        Err(err) => return tool_error(&format!("face detection failed: {err}")),
-    };
-    let Some(face) = faces.into_iter().max_by(|a, b| {
-        face_area(&a.bbox).partial_cmp(&face_area(&b.bbox)).unwrap_or(std::cmp::Ordering::Equal)
-    }) else {
-        return tool_error(&format!("no face found in signal {signal}"));
-    };
-    match people_vectors::enroll(data_dir, subject, people_vectors::Modality::Face, &face.embedding)
-        .await
-    {
-        Ok(refname) => tool_ok(&format!("enrolled a face for {refname}")),
+    match people_vectors::rename(data_dir, id, name).await {
+        Ok(()) => tool_ok(&format!("named {id} → people/{name}")),
         Err(err) => tool_error(&err.to_string()),
     }
 }
 
-/// Validate that frontier signal `n` (1-based, from the front) is a still image,
-/// returning its `(ts, scene, media)` for blob resolution. Pure — unit-tested.
-fn image_signal(tail: &[JournalEntry], n: usize) -> Result<(DateTime<Utc>, &Scene, &Media), String> {
-    let idx = n.checked_sub(1).ok_or_else(|| "signal is 1-based (>= 1)".to_string())?;
-    let entry = tail
-        .get(idx)
-        .ok_or_else(|| format!("signal {n} is past the end ({} unconsolidated signals)", tail.len()))?;
-    match entry {
-        JournalEntry::SignalIn { channel: Channel::Vision, media: Some(m), ts, scene, .. }
-            if m.mime.starts_with("image/") =>
-        {
-            Ok((*ts, scene, m))
-        }
-        JournalEntry::SignalIn { channel: Channel::Vision, media: Some(m), .. } => {
-            Err(format!("signal {n} is {} (video), not a still image to enroll from", m.mime))
-        }
-        _ => Err(format!("signal {n} has no still image to enroll from")),
+/// `merge_people`: fold the `from` cluster into `into` (same person, two keys).
+/// See [`people_vectors::rename`].
+async fn reflection_merge_people(data_dir: &std::path::Path, args: &Value) -> Value {
+    let from = args.get("from").and_then(Value::as_str).unwrap_or_default();
+    let into = args.get("into").and_then(Value::as_str).unwrap_or_default();
+    if from.trim().is_empty() || into.trim().is_empty() {
+        return tool_error("merge_people requires `from` and `into`");
     }
-}
-
-fn face_area(b: &[f32; 4]) -> f32 {
-    (b[2] - b[0]).max(0.0) * (b[3] - b[1]).max(0.0)
+    match people_vectors::rename(data_dir, from, into).await {
+        Ok(()) => tool_ok(&format!("merged people/{from} → people/{into}")),
+        Err(err) => tool_error(&err.to_string()),
+    }
 }
 
 fn result(id: Value, result: Value) -> Value {
@@ -573,49 +530,32 @@ mod view_store_tests {
 }
 
 #[cfg(test)]
-mod enroll_tests {
+mod name_tests {
     use super::*;
-    use crate::types::Origin;
 
-    fn vision(mime: &str) -> JournalEntry {
-        JournalEntry::SignalIn {
-            id: "i".into(),
-            ts: Utc::now(),
-            channel: Channel::Vision,
-            scene: Scene("s".into()),
-            body: "a face".into(),
-            stream: None,
-            media: Some(Media {
-                file: "00/01-02.jpg".into(),
-                mime: mime.into(),
-                duration_ms: None,
-                width: None,
-                height: None,
-            }),
-            origin: Some(Origin::Human),
-        }
+    #[tokio::test]
+    async fn name_person_renames_a_cluster_to_the_name() {
+        let dir = tempfile::tempdir().unwrap();
+        // A clustered-but-unnamed face id with a gallery.
+        people_vectors::enroll(dir.path(), "ff32ce3w", people_vectors::Modality::Face, &[1.0, 0.0])
+            .await
+            .unwrap();
+        let r = reflection_name_person(
+            dir.path(),
+            &json!({ "id": "ff32ce3w", "name": "赵力" }),
+        )
+        .await;
+        assert_eq!(r["isError"], false);
+        let got = people_vectors::nearest(dir.path(), people_vectors::Modality::Face, &[1.0, 0.0], 1)
+            .await
+            .unwrap();
+        assert_eq!(got[0].subject, "赵力");
     }
 
-    fn text() -> JournalEntry {
-        JournalEntry::SignalIn {
-            id: "t".into(),
-            ts: Utc::now(),
-            channel: Channel::Text,
-            scene: Scene("s".into()),
-            body: "hi".into(),
-            stream: None,
-            media: None,
-            origin: Some(Origin::Human),
-        }
-    }
-
-    #[test]
-    fn image_signal_validates_kind_and_range() {
-        let tail = vec![text(), vision("image/jpeg"), vision("video/mp4")];
-        assert!(image_signal(&tail, 2).is_ok(), "the still image");
-        assert!(image_signal(&tail, 1).is_err(), "text has no image");
-        assert!(image_signal(&tail, 3).is_err(), "video is not a still");
-        assert!(image_signal(&tail, 4).is_err(), "past the end");
-        assert!(image_signal(&tail, 0).is_err(), "1-based");
+    #[tokio::test]
+    async fn name_person_rejects_blank_args() {
+        let dir = tempfile::tempdir().unwrap();
+        assert_eq!(reflection_name_person(dir.path(), &json!({ "id": "x" })).await["isError"], true);
+        assert_eq!(reflection_name_person(dir.path(), &json!({ "name": "y" })).await["isError"], true);
     }
 }

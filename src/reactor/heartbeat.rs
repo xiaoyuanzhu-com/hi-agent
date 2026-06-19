@@ -11,14 +11,17 @@
 //! conversation experiences continuity, never a cold restart; the journal stays
 //! the durable backstop if a swap fails.
 
+use std::collections::HashMap;
+use std::path::Path;
 use std::sync::Arc;
 
 use crate::acp::{AcpSession, SessionOpts};
 use crate::agent::SessionRole;
+use crate::capabilities::face;
 use crate::memory::journal::after_cursor;
-use crate::memory::{Snapshot, build_for_scene, episodes, facets, refresh_hot};
+use crate::memory::{Snapshot, build_for_scene, episodes, facets, layout, people_vectors, refresh_hot};
 use crate::observatory::EventKind;
-use crate::types::{JournalEntry, Scene};
+use crate::types::{Channel, JournalEntry, Scene};
 
 use super::Reactor;
 
@@ -196,7 +199,11 @@ async fn run_reflection(reactor: &Reactor, scene: &Scene) -> anyhow::Result<()> 
         .unwrap_or_default();
     let subjects = facets::facet_subject_index(data_dir).await.unwrap_or_default();
 
-    let prompt = build_reflection_prompt(&tail, &prior, &subjects);
+    // Mechanically cluster any faces in the frontier's images first, so the prompt
+    // can show the mind a stable id per detected face to name. No-op without the
+    // face capability.
+    let face_ids = cluster_faces(data_dir, scene, &tail).await;
+    let prompt = build_reflection_prompt(&tail, &prior, &subjects, &face_ids);
     let system_prompt = super::reflection_prompt(data_dir).await;
 
     let session = reactor
@@ -234,8 +241,15 @@ async fn run_reflection(reactor: &Reactor, scene: &Scene) -> anyhow::Result<()> 
 
 /// Assemble the reflection prompt: optional prior-episode and known-subject
 /// context, then the unconsolidated frontier as a numbered, oldest-first list (the
-/// mind hands back a `count` into this list, never a raw id).
-fn build_reflection_prompt(tail: &[JournalEntry], prior: &[String], subjects: &[String]) -> String {
+/// mind hands back a `count` into this list, never a raw id). Image signals are
+/// marked: `⟨faces: <id>…⟩` when clustering placed faces (the ids the mind can
+/// name), else `⟨image⟩`.
+fn build_reflection_prompt(
+    tail: &[JournalEntry],
+    prior: &[String],
+    subjects: &[String],
+    face_ids: &HashMap<usize, Vec<String>>,
+) -> String {
     use std::fmt::Write as _;
     let mut s = String::new();
     if !prior.is_empty() {
@@ -252,7 +266,15 @@ fn build_reflection_prompt(tail: &[JournalEntry], prior: &[String], subjects: &[
     }
     s.push_str("## Unconsolidated signals (oldest first)\n");
     for (i, e) in tail.iter().enumerate() {
-        let _ = writeln!(s, "[{}] {}", i + 1, render_signal(e));
+        let mut line = render_signal(e);
+        match face_ids.get(&i).filter(|v| !v.is_empty()) {
+            Some(ids) => {
+                let _ = write!(line, " ⟨faces: {}⟩", ids.join(", "));
+            }
+            None if is_image(e) => line.push_str(" ⟨image⟩"),
+            None => {}
+        }
+        let _ = writeln!(s, "[{}] {}", i + 1, line);
     }
     s.push_str("\nConsolidate these now.");
     s
@@ -263,18 +285,74 @@ fn build_reflection_prompt(tail: &[JournalEntry], prior: &[String], subjects: &[
 fn render_signal(e: &JournalEntry) -> String {
     use crate::memory::snapshot::{Speaker, transcript_line};
     match e {
-        JournalEntry::SignalIn { channel, body, stream, media, .. } => {
-            let line =
-                transcript_line(Speaker::Them, &channel.with_stream(stream.as_deref()), body.as_str());
-            // Mark signals carrying a still image so the mind knows which ones it
-            // can `enroll_person` a face from.
-            match media {
-                Some(m) if m.mime.starts_with("image/") => format!("{line} ⟨image⟩"),
-                _ => line,
-            }
+        JournalEntry::SignalIn { channel, body, stream, .. } => {
+            transcript_line(Speaker::Them, &channel.with_stream(stream.as_deref()), body.as_str())
         }
         JournalEntry::SignalOut { channel, body, .. } => {
             transcript_line(Speaker::You, channel.as_str(), body.as_str())
         }
     }
 }
+
+/// Whether a frontier signal carries a still image — so the prompt can mark it
+/// `⟨image⟩` even when face clustering found nothing or is unconfigured.
+fn is_image(e: &JournalEntry) -> bool {
+    matches!(e, JournalEntry::SignalIn { media: Some(m), .. } if m.mime.starts_with("image/"))
+}
+
+/// Mechanically cluster the faces in the frontier's still images: for each one,
+/// detect+embed and [`people_vectors::assign`] every salient face to the people
+/// store (append to a near cluster, or mint a fresh id). Returns, per tail index,
+/// the cluster ids the faces landed in — the stable handles the reflection prompt
+/// shows so the mind can name a face, even a first-time one. No-op (empty) when
+/// the face capability is unconfigured; a per-image failure is logged and skipped.
+async fn cluster_faces(
+    data_dir: &Path,
+    scene: &Scene,
+    tail: &[JournalEntry],
+) -> HashMap<usize, Vec<String>> {
+    let mut out: HashMap<usize, Vec<String>> = HashMap::new();
+    if !face::available() {
+        return out;
+    }
+    for (i, e) in tail.iter().enumerate() {
+        let JournalEntry::SignalIn { channel: Channel::Vision, media: Some(m), ts, scene: sig_scene, .. } = e
+        else {
+            continue;
+        };
+        if !m.mime.starts_with("image/") {
+            continue;
+        }
+        let path = layout::channel_day_dir(data_dir, sig_scene, Channel::Vision, *ts).join(&m.file);
+        let bytes = match tokio::fs::read(&path).await {
+            Ok(b) => b,
+            Err(err) => {
+                tracing::warn!(scene = %scene, error = %err, "cluster: reading image failed");
+                continue;
+            }
+        };
+        let faces = match face::detect_and_embed(bytes.into()).await {
+            Ok(f) => f,
+            Err(err) => {
+                tracing::warn!(scene = %scene, error = %err, "cluster: face detect failed");
+                continue;
+            }
+        };
+        for f in faces.iter().filter(|f| salient(f)) {
+            match people_vectors::assign(data_dir, people_vectors::Modality::Face, &f.embedding).await {
+                Ok(id) => out.entry(i).or_default().push(id),
+                Err(err) => tracing::warn!(scene = %scene, error = %err, "cluster: assign failed"),
+            }
+        }
+    }
+    out
+}
+
+/// Skip incidental/background faces: require a confident detection and a face big
+/// enough (in original-image pixels) to embed reliably.
+fn salient(f: &crate::capabilities::face::DetectedFace) -> bool {
+    let w = (f.bbox[2] - f.bbox[0]).max(0.0);
+    let h = (f.bbox[3] - f.bbox[1]).max(0.0);
+    f.score >= 0.6 && w >= 50.0 && h >= 50.0
+}
+

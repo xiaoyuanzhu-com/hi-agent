@@ -22,7 +22,7 @@
 //! produces embeddings (e.g. embedding each STT speaker-turn); wiring it in later
 //! is purely additive.
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use uuid::Uuid;
 
@@ -37,6 +37,11 @@ const DIM: &str = "people";
 /// dominate. First cut keeps the most-recent N (drop oldest); diversity-aware
 /// pruning is a later refinement.
 const MAX_SAMPLES: usize = 32;
+
+/// Cosine at/above which an observation is taken to be an existing person rather
+/// than someone new (see [`assign`]). Conservative — minting a duplicate cluster
+/// (mergeable later) is cheaper than wrongly fusing two people.
+const APPEND_THRESHOLD: f32 = 0.5;
 
 /// Which embedding space a sample lives in. Voice and face occupy different
 /// spaces and are never compared to each other, so each is its own sidecar file.
@@ -110,6 +115,93 @@ pub async fn enroll(
     tokio::fs::rename(&tmp, &path).await?;
     Ok(format!("{DIM}/{subj}"))
 }
+
+/// A short, opaque, stable identity key for a freshly-discovered person — what a
+/// cluster lives under until a real name is learned and it is [`rename`]d onto
+/// the name. Eight base-36 chars from a v7 uuid's random low bits (e.g. `ff32ce3w`).
+pub fn mint_id() -> String {
+    const ALPHABET: &[u8; 36] = b"0123456789abcdefghijklmnopqrstuvwxyz";
+    let mut x = Uuid::now_v7().as_u128() as u64;
+    let mut s = String::with_capacity(8);
+    for _ in 0..8 {
+        s.push(ALPHABET[(x % 36) as usize] as char);
+        x /= 36;
+    }
+    s
+}
+
+/// Place one observed `embedding` into the people store: if it is within
+/// [`APPEND_THRESHOLD`] of an existing subject, append it there and return that
+/// subject; otherwise [`mint_id`] a fresh id, enroll under it, and return the id.
+/// This is the **mechanical half of clustering** — identity forms from biometrics
+/// alone, no name or LLM. The returned subject is an id (new person) or whatever
+/// key the matched cluster currently has (an id, or a name if already named).
+pub async fn assign(data_dir: &Path, modality: Modality, embedding: &[f32]) -> anyhow::Result<String> {
+    if let Some(top) = nearest(data_dir, modality, embedding, 1).await?.into_iter().next()
+        && top.similarity >= APPEND_THRESHOLD
+    {
+        enroll(data_dir, &top.subject, modality, embedding).await?;
+        return Ok(top.subject);
+    }
+    let id = mint_id();
+    enroll(data_dir, &id, modality, embedding).await?;
+    Ok(id)
+}
+
+/// Move every `facets/people/<old>.*` artifact to `<new>.*` — the structural side
+/// of naming (rename a minted id to a learned name) and of merging (collapse two
+/// clusters of one person). For a `.f32` sidecar whose target already exists the
+/// two galleries are concatenated (a later [`enroll`] re-applies the cap); for any
+/// other artifact (the `.md` facet) the target is kept — it regenerates from
+/// episodes — and the old dropped. Renaming a subject onto itself is a no-op.
+pub async fn rename(data_dir: &Path, old: &str, new: &str) -> anyhow::Result<()> {
+    let (old_s, new_s) = (facets::slug(old), facets::slug(new));
+    anyhow::ensure!(!old_s.is_empty() && !new_s.is_empty(), "old and new must each slug to something");
+    if old_s == new_s {
+        return Ok(());
+    }
+
+    let dir = layout::facets_dir(data_dir).join(DIM);
+    let mut rd = match tokio::fs::read_dir(&dir).await {
+        Ok(rd) => rd,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(e) => return Err(e.into()),
+    };
+    // Collect first, then mutate — don't modify the dir mid-iteration.
+    let prefix = format!("{old_s}.");
+    let mut arts: Vec<(PathBuf, String)> = Vec::new();
+    while let Some(ent) = rd.next_entry().await? {
+        let Ok(fname) = ent.file_name().into_string() else {
+            continue;
+        };
+        if fname.starts_with('.') {
+            continue; // skip hidden/tmp
+        }
+        if let Some(ext) = fname.strip_prefix(&prefix) {
+            arts.push((ent.path(), ext.to_string()));
+        }
+    }
+    drop(rd);
+
+    for (src, ext) in arts {
+        let dst = dir.join(format!("{new_s}.{ext}"));
+        let target_exists = tokio::fs::try_exists(&dst).await?;
+        if target_exists && ext.ends_with("f32") {
+            let mut merged = tokio::fs::read(&dst).await?;
+            merged.extend(tokio::fs::read(&src).await?);
+            let tmp = dir.join(format!(".{new_s}.{ext}.tmp-{}", Uuid::now_v7().simple()));
+            tokio::fs::write(&tmp, &merged).await?;
+            tokio::fs::rename(&tmp, &dst).await?;
+            tokio::fs::remove_file(&src).await?;
+        } else if target_exists {
+            tokio::fs::remove_file(&src).await?;
+        } else {
+            tokio::fs::rename(&src, &dst).await?;
+        }
+    }
+    Ok(())
+}
+
 
 /// Rank known subjects by how close `query` is to their nearest `modality`
 /// sample (the max cosine over that subject's samples), best first, capped at
@@ -292,5 +384,66 @@ mod tests {
         let path = layout::facets_dir(dir.path()).join("people").join("alice.voice.f32");
         let len = std::fs::metadata(&path).unwrap().len() as usize;
         assert_eq!(len, MAX_SAMPLES * 4 * std::mem::size_of::<f32>(), "file holds exactly MAX_SAMPLES");
+    }
+
+    #[test]
+    fn mint_id_is_eight_base36_chars() {
+        let id = mint_id();
+        assert_eq!(id.len(), 8);
+        assert!(id.chars().all(|c| c.is_ascii_lowercase() || c.is_ascii_digit()));
+        assert_ne!(mint_id(), mint_id(), "ids are not constant");
+    }
+
+    #[tokio::test]
+    async fn assign_mints_on_empty_then_appends_close_and_mints_far() {
+        let dir = td();
+        // Empty store → mints a fresh id and stores it.
+        let id = assign(dir.path(), Modality::Face, &[1.0, 0.0, 0.0, 0.0]).await.unwrap();
+        assert_eq!(id.len(), 8);
+        // A near-identical observation → appends to the same id (not a new one).
+        let again = assign(dir.path(), Modality::Face, &[0.98, 0.0, 0.0, 0.0]).await.unwrap();
+        assert_eq!(again, id);
+        // An orthogonal observation (cosine 0 < threshold) → a new id.
+        let other = assign(dir.path(), Modality::Face, &[0.0, 1.0, 0.0, 0.0]).await.unwrap();
+        assert_ne!(other, id);
+    }
+
+    #[tokio::test]
+    async fn rename_moves_all_artifacts_when_target_is_free() {
+        let dir = td();
+        enroll(dir.path(), "ff32ce3w", Modality::Face, &[1.0, 0.0, 0.0, 0.0]).await.unwrap();
+        enroll(dir.path(), "ff32ce3w", Modality::Voice, &[1.0, 0.0, 0.0, 0.0]).await.unwrap();
+        facets::update_facet(dir.path(), "people", "ff32ce3w", "an unnamed face").await.unwrap();
+
+        rename(dir.path(), "ff32ce3w", "赵力").await.unwrap();
+
+        let people = layout::facets_dir(dir.path()).join("people");
+        for f in ["赵力.face.f32", "赵力.voice.f32", "赵力.md"] {
+            assert!(people.join(f).exists(), "{f} moved");
+        }
+        for f in ["ff32ce3w.face.f32", "ff32ce3w.voice.f32", "ff32ce3w.md"] {
+            assert!(!people.join(f).exists(), "{f} gone");
+        }
+        // Recognition now answers with the name.
+        let got = nearest(dir.path(), Modality::Face, &[1.0, 0.0, 0.0, 0.0], 1).await.unwrap();
+        assert_eq!(got[0].subject, "赵力");
+    }
+
+    #[tokio::test]
+    async fn rename_into_existing_merges_galleries() {
+        let dir = td();
+        enroll(dir.path(), "赵力", Modality::Face, &[1.0, 0.0, 0.0, 0.0]).await.unwrap();
+        enroll(dir.path(), "dupe1234", Modality::Face, &[0.0, 1.0, 0.0, 0.0]).await.unwrap();
+        rename(dir.path(), "dupe1234", "赵力").await.unwrap();
+
+        let path = layout::facets_dir(dir.path()).join("people").join("赵力.face.f32");
+        let len = std::fs::metadata(&path).unwrap().len() as usize;
+        assert_eq!(len, 2 * 4 * std::mem::size_of::<f32>(), "both samples now under 赵力");
+        assert!(!layout::facets_dir(dir.path()).join("people").join("dupe1234.face.f32").exists());
+        // Either original observation now matches 赵力.
+        for q in [[1.0, 0.0, 0.0, 0.0], [0.0, 1.0, 0.0, 0.0]] {
+            let got = nearest(dir.path(), Modality::Face, &q, 1).await.unwrap();
+            assert_eq!(got[0].subject, "赵力");
+        }
     }
 }
