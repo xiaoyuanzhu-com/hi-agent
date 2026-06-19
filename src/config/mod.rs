@@ -28,25 +28,20 @@ pub const ENV_COMPACT: &str = "HI_AGENT_COMPACT";
 pub const ENV_PULSE: &str = "HI_AGENT_PULSE";
 /// Env var to disable the reflection ("sleep") pass entirely
 /// (`HI_AGENT_REFLECT=off`). Any other value (or unset) leaves it on; reflection
-/// then runs on its own periodic clock (see [`ENV_REFLECT_EVERY`]),
-/// consolidating the raw frontier into episodes/facets.
+/// then runs on one adaptive clock (see [`ENV_REFLECT_EVERY`]), consolidating the
+/// raw frontier into episodes/facets.
 pub const ENV_REFLECT: &str = "HI_AGENT_REFLECT";
-/// Env var overriding the interval between periodic reflection passes
-/// (`HI_AGENT_REFLECT_EVERY`). Accepts the alarm-delay grammar (`90s`, `30m`,
-/// `1h`; bare integer = seconds); `0` or `off` disables periodic reflection.
-/// Unset / unparseable → the built-in default (hourly).
+/// Env var setting the **base** reflection cadence (`HI_AGENT_REFLECT_EVERY`):
+/// how often a scene with fresh input consolidates. Accepts the alarm-delay
+/// grammar (`90s`, `30m`, `1h`; bare integer = seconds); `0` or `off` disables
+/// reflection. Unset / unparseable → the built-in default (1m). When a scene goes
+/// quiet the gap backs off from this base (doubling) up to [`ENV_REFLECT_MAX`].
 pub const ENV_REFLECT_EVERY: &str = "HI_AGENT_REFLECT_EVERY";
-/// Env var setting how long a scene must be idle (no turns) before an idle
-/// reflection fires (`HI_AGENT_REFLECT_IDLE`) — the "consolidate once the event
-/// ends" trigger that complements the periodic backstop. Alarm-delay grammar;
-/// `0`/`off` disables just the idle trigger. Unset / unparseable → default (5m).
-pub const ENV_REFLECT_IDLE: &str = "HI_AGENT_REFLECT_IDLE";
-/// Env var setting the minimum gap between reflection passes
-/// (`HI_AGENT_REFLECT_COOLDOWN`): any trigger within this window of the last
-/// reflection is skipped, so frequent short lulls don't spawn back-to-back passes.
-/// Alarm-delay grammar; `0`/`off` removes the rate limit. Unset / unparseable →
-/// default (30m).
-pub const ENV_REFLECT_COOLDOWN: &str = "HI_AGENT_REFLECT_COOLDOWN";
+/// Env var capping the idle backoff (`HI_AGENT_REFLECT_MAX`): once a scene is
+/// caught up and quiet, the reflection gap doubles from the base each pass but
+/// never exceeds this, so a long-idle scene stops re-checking in vain. Alarm-delay
+/// grammar; unset / unparseable → the built-in default (8h).
+pub const ENV_REFLECT_MAX: &str = "HI_AGENT_REFLECT_MAX";
 /// Env var (set on the cognition subprocess) carrying hi-agent's own HTTP base
 /// URL, so sessions can read input channels and write the overlay over the same
 /// wire the browser uses. See [`AgentConfig::child_env`].

@@ -139,12 +139,12 @@ fn reflect_enabled() -> bool {
         .unwrap_or(false)
 }
 
-/// Default periodic reflection interval — the backstop cadence ([`reflect_interval`]).
-const DEFAULT_REFLECT_EVERY: Duration = Duration::from_secs(3600);
-/// Default idle gap before an idle reflection fires ([`reflect_idle_interval`]).
-const DEFAULT_REFLECT_IDLE: Duration = Duration::from_secs(300);
-/// Default minimum gap between reflections ([`reflect_cooldown`]).
-const DEFAULT_REFLECT_COOLDOWN: Duration = Duration::from_secs(1800);
+/// Default base reflection cadence — how often a scene with fresh input
+/// consolidates ([`reflect_interval`]). The idle backoff grows from here.
+const DEFAULT_REFLECT_EVERY: Duration = Duration::from_secs(60);
+/// Default ceiling on the idle backoff ([`reflect_max_interval`]): a long-quiet
+/// scene re-checks at most this often.
+const DEFAULT_REFLECT_MAX: Duration = Duration::from_secs(8 * 3600);
 
 /// Resolve a duration env in alarm-delay grammar (`90s`/`30m`/`1h`; bare integer =
 /// seconds): `None` for `off`/`0` (disabled), the parsed value, or `default` when
@@ -169,53 +169,48 @@ fn duration_env(var: &str, default: Duration) -> Option<Duration> {
     }
 }
 
-/// The periodic reflection backstop interval, or `None` if reflection is off
-/// (`HI_AGENT_REFLECT=off`) or `HI_AGENT_REFLECT_EVERY` is `0`/`off`. This guarantees
-/// a scene that stays busy and never goes idle still consolidates eventually.
+/// The base reflection cadence, or `None` if reflection is off
+/// (`HI_AGENT_REFLECT=off`) or `HI_AGENT_REFLECT_EVERY` is `0`/`off`. A scene with
+/// fresh input consolidates this often; once it goes quiet the gap backs off from
+/// here up to [`reflect_max_interval`].
 fn reflect_interval() -> Option<Duration> {
     reflect_enabled()
         .then(|| duration_env(crate::config::ENV_REFLECT_EVERY, DEFAULT_REFLECT_EVERY))
         .flatten()
 }
 
-/// The idle gap before an idle reflection fires — the "the event just ended, file
-/// it" trigger. `None` if reflection is off or `HI_AGENT_REFLECT_IDLE` is `0`/`off`.
-fn reflect_idle_interval() -> Option<Duration> {
-    reflect_enabled()
-        .then(|| duration_env(crate::config::ENV_REFLECT_IDLE, DEFAULT_REFLECT_IDLE))
-        .flatten()
+/// The ceiling on the idle backoff: a caught-up, quiet scene doubles its gap from
+/// the base each pass but never past this. Always returns a value (no `off`); a
+/// `0`/blank `HI_AGENT_REFLECT_MAX` falls back to the default.
+fn reflect_max_interval() -> Duration {
+    duration_env(crate::config::ENV_REFLECT_MAX, DEFAULT_REFLECT_MAX).unwrap_or(DEFAULT_REFLECT_MAX)
 }
 
-/// The minimum gap between reflection passes: every trigger (periodic or idle) is
-/// held off until this long after the previous reflection, so frequent short lulls
-/// don't spawn back-to-back passes. `None` (`HI_AGENT_REFLECT_COOLDOWN=0`/`off`)
-/// removes the rate limit.
-fn reflect_cooldown() -> Option<Duration> {
-    duration_env(crate::config::ENV_REFLECT_COOLDOWN, DEFAULT_REFLECT_COOLDOWN)
-}
-
-/// The soonest a reflection may fire for a scene, or `None` when reflection is fully
-/// disabled (both intervals `None`). Two triggers feed it — the periodic backstop
-/// (`periodic` since the last reflection, or since `loop_started` before the first)
-/// and the idle trigger (`idle` since the last turn, `last_activity`) — and the
-/// `cooldown` clamps both so nothing fires within `cooldown` of the previous
-/// reflection. The first reflection (`last_reflection` = `None`) is unclamped.
+/// The soonest a reflection may fire for a scene, or `None` when reflection is
+/// disabled (`base` is `None`). One adaptive clock, anchored on the **last
+/// reflection** (or `loop_started` before the first) so a never-idle scene still
+/// fires every `base`:
+/// - **fresh input** since the anchor (`last_activity > anchor`) → fire `base`
+///   after the anchor — the active ~1/`base` cadence;
+/// - **caught up and quiet** (`last_activity <= anchor`) → fire `backoff_gap`
+///   after the anchor, where `backoff_gap` has been doubling toward the cap.
+///
+/// `backoff_gap` is the loop's running idle gap (reset to `base` whenever a pass
+/// runs with fresh input, doubled toward the cap when one runs while quiet); this
+/// function just reads it. Activity after a long idle re-anchors on the old
+/// reflection, so the next pass is due immediately — fine, it's a detached session
+/// and an under-`MIN_REFLECT_SIGNALS` frontier no-ops cheaply.
 fn next_reflection_at(
     loop_started: Instant,
     last_activity: Instant,
     last_reflection: Option<Instant>,
-    periodic: Option<Duration>,
-    idle: Option<Duration>,
-    cooldown: Option<Duration>,
+    base: Option<Duration>,
+    backoff_gap: Duration,
 ) -> Option<Instant> {
-    let cooldown_floor = match (last_reflection, cooldown) {
-        (Some(t), Some(c)) => Some(t + c),
-        _ => None,
-    };
-    let clamp = |raw: Instant| cooldown_floor.map_or(raw, |cd| raw.max(cd));
-    let periodic_at = periodic.map(|every| clamp(last_reflection.unwrap_or(loop_started) + every));
-    let idle_at = idle.map(|d| clamp(last_activity + d));
-    [periodic_at, idle_at].into_iter().flatten().min()
+    let base = base?;
+    let anchor = last_reflection.unwrap_or(loop_started);
+    let gap = if last_activity > anchor { base } else { backoff_gap };
+    Some(anchor + gap)
 }
 
 #[cfg(test)]
@@ -227,50 +222,50 @@ mod reflection_schedule_tests {
     }
 
     #[test]
-    fn idle_fires_before_the_periodic_backstop() {
+    fn fresh_input_fires_at_base_after_the_anchor() {
         let t0 = Instant::now();
-        // Never reflected; quiet since t0. Idle (5m) beats the periodic backstop (1h).
-        let at = next_reflection_at(t0, t0, None, Some(secs(3600)), Some(secs(300)), Some(secs(1800)));
-        assert_eq!(at, Some(t0 + secs(300)));
+        // Never reflected; a turn landed at t0+30s. Anchor is loop_start (t0), and
+        // fresh input since then → fire base (60s) after the anchor.
+        let at = next_reflection_at(t0, t0 + secs(30), None, Some(secs(60)), secs(60));
+        assert_eq!(at, Some(t0 + secs(60)));
     }
 
     #[test]
-    fn cooldown_holds_idle_off_after_a_recent_reflection() {
+    fn busy_scene_fires_base_after_the_last_reflection() {
         let t0 = Instant::now();
-        // Reflected at t0; a turn landed 100s later, then quiet. Idle would be due at
-        // t0+400s, but the 30m cooldown pushes the next reflection to t0+1800s.
-        let last_activity = t0 + secs(100);
-        let at = next_reflection_at(
-            t0,
-            last_activity,
-            Some(t0),
-            Some(secs(3600)),
-            Some(secs(300)),
-            Some(secs(1800)),
-        );
-        assert_eq!(at, Some(t0 + secs(1800)));
+        // Reflected at t0+60s; a later turn keeps activity ahead of the anchor, so
+        // the next pass is base after the *reflection*, not pushed out by activity.
+        let last_reflection = t0 + secs(60);
+        let at = next_reflection_at(t0, t0 + secs(90), Some(last_reflection), Some(secs(60)), secs(60));
+        assert_eq!(at, Some(last_reflection + secs(60)));
     }
 
     #[test]
-    fn without_cooldown_idle_is_not_clamped() {
+    fn quiet_scene_uses_the_backed_off_gap() {
         let t0 = Instant::now();
-        let last_activity = t0 + secs(100);
-        let at = next_reflection_at(t0, last_activity, Some(t0), Some(secs(3600)), Some(secs(300)), None);
-        assert_eq!(at, Some(t0 + secs(400)));
+        // Reflected at t0+60s, nothing since (activity at t0 < anchor) → fire the
+        // backoff gap (already doubled to 240s) after the anchor.
+        let last_reflection = t0 + secs(60);
+        let at = next_reflection_at(t0, t0, Some(last_reflection), Some(secs(60)), secs(240));
+        assert_eq!(at, Some(last_reflection + secs(240)));
     }
 
     #[test]
-    fn disabled_when_both_intervals_off() {
+    fn new_input_after_long_idle_is_due_immediately() {
         let t0 = Instant::now();
-        assert_eq!(next_reflection_at(t0, t0, None, None, None, Some(secs(1800))), None);
+        // Long idle: anchor is an hour-old reflection, gap backed off to 8h. A turn
+        // just landed → fresh input → due `base` after the *old* anchor, i.e. in the
+        // past, so the loop fires it on the next tick.
+        let last_reflection = t0;
+        let at = next_reflection_at(t0, t0 + secs(3600), Some(last_reflection), Some(secs(60)), secs(8 * 3600));
+        assert_eq!(at, Some(last_reflection + secs(60)));
+        assert!(at.unwrap() < t0 + secs(3600));
     }
 
     #[test]
-    fn periodic_backstop_uses_loop_start_before_first_reflection() {
+    fn disabled_when_base_is_off() {
         let t0 = Instant::now();
-        // Idle disabled; never reflected → first periodic at loop_started + 1h.
-        let at = next_reflection_at(t0, t0 + secs(50), None, Some(secs(3600)), None, Some(secs(1800)));
-        assert_eq!(at, Some(t0 + secs(3600)));
+        assert_eq!(next_reflection_at(t0, t0, None, None, secs(60)), None);
     }
 }
 
@@ -955,17 +950,17 @@ async fn per_scene_loop(
     // after the loop stands up also carries how long ago the host process started,
     // which is all "wake on boot" amounts to.
     let pulse_every = pulse_interval();
-    // Reflection runs on two triggers, both decoupled from the compact heartbeat: a
-    // periodic backstop (`reflect_every`) and an idle "the event just ended" trigger
-    // (`reflect_idle`), with a `reflect_cooldown` that keeps the two from firing
-    // back-to-back. `last_reflection` stays `None` until the first pass, so the
-    // cooldown never delays it; see `next_reflection_at`.
-    let reflect_every = reflect_interval();
-    let reflect_idle = reflect_idle_interval();
-    let reflect_cooldown = reflect_cooldown();
+    // Reflection runs on one adaptive clock, decoupled from the compact heartbeat:
+    // a scene with fresh input consolidates every `reflect_base`; once it goes quiet
+    // the gap backs off (doubling) up to `reflect_max`. `backoff_gap` is that
+    // running idle gap — reset to the base when a pass runs with fresh input,
+    // doubled toward the cap when one runs while quiet. See `next_reflection_at`.
+    let reflect_base = reflect_interval();
+    let reflect_max = reflect_max_interval();
     let loop_started = Instant::now();
     let mut last_activity = Instant::now();
     let mut last_reflection: Option<Instant> = None;
+    let mut backoff_gap = reflect_base.unwrap_or(DEFAULT_REFLECT_EVERY);
     let mut pulsed_once = false;
 
     loop {
@@ -981,9 +976,8 @@ async fn per_scene_loop(
                 loop_started,
                 last_activity,
                 last_reflection,
-                reflect_every,
-                reflect_idle,
-                reflect_cooldown,
+                reflect_base,
+                backoff_gap,
             );
             let deadline = [alarms.next_deadline(), pulse_at, reflect_at]
                 .into_iter()
@@ -1050,19 +1044,30 @@ async fn per_scene_loop(
                         tracing::info!(scene = %scene, "pulse fired");
                         batch.push(LoopInput::Pulse { note });
                     }
-                    // Reflection ("sleep"): fires on whichever trigger comes first —
-                    // the periodic backstop or the idle "event just ended" gap — both
-                    // rate-limited by the cooldown (see `next_reflection_at`). Spawned
-                    // detached so it never blocks the floor; the cursor makes it
-                    // idempotent and a pass with too little on the frontier is a fast
-                    // no-op. It drives no turn, so it never joins `batch` — the loop
-                    // just re-waits on the next deadline.
+                    // Reflection ("sleep"): one adaptive clock — fires `base` after
+                    // the last pass while there's fresh input, and on a backed-off
+                    // gap once the scene is caught up and quiet (see
+                    // `next_reflection_at`). Spawned detached so it never blocks the
+                    // floor; the cursor makes it idempotent and a pass with too
+                    // little on the frontier is a fast no-op. It drives no turn, so
+                    // it never joins `batch` — the loop just re-waits on the next
+                    // deadline.
                     if let Some(at) = reflect_at
                         && at <= now
                     {
-                        // Consume the tick whether or not we spawn (start the cooldown
-                        // now), so a busy guard can't hot-spin the wait loop on an
-                        // already-past deadline.
+                        // Adapt the idle backoff against the *old* anchor before
+                        // re-anchoring: a pass with fresh input since the last
+                        // reflection snaps the gap back to the base; one that runs
+                        // while quiet doubles it toward the cap, so a long-idle scene
+                        // stops re-checking in vain. Then consume the tick (re-anchor
+                        // on `now`) whether or not we spawn, so a busy guard can't
+                        // hot-spin the wait loop on an already-past deadline.
+                        let anchor = last_reflection.unwrap_or(loop_started);
+                        backoff_gap = if last_activity > anchor {
+                            reflect_base.unwrap_or(DEFAULT_REFLECT_EVERY)
+                        } else {
+                            backoff_gap.checked_mul(2).unwrap_or(reflect_max).min(reflect_max)
+                        };
                         last_reflection = Some(now);
                         if reflection.as_ref().is_none_or(|h| h.is_finished()) {
                             let r = reactor.clone();
