@@ -46,7 +46,7 @@ base64 = "0.22"
 
 # QR codes for the phone-upload handoff (file-upload carrier). Pure-Rust SVG
 # renderer; default features off to skip the PNG/`image` renderer (we emit SVG).
-qrcode = { version = "0.14", default-features = false }
+qrcode = { version = "0.14", default-features = false, features = ["svg"] }
 
 directories = "5"
 
