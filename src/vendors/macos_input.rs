@@ -16,6 +16,7 @@ use core_graphics::event::{
 };
 use core_graphics::event_source::{CGEventSource, CGEventSourceStateID};
 use core_graphics::geometry::CGPoint;
+use core_graphics::display::CGDisplay;
 
 use crate::capabilities::input::{Action, Key, Point, modifier_mask};
 
@@ -119,4 +120,16 @@ fn press(key: Key, mods: &[crate::capabilities::input::Modifier]) -> anyhow::Res
     up.set_flags(flags);
     up.post(CGEventTapLocation::HID);
     Ok(())
+}
+
+/// The main display's logical bounds size in points (not backing-store pixels).
+/// `CGDisplayBounds` lives in the global display point space — the same unit the
+/// mouse events use — so a normalized screen fraction maps straight through.
+pub fn main_display_point_size() -> anyhow::Result<(f64, f64)> {
+    let bounds = CGDisplay::main().bounds();
+    anyhow::ensure!(
+        bounds.size.width > 0.0 && bounds.size.height > 0.0,
+        "main display reported a zero size"
+    );
+    Ok((bounds.size.width, bounds.size.height))
 }

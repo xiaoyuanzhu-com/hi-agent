@@ -16,6 +16,7 @@
 
 use serde_json::{Value, json};
 
+use base64::Engine as _;
 use crate::memory::people_vectors;
 use crate::reactor::{SceneControl, ToolRegistry};
 use crate::types::Scene;
@@ -45,6 +46,35 @@ fn tools_for_role(role: Option<&str>) -> Vec<Value> {
                     "type": "object",
                     "properties": { "question": { "type": "string", "description": "The question to surface." } },
                     "required": ["question"],
+                }),
+            ),
+            tool(
+                "look",
+                "See the user's screen right now — returns a screenshot of the main display, plus \
+                 its pixel size and the frontmost app. Use it to find where things are before you \
+                 `act`, and again after acting to confirm what changed. The positions you pass to \
+                 `act` are fractions of THIS image.",
+                json!({ "type": "object", "properties": {} }),
+            ),
+            tool(
+                "act",
+                "Operate the user's screen like a human would: move, click, type, or press keys. \
+                 Positions are normalized fractions of the screen read off the latest `look` — `x` \
+                 is 0.0 (left) to 1.0 (right), `y` is 0.0 (top) to 1.0 (bottom). After you act, call \
+                 `look` again to check it worked.",
+                json!({
+                    "type": "object",
+                    "properties": {
+                        "action": { "type": "string", "enum": ["click", "double_click", "right_click", "move", "drag", "type", "press"], "description": "What to do." },
+                        "x": { "type": "number", "description": "Target x as a 0..1 fraction of screen width. For click/double_click/right_click/move, and the start of a drag." },
+                        "y": { "type": "number", "description": "Target y as a 0..1 fraction of screen height." },
+                        "x2": { "type": "number", "description": "Drag end x (0..1), for action=drag." },
+                        "y2": { "type": "number", "description": "Drag end y (0..1), for action=drag." },
+                        "text": { "type": "string", "description": "Text to type, for action=type (handles non-ASCII like a song title)." },
+                        "key": { "type": "string", "description": "Key for action=press: return, tab, space, escape, delete, up, down, left, right, or a single character. For a chord like ⌘A use key=a with mods=[command]." },
+                        "mods": { "type": "array", "items": { "type": "string", "enum": ["command", "shift", "option", "control"] }, "description": "Modifier keys held during a press." },
+                    },
+                    "required": ["action"],
                 }),
             ),
         ],
@@ -292,6 +322,8 @@ async fn dispatch_tool(
         "update_facet" => return reflection_update_facet(data_dir, args).await,
         "name_person" => return reflection_name_person(data_dir, args).await,
         "merge_people" => return reflection_merge_people(data_dir, args).await,
+        "look" => return do_look().await,
+        "act" => return do_act(args).await,
         _ => {}
     }
 
@@ -353,6 +385,158 @@ async fn dispatch_tool(
         Ok(ack) => tool_ok(ack),
         Err(err) => tool_error(&err.to_string()),
     }
+}
+
+/// `look`: capture the screen so the calling session can see where to act. Returns
+/// a text hint (size + frontmost app) and the screenshot as an image content block,
+/// which `claude-agent-acp` forwards to the multimodal model. Errors when capture
+/// is unavailable (non-macOS, or Screen Recording not granted).
+async fn do_look() -> Value {
+    let snap = match crate::capabilities::desktop_context::capture().await {
+        Ok(s) => s,
+        Err(e) => return tool_error(&format!("screen capture not available here: {e}")),
+    };
+    let Some(png) = snap.screenshot_png else {
+        return tool_error("no screenshot — grant Screen Recording to the host app");
+    };
+    let mut hint = match png_dimensions(&png) {
+        Some((w, h)) => format!("screenshot of the main display, {w}x{h} px"),
+        None => "screenshot of the main display".to_string(),
+    };
+    if let Some(app) = &snap.frontmost_app {
+        hint.push_str(&format!("; frontmost app: {app}"));
+    }
+    if let Some(title) = &snap.frontmost_window_title {
+        hint.push_str(&format!("; front window: {title}"));
+    }
+    let b64 = base64::engine::general_purpose::STANDARD.encode(&png);
+    json!({
+        "content": [
+            { "type": "text", "text": hint },
+            { "type": "image", "data": b64, "mimeType": "image/png" },
+        ],
+        "isError": false,
+    })
+}
+
+/// `act`: synthesize one input action on the host. Coordinates arrive as normalized
+/// 0..1 fractions of the screen (what the model reasons about, looking at `look`'s
+/// image) and are mapped to the main display's points here, so the pixel-vs-point
+/// Retina detail never reaches the model.
+async fn do_act(args: &Value) -> Value {
+    use crate::capabilities::input::{self, Action, Point};
+    let action = args.get("action").and_then(Value::as_str).unwrap_or_default();
+
+    let act = match action {
+        "type" => {
+            let text = args.get("text").and_then(Value::as_str).unwrap_or_default();
+            if text.is_empty() {
+                return tool_error("act `type` requires non-empty `text`");
+            }
+            Action::Type(text.to_string())
+        }
+        "press" => {
+            let Some(key) = parse_key(args.get("key").and_then(Value::as_str).unwrap_or_default())
+            else {
+                return tool_error(
+                    "act `press` needs a valid `key`: return, tab, space, escape, delete, \
+                     up/down/left/right, or a single character",
+                );
+            };
+            Action::Press { key, mods: parse_mods(args.get("mods")) }
+        }
+        "click" | "double_click" | "right_click" | "move" | "drag" => {
+            let (w, h) = match input::main_display_point_size() {
+                Ok(s) => s,
+                Err(e) => return tool_error(&format!("could not read display size: {e}")),
+            };
+            let pt = |xk: &str, yk: &str| -> Option<Point> {
+                let x = args.get(xk).and_then(Value::as_f64)?;
+                let y = args.get(yk).and_then(Value::as_f64)?;
+                Some(Point { x: x.clamp(0.0, 1.0) * w, y: y.clamp(0.0, 1.0) * h })
+            };
+            let Some(from) = pt("x", "y") else {
+                return tool_error("act requires `x` and `y` as 0..1 fractions of the screen");
+            };
+            match action {
+                "click" => Action::Click(from),
+                "double_click" => Action::DoubleClick(from),
+                "right_click" => Action::RightClick(from),
+                "move" => Action::MoveTo(from),
+                "drag" => {
+                    let Some(to) = pt("x2", "y2") else {
+                        return tool_error("act `drag` requires `x2` and `y2` (the drag end, 0..1)");
+                    };
+                    Action::Drag { from, to }
+                }
+                _ => unreachable!(),
+            }
+        }
+        other => return tool_error(&format!("unknown act action `{other}`")),
+    };
+
+    match input::perform(act).await {
+        Ok(()) => tool_ok("acted"),
+        Err(e) => tool_error(&e.to_string()),
+    }
+}
+
+/// Read (width, height) from a PNG's IHDR header — big-endian, right after the
+/// 8-byte signature. `None` if the bytes aren't a PNG we recognize.
+fn png_dimensions(png: &[u8]) -> Option<(u32, u32)> {
+    if png.len() < 24 || &png[12..16] != b"IHDR" {
+        return None;
+    }
+    let w = u32::from_be_bytes(png[16..20].try_into().ok()?);
+    let h = u32::from_be_bytes(png[20..24].try_into().ok()?);
+    Some((w, h))
+}
+
+/// Map an `act` `key` string to a [`crate::capabilities::input::Key`]. Named keys
+/// are case-insensitive; anything else is taken as a single character (so `a`, `/`,
+/// `7` work). `None` for an empty or multi-character unknown name.
+fn parse_key(s: &str) -> Option<crate::capabilities::input::Key> {
+    use crate::capabilities::input::Key;
+    Some(match s.to_ascii_lowercase().as_str() {
+        "return" | "enter" => Key::Return,
+        "tab" => Key::Tab,
+        "space" => Key::Space,
+        "escape" | "esc" => Key::Escape,
+        "delete" | "backspace" => Key::Delete,
+        "up" => Key::ArrowUp,
+        "down" => Key::ArrowDown,
+        "left" => Key::ArrowLeft,
+        "right" => Key::ArrowRight,
+        other => {
+            let mut chars = other.chars();
+            let c = chars.next()?;
+            if chars.next().is_some() {
+                return None;
+            }
+            Key::Char(c)
+        }
+    })
+}
+
+/// Map an `act` `mods` array to modifiers, accepting common aliases. Unknown
+/// entries are dropped.
+fn parse_mods(v: Option<&Value>) -> Vec<crate::capabilities::input::Modifier> {
+    use crate::capabilities::input::Modifier;
+    v.and_then(Value::as_array)
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|m| {
+                    Some(match m.as_str()?.to_ascii_lowercase().as_str() {
+                        "command" | "cmd" | "meta" => Modifier::Command,
+                        "shift" => Modifier::Shift,
+                        "option" | "alt" => Modifier::Option,
+                        "control" | "ctrl" => Modifier::Control,
+                        _ => return None,
+                    })
+                })
+                .collect()
+        })
+        .unwrap_or_default()
 }
 
 /// `record_episode`: file the first `count` of the scene's unconsolidated signals
@@ -557,5 +741,44 @@ mod name_tests {
         let dir = tempfile::tempdir().unwrap();
         assert_eq!(reflection_name_person(dir.path(), &json!({ "id": "x" })).await["isError"], true);
         assert_eq!(reflection_name_person(dir.path(), &json!({ "name": "y" })).await["isError"], true);
+    }
+}
+
+#[cfg(test)]
+mod screen_tool_tests {
+    use super::*;
+    use crate::capabilities::input::{Key, Modifier};
+
+    #[test]
+    fn png_dimensions_reads_ihdr() {
+        let mut png = vec![0x89, b'P', b'N', b'G', 0x0D, 0x0A, 0x1A, 0x0A];
+        png.extend_from_slice(&[0, 0, 0, 13]); // IHDR chunk length
+        png.extend_from_slice(b"IHDR");
+        png.extend_from_slice(&256u32.to_be_bytes());
+        png.extend_from_slice(&128u32.to_be_bytes());
+        assert_eq!(png_dimensions(&png), Some((256, 128)));
+        assert_eq!(png_dimensions(b"not a png at all"), None);
+        assert_eq!(png_dimensions(b"short"), None);
+    }
+
+    #[test]
+    fn parse_key_handles_names_and_single_chars() {
+        assert_eq!(parse_key("return"), Some(Key::Return));
+        assert_eq!(parse_key("ENTER"), Some(Key::Return));
+        assert_eq!(parse_key("esc"), Some(Key::Escape));
+        assert_eq!(parse_key("a"), Some(Key::Char('a')));
+        assert_eq!(parse_key("/"), Some(Key::Char('/')));
+        assert_eq!(parse_key("f1"), None);
+        assert_eq!(parse_key(""), None);
+    }
+
+    #[test]
+    fn parse_mods_maps_aliases_and_drops_unknown() {
+        let v = json!(["cmd", "Shift", "alt", "ctrl", "bogus"]);
+        assert_eq!(
+            parse_mods(Some(&v)),
+            vec![Modifier::Command, Modifier::Shift, Modifier::Option, Modifier::Control]
+        );
+        assert_eq!(parse_mods(None), Vec::<Modifier>::new());
     }
 }

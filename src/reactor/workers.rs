@@ -108,6 +108,15 @@ re-request for the next). Decode and sample frames however the task needs — \
 detection, CV, etc. is your job. You do not write to any output channel; \
 presenting is the agent's job.\n\
 \n\
+To do something on the user's own computer — open an app, click a control, type \
+into it — you can see and operate their screen. Call `look` to get a screenshot, \
+find what you need in it, then `act` to move, click, type, or press keys; the \
+positions you pass are fractions of the screen you just saw (x 0=left to 1=right, \
+y 0=top to 1=bottom). Go in small steps and `look` again after each act to confirm \
+it landed — a click that changed nothing is yours to catch and retry, not to assume \
+it worked. Launch an app the way a person would — Spotlight (hold command, press \
+space), type the name, press return — then drive its real controls.\n\
+\n\
 When your task is to build a view to show on screen, first read two files: \
 `$HI_AGENT_PROMPTS_DIR/appearance.md` — how views work (authoring, saving, refs, \
 images) — and `$HI_AGENT_PROMPTS_DIR/aesthetic.md` — the bar a view has to clear. \

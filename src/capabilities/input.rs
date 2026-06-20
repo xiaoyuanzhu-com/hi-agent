@@ -153,6 +153,20 @@ pub async fn perform(action: Action) -> anyhow::Result<()> {
     }
 }
 
+/// The main display's logical size in points (origin top-left) — the unit
+/// [`perform`] coordinates use. A normalized 0..1 screen fraction times this size
+/// gives the global display point to act on. Errors on an unsupported platform.
+pub fn main_display_point_size() -> anyhow::Result<(f64, f64)> {
+    #[cfg(target_os = "macos")]
+    {
+        crate::vendors::macos_input::main_display_point_size()
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        anyhow::bail!("display size is not supported on this platform")
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

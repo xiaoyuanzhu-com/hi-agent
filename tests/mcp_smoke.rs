@@ -105,7 +105,11 @@ async fn tools_list_is_role_gated() {
     .await
     .expect("json");
     let names = tool_names(&worker);
-    assert_eq!(names, vec!["ask".to_string()]);
+    assert!(names.contains(&"ask".to_string()), "got {names:?}");
+    assert!(names.contains(&"look".to_string()), "got {names:?}");
+    assert!(names.contains(&"act".to_string()), "got {names:?}");
+    assert!(!names.contains(&"say".to_string()), "worker must not see say");
+    assert!(!names.contains(&"delegate".to_string()), "worker must not see delegate");
 }
 
 #[tokio::test]
