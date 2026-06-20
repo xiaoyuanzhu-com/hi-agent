@@ -1,5 +1,9 @@
 # hi-agent
 
+## Working alongside uncommitted changes
+
+The working tree may hold the user's in-progress work that is unrelated to your task. Don't entangle with it: keep your changes in new files where possible, put additive config (e.g. a new Cargo dependency) in its own separate block rather than interleaved with theirs, and at commit time stage only the files/hunks your task owns — never `git add -A`. Leave their WIP untouched in the tree for them to commit.
+
 ## Running locally
 
 Use `make dev` — it runs both halves together (Ctrl-C stops both):
