@@ -62,7 +62,7 @@ use tokio_tungstenite::tungstenite::Message;
 use tokio_tungstenite::{MaybeTlsStream, WebSocketStream};
 use uuid::Uuid;
 
-use crate::capabilities::stt::Transcript;
+use crate::capabilities::stt::{DiarizedSpan, Transcript};
 
 // Defaults target the recommended async (optimized) endpoint + doubao 2.0
 // hour version. Override the resource id to point at concurrent variants or
@@ -432,16 +432,19 @@ pub async fn transcribe_streaming(
                         last_returned = text.clone();
                         last_partial.clear();
                         // Carry the segment's speaker label (two-pass diarization)
-                        // so the caller can voiceprint that speaker's audio.
+                        // so the caller can voiceprint that speaker's audio, plus
+                        // every diarized span finalized in this frame so the caller
+                        // slices each speaker's own audio (not the last one only).
                         let speaker_id = parsed.result.as_ref().and_then(|r| r.definite_speaker_id());
-                        let _ = out.send(Transcript { text, is_final: true, speaker_id }).await;
+                        let segments = parsed.result.as_ref().map(|r| r.definite_spans()).unwrap_or_default();
+                        let _ = out.send(Transcript { text, is_final: true, speaker_id, segments }).await;
                     }
                 } else if let Some(text) = parsed.text() {
                     // Rolling preliminary. Dedupe identical updates.
                     if !text.is_empty() && text != last_partial {
                         last_partial = text.clone();
                         last_final.clear();
-                        let _ = out.send(Transcript { text, is_final: false, speaker_id: None }).await;
+                        let _ = out.send(Transcript { text, is_final: false, speaker_id: None, segments: Vec::new() }).await;
                     }
                 }
             }
@@ -591,6 +594,13 @@ struct Utterance {
     /// and will not change.
     #[serde(default)]
     definite: bool,
+    /// Start/end of this utterance in milliseconds from the stream's first audio
+    /// sample (present when `show_utterances` is on). The voiceprint path slices
+    /// the diarized speaker's own audio by this span — see [`ServerResult::definite_spans`].
+    #[serde(default)]
+    start_time: Option<u64>,
+    #[serde(default)]
+    end_time: Option<u64>,
     #[serde(default)]
     additions: UtteranceAdditions,
 }
@@ -641,6 +651,26 @@ impl ServerResult {
             .filter(|s| !s.is_empty())
             .map(str::to_owned)
             .next_back()
+    }
+
+    /// Every finalized (definite) utterance that carries a speaker label and a
+    /// usable time span, as [`DiarizedSpan`]s in utterance order. Unlike
+    /// [`Self::definite_speaker_id`] (which takes only the last definite utterance,
+    /// to tag the dispatched sentence), this returns *all* of them — the voiceprint
+    /// path slices each speaker's own audio by its `[start_ms, end_ms]` so a frame
+    /// that finalized two speakers enrolls each voice cleanly rather than blending
+    /// them. Utterances missing a speaker id, missing timing, or with a non-positive
+    /// span are dropped.
+    fn definite_spans(&self) -> Vec<DiarizedSpan> {
+        self.utterances
+            .iter()
+            .filter(|u| u.definite)
+            .filter_map(|u| {
+                let speaker_id = u.additions.speaker_id.as_deref().map(str::trim).filter(|s| !s.is_empty())?;
+                let (start_ms, end_ms) = (u.start_time?, u.end_time?);
+                (end_ms > start_ms).then(|| DiarizedSpan { speaker_id: speaker_id.to_owned(), start_ms, end_ms })
+            })
+            .collect()
     }
 
     /// Render the definite utterances as a speaker-labeled transcript, but only
@@ -781,6 +811,43 @@ mod tests {
         let payload = server_payload(&frame).expect("payload");
         let parsed: ServerResponse = serde_json::from_slice(payload).expect("valid JSON");
         assert_eq!(parsed.result.as_ref().unwrap().definite_speaker_id(), None);
+    }
+
+    // The voiceprint path needs *every* finalized speaker turn with its audio
+    // span, not just the last (`definite_speaker_id`). A two-pass frame carries
+    // `start_time`/`end_time` (ms) on each utterance; `definite_spans` collects
+    // them so each speaker's own audio can be sliced and embedded cleanly.
+    #[test]
+    fn definite_spans_yields_one_per_speaker_with_timing() {
+        let json = r#"{"result":{"utterances":[
+            {"definite":true,"text":"你好","start_time":0,"end_time":1500,"additions":{"source":"two_pass","speaker_id":"0"}},
+            {"definite":true,"text":"在的","start_time":1500,"end_time":3200,"additions":{"source":"two_pass","speaker_id":"1"}}
+        ]}}"#;
+        let frame = result_frame(true, json.as_bytes());
+        let payload = server_payload(&frame).expect("payload");
+        let parsed: ServerResponse = serde_json::from_slice(payload).expect("valid JSON");
+        let spans = parsed.result.as_ref().unwrap().definite_spans();
+        assert_eq!(spans.len(), 2);
+        assert_eq!(spans[0].speaker_id, "0");
+        assert_eq!((spans[0].start_ms, spans[0].end_ms), (0, 1500));
+        assert_eq!(spans[1].speaker_id, "1");
+        assert_eq!((spans[1].start_ms, spans[1].end_ms), (1500, 3200));
+    }
+
+    // Drop utterances that can't be sliced/attributed: no speaker, no timing, not
+    // yet definite, or a non-positive span.
+    #[test]
+    fn definite_spans_skips_unusable_utterances() {
+        let json = r#"{"result":{"utterances":[
+            {"definite":true,"text":"a","start_time":0,"end_time":1000},
+            {"definite":true,"text":"b","additions":{"speaker_id":"0"}},
+            {"definite":false,"text":"c","start_time":0,"end_time":1000,"additions":{"speaker_id":"0"}},
+            {"definite":true,"text":"d","start_time":2000,"end_time":2000,"additions":{"speaker_id":"1"}}
+        ]}}"#;
+        let frame = result_frame(true, json.as_bytes());
+        let payload = server_payload(&frame).expect("payload");
+        let parsed: ServerResponse = serde_json::from_slice(payload).expect("valid JSON");
+        assert!(parsed.result.as_ref().unwrap().definite_spans().is_empty());
     }
 
     // A single speaker (or no speaker info) stays a flat transcript — the

@@ -29,6 +29,23 @@ pub struct Transcript {
     /// speaker info is off. It is a within-session cluster id, not a persistent
     /// identity; the caller resolves identity by voiceprinting the utterance audio.
     pub speaker_id: Option<String>,
+    /// Diarized utterance spans carried on a final, one per speaker turn that
+    /// finalized in this update (empty on partials and when diarization is off).
+    /// Each gives a speaker label and the utterance's `[start_ms, end_ms]` from the
+    /// stream start, so the caller can slice that speaker's *own* audio out of the
+    /// live buffer and voiceprint it — instead of attributing a whole multi-speaker
+    /// stretch to one label. Distinct from [`Self::speaker_id`], which names only
+    /// the single turn the dispatched sentence belongs to.
+    pub segments: Vec<DiarizedSpan>,
+}
+
+/// A finalized utterance's speaker and audio span (milliseconds from stream start),
+/// the unit the voiceprint path slices and embeds per speaker.
+#[derive(Debug, Clone)]
+pub struct DiarizedSpan {
+    pub speaker_id: String,
+    pub start_ms: u64,
+    pub end_ms: u64,
 }
 
 enum Backend {

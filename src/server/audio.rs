@@ -80,11 +80,85 @@ const DEFAULT_MIME: &str = "audio/wav";
 /// evidence the agent weighs, not a verdict.
 const VOICE_RECOGNISE_MIN: f32 = 0.4;
 
-/// Safety cap on the rolling live-mic PCM buffer (samples) used for per-utterance
-/// voiceprinting: ~20 s at 16 kHz. Normally the buffer is drained every time a
-/// diarized utterance finalizes (≈ one turn); this only bounds growth if finals
-/// stall, so an embedding never runs on an unbounded slab.
-const MAX_VP_SAMPLES: usize = 16_000 * 20;
+/// Sample rate of the live mic, and samples per millisecond (16 kHz mono). Used to
+/// map a diarized utterance's `[start_ms, end_ms]` onto the timeline buffer.
+const SAMPLES_PER_MS: u64 = 16;
+
+/// Minimum sliced span to voiceprint: ~1 s. Shorter turns ("嗯", "对") embed
+/// poorly and pull clusters toward a noisy centroid, so they're skipped.
+const VP_MIN_SPAN_SAMPLES: u64 = SAMPLES_PER_MS * 1_000;
+
+/// How much audio the timeline retains *before* the last consumed utterance end —
+/// slack so a span whose diarized final lands slightly after its audio can still be
+/// sliced. ~2 s.
+const VP_PRUNE_MARGIN_SAMPLES: u64 = SAMPLES_PER_MS * 2_000;
+
+/// Hard backstop on retained timeline samples (~60 s). The diarized second pass
+/// lags the live stream by seconds; this is generous enough to cover that lag yet
+/// bounds growth if the pass stalls. A span whose audio predates this window is
+/// skipped (we never voiceprint the wrong audio) rather than mis-attributed.
+const VP_RETAIN_CEILING_SAMPLES: u64 = SAMPLES_PER_MS * 60_000;
+
+/// The live mic as an absolute-clock PCM buffer. `base` is the absolute sample
+/// index of `buf[0]` (everything before it has been pruned); `consumed_end` is the
+/// absolute index one past the last utterance span already voiceprinted. A diarized
+/// utterance's `[start_ms, end_ms]` becomes absolute samples `start_ms*16 ..
+/// end_ms*16`, sliced out of `buf` via `base`. This lets each speaker's *own* audio
+/// be embedded even though the two-pass diarized finals lag the audio that spans
+/// several speakers — the bug the old "take everything since the last final" had.
+#[derive(Default)]
+struct VpTimeline {
+    buf: Vec<i16>,
+    base: u64,
+    consumed_end: u64,
+}
+
+impl VpTimeline {
+    /// Absolute index one past the last buffered sample (== total samples ever
+    /// pushed, since `base` accounts for everything dropped).
+    fn end(&self) -> u64 {
+        self.base + self.buf.len() as u64
+    }
+
+    /// Append freshly-decoded samples. Caller passes the count actually decoded
+    /// (`pcm::le_i16` drops a trailing odd byte, so this must not assume bytes/2).
+    fn push(&mut self, samples: &[i16]) {
+        self.buf.extend_from_slice(samples);
+    }
+
+    /// Copy the samples covering absolute `[start, end)` — that speaker's own audio.
+    /// `None` when `start` predates `base` (the audio was already pruned; we refuse
+    /// to substitute other audio, which would re-introduce contamination) or when
+    /// nothing remains after clamping `end` to what's buffered.
+    fn slice(&self, start: u64, end: u64) -> Option<Vec<i16>> {
+        if start < self.base {
+            return None;
+        }
+        let lo = (start - self.base) as usize;
+        let hi = (end.min(self.end()) - self.base) as usize;
+        if hi <= lo || lo >= self.buf.len() {
+            return None;
+        }
+        Some(self.buf[lo..hi.min(self.buf.len())].to_vec())
+    }
+
+    /// Drop audio no longer needed: keep a `margin` of samples before `consumed_end`
+    /// and never retain more than `ceiling` trailing samples. When the unconsumed
+    /// backlog itself exceeds `ceiling` (the second pass stalled), the ceiling wins
+    /// and the stale audio is dropped — its later span then fails `slice` and is
+    /// skipped rather than mis-sliced.
+    fn prune(&mut self, margin: u64, ceiling: u64) {
+        let keep_from = self
+            .consumed_end
+            .saturating_sub(margin)
+            .max(self.end().saturating_sub(ceiling));
+        if keep_from > self.base {
+            let drop = ((keep_from - self.base) as usize).min(self.buf.len());
+            self.buf.drain(..drop);
+            self.base += drop as u64;
+        }
+    }
+}
 
 /// Recognize the speaker of a single-voice clip and render one compact evidence
 /// note to append to the transcript, e.g. ` ⟨voice: 老王 ~0.82⟩`. The audio twin
@@ -308,13 +382,14 @@ async fn stream_audio_in(
     let stt_task = tokio::spawn(async move { stt::transcribe_streaming(audio_rx, tr_tx).await });
 
     // Live-mic voiceprint: who is speaking, from the vendor's diarized segments.
-    // The PCM pump (below) accumulates raw samples into `pcm_accum`; when a
-    // diarized utterance finalizes, the out task takes that slice, embeds it, and
+    // The PCM pump (below) appends raw samples to `timeline` (an absolute-clock
+    // buffer); when a diarized utterance finalizes, the out task slices *that
+    // speaker's own* audio by the utterance's `[start_ms, end_ms]`, embeds it, and
     // clusters it into the people store, caching `speaker_id → person` so each
     // delivered sentence can be tagged with the speaker. Only armed when the
     // voiceprint capability is configured.
     let vp_on = voiceprint::available();
-    let pcm_accum: Arc<Mutex<Vec<i16>>> = Arc::new(Mutex::new(Vec::new()));
+    let timeline: Arc<Mutex<VpTimeline>> = Arc::new(Mutex::new(VpTimeline::default()));
     let speaker_names: Arc<Mutex<HashMap<String, String>>> = Arc::new(Mutex::new(HashMap::new()));
 
     // An explicit Segmenter — not the upstream's silence flag — decides where the
@@ -324,7 +399,7 @@ async fn stream_audio_in(
     let relay_state = state.clone();
     let relay_scene = scene.clone();
     let relay_stream = stream.clone();
-    let relay_pcm = pcm_accum.clone();
+    let relay_pcm = timeline.clone();
     let relay_names = speaker_names.clone();
     let out_task = tokio::spawn(async move {
         let mut seg = Segmenter::new(Speech::default(), Instant::now());
@@ -349,16 +424,39 @@ async fn stream_audio_in(
                             relay_state.echo_input(&relay_scene, Channel::Text, &t.text, false);
                             relay_state.interrupts.note_speech(&relay_scene, tokio::time::Instant::now()).await;
                         }
-                        // A diarized utterance just finalized: its audio is the PCM
-                        // gathered since the last final. Take that slice and resolve
-                        // the speaker's identity off-thread (embed + cluster), then
-                        // remember which speaker is currently talking.
-                        if t.is_final && let Some(spk) = t.speaker_id.clone() {
-                            if vp_on {
-                                let pcm: Vec<i16> = std::mem::take(&mut *relay_pcm.lock().unwrap());
-                                resolve_speaker(&relay_state, relay_names.clone(), spk.clone(), pcm);
+                        // A diarized utterance just finalized. Each segment names a
+                        // speaker and its `[start_ms, end_ms]`; slice that speaker's
+                        // *own* audio out of the timeline (not the whole stretch
+                        // since the last final, which spans several speakers because
+                        // the diarized second pass lags) and resolve each off-thread.
+                        if t.is_final {
+                            if vp_on && !t.segments.is_empty() {
+                                let sliced: Vec<(String, Vec<i16>)> = {
+                                    let mut tl = relay_pcm.lock().unwrap();
+                                    t.segments
+                                        .iter()
+                                        .filter_map(|sp| {
+                                            let start = sp.start_ms.saturating_mul(SAMPLES_PER_MS);
+                                            let end = sp.end_ms.saturating_mul(SAMPLES_PER_MS);
+                                            if end <= tl.consumed_end {
+                                                return None; // already handled (re-sent span)
+                                            }
+                                            let pcm = tl.slice(start, end);
+                                            tl.consumed_end = tl.consumed_end.max(end);
+                                            pcm.filter(|p| p.len() as u64 >= VP_MIN_SPAN_SAMPLES)
+                                                .map(|p| (sp.speaker_id.clone(), p))
+                                        })
+                                        .collect()
+                                };
+                                for (spk, pcm) in sliced {
+                                    resolve_speaker(&relay_state, relay_names.clone(), spk, pcm);
+                                }
                             }
-                            current_speaker = Some(spk);
+                            // Tag the dispatched sentence with the last finalized
+                            // speaker — the turn the Segmenter is about to emit.
+                            if let Some(spk) = t.speaker_id.clone() {
+                                current_speaker = Some(spk);
+                            }
                         }
                         seg.observe(&t.text, t.is_final, Instant::now())
                     }
@@ -438,16 +536,15 @@ async fn stream_audio_in(
                     _ => {}
                 }
                 cap_buf.extend_from_slice(&b);
-                // Feed the rolling voiceprint buffer (same raw 16 kHz mono PCM).
-                // Drained per diarized utterance by the out task; capped so a
-                // stalled stream can't grow it without bound.
+                // Feed the voiceprint timeline (same raw 16 kHz mono PCM). Push the
+                // samples actually decoded (le_i16 drops a trailing odd byte, so a
+                // byte-derived clock would drift), then prune audio the out task has
+                // already consumed — bounded so a stalled diarized pass can't grow it.
                 if vp_on {
-                    let mut acc = pcm_accum.lock().unwrap();
-                    acc.extend(pcm::le_i16(&b));
-                    if acc.len() > MAX_VP_SAMPLES {
-                        let excess = acc.len() - MAX_VP_SAMPLES;
-                        acc.drain(..excess);
-                    }
+                    let samples = pcm::le_i16(&b);
+                    let mut tl = timeline.lock().unwrap();
+                    tl.push(&samples);
+                    tl.prune(VP_PRUNE_MARGIN_SAMPLES, VP_RETAIN_CEILING_SAMPLES);
                 }
                 if audio_tx.send(b).await.is_err() {
                     break;
@@ -808,5 +905,55 @@ mod tests {
         assert_eq!(u16le(34), 16); // bits per sample
         assert_eq!(&wav[36..40], b"data");
         assert_eq!(u32le(40), pcm.len() as u32); // data size
+    }
+
+    #[test]
+    fn timeline_slices_a_spans_own_samples() {
+        let mut tl = VpTimeline::default();
+        tl.push(&(0..100).collect::<Vec<i16>>());
+        // Absolute [10, 20) → exactly those samples.
+        assert_eq!(tl.slice(10, 20).unwrap(), (10..20).collect::<Vec<i16>>());
+        // End clamps to what's buffered.
+        assert_eq!(tl.slice(95, 999).unwrap(), (95..100).collect::<Vec<i16>>());
+    }
+
+    #[test]
+    fn timeline_maps_through_base_after_prune_and_refuses_dropped_audio() {
+        let mut tl = VpTimeline::default();
+        tl.push(&(0..100).collect::<Vec<i16>>());
+        tl.consumed_end = 50;
+        tl.prune(0, 1_000_000); // margin 0, huge ceiling → drop everything below consumed_end
+        assert_eq!(tl.base, 50);
+        // Absolute coordinates still map correctly through `base`.
+        assert_eq!(tl.slice(60, 70).unwrap(), (60..70).collect::<Vec<i16>>());
+        // Audio before `base` was pruned: refuse rather than substitute other audio.
+        assert!(tl.slice(10, 20).is_none());
+    }
+
+    #[test]
+    fn timeline_prune_caps_at_ceiling_even_when_unconsumed() {
+        let mut tl = VpTimeline::default();
+        tl.push(&vec![0i16; 1000]);
+        // consumed_end stays 0 (second pass stalled), ceiling 400 → keep last 400.
+        tl.prune(0, 400);
+        assert_eq!(tl.base, 600);
+        assert_eq!(tl.buf.len(), 400);
+    }
+
+    #[test]
+    fn timeline_slice_is_none_on_empty_or_inverted_range() {
+        let tl = VpTimeline::default();
+        assert!(tl.slice(0, 10).is_none()); // nothing buffered yet
+        let mut tl = VpTimeline::default();
+        tl.push(&vec![1i16; 10]);
+        assert!(tl.slice(5, 5).is_none()); // zero-width
+    }
+
+    #[test]
+    fn one_second_gate_threshold_is_16k_samples() {
+        // The out_task drops sliced spans shorter than this before voiceprinting.
+        assert_eq!(VP_MIN_SPAN_SAMPLES, 16_000);
+        let short: Vec<i16> = vec![0; 8_000]; // 0.5 s
+        assert!((short.len() as u64) < VP_MIN_SPAN_SAMPLES);
     }
 }

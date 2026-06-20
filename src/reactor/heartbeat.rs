@@ -402,10 +402,17 @@ async fn cluster_voices(
         return out;
     }
     for (i, e) in tail.iter().enumerate() {
-        let JournalEntry::SignalIn { channel: Channel::Audio, media: Some(m), ts, scene: sig_scene, .. } = e
+        let JournalEntry::SignalIn { channel: Channel::Audio, media: Some(m), ts, scene: sig_scene, body, .. } = e
         else {
             continue;
         };
+        // A diarized, multi-speaker clip ("说话人0：…") is not one voice; embedding
+        // the blend into a single sample would contaminate a cluster. Mirror the
+        // hear-time guard in `voice_note` and skip it — the labeled transcript
+        // already attributes the turns.
+        if body.starts_with("说话人") {
+            continue;
+        }
         let path = layout::channel_day_dir(data_dir, sig_scene, Channel::Audio, *ts).join(&m.file);
         let bytes = match tokio::fs::read(&path).await {
             Ok(b) => b,

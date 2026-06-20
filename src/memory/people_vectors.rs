@@ -301,6 +301,46 @@ pub async fn rename(data_dir: &Path, old: &str, new: &str) -> anyhow::Result<()>
     Ok(())
 }
 
+/// Delete every person's **voice** gallery — the `voice.f32` samples and the
+/// `voice/` preview dir — across all `people/<subject>/`, leaving `face.f32`,
+/// `facet.md`, and the (possibly named) subject dirs intact. One-shot maintenance
+/// to clear voiceprint clusters contaminated before per-speaker span-slicing
+/// landed; afterwards voice re-clusters cleanly from fresh observations. Returns
+/// how many subjects had a voice gallery removed. A missing people dir is not an
+/// error (nothing to purge).
+pub async fn purge_voice(data_dir: &Path) -> anyhow::Result<usize> {
+    let dir = people_dir(data_dir);
+    let mut rd = match tokio::fs::read_dir(&dir).await {
+        Ok(rd) => rd,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(0),
+        Err(e) => return Err(e.into()),
+    };
+    let voice_file = gallery_file(Modality::Voice);
+    let voice_tag = Modality::Voice.tag();
+    let mut removed = 0;
+    while let Some(ent) = rd.next_entry().await? {
+        if !ent.file_type().await?.is_dir() {
+            continue;
+        }
+        let subj = ent.path();
+        let mut hit = false;
+        match tokio::fs::remove_file(subj.join(&voice_file)).await {
+            Ok(()) => hit = true,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => return Err(e.into()),
+        }
+        match tokio::fs::remove_dir_all(subj.join(voice_tag)).await {
+            Ok(()) => hit = true,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => return Err(e.into()),
+        }
+        if hit {
+            removed += 1;
+        }
+    }
+    Ok(removed)
+}
+
 
 /// Rank known subjects by how close `query` is to their nearest `modality`
 /// sample (the max cosine over that subject's samples), best first, capped at
@@ -588,5 +628,36 @@ mod tests {
         // Both clusters' previews now live under the surviving subject.
         assert_eq!(preview_count(dir.path(), "赵力", Modality::Voice).await, 2);
         assert!(!layout::facets_dir(dir.path()).join("people").join("dupe1234").exists());
+    }
+
+    #[tokio::test]
+    async fn purge_voice_removes_voice_keeps_face_and_prose() {
+        let dir = td();
+        enroll(dir.path(), "赵力", Modality::Face, &[1.0, 0.0, 0.0, 0.0]).await.unwrap();
+        enroll(dir.path(), "赵力", Modality::Voice, &[1.0, 0.0, 0.0, 0.0]).await.unwrap();
+        save_preview(dir.path(), "赵力", Modality::Voice, &[7u8; 8], "wav").await.unwrap();
+        save_preview(dir.path(), "赵力", Modality::Face, &[7u8; 8], "jpg").await.unwrap();
+        facets::update_facet(dir.path(), "people", "赵力", "prose").await.unwrap();
+
+        assert_eq!(purge_voice(dir.path()).await.unwrap(), 1);
+
+        let subj = layout::facets_dir(dir.path()).join("people").join("赵力");
+        assert!(!subj.join("voice.f32").exists(), "voice gallery removed");
+        assert!(!subj.join("voice").exists(), "voice previews removed");
+        assert!(subj.join("face.f32").exists(), "face gallery kept");
+        assert!(subj.join("face").exists(), "face previews kept");
+        assert!(subj.join("facet.md").exists(), "prose kept");
+        // Voice no longer matches; the named person still recognizes by face.
+        assert!(nearest(dir.path(), Modality::Voice, &[1.0, 0.0, 0.0, 0.0], 1).await.unwrap().is_empty());
+        assert_eq!(
+            nearest(dir.path(), Modality::Face, &[1.0, 0.0, 0.0, 0.0], 1).await.unwrap()[0].subject,
+            "赵力"
+        );
+    }
+
+    #[tokio::test]
+    async fn purge_voice_on_empty_store_is_noop() {
+        let dir = td();
+        assert_eq!(purge_voice(dir.path()).await.unwrap(), 0);
     }
 }

@@ -14,6 +14,12 @@ struct Cli {
     /// Root for memory (`memory/raw/…`), the soul, and runtime state.
     #[arg(long, default_value = "./data")]
     data_dir: PathBuf,
+
+    /// Delete every person's voice gallery (voice.f32 + voice/ previews) and exit.
+    /// One-shot maintenance to clear voiceprint clusters contaminated before the
+    /// per-speaker span-slicing fix; face data, names, and prose facets are kept.
+    #[arg(long)]
+    purge_voice_galleries: bool,
 }
 
 /// Version line including the pinned runtime component versions.
@@ -36,6 +42,12 @@ async fn main() -> anyhow::Result<()> {
         .with_env_filter(EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info")))
         .with_target(false)
         .init();
+
+    if cli.purge_voice_galleries {
+        let removed = hi_agent::memory::people_vectors::purge_voice(&cli.data_dir).await?;
+        tracing::info!(removed, data_dir = %cli.data_dir.display(), "purged voice galleries");
+        return Ok(());
+    }
 
     let agent = hi_agent::config::AgentConfig::load()?;
     let config = hi_agent::Config {
