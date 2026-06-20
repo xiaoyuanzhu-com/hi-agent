@@ -54,15 +54,18 @@ pub struct Handoff {
 // Core: receive one handed file
 // -----------------------------------------------------------------------------
 
-/// Store one handed file and deliver it as an inbound signal that wakes the
-/// reactor. The `body` is the text surface the mind reacts to (it never sees the
-/// bytes); the blob path rides the journal entry's `media`.
-async fn receive_file(
+/// Store one handed file under the `file` channel and deliver it as an inbound
+/// signal that wakes the reactor. `body` is the text surface the mind reacts to
+/// (it never sees the bytes); the blob path rides the journal entry's `media`.
+/// The framing in `body` is the caller's — a neutral handoff ([`receive_file`])
+/// or the "come and see this" gesture ([`receive_screenshot`]).
+async fn ingest_file(
     state: &AppState,
     scene: &Scene,
     name: &str,
     mime: &str,
     bytes: &Bytes,
+    body: String,
 ) -> Result<(), String> {
     let ts = Utc::now();
     let ext = ext_for(name, mime);
@@ -70,7 +73,6 @@ async fn receive_file(
         .await
         .map_err(|e| format!("store file: {e}"))?;
 
-    let body = format!("The user handed you a file: {name} ({mime}, {}).", human_size(bytes.len()));
     crate::channel_log::inbound(Channel::File, scene, &body);
 
     let entry = JournalEntry::SignalIn {
@@ -95,6 +97,37 @@ async fn receive_file(
         .await
         .map_err(|_| "inbound channel closed".to_string())?;
     Ok(())
+}
+
+/// Receive one handed file (drag-drop / picker / phone handoff) — a neutral
+/// document handoff, framed as such.
+async fn receive_file(
+    state: &AppState,
+    scene: &Scene,
+    name: &str,
+    mime: &str,
+    bytes: &Bytes,
+) -> Result<(), String> {
+    let body = format!("The user handed you a file: {name} ({mime}, {}).", human_size(bytes.len()));
+    ingest_file(state, scene, name, mime, bytes, body).await
+}
+
+/// Receive a screenshot pushed with the "come and see this" gesture (double-tap
+/// Command; see [`crate::gesture`]). Same `file` channel, same wake — only the
+/// framing differs: this is the user's current screen / working context, handed
+/// over for the agent to look at and help with, not a neutral document.
+pub(crate) async fn receive_screenshot(
+    state: &AppState,
+    scene: &Scene,
+    bytes: &Bytes,
+) -> Result<(), String> {
+    let name = format!("screen-{}.png", Utc::now().format("%Y%m%d-%H%M%S"));
+    let body = format!(
+        "The user double-tapped Command to show you their screen — \u{201c}come and see this.\u{201d} \
+         Attached is a screenshot of what they're looking at right now ({}).",
+        human_size(bytes.len())
+    );
+    ingest_file(state, scene, &name, "image/png", bytes, body).await
 }
 
 /// Drain a multipart body, storing every file part. Returns how many landed, or

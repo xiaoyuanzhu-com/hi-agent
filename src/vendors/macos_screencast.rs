@@ -102,6 +102,28 @@ fn grab_args(window_id: u32, path: &str) -> Vec<String> {
     ]
 }
 
+/// Grab the whole screen as PNG. With no `-l<id>`, `screencapture` captures the
+/// main display fullscreen; `-x` silences the shutter sound.
+pub async fn grab_screen_png() -> anyhow::Result<Bytes> {
+    let path = std::env::temp_dir().join(format!("hi-agent-screen-{}.png", uuid::Uuid::now_v7()));
+    let path_str = path.to_string_lossy().into_owned();
+    let status = Command::new("/usr/sbin/screencapture")
+        .args(grab_screen_args(&path_str))
+        .status()
+        .await
+        .context("spawning screencapture")?;
+    anyhow::ensure!(status.success(), "screencapture exited {status}");
+    let bytes = tokio::fs::read(&path).await.context("reading screencapture output")?;
+    let _ = tokio::fs::remove_file(&path).await;
+    Ok(Bytes::from(bytes))
+}
+
+/// The `screencapture` argv for a whole-screen PNG grab — like [`grab_args`] but
+/// with no window target. Pure so the flags are unit-testable without a GUI.
+fn grab_screen_args(path: &str) -> Vec<String> {
+    vec!["-x".into(), "-t".into(), "png".into(), path.into()]
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -112,5 +134,13 @@ mod tests {
         assert!(args.contains(&"-l42".to_string()), "window id glued to -l");
         assert!(args.contains(&"png".to_string()));
         assert_eq!(args.last().unwrap(), "/tmp/w.png");
+    }
+
+    #[test]
+    fn grab_screen_args_have_no_window_target() {
+        let args = grab_screen_args("/tmp/s.png");
+        assert!(!args.iter().any(|a| a.starts_with("-l")), "whole-screen grab has no -l");
+        assert!(args.contains(&"png".to_string()));
+        assert_eq!(args.last().unwrap(), "/tmp/s.png");
     }
 }

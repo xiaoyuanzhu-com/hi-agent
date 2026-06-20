@@ -19,15 +19,16 @@
 //! auto-provisions on first run (see [`crate::models`]), so they have no provider
 //! toggle and nothing for the operator to set.
 //!
-//! [`desktop_context`], [`input`], and [`screencast`] are the exceptions to the
-//! env-config pattern: their vendor is the operating system, selected at compile
-//! time, so they have no `init_from_env` and do not appear in the composition
-//! root.
+//! [`desktop_context`], [`hotkey`], [`input`], and [`screencast`] are the
+//! exceptions to the env-config pattern: their vendor is the operating system,
+//! selected at compile time, so they have no `init_from_env` and do not appear in
+//! the composition root.
 
 use crate::models;
 
 pub mod desktop_context;
 pub mod face;
+pub mod hotkey;
 pub mod image_gen;
 pub mod input;
 pub mod screencast;

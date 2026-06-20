@@ -462,7 +462,7 @@ pub fn build(
         // images, and build-agent artifacts. Served here, not in the appearance
         // router, because that router is embed-only and stateless.
         .route("/views/{*path}", get(generated::views_file))
-        .with_state(state)
+        .with_state(state.clone())
         .merge(crate::appearance::router())
         .fallback(not_found)
         .layer(TraceLayer::new_for_http());
@@ -472,6 +472,7 @@ pub fn build(
         warm_rx,
         text_bus,
         out_tx,
+        state,
     };
 
     (router, seams)
@@ -482,12 +483,15 @@ pub fn build(
 /// GET raises; `out_tx` is the reactor's single transport-free outbound seam (the
 /// binder spawned in `build` carries it to the wire). The `text_bus` is exposed
 /// only so integration tests can drive utterances directly without standing up a
-/// reactor.
+/// reactor. `state` is the shared `AppState` (the same `Arc` the router holds), so
+/// a non-HTTP producer — the come-and-see-this gesture — can inject inbound
+/// signals through the same path as a channel POST.
 pub struct ServerSeams {
     pub inbound_rx: mpsc::Receiver<Signal>,
     pub warm_rx: mpsc::Receiver<Scene>,
     pub text_bus: TextBus,
     pub out_tx: mpsc::Sender<OutboundSignal>,
+    pub state: Arc<AppState>,
 }
 
 async fn not_found() -> (StatusCode, &'static str) {

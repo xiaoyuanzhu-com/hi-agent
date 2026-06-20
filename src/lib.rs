@@ -12,6 +12,7 @@ pub mod appearance;
 pub mod capabilities;
 pub mod channel_log;
 pub mod config;
+pub mod gesture;
 pub mod llm_proxy;
 pub mod mcp;
 pub mod memory;
@@ -281,6 +282,12 @@ pub async fn run(config: Config) -> anyhow::Result<()> {
         views_dir,
     );
     tracing::info!("reactor started");
+
+    // Arm the "come and see this" gesture: a double-tap of Command hands the agent
+    // a screenshot of the current screen as a file (macOS only, best-effort — needs
+    // the Accessibility + Screen Recording grants, else it stays inert). One
+    // desktop, one person showing one agent, so it lands in a single fixed scene.
+    gesture::install(seams.state, crate::types::Scene("desktop".to_string()));
 
     let addr = ("0.0.0.0", config.port);
     let listener = TcpListener::bind(addr).await?;
