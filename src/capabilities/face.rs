@@ -10,18 +10,20 @@
 //! It is bundled: a single capability whose one vendor owns the whole
 //! detect→align→embed pipeline, so there is no cross-capability reference (the
 //! same way `vision` is one capability). Like the others it is a module of free
-//! functions over a process-global, once-initialized config: [`init_from_env`]
-//! loads the local ONNX pair when its models are present, [`available`] reports
+//! functions over a process-global, once-initialized config: [`init`] loads the
+//! local ONNX pair (auto-provisioned by [`crate::models`]), [`available`] reports
 //! whether it is loaded, and [`detect_and_embed`] dispatches. There is only one
 //! implementation and no meaningful choice to expose, so it is built-in (on
-//! whenever the models resolve) rather than a provider toggle. The vendor is a
-//! local ONNX pair (InsightFace SCRFD + ArcFace, the `buffalo_l` models Immich
-//! uses), so inference is CPU-bound and runs on a blocking thread.
+//! whenever the models provision) rather than a provider toggle — there is
+//! nothing to configure. The vendor is a local ONNX pair (InsightFace SCRFD +
+//! ArcFace, the `buffalo_l` models Immich uses), so inference is CPU-bound and
+//! runs on a blocking thread.
 //!
 //! Callers: posted stills and camera-stream keyframes are recognized in
 //! [`crate::server::vision`], and reflection clusters faces into the people store
 //! in [`crate::reactor::heartbeat`].
 
+use std::path::PathBuf;
 use std::sync::OnceLock;
 
 use anyhow::Context;
@@ -44,29 +46,26 @@ pub struct DetectedFace {
 }
 
 enum Backend {
-    Disabled,
     Insightface(insightface_face::Config),
 }
 
 static BACKEND: OnceLock<Backend> = OnceLock::new();
 
-/// Turn the face capability on when its models are present. There is one
-/// implementation (the InsightFace `buffalo_l` ONNX pair) and no meaningful
-/// choice to expose, so this is built-in rather than a provider toggle:
-/// configured (`SCRFD_MODEL` + `ARCFACE_MODEL` set) → load it; unset → quietly
-/// disabled. A set-but-unloadable model is a real misconfiguration and fails
-/// fast. Idempotent — first init wins.
-pub fn init_from_env() -> anyhow::Result<()> {
-    let backend = if insightface_face::configured() {
-        Backend::Insightface(insightface_face::Config::from_env()?)
-    } else {
-        Backend::Disabled
-    };
-    let _ = BACKEND.set(backend);
+/// Turn the face capability on by loading the auto-provisioned InsightFace ONNX
+/// pair at `scrfd_path` (detector) and `arcface_path` (recognizer). The sessions
+/// are built on a blocking thread (parsing the models is synchronous CPU/IO).
+/// Errors if either can't be loaded (a real pin/corruption bug — the caller
+/// leaves the capability disabled). Idempotent — first init wins.
+pub async fn init(scrfd_path: PathBuf, arcface_path: PathBuf) -> anyhow::Result<()> {
+    let cfg =
+        tokio::task::spawn_blocking(move || insightface_face::Config::load(&scrfd_path, &arcface_path))
+            .await
+            .context("InsightFace load task panicked")??;
+    let _ = BACKEND.set(Backend::Insightface(cfg));
     Ok(())
 }
 
-/// Whether a provider is configured.
+/// Whether the capability is loaded and ready.
 pub fn available() -> bool {
     matches!(BACKEND.get(), Some(Backend::Insightface(_)))
 }
@@ -78,7 +77,7 @@ pub fn available() -> bool {
 pub async fn detect_and_embed(image: Bytes) -> anyhow::Result<Vec<DetectedFace>> {
     tokio::task::spawn_blocking(move || match BACKEND.get() {
         Some(Backend::Insightface(cfg)) => insightface_face::detect_and_embed(cfg, &image),
-        _ => anyhow::bail!("face not configured (set SCRFD_MODEL + ARCFACE_MODEL)"),
+        None => anyhow::bail!("face capability not loaded"),
     })
     .await
     .context("face detect_and_embed task panicked")?

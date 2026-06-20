@@ -8,17 +8,19 @@
 //! identity belief live downstream; this capability only produces the vector.
 //!
 //! Like the other capabilities it is a module of free functions over a
-//! process-global, once-initialized config: [`init_from_env`] loads the local
-//! CAM++ ONNX when its model is present, [`available`] reports whether it is
+//! process-global, once-initialized config: [`init`] loads the local CAM++ ONNX
+//! (auto-provisioned by [`crate::models`]), [`available`] reports whether it is
 //! loaded, and [`embed`] dispatches to it. There is only one implementation and
-//! no meaningful choice to expose, so it is built-in (on whenever `CAMPLUS_MODEL`
-//! resolves) rather than a provider toggle. The vendor is a local ONNX model, so
-//! inference is CPU-bound and runs on a blocking thread.
+//! no meaningful choice to expose, so it is built-in (on whenever the model
+//! provisions) rather than a provider toggle — there is nothing to configure.
+//! The vendor is a local ONNX model, so inference is CPU-bound and runs on a
+//! blocking thread.
 //!
 //! Callers: the audio channel voiceprints posted clips and live-mic speaker
 //! turns ([`crate::server::audio`]), and reflection clusters clip voices into the
 //! people store ([`crate::reactor::heartbeat`]).
 
+use std::path::PathBuf;
 use std::sync::OnceLock;
 
 use anyhow::Context;
@@ -26,28 +28,25 @@ use anyhow::Context;
 use crate::vendors::campplus;
 
 enum Backend {
-    Disabled,
     CamPlusPlus(campplus::Config),
 }
 
 static BACKEND: OnceLock<Backend> = OnceLock::new();
 
-/// Turn the voiceprint capability on when its model is present. There is one
-/// implementation (CAM++ ONNX) and no meaningful choice to expose, so this is
-/// built-in rather than a provider toggle: configured (`CAMPLUS_MODEL` set) →
-/// load it; unset → quietly disabled. A set-but-unloadable model is a real
-/// misconfiguration and fails fast. Idempotent — the first init wins.
-pub fn init_from_env() -> anyhow::Result<()> {
-    let backend = if campplus::configured() {
-        Backend::CamPlusPlus(campplus::Config::from_env()?)
-    } else {
-        Backend::Disabled
-    };
-    let _ = BACKEND.set(backend);
+/// Turn the voiceprint capability on by loading the auto-provisioned CAM++ ONNX
+/// at `model_path`. The ONNX session is built on a blocking thread (parsing a
+/// model is synchronous CPU/IO). Errors if the model can't be loaded (a real
+/// pin/corruption bug — the caller leaves the capability disabled). Idempotent —
+/// the first init wins.
+pub async fn init(model_path: PathBuf) -> anyhow::Result<()> {
+    let cfg = tokio::task::spawn_blocking(move || campplus::Config::load(&model_path))
+        .await
+        .context("CAM++ load task panicked")??;
+    let _ = BACKEND.set(Backend::CamPlusPlus(cfg));
     Ok(())
 }
 
-/// Whether a provider is configured.
+/// Whether the capability is loaded and ready.
 pub fn available() -> bool {
     matches!(BACKEND.get(), Some(Backend::CamPlusPlus(_)))
 }
@@ -59,7 +58,7 @@ pub fn available() -> bool {
 pub async fn embed(pcm_16k_mono: Vec<i16>) -> anyhow::Result<Vec<f32>> {
     tokio::task::spawn_blocking(move || match BACKEND.get() {
         Some(Backend::CamPlusPlus(cfg)) => campplus::embed(cfg, &pcm_16k_mono),
-        _ => anyhow::bail!("voiceprint not configured (set CAMPLUS_MODEL)"),
+        None => anyhow::bail!("voiceprint capability not loaded"),
     })
     .await
     .context("voiceprint embed task panicked")?

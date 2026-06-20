@@ -16,14 +16,12 @@
 //! dimension (192 for the zh-cn model) is whatever the loaded model emits — we
 //! don't hardcode it.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 
 use anyhow::Context;
 use ort::session::Session;
 use ort::value::Tensor;
-
-const ENV_MODEL: &str = "CAMPLUS_MODEL";
 
 pub struct Config {
     session: Mutex<Session>,
@@ -32,29 +30,16 @@ pub struct Config {
     model_path: PathBuf,
 }
 
-/// Whether the voiceprint model is configured — `CAMPLUS_MODEL` points
-/// somewhere. Voiceprint is built-in (one implementation, no provider to pick);
-/// it simply turns on when the model is present. Used to decide whether to load
-/// at startup.
-pub fn configured() -> bool {
-    std::env::var(ENV_MODEL).map(|s| !s.trim().is_empty()).unwrap_or(false)
-}
-
 impl Config {
-    /// Load the CAM++ ONNX named by `CAMPLUS_MODEL`. Fails fast at startup if the
-    /// var is unset or the file can't be opened as a model — a misconfigured
-    /// model path should not surface as an error at first embed.
-    pub fn from_env() -> anyhow::Result<Self> {
-        let model_path: PathBuf = std::env::var(ENV_MODEL)
-            .map_err(|_| {
-                anyhow::anyhow!("{ENV_MODEL} is required to enable voiceprint recognition")
-            })?
-            .into();
+    /// Load the CAM++ ONNX at `model_path` — the model auto-provisioned by
+    /// [`crate::models`]. Fails if the file can't be opened as a model (a real
+    /// pin/corruption bug), so it surfaces at startup, not at first embed.
+    pub fn load(model_path: &Path) -> anyhow::Result<Self> {
         let session = Session::builder()
             .context("creating ORT session builder")?
-            .commit_from_file(&model_path)
+            .commit_from_file(model_path)
             .with_context(|| format!("loading CAM++ model from {}", model_path.display()))?;
-        Ok(Self { session: Mutex::new(session), model_path })
+        Ok(Self { session: Mutex::new(session), model_path: model_path.to_path_buf() })
     }
 }
 

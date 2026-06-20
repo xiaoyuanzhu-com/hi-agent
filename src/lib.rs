@@ -15,6 +15,7 @@ pub mod config;
 pub mod llm_proxy;
 pub mod mcp;
 pub mod memory;
+pub mod models;
 pub mod observatory;
 pub mod pcm;
 pub mod presence;
@@ -127,6 +128,10 @@ pub async fn run(config: Config) -> anyhow::Result<()> {
     // Resolve all capabilities from the environment. Unconfigured capabilities
     // are fine; gates affect /audio (STT) and the speak path (TTS) only.
     capabilities::init_from_env()?;
+    // Voice/face recognition need no env config — provision their pinned local
+    // ONNX models on first run (cached thereafter) and load them. Best-effort:
+    // a failed provision leaves the capability disabled, never blocks startup.
+    capabilities::init_recognition().await;
     tracing::info!(
         stt = capabilities::stt::available(),
         tts = capabilities::tts::available(),

@@ -20,7 +20,7 @@
 //! inference is synchronous CPU work the capability layer runs on a blocking
 //! thread.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 
 use anyhow::Context;
@@ -29,9 +29,6 @@ use ort::session::Session;
 use ort::value::Tensor;
 
 use crate::capabilities::face::DetectedFace;
-
-const ENV_SCRFD: &str = "SCRFD_MODEL";
-const ENV_ARCFACE: &str = "ARCFACE_MODEL";
 
 /// SCRFD square input edge. InsightFace's standard detector input.
 const DET_SIZE: usize = 640;
@@ -64,40 +61,24 @@ pub struct Config {
     arcface_path: PathBuf,
 }
 
-/// Whether the face models are configured — both `SCRFD_MODEL` and
-/// `ARCFACE_MODEL` point somewhere. Face recognition is built-in (one
-/// implementation, no provider to pick); it simply turns on when the models are
-/// present. Used to decide whether to load at startup.
-pub fn configured() -> bool {
-    [ENV_SCRFD, ENV_ARCFACE]
-        .iter()
-        .all(|v| std::env::var(v).map(|s| !s.trim().is_empty()).unwrap_or(false))
-}
-
 impl Config {
-    /// Load both ONNX models named by `SCRFD_MODEL` (detector) and
-    /// `ARCFACE_MODEL` (recognizer). Fails fast if either var is unset or the
-    /// file can't be opened as a model.
-    pub fn from_env() -> anyhow::Result<Self> {
-        let scrfd_path: PathBuf = std::env::var(ENV_SCRFD)
-            .map_err(|_| anyhow::anyhow!("{ENV_SCRFD} is required to enable face recognition"))?
-            .into();
-        let arcface_path: PathBuf = std::env::var(ENV_ARCFACE)
-            .map_err(|_| anyhow::anyhow!("{ENV_ARCFACE} is required to enable face recognition"))?
-            .into();
+    /// Load both ONNX models auto-provisioned by [`crate::models`]: `scrfd_path`
+    /// (detector) and `arcface_path` (recognizer). Fails if either file can't be
+    /// opened as a model (a real pin/corruption bug), so it surfaces at startup.
+    pub fn load(scrfd_path: &Path, arcface_path: &Path) -> anyhow::Result<Self> {
         let scrfd = Session::builder()
             .context("creating ORT session builder")?
-            .commit_from_file(&scrfd_path)
+            .commit_from_file(scrfd_path)
             .with_context(|| format!("loading SCRFD model from {}", scrfd_path.display()))?;
         let arcface = Session::builder()
             .context("creating ORT session builder")?
-            .commit_from_file(&arcface_path)
+            .commit_from_file(arcface_path)
             .with_context(|| format!("loading ArcFace recognizer from {}", arcface_path.display()))?;
         Ok(Self {
             scrfd: Mutex::new(scrfd),
             arcface: Mutex::new(arcface),
-            scrfd_path,
-            arcface_path,
+            scrfd_path: scrfd_path.to_path_buf(),
+            arcface_path: arcface_path.to_path_buf(),
         })
     }
 }

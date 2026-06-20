@@ -64,6 +64,12 @@ image = "0.25"
 knf-rs = "0.3.2"
 nalgebra = "0.33"
 
+# Integrity check for the auto-provisioned ONNX models (see `crate::models`):
+# the recognition models are fetched on first run from third-party mirrors, so
+# each download is verified against a pinned SHA-256 before it is trusted and
+# its content-addressed cache file is published.
+sha2 = "0.10"
+
 # macOS effector capabilities (input actuation + window capture). `core-graphics`
 # gives CGEvent (synthesize mouse/keyboard input) and CGWindowList (enumerate
 # on-screen windows); `core-foundation` reads the CFDictionary window records.
