@@ -58,3 +58,4 @@ What "done" looks like, and how the user knows it worked.
 - [13 · 配一个外部能力(API + 凭证)](13-equip-a-capability.md) — 能力分流:认识进记忆/技能,凭证逐字进 drive 笔记本,密钥不进脑子。
 - [14 · 你对 YOLO 的了解随用而长、被实践修正](14-knowledge-grows.md) — competence 读自证据图(不存等级)+ provenance + 先验被 lived 超越;验证知识模型的核心 journey。
 - [15 · 打断:我一开口,它就让路](15-talk-over-the-agent.md) — 语音对话的底座:嘴串行、字跟嘴走不抢跑;我插话它当场停声并清掉没说出口的尾巴,下一轮带"说到哪 / 我说了啥"重新组织,不复读。
+- [16 · 先认得脸/声音,后来才知道名字,然后处处用得上](16-recognize-people.md) — 身份=生物特征簇:不报名字也能先把人记成"同一个人"(mint 一个 id),名字从对话里学到后把 id 改名成名字;认人是软证据、容忍模糊、可纠错。脸已端到端实测(buffalo_l),声音待建。
