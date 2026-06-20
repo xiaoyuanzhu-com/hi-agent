@@ -8,6 +8,13 @@
 // uploading client reads its own words there like every other client; display
 // and barge-in are driven from that stream, not from this socket.
 //
+// The socket self-heals: an unexpected close (server restart, network blip, or
+// the upstream STT session ending) reopens it while the mic is still meant to be
+// on, so the session never goes silently deaf. The audio graph is independent of
+// the socket, so a reconnect swaps only the WebSocket — the worklet keeps
+// producing frames, which backlog briefly and resume on the fresh socket. Only
+// `stop()` (mic toggled off / unmount) closes it for good.
+//
 // This replaces the old MicCapture, whose homegrown RMS VAD segmented utterances
 // client-side. Moving segmentation to the upstream's ML VAD is both simpler and
 // more reliable; the only thing we do here is resample + frame the audio.
@@ -23,9 +30,15 @@ import workletUrl from "./pcmWorklet.js?url";
 export interface AudioStreamerOptions {
   /** Scene identity; rides in the WS query string (browsers can't set headers). */
   scene: string;
-  /** Fired when the socket closes (network drop or stop()). */
-  onClose?: () => void;
 }
+
+// Reconnect backoff: first retry is quick, then doubles to a ceiling so a server
+// that's down (e.g. a dev rebuild) isn't hammered. Reset once a socket opens.
+const RECONNECT_BASE_MS = 500;
+const RECONNECT_MAX_MS = 5000;
+// Cap the pre-open backlog so a prolonged outage can't grow it without bound —
+// losing audio across an outage is fine; the point is to recover, not buffer.
+const MAX_BACKLOG_FRAMES = 64;
 
 // Tracks which contexts already have the worklet module so we never call
 // addModule twice for the same one (a redundant network round-trip).
@@ -40,11 +53,15 @@ async function ensureWorklet(ctx: BaseAudioContext): Promise<void> {
 export class AudioStreamer {
   private node: AudioWorkletNode;
   private sink: GainNode;
-  private ws: WebSocket;
+  private ws!: WebSocket;
+  private readonly url: string;
 
-  // Frames captured before the socket finished opening.
+  // Frames captured before the (re)opening socket finished connecting.
   private backlog: ArrayBuffer[] = [];
   private stopped = false;
+  // Consecutive failed (re)connects; drives the backoff, reset on open.
+  private retry = 0;
+  private reconnectTimer: ReturnType<typeof setTimeout> | null = null;
 
   /**
    * Start streaming `source`'s audio to the backend. Async because the worklet
@@ -61,16 +78,8 @@ export class AudioStreamer {
 
   private constructor(ctx: AudioContext, source: AudioNode, opts: AudioStreamerOptions) {
     const proto = location.protocol === "https:" ? "wss" : "ws";
-    const url = `${proto}://${location.host}/api/in/audio/stream?scene=${encodeURIComponent(opts.scene)}`;
-    this.ws = new WebSocket(url);
-    this.ws.binaryType = "arraybuffer";
-    this.ws.onopen = () => {
-      for (const buf of this.backlog) this.ws.send(buf);
-      this.backlog = [];
-    };
-    // Upload-only: the server never sends on this socket (recognized speech rides
-    // the observe stream instead), so there is no onmessage handler.
-    this.ws.onclose = () => opts.onClose?.();
+    this.url = `${proto}://${location.host}/api/in/audio/stream?scene=${encodeURIComponent(opts.scene)}`;
+    this.open();
 
     this.node = new AudioWorkletNode(ctx, "pcm-stream", {
       numberOfInputs: 1,
@@ -91,14 +100,51 @@ export class AudioStreamer {
     this.sink.connect(ctx.destination);
   }
 
+  // (Re)open the upload socket. Frames produced before it's OPEN backlog and
+  // flush on connect; an unexpected close schedules a reconnect.
+  private open(): void {
+    const ws = new WebSocket(this.url);
+    ws.binaryType = "arraybuffer";
+    ws.onopen = () => {
+      this.retry = 0;
+      for (const buf of this.backlog) ws.send(buf);
+      this.backlog = [];
+    };
+    // Upload-only: the server never sends on this socket (recognized speech rides
+    // the observe stream instead), so there is no onmessage handler. A close we
+    // didn't ask for means we lost the STT session — reopen so a server restart
+    // or network blip self-heals instead of leaving the mic silently deaf.
+    ws.onclose = () => {
+      if (!this.stopped) this.scheduleReconnect();
+    };
+    this.ws = ws;
+  }
+
+  private scheduleReconnect(): void {
+    if (this.stopped || this.reconnectTimer !== null) return;
+    const delay = Math.min(RECONNECT_BASE_MS * 2 ** this.retry, RECONNECT_MAX_MS);
+    this.retry++;
+    this.reconnectTimer = setTimeout(() => {
+      this.reconnectTimer = null;
+      if (!this.stopped) this.open();
+    }, delay);
+  }
+
   private send(buf: ArrayBuffer): void {
     if (this.ws.readyState === WebSocket.OPEN) this.ws.send(buf);
-    else if (this.ws.readyState === WebSocket.CONNECTING) this.backlog.push(buf);
-    // closing/closed → drop
+    else if (this.ws.readyState === WebSocket.CONNECTING) {
+      this.backlog.push(buf);
+      if (this.backlog.length > MAX_BACKLOG_FRAMES) this.backlog.shift();
+    }
+    // closing/closed → drop (covers the gap between a drop and the reconnect)
   }
 
   stop(): void {
     this.stopped = true;
+    if (this.reconnectTimer !== null) {
+      clearTimeout(this.reconnectTimer);
+      this.reconnectTimer = null;
+    }
     this.node.port.onmessage = null;
     try {
       this.node.disconnect();

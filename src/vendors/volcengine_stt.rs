@@ -83,11 +83,6 @@ const DEFAULT_MODEL: &str = "bigmodel";
 const PCM_CHUNK_BYTES: usize = 3200;
 // Generous overall budget. Real recognitions complete in seconds.
 const TOTAL_TIMEOUT: Duration = Duration::from_secs(30);
-// Streaming is a continuous, always-on session for the whole mic-open period —
-// many utterances, bounded only by how long the human keeps the channel open.
-// The ceiling is generous; the session ends when the client closes the audio
-// input, not on a timer.
-const STREAM_TIMEOUT: Duration = Duration::from_secs(60 * 30);
 // Trailing silence (ms) after which the upstream's server-side VAD finalizes an
 // utterance (`definite=true`) mid-stream. Empirically this is the lever that
 // makes continuous segmentation work; without it the upstream defers all
@@ -146,16 +141,6 @@ pub async fn transcribe(cfg: &Config, audio: Bytes, mime: &str) -> anyhow::Resul
     timeout(TOTAL_TIMEOUT, transcribe_inner(cfg, audio, mime))
         .await
         .map_err(|_| anyhow::anyhow!("volcengine STT timed out after {TOTAL_TIMEOUT:?}"))?
-}
-
-pub async fn transcribe_streaming(
-    cfg: &Config,
-    audio_rx: mpsc::Receiver<Bytes>,
-    out: mpsc::Sender<Transcript>,
-) -> anyhow::Result<String> {
-    timeout(STREAM_TIMEOUT, transcribe_streaming_inner(cfg, audio_rx, out))
-        .await
-        .map_err(|_| anyhow::anyhow!("volcengine STT stream timed out after {STREAM_TIMEOUT:?}"))?
 }
 
 /// Open the upstream WS with the custom auth headers shared by both the
@@ -354,8 +339,10 @@ async fn transcribe_inner(cfg: &Config, audio: Bytes, mime: &str) -> anyhow::Res
 /// while this task reads incremental results. `audio_rx` carries raw 16 kHz
 /// mono 16-bit PCM (no WAV header — the caller already stripped/never added
 /// one). Each non-empty result is emitted on `out`; the polished final is
-/// returned.
-async fn transcribe_streaming_inner(
+/// returned. Always-on for the whole mic-open period: there is no time limit —
+/// the session ends when the caller drops `audio_rx` (the client closed the
+/// audio input) or the upstream errors.
+pub async fn transcribe_streaming(
     cfg: &Config,
     mut audio_rx: mpsc::Receiver<Bytes>,
     out: mpsc::Sender<Transcript>,
