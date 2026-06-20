@@ -15,6 +15,7 @@ pub mod llm_proxy;
 pub mod mcp;
 pub mod memory;
 pub mod observatory;
+pub mod pcm;
 pub mod presence;
 pub mod runtime;
 pub mod reactor;

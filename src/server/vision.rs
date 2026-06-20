@@ -2,10 +2,11 @@
 //!
 //! "Vision is video." The camera streams continuously — the client does not
 //! pre-sample frames — so the *backend* is the control point for how much it
-//! actually looks. Today nothing decodes or samples the stream (the agent is
-//! text-only); the bytes simply flow and are observable, the same way the audio
-//! input channel carries raw audio. When a perception path lands, it subscribes
-//! to `video_in` and applies its own sample rate.
+//! actually looks. Each persisted minute-file is captioned, and when the face
+//! capability is configured one keyframe is decoded out of it (via `ffmpeg`) and
+//! run through face recognition, so the camera recognizes people the same way a
+//! posted still does. The live `video_in` broadcast itself is not yet
+//! frame-sampled in real time — perception works off the minute grid.
 //!
 //! Stream (`WS /api/in/vision/stream`): the client runs a `MediaRecorder` and
 //! ships encoded chunks as binary frames for the whole time the camera is open;
@@ -43,6 +44,7 @@ use uuid::Uuid;
 
 use crate::capabilities::face;
 use crate::capabilities::vision::{self as vision_cap, VisualMedia};
+use crate::vendors::ffmpeg_frame;
 use crate::memory::layout::MediaSlot;
 use crate::memory::media;
 use crate::memory::people_vectors::{self, Modality};
@@ -94,10 +96,36 @@ pub async fn post_vision(
     };
     // The raw image bytes ride to perception twice: once wrapped for captioning,
     // once kept raw for face recognition (a still — video frame-sampling is later).
-    let recognise = body.clone();
+    let recognise = FaceSource::Image(body.clone());
     let visual = VisualMedia::image_bytes(body, mime.clone());
     spawn_perceive(state.clone(), scene.clone(), visual, rel, mime, ts, None, Some(recognise));
     StatusCode::ACCEPTED.into_response()
+}
+
+/// The media a perceived signal can recognize faces from: a still image is ready
+/// for the face pipeline as-is; a video clip needs one keyframe decoded out first
+/// ([`ffmpeg_frame::first_frame`]). Resolved inside the detached perceive task so
+/// the (possibly slow) ffmpeg call never blocks capture.
+enum FaceSource {
+    Image(Bytes),
+    Video(Bytes),
+}
+
+impl FaceSource {
+    /// Reduce to an encoded still image the face pipeline accepts: an image is
+    /// itself; a video yields its first frame. `None` (logged) on a decode failure.
+    async fn into_image(self) -> Option<Bytes> {
+        match self {
+            FaceSource::Image(b) => Some(b),
+            FaceSource::Video(b) => match ffmpeg_frame::first_frame(b).await {
+                Ok(frame) => Some(frame),
+                Err(err) => {
+                    tracing::warn!(error = %err, "vision: keyframe extraction failed");
+                    None
+                }
+            },
+        }
+    }
 }
 
 /// Spawn the perception of one piece of visual media: caption it (via the vision
@@ -112,15 +140,17 @@ fn spawn_perceive(
     mime: String,
     ts: DateTime<Utc>,
     duration_ms: Option<u64>,
-    recognise: Option<Bytes>,
+    recognise: Option<FaceSource>,
 ) {
     tokio::spawn(async move {
         let mut body = caption(media, &mime).await;
         // Fold any recognized faces into the caption as receive-time evidence —
-        // the body is already a derived surface, so this matches it. Still images
-        // only; best-effort (never blocks or fails the signal).
-        if let Some(img) = recognise
-            && face::available()
+        // the body is already a derived surface, so this matches it. Works for a
+        // still image and for a camera-stream minute (one keyframe decoded out);
+        // best-effort (never blocks or fails the signal).
+        if face::available()
+            && let Some(src) = recognise
+            && let Some(img) = src.into_image().await
             && let Some(note) = face_note(img, &state.data_dir).await
         {
             body.push_str(&note);
@@ -215,8 +245,13 @@ async fn flush_video_minute(
             return;
         }
     };
-    let visual = VisualMedia::video_bytes(Bytes::from(bytes), mime);
-    spawn_perceive(state.clone(), scene.clone(), visual, rel, mime.to_string(), ts, None, None);
+    let video = Bytes::from(bytes);
+    // Recognize faces from one keyframe of the minute when the face capability is
+    // on — the camera's twin of the still-image path. Decoding happens inside the
+    // detached perceive task, so the flush itself stays cheap.
+    let recognise = face::available().then(|| FaceSource::Video(video.clone()));
+    let visual = VisualMedia::video_bytes(video, mime);
+    spawn_perceive(state.clone(), scene.clone(), visual, rel, mime.to_string(), ts, None, recognise);
 }
 
 #[derive(Debug, Deserialize)]

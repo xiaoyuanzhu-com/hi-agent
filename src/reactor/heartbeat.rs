@@ -17,11 +17,13 @@ use std::sync::Arc;
 
 use crate::acp::{AcpSession, SessionOpts};
 use crate::agent::SessionRole;
-use crate::capabilities::face;
+use crate::capabilities::{face, voiceprint};
 use crate::memory::journal::after_cursor;
+use crate::pcm;
 use crate::memory::{Snapshot, build_for_scene, episodes, facets, layout, people_vectors, refresh_hot};
 use crate::observatory::EventKind;
 use crate::types::{Channel, JournalEntry, Scene};
+use crate::vendors::ffmpeg_frame;
 
 use super::Reactor;
 
@@ -203,7 +205,8 @@ async fn run_reflection(reactor: &Reactor, scene: &Scene) -> anyhow::Result<()> 
     // can show the mind a stable id per detected face to name. No-op without the
     // face capability.
     let face_ids = cluster_faces(data_dir, scene, &tail).await;
-    let prompt = build_reflection_prompt(&tail, &prior, &subjects, &face_ids);
+    let voice_ids = cluster_voices(data_dir, scene, &tail).await;
+    let prompt = build_reflection_prompt(&tail, &prior, &subjects, &face_ids, &voice_ids);
     let system_prompt = super::reflection_prompt(data_dir).await;
 
     let session = reactor
@@ -243,12 +246,14 @@ async fn run_reflection(reactor: &Reactor, scene: &Scene) -> anyhow::Result<()> 
 /// context, then the unconsolidated frontier as a numbered, oldest-first list (the
 /// mind hands back a `count` into this list, never a raw id). Image signals are
 /// marked: `⟨faces: <id>…⟩` when clustering placed faces (the ids the mind can
-/// name), else `⟨image⟩`.
+/// name), else `⟨image⟩`. Audio clips are marked `⟨voice: <id>…⟩` when voiceprint
+/// clustering placed a speaker — the same nameable handles, for voices.
 fn build_reflection_prompt(
     tail: &[JournalEntry],
     prior: &[String],
     subjects: &[String],
     face_ids: &HashMap<usize, Vec<String>>,
+    voice_ids: &HashMap<usize, Vec<String>>,
 ) -> String {
     use std::fmt::Write as _;
     let mut s = String::new();
@@ -273,6 +278,9 @@ fn build_reflection_prompt(
             }
             None if is_image(e) => line.push_str(" ⟨image⟩"),
             None => {}
+        }
+        if let Some(ids) = voice_ids.get(&i).filter(|v| !v.is_empty()) {
+            let _ = write!(line, " ⟨voice: {}⟩", ids.join(", "));
         }
         let _ = writeln!(s, "[{}] {}", i + 1, line);
     }
@@ -300,12 +308,14 @@ fn is_image(e: &JournalEntry) -> bool {
     matches!(e, JournalEntry::SignalIn { media: Some(m), .. } if m.mime.starts_with("image/"))
 }
 
-/// Mechanically cluster the faces in the frontier's still images: for each one,
+/// Mechanically cluster the faces in the frontier's vision signals: for each one,
 /// detect+embed and [`people_vectors::assign`] every salient face to the people
 /// store (append to a near cluster, or mint a fresh id). Returns, per tail index,
 /// the cluster ids the faces landed in — the stable handles the reflection prompt
-/// shows so the mind can name a face, even a first-time one. No-op (empty) when
-/// the face capability is unconfigured; a per-image failure is logged and skipped.
+/// shows so the mind can name a face, even a first-time one. Covers both posted
+/// stills and camera-stream minutes (one keyframe decoded out of the video, the
+/// same frame the perceive-time note used). No-op (empty) when the face capability
+/// is unconfigured; a per-signal failure is logged and skipped.
 async fn cluster_faces(
     data_dir: &Path,
     scene: &Scene,
@@ -320,18 +330,35 @@ async fn cluster_faces(
         else {
             continue;
         };
-        if !m.mime.starts_with("image/") {
+        let is_image = m.mime.starts_with("image/");
+        let is_video = m.mime.starts_with("video/");
+        if !is_image && !is_video {
             continue;
         }
         let path = layout::channel_day_dir(data_dir, sig_scene, Channel::Vision, *ts).join(&m.file);
         let bytes = match tokio::fs::read(&path).await {
             Ok(b) => b,
             Err(err) => {
-                tracing::warn!(scene = %scene, error = %err, "cluster: reading image failed");
+                tracing::warn!(scene = %scene, error = %err, "cluster: reading vision media failed");
                 continue;
             }
         };
-        let faces = match face::detect_and_embed(bytes.into()).await {
+        // A still is ready for the face pipeline; a camera minute needs one
+        // keyframe decoded out first (the same path the perceive-time note takes).
+        let image: bytes::Bytes = if is_video {
+            match ffmpeg_frame::first_frame(bytes.into()).await {
+                Ok(frame) => frame,
+                Err(err) => {
+                    tracing::warn!(scene = %scene, error = %err, "cluster: keyframe extraction failed");
+                    continue;
+                }
+            }
+        } else {
+            bytes.into()
+        };
+        // Clone for detection (it consumes the bytes); keep `image` to crop the
+        // recognized faces out of for previews.
+        let faces = match face::detect_and_embed(image.clone()).await {
             Ok(f) => f,
             Err(err) => {
                 tracing::warn!(scene = %scene, error = %err, "cluster: face detect failed");
@@ -340,9 +367,81 @@ async fn cluster_faces(
         };
         for f in faces.iter().filter(|f| salient(f)) {
             match people_vectors::assign(data_dir, people_vectors::Modality::Face, &f.embedding).await {
-                Ok(id) => out.entry(i).or_default().push(id),
+                Ok(id) => {
+                    // Keep a viewable crop of this face beside the gallery.
+                    if let Ok(jpg) = face::crop_to_jpeg(image.as_ref(), f.bbox, 0.3)
+                        && let Err(err) = people_vectors::save_preview(
+                            data_dir, &id, people_vectors::Modality::Face, &jpg, "jpg",
+                        ).await
+                    {
+                        tracing::warn!(scene = %scene, error = %err, "cluster: face preview save failed");
+                    }
+                    out.entry(i).or_default().push(id);
+                }
                 Err(err) => tracing::warn!(scene = %scene, error = %err, "cluster: assign failed"),
             }
+        }
+    }
+    out
+}
+
+/// Mechanically cluster the voices in the frontier's audio clips: for each clip
+/// that carries persisted audio, decode it, embed a voiceprint, and
+/// [`people_vectors::assign`] it to the people store (append to a near cluster, or
+/// mint a fresh id). Returns, per tail index, the cluster ids — the audio twin of
+/// [`cluster_faces`], so the mind can name a voice the same way it names a face.
+/// No-op (empty) without the voiceprint capability. Only clips have media here;
+/// live-mic utterances are media-less and are clustered inline on the stream.
+async fn cluster_voices(
+    data_dir: &Path,
+    scene: &Scene,
+    tail: &[JournalEntry],
+) -> HashMap<usize, Vec<String>> {
+    let mut out: HashMap<usize, Vec<String>> = HashMap::new();
+    if !voiceprint::available() {
+        return out;
+    }
+    for (i, e) in tail.iter().enumerate() {
+        let JournalEntry::SignalIn { channel: Channel::Audio, media: Some(m), ts, scene: sig_scene, .. } = e
+        else {
+            continue;
+        };
+        let path = layout::channel_day_dir(data_dir, sig_scene, Channel::Audio, *ts).join(&m.file);
+        let bytes = match tokio::fs::read(&path).await {
+            Ok(b) => b,
+            Err(err) => {
+                tracing::warn!(scene = %scene, error = %err, "cluster: reading audio failed");
+                continue;
+            }
+        };
+        let samples = match pcm::to_i16_16k_mono(&bytes, &m.mime) {
+            Ok(s) if !s.is_empty() => s,
+            Ok(_) => continue,
+            Err(err) => {
+                tracing::warn!(scene = %scene, error = %err, "cluster: audio decode failed");
+                continue;
+            }
+        };
+        let embedding = match voiceprint::embed(samples).await {
+            Ok(e) => e,
+            Err(err) => {
+                tracing::warn!(scene = %scene, error = %err, "cluster: voiceprint embed failed");
+                continue;
+            }
+        };
+        match people_vectors::assign(data_dir, people_vectors::Modality::Voice, &embedding).await {
+            Ok(id) => {
+                // Keep the clip itself beside the gallery as a playable preview.
+                let ext = std::path::Path::new(&m.file).extension().and_then(|e| e.to_str()).unwrap_or("wav");
+                if let Err(err) = people_vectors::save_preview(
+                    data_dir, &id, people_vectors::Modality::Voice, &bytes, ext,
+                ).await
+                {
+                    tracing::warn!(scene = %scene, error = %err, "cluster: voice preview save failed");
+                }
+                out.entry(i).or_default().push(id);
+            }
+            Err(err) => tracing::warn!(scene = %scene, error = %err, "cluster: voice assign failed"),
         }
     }
     out

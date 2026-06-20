@@ -188,10 +188,12 @@ async fn connect(cfg: &Config) -> anyhow::Result<WebSocketStream<MaybeTlsStream<
 /// `end_window_size` so utterances finalize mid-stream (after a short pause)
 /// rather than only at connection close.
 ///
-/// `speaker` requests speaker clustering. It's deliberately decoupled from
-/// `cfg.speaker_info` at the call site: only the batch path opts in, because the
-/// feature forces `enable_nonstream` (see below) which would defeat the live
-/// stream's low-latency partials.
+/// `speaker` requests speaker clustering. Both the batch and streaming paths opt
+/// in (gated on `cfg.speaker_info`): it forces `enable_nonstream` (see below), but
+/// that is **two-pass** (二遍识别), not buffer-only — the streaming pass still
+/// returns low-latency 逐字 partials for barge-in while a non-streaming second pass
+/// re-recognizes each VAD-cut segment and labels it. So diarization does not cost
+/// the live stream its partials.
 fn config_frame(cfg: &Config, show_utterances: bool, speaker: bool) -> anyhow::Result<Vec<u8>> {
     let mut request = json!({
         "model_name": cfg.model,
@@ -205,11 +207,11 @@ fn config_frame(cfg: &Config, show_utterances: bool, speaker: bool) -> anyhow::R
     }
     if speaker {
         // Speaker clustering/diarization. On the optimized async endpoint it's
-        // gated on enable_nonstream=true (which buffers for a post-processed
-        // result instead of streaming low-latency partials) and ssd_version=200
-        // (the ASR 2.0 model). All three must be set together or the upstream
-        // ignores the speaker request. The labels then ride the post-processed
-        // `definite` utterances as `additions.speaker_id`.
+        // gated on enable_nonstream=true (two-pass: real-time partials PLUS a
+        // non-streaming re-recognition of each segment) and ssd_version=200 (the
+        // ASR 2.0 model). All three must be set together or the upstream ignores
+        // the speaker request. The labels then ride the post-processed `definite`
+        // utterances as `additions.speaker_id`.
         request["enable_speaker_info"] = json!(true);
         request["enable_nonstream"] = json!(true);
         request["ssd_version"] = json!("200");
@@ -359,7 +361,11 @@ async fn transcribe_streaming_inner(
     out: mpsc::Sender<Transcript>,
 ) -> anyhow::Result<String> {
     let (mut tx, mut rx) = connect(cfg).await?.split();
-    tx.send(Message::Binary(config_frame(cfg, true, false)?)).await?;
+    // Two-pass (`enable_nonstream`) when speaker info is on: the streaming pass
+    // keeps returning low-latency 逐字 partials (the barge-in trigger), while a
+    // non-streaming second pass re-recognizes each VAD-cut segment and tags it
+    // with `speaker_id`. So diarization here does NOT cost the live partials.
+    tx.send(Message::Binary(config_frame(cfg, true, cfg.speaker_info)?)).await?;
 
     // Sender task: stream PCM chunks until the input closes, then mark the
     // last chunk so the upstream finalizes.
@@ -438,14 +444,17 @@ async fn transcribe_streaming_inner(
                         last_final = text.clone();
                         last_returned = text.clone();
                         last_partial.clear();
-                        let _ = out.send(Transcript { text, is_final: true }).await;
+                        // Carry the segment's speaker label (two-pass diarization)
+                        // so the caller can voiceprint that speaker's audio.
+                        let speaker_id = parsed.result.as_ref().and_then(|r| r.definite_speaker_id());
+                        let _ = out.send(Transcript { text, is_final: true, speaker_id }).await;
                     }
                 } else if let Some(text) = parsed.text() {
                     // Rolling preliminary. Dedupe identical updates.
                     if !text.is_empty() && text != last_partial {
                         last_partial = text.clone();
                         last_final.clear();
-                        let _ = out.send(Transcript { text, is_final: false }).await;
+                        let _ = out.send(Transcript { text, is_final: false, speaker_id: None }).await;
                     }
                 }
             }
@@ -632,6 +641,21 @@ impl ServerResult {
             .or_else(|| self.first_text())
     }
 
+    /// Speaker label of the finalized (definite) utterance — aligned with
+    /// [`Self::definite_text`] (both take the last definite utterance), so the
+    /// dispatched final and its speaker id come from the same segment. `None` when
+    /// diarization is off or the segment carries no `speaker_id`.
+    fn definite_speaker_id(&self) -> Option<String> {
+        self.utterances
+            .iter()
+            .filter(|u| u.definite)
+            .filter_map(|u| u.additions.speaker_id.as_deref())
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(str::to_owned)
+            .next_back()
+    }
+
     /// Render the definite utterances as a speaker-labeled transcript, but only
     /// when speaker clustering actually distinguished ≥2 voices. Each line is
     /// `说话人{id}：{text}`, in utterance order. Returns `None` for a single
@@ -746,6 +770,30 @@ mod tests {
                  说话人0：照常进行，我已经通知了所有人，会议室也订好了。"
             )
         );
+    }
+
+    // On the streaming two-pass path, a finalized (definite) segment carries its
+    // speaker label at `additions.speaker_id`, aligned with `definite_text` (both
+    // take the last definite utterance) so the dispatched sentence and its speaker
+    // come from the same segment.
+    #[test]
+    fn definite_speaker_id_tracks_the_finalized_segment() {
+        let json = r#"{"result":{"utterances":[
+            {"definite":true,"text":"明天的会还开吗？","additions":{"source":"two_pass","speaker_id":"1"}}
+        ]}}"#;
+        let frame = result_frame(true, json.as_bytes());
+        let payload = server_payload(&frame).expect("payload");
+        let parsed: ServerResponse = serde_json::from_slice(payload).expect("valid JSON");
+        let result = parsed.result.as_ref().unwrap();
+        assert_eq!(result.definite_text().as_deref(), Some("明天的会还开吗？"));
+        assert_eq!(result.definite_speaker_id().as_deref(), Some("1"));
+
+        // No speaker info on the segment → no label (1:1, diarization off).
+        let plain = r#"{"result":{"utterances":[{"definite":true,"text":"在的。","additions":{}}]}}"#;
+        let frame = result_frame(true, plain.as_bytes());
+        let payload = server_payload(&frame).expect("payload");
+        let parsed: ServerResponse = serde_json::from_slice(payload).expect("valid JSON");
+        assert_eq!(parsed.result.as_ref().unwrap().definite_speaker_id(), None);
     }
 
     // A single speaker (or no speaker info) stays a flat transcript — the

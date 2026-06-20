@@ -1,10 +1,16 @@
-//! Derived current-understanding — `memory/facets/<dim>/<subject>.md`.
+//! Derived current-understanding — `memory/facets/<dim>/<subject>/facet.md`.
 //!
 //! A facet is the agent's best current understanding of one subject (a person, a
 //! place, a project, a cultural topic), **regenerated from episodes** at
 //! reflection time with every claim citing the episodes it came from. Like
 //! episodes it is a disposable projection over the raw log — never a source of
 //! truth.
+//!
+//! Each subject is a **directory** (`<dim>/<subject>/`) holding the prose
+//! `facet.md` and, for `people`, the biometric gallery sidecars
+//! ([`super::people_vectors`] writes `face.f32` / `voice.f32` into the same dir).
+//! One dir per subject mirrors the episodes layout (`<id>/episode.md`) and keeps a
+//! person's prose and galleries grouped, so naming/merging is a directory move.
 //!
 //! Dimensions are open-ended: `people`/`locations`/`projects`/`culture` are seeds,
 //! not an enum. The mind supplies the dimension and subject; this module only does
@@ -24,6 +30,18 @@ use std::path::{Path, PathBuf};
 use uuid::Uuid;
 
 use super::layout;
+
+/// The prose file inside each subject directory. A fixed, well-known name (like
+/// episodes' `episode.md`) so the subject dir can also hold sibling artifacts
+/// (the people galleries) without name collisions.
+pub(crate) const FACET_FILE: &str = "facet.md";
+
+/// The directory holding one subject's artifacts (`<dim>/<subject>/`): its prose
+/// [`FACET_FILE`] and, for people, the gallery sidecars. Both name segments are
+/// slugged so the path is safe and round-trips through the subject index.
+pub(crate) fn subject_dir(data_dir: &Path, dim: &str, subject: &str) -> PathBuf {
+    layout::facets_dir(data_dir).join(slug(dim)).join(slug(subject))
+}
 
 /// The current understanding of `dim`/`subject`, or `None` if nothing has been
 /// written for it yet. Used by reflection to regenerate (read the old, fold in new
@@ -56,10 +74,10 @@ pub async fn update_facet(
     if dim_s.is_empty() || subj_s.is_empty() {
         anyhow::bail!("dimension and subject must each contain a usable character");
     }
-    let dir = layout::facets_dir(data_dir).join(&dim_s);
+    let dir = layout::facets_dir(data_dir).join(&dim_s).join(&subj_s);
     tokio::fs::create_dir_all(&dir).await?;
-    let path = dir.join(format!("{subj_s}.md"));
-    let tmp = dir.join(format!(".{subj_s}.md.tmp-{}", Uuid::now_v7().simple()));
+    let path = dir.join(FACET_FILE);
+    let tmp = dir.join(format!(".{FACET_FILE}.tmp-{}", Uuid::now_v7().simple()));
     tokio::fs::write(&tmp, content).await?;
     tokio::fs::rename(&tmp, &path).await?;
     Ok(format!("{dim_s}/{subj_s}"))
@@ -85,11 +103,20 @@ pub async fn facet_subject_index(data_dir: &Path) -> anyhow::Result<Vec<String>>
         };
         let mut subs = tokio::fs::read_dir(dim_ent.path()).await?;
         while let Some(s) = subs.next_entry().await? {
-            if let Ok(fname) = s.file_name().into_string()
-                && let Some(stem) = fname.strip_suffix(".md")
-                && !stem.is_empty()
-            {
-                out.push(format!("{dim_name}/{stem}"));
+            if !s.file_type().await?.is_dir() {
+                continue; // a stray file under <dim>/ is not a subject
+            }
+            let Ok(subj) = s.file_name().into_string() else {
+                continue;
+            };
+            // A subject "exists" once it has prose. A people dir holding only
+            // biometric galleries (no facet.md yet) is a cluster the mind hasn't
+            // modeled — it must not look like a named subject here.
+            if subj.is_empty() || subj.starts_with('.') {
+                continue;
+            }
+            if tokio::fs::try_exists(s.path().join(FACET_FILE)).await.unwrap_or(false) {
+                out.push(format!("{dim_name}/{subj}"));
             }
         }
     }
@@ -98,9 +125,7 @@ pub async fn facet_subject_index(data_dir: &Path) -> anyhow::Result<Vec<String>>
 }
 
 fn facet_path(data_dir: &Path, dim: &str, subject: &str) -> PathBuf {
-    layout::facets_dir(data_dir)
-        .join(slug(dim))
-        .join(format!("{}.md", slug(subject)))
+    subject_dir(data_dir, dim, subject).join(FACET_FILE)
 }
 
 /// A path-safe, human-readable slug for one name segment: lowercase, runs of

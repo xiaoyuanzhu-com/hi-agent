@@ -2,7 +2,7 @@
 
 **Persona:** 用户和 agent 在不同时间遇到同一些人——摄像头里的一张脸、通话里的一把声音。有的人 agent 早就在记,只是还不知道叫什么。
 **Goal:** agent 应当**先凭脸 / 声音把人记成"同一个人"**(完全不需要名字),**名字后来从对话里学到**(老板说"这是赵力"),从此**按名字认人并用起来**(打招呼带名、接上对这个人已知的事);全程**接受模糊**,像人一样。
-**Preconditions:** 人脸 / 声纹能力 + people 记忆——每个人是 `memory/facets/people/<key>` 下的 `.md`(散文 facet)+ `.face.f32` / `.voice.f32`(画廊)。**身份模型见 [[project-people-recognition-design]];脸已实测(InsightFace buffalo_l),声音待建。与 [13](13-equip-a-capability.md)(能力分流)、[14](14-knowledge-grows.md)(随用而长)相连。**
+**Preconditions:** 人脸 / 声纹能力 + people 记忆——每个人是一个目录 `memory/facets/people/<key>/`,里面放 `facet.md`(散文 facet)+ `face.f32` / `voice.f32`(画廊,可多段样本)+ `face/`、`voice/` 子目录存原始人脸截图 / 语音片段供预览(与画廊解耦,只为人眼可看)。**身份模型见 [[project-people-recognition-design]];脸已实测(InsightFace buffalo_l),声音(CAM++)已接通全链路——clip + 实时麦克风(声纹分离)+ reflection 聚簇,待实测。与 [13](13-equip-a-capability.md)(能力分流)、[14](14-knowledge-grows.md)(随用而长)相连。**
 
 ## Steps & expected UX
 

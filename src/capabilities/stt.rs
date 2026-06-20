@@ -24,6 +24,11 @@ use crate::vendors::volcengine_stt;
 pub struct Transcript {
     pub text: String,
     pub is_final: bool,
+    /// Vendor speaker-cluster label for a finalized utterance when diarization is
+    /// on (two-pass mode) — e.g. `"0"`, `"1"`. `None` on rolling partials and when
+    /// speaker info is off. It is a within-session cluster id, not a persistent
+    /// identity; the caller resolves identity by voiceprinting the utterance audio.
+    pub speaker_id: Option<String>,
 }
 
 enum Backend {

@@ -64,16 +64,26 @@ pub struct Config {
     arcface_path: PathBuf,
 }
 
+/// Whether the face models are configured — both `SCRFD_MODEL` and
+/// `ARCFACE_MODEL` point somewhere. Face recognition is built-in (one
+/// implementation, no provider to pick); it simply turns on when the models are
+/// present. Used to decide whether to load at startup.
+pub fn configured() -> bool {
+    [ENV_SCRFD, ENV_ARCFACE]
+        .iter()
+        .all(|v| std::env::var(v).map(|s| !s.trim().is_empty()).unwrap_or(false))
+}
+
 impl Config {
     /// Load both ONNX models named by `SCRFD_MODEL` (detector) and
     /// `ARCFACE_MODEL` (recognizer). Fails fast if either var is unset or the
     /// file can't be opened as a model.
     pub fn from_env() -> anyhow::Result<Self> {
         let scrfd_path: PathBuf = std::env::var(ENV_SCRFD)
-            .map_err(|_| anyhow::anyhow!("{ENV_SCRFD} is required when FACE_PROVIDER=insightface"))?
+            .map_err(|_| anyhow::anyhow!("{ENV_SCRFD} is required to enable face recognition"))?
             .into();
         let arcface_path: PathBuf = std::env::var(ENV_ARCFACE)
-            .map_err(|_| anyhow::anyhow!("{ENV_ARCFACE} is required when FACE_PROVIDER=insightface"))?
+            .map_err(|_| anyhow::anyhow!("{ENV_ARCFACE} is required to enable face recognition"))?
             .into();
         let scrfd = Session::builder()
             .context("creating ORT session builder")?

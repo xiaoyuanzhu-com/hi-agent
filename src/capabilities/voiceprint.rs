@@ -8,15 +8,16 @@
 //! identity belief live downstream; this capability only produces the vector.
 //!
 //! Like the other capabilities it is a module of free functions over a
-//! process-global, once-initialized config: [`init_from_env`] reads
-//! `VOICEPRINT_PROVIDER`, [`available`] reports whether a provider is
-//! configured, and [`embed`] dispatches to it. The config never appears in a
-//! signature. Unlike the API-backed capabilities the vendor is a local ONNX
-//! model, so inference is CPU-bound and runs on a blocking thread.
+//! process-global, once-initialized config: [`init_from_env`] loads the local
+//! CAM++ ONNX when its model is present, [`available`] reports whether it is
+//! loaded, and [`embed`] dispatches to it. There is only one implementation and
+//! no meaningful choice to expose, so it is built-in (on whenever `CAMPLUS_MODEL`
+//! resolves) rather than a provider toggle. The vendor is a local ONNX model, so
+//! inference is CPU-bound and runs on a blocking thread.
 //!
-//! **No caller wires this in yet.** This is the capability a future perception
-//! path (e.g. embedding each speaker-turn the STT returns) will call; wiring it
-//! in later is purely additive.
+//! Callers: the audio channel voiceprints posted clips and live-mic speaker
+//! turns ([`crate::server::audio`]), and reflection clusters clip voices into the
+//! people store ([`crate::reactor::heartbeat`]).
 
 use std::sync::OnceLock;
 
@@ -31,17 +32,16 @@ enum Backend {
 
 static BACKEND: OnceLock<Backend> = OnceLock::new();
 
-const ENV_PROVIDER: &str = "VOICEPRINT_PROVIDER";
-
-/// Resolve the provider from `VOICEPRINT_PROVIDER` into the process-global
-/// config. Unset or `none` disables the capability; an unknown name is an error
-/// so a typo fails at startup rather than at first use. Idempotent — the first
-/// init wins.
+/// Turn the voiceprint capability on when its model is present. There is one
+/// implementation (CAM++ ONNX) and no meaningful choice to expose, so this is
+/// built-in rather than a provider toggle: configured (`CAMPLUS_MODEL` set) →
+/// load it; unset → quietly disabled. A set-but-unloadable model is a real
+/// misconfiguration and fails fast. Idempotent — the first init wins.
 pub fn init_from_env() -> anyhow::Result<()> {
-    let backend = match std::env::var(ENV_PROVIDER).unwrap_or_default().as_str() {
-        "" | "none" => Backend::Disabled,
-        "campplus" => Backend::CamPlusPlus(campplus::Config::from_env()?),
-        other => anyhow::bail!("unknown {ENV_PROVIDER}: {other}"),
+    let backend = if campplus::configured() {
+        Backend::CamPlusPlus(campplus::Config::from_env()?)
+    } else {
+        Backend::Disabled
     };
     let _ = BACKEND.set(backend);
     Ok(())
@@ -59,7 +59,7 @@ pub fn available() -> bool {
 pub async fn embed(pcm_16k_mono: Vec<i16>) -> anyhow::Result<Vec<f32>> {
     tokio::task::spawn_blocking(move || match BACKEND.get() {
         Some(Backend::CamPlusPlus(cfg)) => campplus::embed(cfg, &pcm_16k_mono),
-        _ => anyhow::bail!("voiceprint not configured (set {ENV_PROVIDER})"),
+        _ => anyhow::bail!("voiceprint not configured (set CAMPLUS_MODEL)"),
     })
     .await
     .context("voiceprint embed task panicked")?

@@ -1,10 +1,16 @@
 //! Per-person voice/face embedding samples — the recognition sidecars of the
 //! `people` facet dimension.
 //!
-//! Each person's prose understanding lives at `memory/facets/people/<subject>.md`
-//! (see [`super::facets`]). This module stores their **embedding samples** right
-//! next to it as compact binary `<subject>.<modality>.f32` files, and answers the
-//! one mechanical question: *which known person is this query vector nearest to?*
+//! Each person is a directory `memory/facets/people/<subject>/` (see
+//! [`super::facets`]): its prose understanding is `facet.md`, and this module
+//! stores their **embedding samples** right beside it as compact binary
+//! `<modality>.f32` files (`face.f32`, `voice.f32`). It answers the one mechanical
+//! question: *which known person is this query vector nearest to?*
+//!
+//! The `.f32` galleries are the recognition index. The **raw media** each sample
+//! came from — face crops, voice turns — is kept separately under
+//! `<subject>/<modality>/<id>.<ext>` ([`save_preview`]) purely so a cluster can be
+//! eyeballed; it never enters matching.
 //!
 //! A modality file is a flat concatenation of fixed-length samples written as raw
 //! little-endian f32. The sample dimension is inferred from the query at match
@@ -18,9 +24,10 @@
 //! agent's, deliberately ([[project-people-recognition-design]]). Like facets,
 //! writes are atomic (temp sibling + rename) and last-writer-wins across scenes.
 //!
-//! **No caller wires this in yet.** The future caller is the perception path that
-//! produces embeddings (e.g. embedding each STT speaker-turn); wiring it in later
-//! is purely additive.
+//! Callers: the perception paths that produce embeddings — face recognition on
+//! posted stills and camera-stream keyframes, voiceprints of posted clips and
+//! live-mic speaker turns ([`crate::server`]) — and reflection clustering
+//! ([`crate::reactor::heartbeat`]).
 
 use std::path::{Path, PathBuf};
 
@@ -30,6 +37,16 @@ use super::{facets, layout};
 
 /// The facet dimension these sidecars attach to.
 const DIM: &str = "people";
+
+/// The directory under [`layout::facets_dir`] holding every person's subdir.
+fn people_dir(data_dir: &Path) -> PathBuf {
+    layout::facets_dir(data_dir).join(DIM)
+}
+
+/// Gallery filename for a modality inside a person's dir, e.g. `face.f32`.
+fn gallery_file(modality: Modality) -> String {
+    format!("{}.f32", modality.tag())
+}
 
 /// Cap on samples kept per subject per modality. A gallery is a *bounded,
 /// diverse* set, not a log of every observation — without this, one long call
@@ -84,9 +101,10 @@ pub async fn enroll(
     anyhow::ensure!(!subj.is_empty(), "subject must contain a usable character");
     anyhow::ensure!(!sample.is_empty(), "sample must be non-empty");
 
-    let dir = layout::facets_dir(data_dir).join(DIM);
+    let dir = people_dir(data_dir).join(&subj);
     tokio::fs::create_dir_all(&dir).await?;
-    let path = dir.join(format!("{subj}.{}.f32", modality.tag()));
+    let file = gallery_file(modality);
+    let path = dir.join(&file);
 
     let mut bytes = match tokio::fs::read(&path).await {
         Ok(b) => b,
@@ -110,7 +128,7 @@ pub async fn enroll(
         bytes.drain(..bytes.len() - max_bytes);
     }
 
-    let tmp = dir.join(format!(".{subj}.{}.f32.tmp-{}", modality.tag(), Uuid::now_v7().simple()));
+    let tmp = dir.join(format!(".{file}.tmp-{}", Uuid::now_v7().simple()));
     tokio::fs::write(&tmp, &bytes).await?;
     tokio::fs::rename(&tmp, &path).await?;
     Ok(format!("{DIM}/{subj}"))
@@ -148,12 +166,69 @@ pub async fn assign(data_dir: &Path, modality: Modality, embedding: &[f32]) -> a
     Ok(id)
 }
 
-/// Move every `facets/people/<old>.*` artifact to `<new>.*` — the structural side
-/// of naming (rename a minted id to a learned name) and of merging (collapse two
-/// clusters of one person). For a `.f32` sidecar whose target already exists the
-/// two galleries are concatenated (a later [`enroll`] re-applies the cap); for any
-/// other artifact (the `.md` facet) the target is kept — it regenerates from
-/// episodes — and the old dropped. Renaming a subject onto itself is a no-op.
+/// Save the raw media a sample came from — a face crop, a voice turn — beside the
+/// gallery so a cluster can be *eyeballed*, not just matched on its vectors. Lands
+/// at `people/<subject>/<modality>/<id>.<ext>` and is capped to [`MAX_SAMPLES`]
+/// files (oldest dropped), mirroring the gallery's bound. Pair it with [`assign`]:
+/// assign returns the subject the embedding landed in, then save the preview under
+/// that same subject. Deliberately decoupled from matching — purely for human
+/// preview — so a failure here never affects recognition. The `id` is a fresh
+/// time-ordered uuid, unrelated to any gallery offset.
+pub async fn save_preview(
+    data_dir: &Path,
+    subject: &str,
+    modality: Modality,
+    bytes: &[u8],
+    ext: &str,
+) -> anyhow::Result<()> {
+    let subj = facets::slug(subject);
+    anyhow::ensure!(!subj.is_empty(), "subject must contain a usable character");
+    anyhow::ensure!(!bytes.is_empty(), "preview must be non-empty");
+    // Keep the extension a safe single path segment (it can come from an arbitrary
+    // upload mime); fall back to a neutral one.
+    let ext: String = ext.chars().filter(|c| c.is_ascii_alphanumeric()).collect();
+    let ext = if ext.is_empty() { "bin".to_string() } else { ext };
+
+    let dir = people_dir(data_dir).join(&subj).join(modality.tag());
+    tokio::fs::create_dir_all(&dir).await?;
+    let path = dir.join(format!("{}.{ext}", Uuid::now_v7().simple()));
+    tokio::fs::write(&path, bytes).await?;
+    prune_previews(&dir, MAX_SAMPLES).await?;
+    Ok(())
+}
+
+/// Keep at most `max` preview files in `dir`, dropping the oldest. Names are
+/// time-ordered uuids, so a lexical sort is chronological. Best-effort.
+async fn prune_previews(dir: &Path, max: usize) -> anyhow::Result<()> {
+    let mut names: Vec<String> = Vec::new();
+    let mut rd = tokio::fs::read_dir(dir).await?;
+    while let Some(ent) = rd.next_entry().await? {
+        if let Ok(name) = ent.file_name().into_string()
+            && !name.starts_with('.')
+        {
+            names.push(name);
+        }
+    }
+    if names.len() <= max {
+        return Ok(());
+    }
+    names.sort();
+    let drop = names.len() - max;
+    for name in &names[..drop] {
+        let _ = tokio::fs::remove_file(dir.join(name)).await;
+    }
+    Ok(())
+}
+
+/// Move the `facets/people/<old>/` directory to `<new>/` — the structural side of
+/// naming (rename a minted id to a learned name) and of merging (collapse two
+/// clusters of one person). When `<new>/` is free the whole dir is renamed in one
+/// step; when it already exists the two are merged artifact by artifact: a `.f32`
+/// gallery present on both sides is concatenated (a later [`enroll`] re-applies the
+/// cap), a preview dir (`face/`, `voice/`) has its uuid-named files moved over and
+/// re-capped, any other file (the `facet.md` prose) keeps the target — it
+/// regenerates from episodes — and the old is dropped. Renaming a subject onto
+/// itself, or one with no directory, is a no-op.
 pub async fn rename(data_dir: &Path, old: &str, new: &str) -> anyhow::Result<()> {
     let (old_s, new_s) = (facets::slug(old), facets::slug(new));
     anyhow::ensure!(!old_s.is_empty() && !new_s.is_empty(), "old and new must each slug to something");
@@ -161,44 +236,68 @@ pub async fn rename(data_dir: &Path, old: &str, new: &str) -> anyhow::Result<()>
         return Ok(());
     }
 
-    let dir = layout::facets_dir(data_dir).join(DIM);
-    let mut rd = match tokio::fs::read_dir(&dir).await {
-        Ok(rd) => rd,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
-        Err(e) => return Err(e.into()),
-    };
-    // Collect first, then mutate — don't modify the dir mid-iteration.
-    let prefix = format!("{old_s}.");
+    let dim_dir = people_dir(data_dir);
+    let old_dir = dim_dir.join(&old_s);
+    let new_dir = dim_dir.join(&new_s);
+    if !tokio::fs::try_exists(&old_dir).await? {
+        return Ok(()); // nothing to rename
+    }
+    if !tokio::fs::try_exists(&new_dir).await? {
+        // Target free: a single directory rename moves prose + every gallery.
+        if let Some(parent) = new_dir.parent() {
+            tokio::fs::create_dir_all(parent).await?;
+        }
+        tokio::fs::rename(&old_dir, &new_dir).await?;
+        return Ok(());
+    }
+
+    // Merge into the existing target. Collect the old dir's entries first, then
+    // mutate, so we don't read and modify the directory at the same time.
+    let mut rd = tokio::fs::read_dir(&old_dir).await?;
     let mut arts: Vec<(PathBuf, String)> = Vec::new();
     while let Some(ent) = rd.next_entry().await? {
         let Ok(fname) = ent.file_name().into_string() else {
             continue;
         };
         if fname.starts_with('.') {
-            continue; // skip hidden/tmp
+            continue; // skip hidden/tmp half-writes
         }
-        if let Some(ext) = fname.strip_prefix(&prefix) {
-            arts.push((ent.path(), ext.to_string()));
-        }
+        arts.push((ent.path(), fname));
     }
     drop(rd);
 
-    for (src, ext) in arts {
-        let dst = dir.join(format!("{new_s}.{ext}"));
+    for (src, fname) in arts {
+        let dst = new_dir.join(&fname);
         let target_exists = tokio::fs::try_exists(&dst).await?;
-        if target_exists && ext.ends_with("f32") {
+        if src.is_dir() {
+            // A preview directory (face/, voice/). Move its files into the target's
+            // matching dir — names are unique uuids, so no collision — then re-cap.
+            tokio::fs::create_dir_all(&dst).await?;
+            let mut prd = tokio::fs::read_dir(&src).await?;
+            while let Some(pent) = prd.next_entry().await? {
+                if let Ok(pname) = pent.file_name().into_string()
+                    && !pname.starts_with('.')
+                    && !tokio::fs::try_exists(dst.join(&pname)).await?
+                {
+                    tokio::fs::rename(pent.path(), dst.join(&pname)).await?;
+                }
+            }
+            drop(prd);
+            prune_previews(&dst, MAX_SAMPLES).await?;
+        } else if target_exists && fname.ends_with(".f32") {
             let mut merged = tokio::fs::read(&dst).await?;
             merged.extend(tokio::fs::read(&src).await?);
-            let tmp = dir.join(format!(".{new_s}.{ext}.tmp-{}", Uuid::now_v7().simple()));
+            let tmp = new_dir.join(format!(".{fname}.tmp-{}", Uuid::now_v7().simple()));
             tokio::fs::write(&tmp, &merged).await?;
             tokio::fs::rename(&tmp, &dst).await?;
-            tokio::fs::remove_file(&src).await?;
-        } else if target_exists {
-            tokio::fs::remove_file(&src).await?;
-        } else {
+        } else if !target_exists {
             tokio::fs::rename(&src, &dst).await?;
         }
+        // else: keep the target (e.g. facet.md regenerates); the old copy is
+        // dropped with the directory below.
     }
+    // Drop the now-merged source directory and any leftover (hidden/kept) files.
+    tokio::fs::remove_dir_all(&old_dir).await?;
     Ok(())
 }
 
@@ -216,8 +315,8 @@ pub async fn nearest(
 ) -> anyhow::Result<Vec<Candidate>> {
     anyhow::ensure!(!query.is_empty(), "query must be non-empty");
 
-    let dir = layout::facets_dir(data_dir).join(DIM);
-    let suffix = format!(".{}.f32", modality.tag());
+    let dir = people_dir(data_dir);
+    let file = gallery_file(modality);
     let mut rd = match tokio::fs::read_dir(&dir).await {
         Ok(rd) => rd,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
@@ -226,20 +325,24 @@ pub async fn nearest(
 
     let mut out: Vec<Candidate> = Vec::new();
     while let Some(ent) = rd.next_entry().await? {
-        let Ok(fname) = ent.file_name().into_string() else {
-            continue;
-        };
-        // Match only this modality's sidecars; the `.md` facet and the other
-        // modality (and any `.tmp-…` half-write) don't end in this suffix.
-        let Some(subject) = fname.strip_suffix(&suffix) else {
+        if !ent.file_type().await?.is_dir() {
+            continue; // each subject is a directory; skip stray files
+        }
+        let Ok(subject) = ent.file_name().into_string() else {
             continue;
         };
         if subject.is_empty() || subject.starts_with('.') {
             continue;
         }
-        let bytes = tokio::fs::read(ent.path()).await?;
+        // This subject's gallery for the modality; absent (person known only by
+        // the other modality, or only by prose) → skip, not an error.
+        let bytes = match tokio::fs::read(ent.path().join(&file)).await {
+            Ok(b) => b,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(e) => return Err(e.into()),
+        };
         if let Some(best) = best_cosine(&bytes, query) {
-            out.push(Candidate { subject: subject.to_string(), similarity: best });
+            out.push(Candidate { subject, similarity: best });
         }
     }
 
@@ -381,7 +484,7 @@ mod tests {
         for i in 0..(MAX_SAMPLES + 5) {
             enroll(dir.path(), "Alice", Modality::Voice, &[i as f32, 1.0, 0.0, 0.0]).await.unwrap();
         }
-        let path = layout::facets_dir(dir.path()).join("people").join("alice.voice.f32");
+        let path = layout::facets_dir(dir.path()).join("people").join("alice").join("voice.f32");
         let len = std::fs::metadata(&path).unwrap().len() as usize;
         assert_eq!(len, MAX_SAMPLES * 4 * std::mem::size_of::<f32>(), "file holds exactly MAX_SAMPLES");
     }
@@ -418,12 +521,10 @@ mod tests {
         rename(dir.path(), "ff32ce3w", "赵力").await.unwrap();
 
         let people = layout::facets_dir(dir.path()).join("people");
-        for f in ["赵力.face.f32", "赵力.voice.f32", "赵力.md"] {
-            assert!(people.join(f).exists(), "{f} moved");
+        for f in ["face.f32", "voice.f32", "facet.md"] {
+            assert!(people.join("赵力").join(f).exists(), "{f} moved into 赵力/");
         }
-        for f in ["ff32ce3w.face.f32", "ff32ce3w.voice.f32", "ff32ce3w.md"] {
-            assert!(!people.join(f).exists(), "{f} gone");
-        }
+        assert!(!people.join("ff32ce3w").exists(), "old id dir gone");
         // Recognition now answers with the name.
         let got = nearest(dir.path(), Modality::Face, &[1.0, 0.0, 0.0, 0.0], 1).await.unwrap();
         assert_eq!(got[0].subject, "赵力");
@@ -436,14 +537,56 @@ mod tests {
         enroll(dir.path(), "dupe1234", Modality::Face, &[0.0, 1.0, 0.0, 0.0]).await.unwrap();
         rename(dir.path(), "dupe1234", "赵力").await.unwrap();
 
-        let path = layout::facets_dir(dir.path()).join("people").join("赵力.face.f32");
+        let path = layout::facets_dir(dir.path()).join("people").join("赵力").join("face.f32");
         let len = std::fs::metadata(&path).unwrap().len() as usize;
         assert_eq!(len, 2 * 4 * std::mem::size_of::<f32>(), "both samples now under 赵力");
-        assert!(!layout::facets_dir(dir.path()).join("people").join("dupe1234.face.f32").exists());
+        assert!(!layout::facets_dir(dir.path()).join("people").join("dupe1234").exists());
         // Either original observation now matches 赵力.
         for q in [[1.0, 0.0, 0.0, 0.0], [0.0, 1.0, 0.0, 0.0]] {
             let got = nearest(dir.path(), Modality::Face, &q, 1).await.unwrap();
             assert_eq!(got[0].subject, "赵力");
         }
+    }
+
+    /// Count the non-hidden files in a subject's preview dir.
+    async fn preview_count(data_dir: &Path, subject: &str, modality: Modality) -> usize {
+        let dir = layout::facets_dir(data_dir).join("people").join(subject).join(modality.tag());
+        let mut rd = match tokio::fs::read_dir(&dir).await {
+            Ok(rd) => rd,
+            Err(_) => return 0,
+        };
+        let mut n = 0;
+        while let Some(e) = rd.next_entry().await.unwrap() {
+            if !e.file_name().to_string_lossy().starts_with('.') {
+                n += 1;
+            }
+        }
+        n
+    }
+
+    #[tokio::test]
+    async fn save_preview_keeps_a_capped_bag_separate_from_the_gallery() {
+        let dir = td();
+        for i in 0..(MAX_SAMPLES + 4) {
+            save_preview(dir.path(), "Alice", Modality::Face, &[i as u8; 16], "jpg").await.unwrap();
+        }
+        assert_eq!(preview_count(dir.path(), "alice", Modality::Face).await, MAX_SAMPLES);
+        // Previews never pollute the gallery index — no .f32 was written.
+        assert!(nearest(dir.path(), Modality::Face, &[1.0, 0.0], 1).await.unwrap().is_empty());
+        // ...nor the named-subject index (no facet.md prose yet).
+        assert!(facets::facet_subject_index(dir.path()).await.unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn rename_into_existing_merges_preview_bags() {
+        let dir = td();
+        for s in ["dupe1234", "赵力"] {
+            enroll(dir.path(), s, Modality::Voice, &[1.0, 0.0, 0.0, 0.0]).await.unwrap();
+            save_preview(dir.path(), s, Modality::Voice, &[7u8; 8], "wav").await.unwrap();
+        }
+        rename(dir.path(), "dupe1234", "赵力").await.unwrap();
+        // Both clusters' previews now live under the surviving subject.
+        assert_eq!(preview_count(dir.path(), "赵力", Modality::Voice).await, 2);
+        assert!(!layout::facets_dir(dir.path()).join("people").join("dupe1234").exists());
     }
 }

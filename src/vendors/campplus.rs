@@ -32,14 +32,22 @@ pub struct Config {
     model_path: PathBuf,
 }
 
+/// Whether the voiceprint model is configured — `CAMPLUS_MODEL` points
+/// somewhere. Voiceprint is built-in (one implementation, no provider to pick);
+/// it simply turns on when the model is present. Used to decide whether to load
+/// at startup.
+pub fn configured() -> bool {
+    std::env::var(ENV_MODEL).map(|s| !s.trim().is_empty()).unwrap_or(false)
+}
+
 impl Config {
     /// Load the CAM++ ONNX named by `CAMPLUS_MODEL`. Fails fast at startup if the
     /// var is unset or the file can't be opened as a model — a misconfigured
-    /// provider should not surface as an error at first embed.
+    /// model path should not surface as an error at first embed.
     pub fn from_env() -> anyhow::Result<Self> {
         let model_path: PathBuf = std::env::var(ENV_MODEL)
             .map_err(|_| {
-                anyhow::anyhow!("{ENV_MODEL} is required when VOICEPRINT_PROVIDER=campplus")
+                anyhow::anyhow!("{ENV_MODEL} is required to enable voiceprint recognition")
             })?
             .into();
         let session = Session::builder()

@@ -11,13 +11,16 @@
 //! detect→align→embed pipeline, so there is no cross-capability reference (the
 //! same way `vision` is one capability). Like the others it is a module of free
 //! functions over a process-global, once-initialized config: [`init_from_env`]
-//! reads `FACE_PROVIDER`, [`available`] reports configuration, and
-//! [`detect_and_embed`] dispatches. The vendor is a local ONNX pair (InsightFace
-//! SCRFD + ArcFace, the `buffalo_l` models Immich uses), so inference is
-//! CPU-bound and runs on a blocking thread.
+//! loads the local ONNX pair when its models are present, [`available`] reports
+//! whether it is loaded, and [`detect_and_embed`] dispatches. There is only one
+//! implementation and no meaningful choice to expose, so it is built-in (on
+//! whenever the models resolve) rather than a provider toggle. The vendor is a
+//! local ONNX pair (InsightFace SCRFD + ArcFace, the `buffalo_l` models Immich
+//! uses), so inference is CPU-bound and runs on a blocking thread.
 //!
-//! **No caller wires this in yet.** A future perception path (e.g. sampling
-//! video frames into faces) is the caller; wiring it in later is purely additive.
+//! Callers: posted stills and camera-stream keyframes are recognized in
+//! [`crate::server::vision`], and reflection clusters faces into the people store
+//! in [`crate::reactor::heartbeat`].
 
 use std::sync::OnceLock;
 
@@ -47,16 +50,17 @@ enum Backend {
 
 static BACKEND: OnceLock<Backend> = OnceLock::new();
 
-const ENV_PROVIDER: &str = "FACE_PROVIDER";
-
-/// Resolve the provider from `FACE_PROVIDER` into the process-global config.
-/// Unset or `none` disables the capability; an unknown name is an error so a
-/// typo fails at startup rather than at first use. Idempotent — first init wins.
+/// Turn the face capability on when its models are present. There is one
+/// implementation (the InsightFace `buffalo_l` ONNX pair) and no meaningful
+/// choice to expose, so this is built-in rather than a provider toggle:
+/// configured (`SCRFD_MODEL` + `ARCFACE_MODEL` set) → load it; unset → quietly
+/// disabled. A set-but-unloadable model is a real misconfiguration and fails
+/// fast. Idempotent — first init wins.
 pub fn init_from_env() -> anyhow::Result<()> {
-    let backend = match std::env::var(ENV_PROVIDER).unwrap_or_default().as_str() {
-        "" | "none" => Backend::Disabled,
-        "insightface" => Backend::Insightface(insightface_face::Config::from_env()?),
-        other => anyhow::bail!("unknown {ENV_PROVIDER}: {other}"),
+    let backend = if insightface_face::configured() {
+        Backend::Insightface(insightface_face::Config::from_env()?)
+    } else {
+        Backend::Disabled
     };
     let _ = BACKEND.set(backend);
     Ok(())
@@ -74,7 +78,7 @@ pub fn available() -> bool {
 pub async fn detect_and_embed(image: Bytes) -> anyhow::Result<Vec<DetectedFace>> {
     tokio::task::spawn_blocking(move || match BACKEND.get() {
         Some(Backend::Insightface(cfg)) => insightface_face::detect_and_embed(cfg, &image),
-        _ => anyhow::bail!("face not configured (set {ENV_PROVIDER})"),
+        _ => anyhow::bail!("face not configured (set SCRFD_MODEL + ARCFACE_MODEL)"),
     })
     .await
     .context("face detect_and_embed task panicked")?
@@ -85,6 +89,29 @@ pub async fn detect_and_embed(image: Bytes) -> anyhow::Result<Vec<DetectedFace>>
 /// means more likely the same person. The threshold/decision is the caller's.
 pub fn cosine_similarity(a: &[f32], b: &[f32]) -> f32 {
     a.iter().zip(b).map(|(x, y)| x * y).sum()
+}
+
+/// Crop one detected face out of `image` (the original encoded bytes) to a JPEG —
+/// the previewable likeness of a [`DetectedFace`], so a cluster shows *whose* face
+/// it is, not just a vector. `bbox` is `[x1, y1, x2, y2]` in original-image pixels;
+/// `margin` pads it by that fraction of the box on each side (e.g. `0.3` for a bit
+/// of head/shoulders), clamped to the image. Independent of detection/embedding so
+/// the caller can keep a crop beside the gallery without re-running the model.
+pub fn crop_to_jpeg(image: &[u8], bbox: [f32; 4], margin: f32) -> anyhow::Result<Vec<u8>> {
+    let img = image::load_from_memory(image).context("decoding image for face crop")?;
+    let (iw, ih) = (img.width() as f32, img.height() as f32);
+    let [x1, y1, x2, y2] = bbox;
+    let (mw, mh) = ((x2 - x1) * margin, (y2 - y1) * margin);
+    let x1 = (x1 - mw).max(0.0);
+    let y1 = (y1 - mh).max(0.0);
+    let x2 = (x2 + mw).min(iw);
+    let y2 = (y2 + mh).min(ih);
+    let (w, h) = (((x2 - x1) as u32).max(1), ((y2 - y1) as u32).max(1));
+    let crop = img.crop_imm(x1 as u32, y1 as u32, w, h);
+    let mut out = Vec::new();
+    crop.write_to(&mut std::io::Cursor::new(&mut out), image::ImageFormat::Jpeg)
+        .context("encoding face crop as JPEG")?;
+    Ok(out)
 }
 
 #[cfg(test)]

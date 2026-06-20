@@ -45,8 +45,9 @@
 //! semantics as the other channels — the request is fine, the agent just never
 //! speaks).
 
-use std::sync::Arc;
+use std::collections::HashMap;
 use std::sync::atomic::Ordering;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use axum::body::{Body, Bytes};
@@ -61,8 +62,11 @@ use tokio::sync::broadcast::error::RecvError;
 use tokio::sync::mpsc;
 
 use crate::capabilities::stt::{self, Transcript};
+use crate::capabilities::voiceprint;
 use crate::memory::layout::MediaSlot;
 use crate::memory::media;
+use crate::memory::people_vectors::{self, Modality};
+use crate::pcm;
 use crate::server::headers::{AuthBearer, RequiredScene, SceneHeader, StreamHeader};
 use crate::server::{AppState, AudioEvent, AudioInEvent};
 use crate::segment::{Segmenter, Speech};
@@ -70,6 +74,53 @@ use crate::types::{Channel, JournalEntry, Media, Origin, Scene, Signal};
 use uuid::Uuid;
 
 const DEFAULT_MIME: &str = "audio/wav";
+
+/// Cosine floor for naming a recognized voice in the evidence note; below it the
+/// voice reads "unfamiliar". Mirrors the vision channel's `RECOGNISE_MIN` — soft
+/// evidence the agent weighs, not a verdict.
+const VOICE_RECOGNISE_MIN: f32 = 0.4;
+
+/// Safety cap on the rolling live-mic PCM buffer (samples) used for per-utterance
+/// voiceprinting: ~20 s at 16 kHz. Normally the buffer is drained every time a
+/// diarized utterance finalizes (≈ one turn); this only bounds growth if finals
+/// stall, so an embedding never runs on an unbounded slab.
+const MAX_VP_SAMPLES: usize = 16_000 * 20;
+
+/// Recognize the speaker of a single-voice clip and render one compact evidence
+/// note to append to the transcript, e.g. ` ⟨voice: 老王 ~0.82⟩`. The audio twin
+/// of the vision channel's `face_note`. Returns `None` when voiceprint is
+/// unconfigured, the clip can't be decoded/embedded, or the clip is diarized into
+/// multiple speakers (a single blended embedding would be misleading — the
+/// labeled transcript already attributes the turns). Best-effort: the signal
+/// stands regardless.
+async fn voice_note(bytes: &Bytes, mime: &str, transcript: &str, data_dir: &std::path::Path) -> Option<String> {
+    if !voiceprint::available() {
+        return None;
+    }
+    // A diarized, multi-speaker clip ("说话人0：…") is not one voice; skip rather
+    // than embed a blend of several speakers into one misleading sample.
+    if transcript.starts_with("说话人") {
+        return None;
+    }
+    let samples = pcm::to_i16_16k_mono(bytes, mime).ok().filter(|s| !s.is_empty())?;
+    let embedding = match voiceprint::embed(samples).await {
+        Ok(e) => e,
+        Err(err) => {
+            tracing::warn!(error = %err, "voiceprint embed failed");
+            return None;
+        }
+    };
+    let top = people_vectors::nearest(data_dir, Modality::Voice, &embedding, 1)
+        .await
+        .unwrap_or_default()
+        .into_iter()
+        .next();
+    let who = match top {
+        Some(c) if c.similarity >= VOICE_RECOGNISE_MIN => format!("{} ~{:.2}", c.subject, c.similarity),
+        _ => "unfamiliar".to_string(),
+    };
+    Some(format!(" ⟨voice: {who}⟩"))
+}
 
 /// Format of the live mic stream: raw 16 kHz mono signed 16-bit little-endian PCM.
 /// Carried on the inbound-audio `Start` so a listener knows how to decode it.
@@ -148,6 +199,9 @@ pub async fn post_audio(
     });
     let _ = state.audio_in.send(AudioInEvent::End { scene: Some(scene.clone()), turn });
 
+    // Keep the raw bytes for voiceprint before STT consumes them below.
+    let vp_bytes = body.clone();
+
     // 3. Transcribe. Errors surface as 502 — the upstream provider failed.
     let transcript = match stt::transcribe(body, &mime).await {
         Ok(t) => t,
@@ -183,7 +237,14 @@ pub async fn post_audio(
         width: None,
         height: None,
     };
-    if !deliver_transcript(&state, &scene, stream, &transcript, Some((ts, id, media))).await {
+    // Fold a voiceprint recognition note into the agent-facing transcript (who is
+    // speaking), the way the vision path folds in recognized faces. The ack keeps
+    // the raw transcript so the SPA caption isn't cluttered with the evidence tag.
+    let mut delivered = transcript.clone();
+    if let Some(note) = voice_note(&vp_bytes, &mime, &transcript, &state.data_dir).await {
+        delivered.push_str(&note);
+    }
+    if !deliver_transcript(&state, &scene, stream, &delivered, Some((ts, id, media))).await {
         return (StatusCode::SERVICE_UNAVAILABLE, "inbound channel closed\n").into_response();
     }
 
@@ -246,6 +307,16 @@ async fn stream_audio_in(
 
     let stt_task = tokio::spawn(async move { stt::transcribe_streaming(audio_rx, tr_tx).await });
 
+    // Live-mic voiceprint: who is speaking, from the vendor's diarized segments.
+    // The PCM pump (below) accumulates raw samples into `pcm_accum`; when a
+    // diarized utterance finalizes, the out task takes that slice, embeds it, and
+    // clusters it into the people store, caching `speaker_id → person` so each
+    // delivered sentence can be tagged with the speaker. Only armed when the
+    // voiceprint capability is configured.
+    let vp_on = voiceprint::available();
+    let pcm_accum: Arc<Mutex<Vec<i16>>> = Arc::new(Mutex::new(Vec::new()));
+    let speaker_names: Arc<Mutex<HashMap<String, String>>> = Arc::new(Mutex::new(HashMap::new()));
+
     // An explicit Segmenter — not the upstream's silence flag — decides where the
     // continuous word-stream is cut into sentences for the agent. A periodic tick
     // drives the time-based cut rules when the speaker has gone quiet. Each
@@ -253,10 +324,16 @@ async fn stream_audio_in(
     let relay_state = state.clone();
     let relay_scene = scene.clone();
     let relay_stream = stream.clone();
+    let relay_pcm = pcm_accum.clone();
+    let relay_names = speaker_names.clone();
     let out_task = tokio::spawn(async move {
         let mut seg = Segmenter::new(Speech::default(), Instant::now());
         let mut ticker = tokio::time::interval(Duration::from_millis(150));
         ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        // The speaker of the latest diarized final, and the last subject we tagged
+        // a sentence with — so we mark turn changes, not every line.
+        let mut current_speaker: Option<String> = None;
+        let mut last_tagged: Option<String> = None;
         loop {
             let cuts = tokio::select! {
                 msg = tr_rx.recv() => match msg {
@@ -272,6 +349,17 @@ async fn stream_audio_in(
                             relay_state.echo_input(&relay_scene, Channel::Text, &t.text, false);
                             relay_state.interrupts.note_speech(&relay_scene, tokio::time::Instant::now()).await;
                         }
+                        // A diarized utterance just finalized: its audio is the PCM
+                        // gathered since the last final. Take that slice and resolve
+                        // the speaker's identity off-thread (embed + cluster), then
+                        // remember which speaker is currently talking.
+                        if t.is_final && let Some(spk) = t.speaker_id.clone() {
+                            if vp_on {
+                                let pcm: Vec<i16> = std::mem::take(&mut *relay_pcm.lock().unwrap());
+                                resolve_speaker(&relay_state, relay_names.clone(), spk.clone(), pcm);
+                            }
+                            current_speaker = Some(spk);
+                        }
                         seg.observe(&t.text, t.is_final, Instant::now())
                     }
                     None => break, // STT session ended
@@ -279,7 +367,18 @@ async fn stream_audio_in(
                 _ = ticker.tick() => seg.tick(Instant::now()),
             };
             for sentence in cuts {
-                deliver_transcript(&relay_state, &relay_scene, relay_stream.clone(), &sentence, None).await;
+                // Tag the sentence with the current speaker's identity when it's
+                // known and the turn changed — soft evidence, low noise (a 1:1
+                // chat shows it once; a multi-party one marks each handoff).
+                let mut line = sentence;
+                if let Some(spk) = &current_speaker
+                    && let Some(subject) = relay_names.lock().unwrap().get(spk).cloned()
+                    && last_tagged.as_deref() != Some(subject.as_str())
+                {
+                    line.push_str(&format!(" ⟨voice: {subject}⟩"));
+                    last_tagged = Some(subject);
+                }
+                deliver_transcript(&relay_state, &relay_scene, relay_stream.clone(), &line, None).await;
             }
         }
         // Flush any trailing words as a final sentence when the session ends.
@@ -339,6 +438,17 @@ async fn stream_audio_in(
                     _ => {}
                 }
                 cap_buf.extend_from_slice(&b);
+                // Feed the rolling voiceprint buffer (same raw 16 kHz mono PCM).
+                // Drained per diarized utterance by the out task; capped so a
+                // stalled stream can't grow it without bound.
+                if vp_on {
+                    let mut acc = pcm_accum.lock().unwrap();
+                    acc.extend(pcm::le_i16(&b));
+                    if acc.len() > MAX_VP_SAMPLES {
+                        let excess = acc.len() - MAX_VP_SAMPLES;
+                        acc.drain(..excess);
+                    }
+                }
                 if audio_tx.send(b).await.is_err() {
                     break;
                 }
@@ -415,6 +525,50 @@ async fn deliver_transcript(
         return false;
     }
     true
+}
+
+/// Resolve a diarized speaker's identity off the hot path: embed the utterance's
+/// PCM into a voiceprint, cluster it into the people store
+/// ([`people_vectors::assign`] — append to a near cluster, or mint a fresh id),
+/// and cache `speaker_id → subject` so the stream can tag this speaker's
+/// sentences. Detached and best-effort — a failure just leaves the speaker
+/// untagged. Unlike clips and stills, the live mic persists no per-utterance media
+/// for the reflection pass to re-derive, so the clustering must happen inline here.
+fn resolve_speaker(
+    state: &Arc<AppState>,
+    names: Arc<Mutex<HashMap<String, String>>>,
+    speaker_id: String,
+    pcm: Vec<i16>,
+) {
+    if pcm.is_empty() {
+        return;
+    }
+    let data_dir = state.data_dir.clone();
+    // A playable WAV of this turn, built before the PCM is consumed by `embed`, so
+    // the cluster keeps an audible preview of the live-mic voice (the stream stores
+    // no per-utterance clip otherwise).
+    let pcm_bytes: Vec<u8> = pcm.iter().flat_map(|s| s.to_le_bytes()).collect();
+    let wav = pcm16_mono_16k_to_wav(&pcm_bytes);
+    tokio::spawn(async move {
+        let embedding = match voiceprint::embed(pcm).await {
+            Ok(e) => e,
+            Err(err) => {
+                tracing::warn!(error = %err, "live voiceprint embed failed");
+                return;
+            }
+        };
+        match people_vectors::assign(&data_dir, Modality::Voice, &embedding).await {
+            Ok(subject) => {
+                if let Err(err) =
+                    people_vectors::save_preview(&data_dir, &subject, Modality::Voice, &wav, "wav").await
+                {
+                    tracing::warn!(error = %err, "live voice preview save failed");
+                }
+                names.lock().unwrap().insert(speaker_id, subject);
+            }
+            Err(err) => tracing::warn!(error = %err, "live voice assign failed"),
+        }
+    });
 }
 
 /// Persist one wall-clock minute of live mic PCM as a WAV under
