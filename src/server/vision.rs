@@ -302,9 +302,18 @@ async fn stream_video_in(
 
     // Persist the camera on a wall-clock-minute grid: media chunks accumulate per
     // minute and flush to `vision/<date>/<HH>/<MM>.<ext>` at each rollover (and at
-    // close). The init segment (the first chunk) prefixes every minute file so
-    // each is independently decodable. Each flushed minute is also perceived.
+    // close). The init segment prefixes every minute file so each is independently
+    // decodable. Each flushed minute is also perceived.
+    //
+    // We can't assume "first WS chunk == the full init segment": `MediaRecorder`
+    // splits a fragmented-MP4 init (`ftyp`+`moov`) across the first *two* chunks,
+    // so caching only chunk 0 (the `ftyp`) drops the `moov` (track/codec config)
+    // from every minute file but the first — they then fail to decode. So we
+    // accumulate leading bytes in `init_acc` until the container delimits the init
+    // segment ([`init_segment_len`]), cache that, and treat the remainder as the
+    // first media bytes.
     let mut cap_init: Option<Bytes> = None;
+    let mut init_acc: Vec<u8> = Vec::new();
     let mut cap_minute: Option<String> = None;
     let mut cap_ts = Utc::now();
     let mut cap_buf: Vec<u8> = Vec::new();
@@ -314,13 +323,13 @@ async fn stream_video_in(
             Ok(WsMessage::Binary(b)) => {
                 let now = Utc::now();
                 if !started {
-                    // The first chunk is the init segment: cache it for
-                    // late-joining observers and for prefixing each minute file,
-                    // then announce the source. It is not buffered as media.
+                    // First chunk: announce the source now so observers connected
+                    // from the start receive the init segment in order as live
+                    // frames. The late-joiner cache holds this provisional init
+                    // until the full segment is assembled (refined below).
                     started = true;
-                    cap_init = Some(b.clone());
-                    cap_minute = Some(now.format("%Y-%m-%dT%H:%M").to_string());
                     cap_ts = now;
+                    cap_minute = Some(now.format("%Y-%m-%dT%H:%M").to_string());
                     state.video_in_live.lock().unwrap().insert(
                         scene.clone(),
                         VideoSource { turn, mime: mime.clone(), init: b.clone() },
@@ -330,6 +339,25 @@ async fn stream_video_in(
                         turn,
                         mime: mime.clone(),
                     });
+                }
+
+                if cap_init.is_none() {
+                    // Still delimiting the init segment. Accumulate; once the full
+                    // segment is present, split it off — the leading bytes are the
+                    // cached init, the remainder is the opening minute's first media.
+                    init_acc.extend_from_slice(&b);
+                    if let Some(n) = init_segment_len(&mime, &init_acc) {
+                        let init = Bytes::copy_from_slice(&init_acc[..n]);
+                        cap_buf.extend_from_slice(&init_acc[n..]);
+                        init_acc = Vec::new();
+                        // Refine the late-joiner cache to the *full* init segment.
+                        if let Some(src) = state.video_in_live.lock().unwrap().get_mut(&scene)
+                            && src.turn == turn
+                        {
+                            src.init = init.clone();
+                        }
+                        cap_init = Some(init);
+                    }
                 } else {
                     let minute = now.format("%Y-%m-%dT%H:%M").to_string();
                     if cap_minute.as_deref() != Some(minute.as_str()) {
@@ -472,6 +500,62 @@ fn mime_to_ext(mime: &str) -> &'static str {
     }
 }
 
+/// Byte length of the initialization segment at the front of `buf`, or `None`
+/// if `buf` doesn't yet hold the whole segment (the caller accumulates more).
+///
+/// The init segment is the decoder/track config that must prefix every persisted
+/// minute file (and every late-joining observer's stream) for it to decode. It
+/// can straddle WS-chunk boundaries, so we delimit it by container structure
+/// rather than by chunk granularity — the bug that left every fragmented-MP4
+/// minute file but the first missing its `moov`.
+fn init_segment_len(mime: &str, buf: &[u8]) -> Option<usize> {
+    match mime.split(';').next().unwrap_or("").trim().to_ascii_lowercase().as_str() {
+        // Fragmented MP4: init is `ftyp`+`moov` — everything before the first
+        // media fragment (`moof`).
+        "video/mp4" => mp4_init_len(buf),
+        // WebM (the default, and the fallback for anything else): init is the
+        // EBML/Segment header — everything before the first `Cluster`.
+        _ => webm_init_len(buf),
+    }
+}
+
+/// Offset of the first `moof` box in a fragmented-MP4 byte stream, i.e. the
+/// length of the `ftyp`+`moov` init segment. `None` until enough bytes are
+/// buffered to reach the `moof` (or on a malformed box).
+fn mp4_init_len(buf: &[u8]) -> Option<usize> {
+    let mut i = 0usize;
+    while i + 8 <= buf.len() {
+        let size32 = u32::from_be_bytes([buf[i], buf[i + 1], buf[i + 2], buf[i + 3]]) as usize;
+        if &buf[i + 4..i + 8] == b"moof" {
+            return Some(i);
+        }
+        let size = match size32 {
+            // 64-bit `largesize` in the 8 bytes after the type.
+            1 => {
+                if i + 16 > buf.len() {
+                    return None;
+                }
+                u64::from_be_bytes(buf[i + 8..i + 16].try_into().ok()?) as usize
+            }
+            // 0 means "to end of file" — an init box never uses it; bail.
+            0 => return None,
+            n => n,
+        };
+        if size < 8 {
+            return None; // malformed box header
+        }
+        i = i.checked_add(size)?;
+    }
+    None
+}
+
+/// Offset of the first `Cluster` element (id `1F 43 B6 75`) in a WebM byte
+/// stream, i.e. the length of the EBML/Segment init header. `None` until that
+/// id appears in `buf`.
+fn webm_init_len(buf: &[u8]) -> Option<usize> {
+    buf.windows(4).position(|w| w == [0x1F, 0x43, 0xB6, 0x75])
+}
+
 /// Map a streaming video mime to a file extension for the persisted minute file.
 /// The client negotiates the container at runtime (fragmented MP4 for hardware
 /// HEVC/H.264, else WebM), so the extension must follow the actual stream.
@@ -480,5 +564,74 @@ fn video_mime_to_ext(mime: &str) -> &'static str {
         "video/mp4" => "mp4",
         "video/webm" => "webm",
         _ => "bin",
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Build a minimal MP4 box: 4-byte big-endian size + 4-byte type + body.
+    fn box_bytes(typ: &[u8; 4], body: &[u8]) -> Vec<u8> {
+        let size = (8 + body.len()) as u32;
+        let mut v = size.to_be_bytes().to_vec();
+        v.extend_from_slice(typ);
+        v.extend_from_slice(body);
+        v
+    }
+
+    #[test]
+    fn mp4_init_ends_at_first_moof() {
+        let ftyp = box_bytes(b"ftyp", b"isomhvc1");
+        let moov = box_bytes(b"moov", &[0u8; 200]);
+        let moof = box_bytes(b"moof", &[0u8; 50]);
+        let mut stream = Vec::new();
+        stream.extend_from_slice(&ftyp);
+        stream.extend_from_slice(&moov);
+        stream.extend_from_slice(&moof);
+        let want = ftyp.len() + moov.len();
+        assert_eq!(init_segment_len("video/mp4", &stream), Some(want));
+    }
+
+    #[test]
+    fn mp4_init_incomplete_when_moov_not_yet_buffered() {
+        // ftyp present but moov box only partially received → can't reach moof.
+        let ftyp = box_bytes(b"ftyp", b"isomhvc1");
+        let mut moov = box_bytes(b"moov", &[0u8; 200]);
+        moov.truncate(moov.len() - 50);
+        let mut stream = ftyp.clone();
+        stream.extend_from_slice(&moov);
+        assert_eq!(init_segment_len("video/mp4", &stream), None);
+    }
+
+    #[test]
+    fn mp4_init_spanning_two_chunks_resolves_after_concat() {
+        // Mirrors the MediaRecorder split: chunk0 = ftyp, chunk1 = moov + moof.
+        let ftyp = box_bytes(b"ftyp", b"isomhvc1");
+        let moov = box_bytes(b"moov", &[0u8; 120]);
+        let moof = box_bytes(b"moof", &[0u8; 30]);
+        let chunk0 = ftyp.clone();
+        let mut chunk1 = moov.clone();
+        chunk1.extend_from_slice(&moof);
+        assert_eq!(init_segment_len("video/mp4", &chunk0), None);
+        let mut acc = chunk0.clone();
+        acc.extend_from_slice(&chunk1);
+        assert_eq!(init_segment_len("video/mp4", &acc), Some(ftyp.len() + moov.len()));
+    }
+
+    #[test]
+    fn webm_init_ends_at_first_cluster() {
+        let mut stream = vec![0x1A, 0x45, 0xDF, 0xA3]; // EBML header id
+        stream.extend_from_slice(&[0u8; 40]); // header/segment/tracks payload
+        let head = stream.len();
+        stream.extend_from_slice(&[0x1F, 0x43, 0xB6, 0x75]); // Cluster id
+        stream.extend_from_slice(&[0u8; 20]);
+        assert_eq!(init_segment_len("video/webm;codecs=vp8", &stream), Some(head));
+    }
+
+    #[test]
+    fn webm_init_incomplete_without_cluster() {
+        let stream = vec![0x1A, 0x45, 0xDF, 0xA3, 0, 0, 0, 0];
+        assert_eq!(init_segment_len("video/webm", &stream), None);
     }
 }
