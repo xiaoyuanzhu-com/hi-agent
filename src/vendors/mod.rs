@@ -13,5 +13,9 @@ pub mod doubao_vision;
 pub mod insightface_face;
 #[cfg(target_os = "macos")]
 pub mod macos_desktop_context;
+#[cfg(target_os = "macos")]
+pub mod macos_input;
+#[cfg(target_os = "macos")]
+pub mod macos_screencast;
 pub mod volcengine_stt;
 pub mod volcengine_tts;

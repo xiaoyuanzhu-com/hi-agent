@@ -15,13 +15,16 @@
 //! own `init_from_env`, so a misconfigured provider (unknown name, missing key)
 //! fails fast at startup rather than as an error at first use.
 //!
-//! [`desktop_context`] is the one exception to the env-config pattern: its
-//! vendor is the operating system, selected at compile time, so it has no
-//! `init_from_env` and does not appear in the composition root.
+//! [`desktop_context`], [`input`], and [`screencast`] are the exceptions to the
+//! env-config pattern: their vendor is the operating system, selected at compile
+//! time, so they have no `init_from_env` and do not appear in the composition
+//! root.
 
 pub mod desktop_context;
 pub mod face;
 pub mod image_gen;
+pub mod input;
+pub mod screencast;
 pub mod stt;
 pub mod tts;
 pub mod video_gen;

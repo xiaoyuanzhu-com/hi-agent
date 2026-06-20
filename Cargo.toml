@@ -64,6 +64,14 @@ image = "0.25"
 knf-rs = "0.3.2"
 nalgebra = "0.33"
 
+# macOS effector capabilities (input actuation + window capture). `core-graphics`
+# gives CGEvent (synthesize mouse/keyboard input) and CGWindowList (enumerate
+# on-screen windows); `core-foundation` reads the CFDictionary window records.
+# Target-gated so the Linux dev box and the Docker image skip them entirely.
+[target.'cfg(target_os = "macos")'.dependencies]
+core-graphics = "0.24"
+core-foundation = "0.10"
+
 [dev-dependencies]
 # tempfile is used by integration tests for throwaway data dirs.
 tempfile = "3"
