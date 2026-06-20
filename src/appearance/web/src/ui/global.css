@@ -261,6 +261,69 @@ button {
   align-items: flex-end;
 }
 
+/* --- View stage (host frame around an agent view) --------------------
+   A view that declares no layout of its own still lands centered and legible:
+   the host centers its content in a safe-area kept clear of the caption dock (the
+   side the view itself declared), the camera pip (bottom-left, z55) and the
+   channel controls / keyboard (bottom corners + bottom-center, z60), and paints a
+   surface behind it so it reads over the live, variable backdrop. A view that
+   wants the whole frame opts out with `export const surface = "none"` — no frame,
+   no surface, the bare full-bleed layer (ViewSlot). */
+.hi-view-frame {
+  position: absolute;
+  inset: 0;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  /* The empty margins fall through to the room behind — only the surface itself
+     takes pointer events (set below). */
+  pointer-events: none;
+  /* Base safe-area: clear the bottom corner widgets (pip / controls / kbd). */
+  padding: calc(env(safe-area-inset-top, 0px) + 28px)
+    max(24px, env(safe-area-inset-right, 0px) + 16px)
+    calc(env(safe-area-inset-bottom, 0px) + 104px)
+    max(24px, env(safe-area-inset-left, 0px) + 16px);
+}
+
+/* Reserve the strip the view's own captions dock into, so the content centers
+   clear of them rather than under them (the upload-carrier collision). */
+.hi-view-frame[data-aside="top"] {
+  padding-top: calc(env(safe-area-inset-top, 0px) + 116px);
+}
+.hi-view-frame[data-aside="bottom"] {
+  padding-bottom: calc(env(safe-area-inset-bottom, 0px) + 140px);
+}
+.hi-view-frame[data-aside="left"] {
+  padding-left: min(440px, 42vw);
+}
+.hi-view-frame[data-aside="right"] {
+  padding-right: min(440px, 42vw);
+}
+
+.hi-view-surface {
+  pointer-events: auto;
+  width: 100%;
+  max-width: min(680px, 100%);
+  max-height: 100%;
+  overflow: auto;
+  color: var(--fg);
+  /* The default surface — a light card legible over the frosted-white stage.
+     This is the floor; a view can still paint its own on top. */
+  padding: 24px;
+  border-radius: 24px;
+  background: rgba(255, 255, 255, 0.86);
+  border: 1px solid rgba(255, 255, 255, 0.7);
+  box-shadow: 0 18px 60px rgba(17, 21, 28, 0.18);
+  backdrop-filter: blur(14px) saturate(1.4);
+  -webkit-backdrop-filter: blur(14px) saturate(1.4);
+}
+
+/* Until the module resolves, the surface holds nothing — don't flash an empty
+   card before the view paints. */
+.hi-view-surface:empty {
+  display: none;
+}
+
 /* --- Wake gate -------------------------------------------------------- */
 .hi-wake {
   position: fixed;

@@ -30,9 +30,17 @@ export interface ActiveView {
  * stands down. Declared by the view module as `export const captionAside`. */
 export type CaptionAside = "top" | "bottom" | "left" | "right" | "self";
 
+/** Whether the host frames the view's content. `"card"` (the default when a module
+ * declares nothing) = the host centers the content in a safe-area clear of the
+ * captions / camera / controls and paints a legible surface behind it. `"none"` =
+ * full-bleed: the view fills the stage and owns its own background and layout (e.g.
+ * a photo or a dark composition). Declared as `export const surface`. */
+export type ViewSurface = "card" | "none";
+
 /** What a view's module declared about itself, known only after import. */
 export interface ViewMeta {
   captionAside?: CaptionAside;
+  surface?: ViewSurface;
 }
 
 interface ViewsValue {

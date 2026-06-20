@@ -51,7 +51,8 @@ export default function Upload() {
   }
 
   return (
-    <div style={S.wrap}>
+    <div style={S.root}>
+      <div style={S.title}>传文件给我</div>
       <div style={S.row}>
         <div
           onDragOver={(e) => {
@@ -105,8 +106,11 @@ export default function Upload() {
   );
 }
 
+// Content only — the host frames this view: it centres us in a safe-area clear of
+// the captions (we dock them up top) and paints the surface behind us.
 const S = {
-  wrap: { display: "flex", flexDirection: "column", gap: 16, padding: 20, maxWidth: 560, margin: "0 auto", fontFamily: "-apple-system,system-ui,sans-serif" },
+  root: { display: "flex", flexDirection: "column", gap: 16, fontFamily: "-apple-system,system-ui,sans-serif" },
+  title: { fontWeight: 600, fontSize: 18, textAlign: "center" },
   row: { display: "flex", flexWrap: "wrap", gap: 16, alignItems: "stretch" },
   drop: { flex: "1 1 240px", minHeight: 184, border: "2px dashed #9aa0a6", borderRadius: 16, display: "flex", flexDirection: "column", alignItems: "center", justifyContent: "center", textAlign: "center", padding: 20, cursor: "pointer", transition: "border-color .15s, background .15s" },
   dropActive: { borderColor: "#2563eb", background: "rgba(37,99,235,.08)" },

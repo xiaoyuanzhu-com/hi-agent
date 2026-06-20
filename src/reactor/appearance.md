@@ -30,6 +30,22 @@ is one idea — not a whole list crammed onto one slide. If the brief is a seque
 (a ranking, a timeline), build one view per item so the agent can walk them one at a
 time; give each its own id.
 
+**The host frames your view.** You don't lay out the whole screen. The host centers
+your content in a safe-area kept clear of the live captions, the camera self-view,
+and the on-screen controls, and paints a light surface behind it — so a view that
+lays out nothing of its own still lands centered and readable. Return your content
+directly (a `Stack`, a `Card`, your own elements); don't reach for the viewport,
+full-screen backgrounds, or absolute positioning to center yourself — that fights the
+frame. If your view *is* the full bleed — a photo, a map, a dark composition that owns
+the whole frame — opt out:
+
+```
+export const surface = "none"; // fill the stage; you own the background and layout
+```
+
+With `"none"` the host steps back to a bare full-screen layer and the captions keep a
+dark scrim so they stay legible over whatever you paint.
+
 **Images: never hotlink.** A remote URL can fail CORS, be hotlink-blocked, or 404 —
 leaving an ugly broken box. Instead **download the image into your project folder**
 with your own tools (find it via web/image search, then `curl`/fetch it to a file

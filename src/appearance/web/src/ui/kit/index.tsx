@@ -18,7 +18,8 @@ export function Stack({ children, style, className, gap = 12 }: BoxProps & { gap
   );
 }
 
-/** A bounded surface for a unit of content. */
+/** A bounded surface for a unit of content. A light, subtle inner panel — it reads
+ * as a grouping on the host's light view surface, not a card of its own. */
 export function Card({ children, style, className }: BoxProps) {
   return (
     <div
@@ -26,9 +27,9 @@ export function Card({ children, style, className }: BoxProps) {
       style={{
         padding: 20,
         borderRadius: 14,
-        background: "rgba(255,255,255,0.04)",
-        border: "1px solid rgba(255,255,255,0.08)",
-        color: "#e8e6e1",
+        background: "rgba(36, 40, 46, 0.035)",
+        border: "1px solid var(--line)",
+        color: "var(--fg)",
         ...style,
       }}
     >
@@ -40,7 +41,7 @@ export function Card({ children, style, className }: BoxProps) {
 /** A line or run of text in the house voice. */
 export function Text({ children, style, className }: BoxProps) {
   return (
-    <span className={className} style={{ fontSize: 16, lineHeight: 1.5, color: "#e8e6e1", ...style }}>
+    <span className={className} style={{ fontSize: 16, lineHeight: 1.5, color: "var(--fg)", ...style }}>
       {children}
     </span>
   );
