@@ -17,7 +17,7 @@ use std::sync::Arc;
 
 use agent_client_protocol::schema::{HttpHeader, McpServer, McpServerHttp};
 
-use crate::acp::{AcpProcess, AcpSession, AcpTap, SessionOpts};
+use crate::acp::{AcpProcess, AcpSession, AcpTap, ProcessRegistry, SessionOpts};
 use crate::config::{HEADER_ROLE, HEADER_SCENE, HEADER_WORKER_ID};
 use crate::types::Scene;
 
@@ -69,6 +69,10 @@ struct Inner {
     /// Raw JSON-RPC wire tap — every session's subprocess records its frames here
     /// for the raw ACP inspector. Handed to each [`AcpProcess`] at spawn.
     tap: AcpTap,
+    /// Every spawned subprocess registers its driver here, so the host can reap
+    /// them all on shutdown instead of leaking orphaned children. See
+    /// [`AgentLayer::shutdown`].
+    registry: ProcessRegistry,
 }
 
 impl AgentLayer {
@@ -78,6 +82,7 @@ impl AgentLayer {
                 spawn,
                 server_base_url,
                 tap,
+                registry: ProcessRegistry::new(),
             }),
         }
     }
@@ -118,6 +123,7 @@ impl AgentLayer {
             spawn.env.clone(),
             self.inner.tap.clone(),
             scene.0.clone(),
+            &self.inner.registry,
         )
         .await?;
         let id = process
@@ -125,5 +131,13 @@ impl AgentLayer {
             .await?;
 
         Ok(AcpSession::new(id, process, rx, system_prompt))
+    }
+
+    /// Reap every live ACP subprocess this layer has spawned (reactor, worker and
+    /// reflection sessions all flow through [`session`](Self::session)). Used on
+    /// host shutdown so no `node`/`claude` children are orphaned. Bound the call
+    /// with a timeout — a wedged child should not hang process exit.
+    pub async fn shutdown(&self) {
+        self.inner.registry.shutdown().await;
     }
 }

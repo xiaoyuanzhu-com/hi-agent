@@ -14,8 +14,10 @@
 //! responds immediately. If the agent ever needs a human gate, re-wire a
 //! bridge here.
 
+use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
 
 use agent_client_protocol as acp;
 use acp::schema::{
@@ -51,7 +53,71 @@ pub struct SessionOpts {
 pub struct AcpProcess {
     connection: acp::ConnectionTo<acp::Agent>,
     shutdown_tx: Option<oneshot::Sender<()>>,
-    driver: Option<JoinHandle<anyhow::Result<()>>>,
+}
+
+/// Tracks every live ACP subprocess's driver task, so the host can reap them all
+/// on shutdown rather than leaking orphaned `node`/`claude` children.
+///
+/// Each [`AcpProcess::spawn`] registers its driver here under the per-connection
+/// id; the driver task removes its own entry when it exits (its session handle
+/// was dropped, which signals shutdown), so the map only ever holds *live*
+/// processes. [`shutdown`](Self::shutdown) aborts whatever remains — dropping a
+/// driver future drops the ACP crate's `ChildGuard`, which `kill()`s the child.
+#[derive(Clone, Default)]
+pub struct ProcessRegistry {
+    inner: Arc<Mutex<HashMap<u64, JoinHandle<anyhow::Result<()>>>>>,
+}
+
+impl ProcessRegistry {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    fn insert(&self, id: u64, driver: JoinHandle<anyhow::Result<()>>) {
+        self.inner.lock().expect("process registry mutex").insert(id, driver);
+    }
+
+    /// Drop a driver handle from the live map. Called by the driver's own guard
+    /// when it exits; removing a finished task's handle is harmless.
+    fn remove(&self, id: u64) {
+        let _ = self.inner.lock().expect("process registry mutex").remove(&id);
+    }
+
+    /// Reap every live ACP subprocess. Aborting a driver future drops its
+    /// `ChildGuard` (which `kill()`s the child); awaiting the aborted handle
+    /// confirms the kill ran before we return. The caller should bound this with
+    /// a timeout so a wedged child can't hang process exit.
+    pub async fn shutdown(&self) {
+        let drivers: Vec<JoinHandle<anyhow::Result<()>>> = {
+            let mut map = self.inner.lock().expect("process registry mutex");
+            map.drain().map(|(_, driver)| driver).collect()
+        };
+        if drivers.is_empty() {
+            tracing::info!("no live ACP subprocesses to reap");
+            return;
+        }
+        let n = drivers.len();
+        tracing::info!(sessions = n, "reaping ACP subprocesses");
+        for driver in drivers {
+            driver.abort();
+            let _ = driver.await;
+        }
+        tracing::info!(sessions = n, "ACP subprocesses reaped");
+    }
+}
+
+/// Removes one driver's entry from the [`ProcessRegistry`] when the driver task
+/// exits — by clean shutdown, error, or abort. Lives inside the driver task's
+/// future, so it fires however that future ends.
+struct RegistryGuard {
+    registry: ProcessRegistry,
+    id: u64,
+}
+
+impl Drop for RegistryGuard {
+    fn drop(&mut self) {
+        self.registry.remove(self.id);
+    }
 }
 
 impl AcpProcess {
@@ -61,6 +127,7 @@ impl AcpProcess {
         env: Vec<(String, String)>,
         tap: AcpTap,
         scene: String,
+        registry: &ProcessRegistry,
     ) -> anyhow::Result<(Self, mpsc::UnboundedReceiver<SessionUpdate>)> {
         let program_str = program
             .to_str()
@@ -114,7 +181,12 @@ impl AcpProcess {
         let (conn_tx, conn_rx) = oneshot::channel::<acp::ConnectionTo<acp::Agent>>();
         let (shutdown_tx, shutdown_rx) = oneshot::channel::<()>();
 
+        // The driver self-removes from the registry when it exits, so the live
+        // map never accumulates finished sessions. Moved into the task below.
+        let registry_guard = RegistryGuard { registry: registry.clone(), id: conn };
+
         let driver: JoinHandle<anyhow::Result<()>> = tokio::spawn(async move {
+            let _registry_guard = registry_guard;
             let result: acp::Result<()> = acp::Client
                 .builder()
                 .on_receive_notification(
@@ -179,11 +251,15 @@ impl AcpProcess {
             }
         };
 
+        // Hand the live driver to the registry so host shutdown can reap this
+        // subprocess; the guard inside the task removes it when the session
+        // handle drops and signals shutdown.
+        registry.insert(conn, driver);
+
         Ok((
             Self {
                 connection,
                 shutdown_tx: Some(shutdown_tx),
-                driver: Some(driver),
             },
             update_rx,
         ))
@@ -219,17 +295,6 @@ impl AcpProcess {
     /// The shared JSON-RPC connection, for the owning session to drive prompts on.
     pub(crate) fn connection(&self) -> &acp::ConnectionTo<acp::Agent> {
         &self.connection
-    }
-
-    pub async fn shutdown(mut self) -> anyhow::Result<()> {
-        self.signal_shutdown();
-        if let Some(driver) = self.driver.take() {
-            match driver.await {
-                Ok(inner) => inner?,
-                Err(join_err) => return Err(anyhow!("ACP driver join failed: {join_err}")),
-            }
-        }
-        Ok(())
     }
 
     fn signal_shutdown(&mut self) {

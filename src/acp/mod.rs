@@ -11,6 +11,6 @@ pub mod process;
 pub mod session;
 pub mod tap;
 
-pub use process::{AcpProcess, SessionOpts};
+pub use process::{AcpProcess, ProcessRegistry, SessionOpts};
 pub use session::{AcpSession, PromptResult, SessionRun, SessionUpdate};
 pub use tap::{AcpTap, Dir, RawFrame};

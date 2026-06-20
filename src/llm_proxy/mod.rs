@@ -58,6 +58,14 @@ impl LlmProxy {
     }
 }
 
+impl Drop for LlmProxy {
+    fn drop(&mut self) {
+        // Stop serving: aborting frees the bound 127.0.0.1 port immediately
+        // rather than leaving the task detached until the runtime is torn down.
+        self._server.abort();
+    }
+}
+
 /// Forward any request to the upstream, replacing auth with the real key and
 /// streaming the response body straight back.
 async fn forward(

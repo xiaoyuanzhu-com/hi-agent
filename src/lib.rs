@@ -1,6 +1,7 @@
 //! hi-agent — reference implementation of the human-interface spec.
 
 use std::path::{Component, Path, PathBuf};
+use std::time::Duration;
 
 use anyhow::Context;
 use tokio::net::TcpListener;
@@ -245,9 +246,11 @@ pub async fn run(config: Config) -> anyhow::Result<()> {
         format!("http://127.0.0.1:{}", config.port),
     );
     tracing::info!("agent session layer ready (one subprocess spawns per session)");
+    // A handle for shutdown: the reactor takes ownership of `agent` below, but on
+    // termination we still need to reap every subprocess it spawned. The clone
+    // shares the same process registry.
+    let agent_for_shutdown = agent.clone();
 
-    // Keep the proxy alive for the life of the process.
-    let _proxy = proxy;
 
     let soul = reactor::load_soul(&config.data_dir);
     // The reactor compiles view source to ESM via esbuild; modules land under
@@ -278,6 +281,87 @@ pub async fn run(config: Config) -> anyhow::Result<()> {
     let listener = TcpListener::bind(addr).await?;
     tracing::info!("hi-agent listening on http://0.0.0.0:{}", config.port);
 
-    axum::serve(listener, router).await?;
+    // Serve until SIGINT/SIGTERM. `with_graceful_shutdown` stops accepting new
+    // connections and lets in-flight requests finish. We run it in a task so we
+    // can also watch the same signal ourselves and *bound* the drain: the SSE and
+    // long-poll endpoints hold a connection open indefinitely, so an unbounded
+    // graceful wait would never return.
+    let mut server = tokio::spawn(async move {
+        axum::serve(listener, router)
+            .with_graceful_shutdown(shutdown_signal())
+            .await
+    });
+
+    tokio::select! {
+        joined = &mut server => match joined {
+            Ok(Ok(())) => tracing::info!("HTTP server stopped"),
+            Ok(Err(e)) => tracing::error!(error = %e, "HTTP server error"),
+            Err(e) => tracing::error!(error = %e, "HTTP server task panicked"),
+        },
+        _ = shutdown_signal() => {
+            tracing::info!(grace = ?SHUTDOWN_GRACE, "shutdown signal received; draining in-flight requests");
+            match tokio::time::timeout(SHUTDOWN_GRACE, &mut server).await {
+                Ok(Ok(Ok(()))) => tracing::info!("HTTP server drained cleanly"),
+                Ok(Ok(Err(e))) => tracing::error!(error = %e, "HTTP server error during drain"),
+                Ok(Err(e)) => tracing::error!(error = %e, "HTTP server task panicked during drain"),
+                Err(_) => {
+                    tracing::warn!(grace = ?SHUTDOWN_GRACE, "drain grace elapsed; aborting in-flight connections");
+                    server.abort();
+                }
+            }
+        }
+    }
+
+    // Reap every ACP subprocess (one `node` + `claude` per live session) so none
+    // are orphaned. Bounded so a stuck child can't hang exit.
+    if tokio::time::timeout(SHUTDOWN_GRACE, agent_for_shutdown.shutdown()).await.is_err() {
+        tracing::warn!("ACP subprocess reaping timed out");
+    }
+
+    // Stop the local LLM proxy (its `Drop` aborts the server task).
+    drop(proxy);
+
+    tracing::info!("hi-agent shut down");
     Ok(())
+}
+
+/// How long in-flight HTTP requests get to finish after a shutdown signal — and,
+/// separately, the budget for reaping ACP subprocesses — before we stop waiting
+/// and exit anyway.
+const SHUTDOWN_GRACE: Duration = Duration::from_secs(10);
+
+/// Resolves on the first SIGINT (Ctrl-C) or SIGTERM. Each call registers fresh
+/// listeners, and tokio delivers the signal to all of them, so it is safe to
+/// await in more than one place (the server's graceful-shutdown future and the
+/// drain supervisor both use it). A failure to install a handler logs and then
+/// parks forever, so it never spuriously triggers shutdown.
+async fn shutdown_signal() {
+    let ctrl_c = async {
+        if let Err(e) = tokio::signal::ctrl_c().await {
+            tracing::error!(error = %e, "failed to listen for ctrl-c");
+            std::future::pending::<()>().await;
+        }
+    };
+
+    #[cfg(unix)]
+    let terminate = async {
+        use tokio::signal::unix::{signal, SignalKind};
+        match signal(SignalKind::terminate()) {
+            Ok(mut stream) => {
+                stream.recv().await;
+            }
+            Err(e) => {
+                tracing::error!(error = %e, "failed to install SIGTERM handler");
+                std::future::pending::<()>().await;
+            }
+        }
+    };
+
+    #[cfg(not(unix))]
+    let terminate = std::future::pending::<()>();
+
+    tokio::select! {
+        _ = ctrl_c => {}
+        _ = terminate => {}
+    }
 }
