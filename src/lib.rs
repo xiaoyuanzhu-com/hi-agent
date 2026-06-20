@@ -99,6 +99,16 @@ pub async fn run(config: Config) -> anyhow::Result<()> {
     };
     std::fs::create_dir_all(&views_dir).context("creating views dir")?;
 
+    // Seed the bundled built-in views (the file-upload entry) into the tree so the
+    // agent can show them by ref like any view. Overwritten each boot — the tree is
+    // disposable, so a binary update reseeds the latest.
+    views::install_builtin_views(&config.data_dir).context("installing built-in views")?;
+
+    // The agent's precious drive — where it files artifacts worth keeping (a user's
+    // handed-over documents, its own kept work). Created here so it always exists;
+    // filling it is the agent's job. (Verbatim annex of memory; see data-dir-layout.)
+    std::fs::create_dir_all(config.data_dir.join("drive")).context("creating drive dir")?;
+
     // Structured visibility into the ACP session lifecycle. The agent layer,
     // reactor, workers and heartbeat feed it; `GET /api/sessions` reads the live
     // mirror and `GET /api/sessions/events` streams the history over SSE.

@@ -54,6 +54,11 @@ pub enum Channel {
     Text,
     Vision,
     Audio,
+    /// Handed artifacts — a file the user gives the agent (a contract, a passport
+    /// scan), received by reference through an upload carrier. NOT a sense: the
+    /// agent doesn't *perceive* a file, it is *handed* one; the bytes are kept
+    /// verbatim and the signal says who handed over what.
+    File,
     Touch,
     Smell,
     Taste,
@@ -65,6 +70,7 @@ impl Channel {
             Channel::Text => "text",
             Channel::Vision => "vision",
             Channel::Audio => "audio",
+            Channel::File => "file",
             Channel::Touch => "touch",
             Channel::Smell => "smell",
             Channel::Taste => "taste",
@@ -101,6 +107,7 @@ impl FromStr for Channel {
             "text" | "thought" => Ok(Channel::Text),
             "vision" => Ok(Channel::Vision),
             "audio" => Ok(Channel::Audio),
+            "file" => Ok(Channel::File),
             "touch" => Ok(Channel::Touch),
             "smell" => Ok(Channel::Smell),
             "taste" => Ok(Channel::Taste),

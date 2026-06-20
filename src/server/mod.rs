@@ -6,6 +6,7 @@ use std::sync::{Arc, Mutex};
 use std::sync::atomic::AtomicU64;
 
 use axum::Router;
+use axum::extract::DefaultBodyLimit;
 use axum::http::StatusCode;
 use axum::routing::{get, post};
 use bytes::Bytes;
@@ -23,6 +24,7 @@ pub mod acp;
 pub mod audio;
 pub mod binder;
 pub mod channels;
+pub mod files;
 pub mod generated;
 pub mod headers;
 pub mod mcp;
@@ -312,6 +314,12 @@ pub struct AppState {
     /// handlers hold a [`crate::presence::PresenceGuard`] per connection; the
     /// reactor renders the counts into each turn as human-model facts.
     pub presence: crate::presence::Presence,
+
+    /// Scene-scoped phone-upload tokens for the file-upload carrier. A QR encodes
+    /// `/up/<token>`; the token resolves to the scene so a phone with no
+    /// `X-HI-Scene` header lands in the right scene. Short TTL, pruned on access,
+    /// in-memory (a restart drops outstanding links). See [`files`].
+    pub handoffs: Mutex<HashMap<String, files::Handoff>>,
 }
 
 impl AppState {
@@ -337,6 +345,10 @@ impl AppState {
         let _ = self.warm.try_send(scene.clone());
     }
 }
+
+/// Max body for a handed-file upload. Generous enough for photos/scans/PDFs;
+/// the rest of the channels keep axum's small default.
+const MAX_UPLOAD: usize = 50 * 1024 * 1024;
 
 pub fn build(
     memory: Memory,
@@ -401,6 +413,7 @@ pub fn build(
         tool_registry,
         interrupts,
         presence,
+        handoffs: Mutex::new(HashMap::new()),
     });
 
     // Channels are namespaced by boundary: `/api/in/*` is the world→agent side
@@ -420,6 +433,16 @@ pub fn build(
         // WebM over the WS, GET plays the live video; POST persists a still frame.
         .route("/api/in/vision", post(vision::post_vision).get(vision::get_vision))
         .route("/api/in/vision/stream", get(vision::get_vision_stream))
+        // The file channel — handing the agent a file (handed artifact, not a
+        // sense). Drag-drop posts to /api/in/file; the phone handoff mints a
+        // token (/api/handoff), serves an uploader at /up/<token>, receives at
+        // /api/up/<token>, and renders the QR via /api/qr. Uploads get a generous
+        // body limit; everything else keeps axum's small default.
+        .route("/api/in/file", post(files::post_file).layer(DefaultBodyLimit::max(MAX_UPLOAD)))
+        .route("/api/handoff", post(files::post_handoff))
+        .route("/up/{token}", get(files::get_up_page))
+        .route("/api/up/{token}", post(files::post_up).layer(DefaultBodyLimit::max(MAX_UPLOAD)))
+        .route("/api/qr", get(files::get_qr))
         .route("/api/in/touch", post(stubs::post_touch))
         .route("/api/in/smell", post(stubs::post_smell))
         .route("/api/in/taste", post(stubs::post_taste))

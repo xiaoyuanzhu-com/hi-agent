@@ -22,6 +22,9 @@ use anyhow::{Context, bail};
 use tokio::io::AsyncWriteExt;
 use tokio::process::Command;
 
+pub mod builtin;
+pub use builtin::install_builtin_views;
+
 /// Compiles agent view source to a served ESM module URL. Cheap to clone.
 #[derive(Debug, Clone)]
 pub struct ViewCompiler {
