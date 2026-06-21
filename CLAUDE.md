@@ -1,5 +1,19 @@
 # hi-agent
 
+## Making changes: always in a worktree
+
+Do all work for a task in its own fresh git worktree branched from `origin/main` — never edit the primary checkout directly. When the work is done and the user gives the go: commit, fetch + rebase, then push `<branch>:main`. Once the push lands, delete the worktree and its branch — never keep one around.
+
+    git fetch origin
+    # create a worktree off origin/main; make all changes there
+
+    # --- when ready (after the user's "go") ---
+    git fetch origin && git rebase origin/main
+    git push origin <branch>:main
+
+    # --- after the push lands: tear it down ---
+    git worktree remove <path> && git branch -d <branch>
+
 ## Working alongside uncommitted changes
 
 The working tree may hold the user's in-progress work that is unrelated to your task. Don't entangle with it: keep your changes in new files where possible, put additive config (e.g. a new Cargo dependency) in its own separate block rather than interleaved with theirs, and at commit time stage only the files/hunks your task owns — never `git add -A`. Leave their WIP untouched in the tree for them to commit.
