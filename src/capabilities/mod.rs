@@ -19,8 +19,8 @@
 //! auto-provisions on first run (see [`crate::models`]), so they have no provider
 //! toggle and nothing for the operator to set.
 //!
-//! [`desktop_context`], [`hotkey`], [`input`], and [`screencast`] are the
-//! exceptions to the env-config pattern: their vendor is the operating system,
+//! [`desktop_context`], [`hotkey`], [`input`], [`screencast`], and [`tray`] are
+//! the exceptions to the env-config pattern: their vendor is the operating system,
 //! selected at compile time, so they have no `init_from_env` and do not appear in
 //! the composition root.
 
@@ -33,6 +33,7 @@ pub mod image_gen;
 pub mod input;
 pub mod screencast;
 pub mod stt;
+pub mod tray;
 pub mod tts;
 pub mod video_gen;
 pub mod vision;

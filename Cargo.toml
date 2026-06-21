@@ -78,6 +78,26 @@ sha2 = "0.10"
 core-graphics = "0.24"
 core-foundation = "0.10"
 
+# macOS menu-bar (tray) status item — see `crate::vendors::macos_tray`. The tray
+# needs an Objective-C action target for the menu clicks, so this uses the modern
+# `objc2` family (not the cocoa-rs family the lines above belong to): `define_class!`
+# generates that target safely. Per-class APIs in objc2-app-kit / objc2-foundation
+# are behind feature flags, so each AppKit/Foundation type we touch is enabled here.
+objc2 = "0.6"
+objc2-foundation = { version = "0.3", features = ["NSString", "NSThread"] }
+objc2-app-kit = { version = "0.3", features = [
+    "NSApplication",
+    "NSResponder",
+    "NSStatusBar",
+    "NSStatusItem",
+    "NSStatusBarButton",
+    "NSButton",
+    "NSControl",
+    "NSMenu",
+    "NSMenuItem",
+    "NSImage",
+] }
+
 [dev-dependencies]
 # tempfile is used by integration tests for throwaway data dirs.
 tempfile = "3"

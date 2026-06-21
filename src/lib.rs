@@ -1,10 +1,12 @@
 //! hi-agent — reference implementation of the human-interface spec.
 
 use std::path::{Component, Path, PathBuf};
+use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::Context;
 use tokio::net::TcpListener;
+use tokio::sync::Notify;
 
 pub mod acp;
 pub mod agent;
@@ -57,9 +59,19 @@ fn normalize_dir(dir: &Path) -> anyhow::Result<PathBuf> {
     Ok(out)
 }
 
-/// Build the axum app, spawn the ACP subprocess + reactor, bind, and serve
-/// until the process is terminated.
+/// Public entry: serve until SIGINT/SIGTERM. Thin wrapper over
+/// [`run_with_shutdown`] with a trigger that never fires, so the only shutdown
+/// sources are the OS signals — byte-for-byte the historical behavior. The Linux,
+/// Docker, and headless-macOS paths all enter here.
 pub async fn run(config: Config) -> anyhow::Result<()> {
+    run_with_shutdown(config, Arc::new(Notify::new())).await
+}
+
+/// Build the axum app, spawn the ACP subprocess + reactor, bind, and serve until
+/// the process is terminated by an OS signal **or** `shutdown` is notified. The
+/// notify is the macOS tray's "Quit" path ([`run_with_tray`]); everywhere else it
+/// is a no-op trigger handed in by [`run`].
+async fn run_with_shutdown(config: Config, shutdown: Arc<Notify>) -> anyhow::Result<()> {
     // Normalize the data dir once, up front: absolutize it (it rides to child
     // processes via env, which may run with a different cwd) and strip `.`/`..`
     // components so the paths we hand the mind read as clean absolutes —
@@ -293,14 +305,15 @@ pub async fn run(config: Config) -> anyhow::Result<()> {
     let listener = TcpListener::bind(addr).await?;
     tracing::info!("hi-agent listening on http://0.0.0.0:{}", config.port);
 
-    // Serve until SIGINT/SIGTERM. `with_graceful_shutdown` stops accepting new
-    // connections and lets in-flight requests finish. We run it in a task so we
-    // can also watch the same signal ourselves and *bound* the drain: the SSE and
-    // long-poll endpoints hold a connection open indefinitely, so an unbounded
-    // graceful wait would never return.
+    // Serve until SIGINT/SIGTERM or the tray's Quit. `with_graceful_shutdown`
+    // stops accepting new connections and lets in-flight requests finish. We run
+    // it in a task so we can also watch the same trigger ourselves and *bound* the
+    // drain: the SSE and long-poll endpoints hold a connection open indefinitely,
+    // so an unbounded graceful wait would never return.
+    let server_shutdown = shutdown.clone();
     let mut server = tokio::spawn(async move {
         axum::serve(listener, router)
-            .with_graceful_shutdown(shutdown_signal())
+            .with_graceful_shutdown(shutdown_requested(server_shutdown))
             .await
     });
 
@@ -310,8 +323,8 @@ pub async fn run(config: Config) -> anyhow::Result<()> {
             Ok(Err(e)) => tracing::error!(error = %e, "HTTP server error"),
             Err(e) => tracing::error!(error = %e, "HTTP server task panicked"),
         },
-        _ = shutdown_signal() => {
-            tracing::info!(grace = ?SHUTDOWN_GRACE, "shutdown signal received; draining in-flight requests");
+        _ = shutdown_requested(shutdown.clone()) => {
+            tracing::info!(grace = ?SHUTDOWN_GRACE, "shutdown requested; draining in-flight requests");
             match tokio::time::timeout(SHUTDOWN_GRACE, &mut server).await {
                 Ok(Ok(Ok(()))) => tracing::info!("HTTP server drained cleanly"),
                 Ok(Ok(Err(e))) => tracing::error!(error = %e, "HTTP server error during drain"),
@@ -337,10 +350,70 @@ pub async fn run(config: Config) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// macOS entry: run the menu-bar status item on the **main thread** (AppKit's
+/// `NSStatusItem` requires it) while the HTTP server + reactor run on a background
+/// thread with their own runtime. This is the inversion the one-binary
+/// distribution model accepted as the cost of a tray: elsewhere tokio owns the
+/// main thread, here AppKit does.
+///
+/// The tray's "Quit" notifies `shutdown`; the server thread observes it, runs the
+/// normal graceful drain + ACP reap, then exits the process — which also tears
+/// down the main-thread AppKit loop. If the status item can't be created (e.g. no
+/// window-server session), the agent falls back to running headless rather than
+/// failing.
+#[cfg(target_os = "macos")]
+pub fn run_with_tray(config: Config) -> anyhow::Result<()> {
+    let url = format!("http://127.0.0.1:{}/", config.port);
+    let shutdown = Arc::new(Notify::new());
+
+    let server_shutdown = shutdown.clone();
+    let server = std::thread::Builder::new()
+        .name("hi-agent-server".to_string())
+        .spawn(move || {
+            let rt = match tokio::runtime::Builder::new_multi_thread().enable_all().build() {
+                Ok(rt) => rt,
+                Err(e) => {
+                    tracing::error!(error = %e, "failed to build server runtime");
+                    std::process::exit(1);
+                }
+            };
+            match rt.block_on(run_with_shutdown(config, server_shutdown)) {
+                // Graceful shutdown completed (drained + ACP subprocesses reaped).
+                // Exit the process, which also stops the main-thread AppKit loop.
+                Ok(()) => std::process::exit(0),
+                Err(e) => {
+                    tracing::error!(error = %e, "hi-agent server exited with error");
+                    std::process::exit(1);
+                }
+            }
+        })
+        .context("spawning server thread")?;
+
+    // Blocks on the AppKit run loop until the process exits via the server thread
+    // above. Returns early only if the status item can't be created — in which
+    // case fall back to running headless by joining the server.
+    if let Err(e) = capabilities::tray::run(url, shutdown) {
+        tracing::warn!(error = %e, "menu-bar item unavailable; running without it");
+    }
+    let _ = server.join();
+    Ok(())
+}
+
 /// How long in-flight HTTP requests get to finish after a shutdown signal — and,
 /// separately, the budget for reaping ACP subprocesses — before we stop waiting
 /// and exit anyway.
 const SHUTDOWN_GRACE: Duration = Duration::from_secs(10);
+
+/// Resolves when shutdown is requested by an OS signal (SIGINT/SIGTERM) **or** by
+/// the `extra` trigger (the tray's Quit). Takes the `Notify` by `Arc` so it can be
+/// moved into the server task's graceful-shutdown future. See [`shutdown_signal`]
+/// for the signal half.
+async fn shutdown_requested(extra: Arc<Notify>) {
+    tokio::select! {
+        _ = shutdown_signal() => {}
+        _ = extra.notified() => {}
+    }
+}
 
 /// Resolves on the first SIGINT (Ctrl-C) or SIGTERM. Each call registers fresh
 /// listeners, and tokio delivers the signal to all of them, so it is safe to

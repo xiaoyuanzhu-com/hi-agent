@@ -20,6 +20,12 @@ struct Cli {
     /// per-speaker span-slicing fix; face data, names, and prose facets are kept.
     #[arg(long)]
     purge_voice_galleries: bool,
+
+    /// macOS only: run headless (no menu-bar icon), giving the HTTP server the main
+    /// thread as on Linux/Docker. The tray is also auto-skipped under SSH (no window
+    /// server). No effect on other platforms.
+    #[arg(long)]
+    no_tray: bool,
 }
 
 /// Version line including the pinned runtime component versions.
@@ -32,8 +38,7 @@ fn version_string() -> &'static str {
     )
 }
 
-#[tokio::main]
-async fn main() -> anyhow::Result<()> {
+fn main() -> anyhow::Result<()> {
     let _ = dotenvy::dotenv();
 
     let cli = Cli::parse();
@@ -44,17 +49,41 @@ async fn main() -> anyhow::Result<()> {
         .init();
 
     if cli.purge_voice_galleries {
-        let removed = hi_agent::memory::people_vectors::purge_voice(&cli.data_dir).await?;
-        tracing::info!(removed, data_dir = %cli.data_dir.display(), "purged voice galleries");
-        return Ok(());
+        let data_dir = cli.data_dir.clone();
+        let rt = tokio::runtime::Runtime::new()?;
+        return rt.block_on(async move {
+            let removed = hi_agent::memory::people_vectors::purge_voice(&data_dir).await?;
+            tracing::info!(removed, data_dir = %data_dir.display(), "purged voice galleries");
+            Ok(())
+        });
     }
 
     let agent = hi_agent::config::AgentConfig::load()?;
+    // Read on every platform (so the flag is never dead code); only consulted on
+    // macOS, where it selects the headless/server-owns-main-thread path.
+    let no_tray = cli.no_tray;
     let config = hi_agent::Config {
         port: cli.port,
         data_dir: cli.data_dir,
         agent,
     };
 
-    hi_agent::run(config).await
+    // On macOS the default install shape is a desktop app: AppKit owns the main
+    // thread and shows a menu-bar icon, while the HTTP server runs on a background
+    // thread (see `hi_agent::run_with_tray`). Skip it — and keep today's behavior of
+    // the server owning the main thread — when explicitly disabled (`--no-tray`) or
+    // when there is no window server (running over SSH, where AppKit can't draw).
+    #[cfg(target_os = "macos")]
+    {
+        let headless = no_tray || std::env::var_os("SSH_CONNECTION").is_some();
+        if !headless {
+            return hi_agent::run_with_tray(config);
+        }
+        tracing::info!("tray skipped (headless); serving without a menu-bar icon");
+    }
+    #[cfg(not(target_os = "macos"))]
+    let _ = no_tray;
+
+    let rt = tokio::runtime::Builder::new_multi_thread().enable_all().build()?;
+    rt.block_on(hi_agent::run(config))
 }

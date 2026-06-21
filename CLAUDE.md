@@ -30,6 +30,12 @@ The app targets two install shapes:
 
 The managed runtime (Node + ACP adapter + claude + esbuild) auto-installs into the OS cache on first run, so a bundled app needs no separate runtime install. On a dev box with `node` + `claude-agent-acp` + `claude` on PATH, the **system runtime** is used instead (esbuild is then provisioned separately — see [runtime::ensure_view_esbuild](src/runtime/mod.rs)).
 
+## macOS entry shape (tray vs. headless)
+
+On macOS the binary's default shape is a **desktop app**: AppKit owns the main thread and shows a menu-bar status item (Open / Quit), while the HTTP server + reactor run on a background thread ([run_with_tray](src/lib.rs); status item in [vendors/macos_tray.rs](src/vendors/macos_tray.rs)). Everywhere else (Linux/Docker) tokio keeps the main thread as before. Still one binary — this is the main-thread inversion the distribution model accepted as the cost of a tray; no shell crate, no Tauri.
+
+The tray **auto-skips when `SSH_CONNECTION` is set** (no window server over SSH) or with `--no-tray`, falling back to the server-owns-main-thread path. So the SSH journey-testing command below is unchanged. The visible icon can only be tested from a real desktop session (same GUI-session wall as screencast/hotkey); over SSH you can verify compile, tests, and that startup logs `tray skipped (headless)` and still binds.
+
 ## Testing user journeys live (Mac mini)
 
 Journeys in [docs/user-journeys/](docs/user-journeys/) are specs of *intended* behavior — test them against a real running instance, not by code-reading. Standing setup: clone at `~/projects/hi-agent` on the Mac mini (`ssh macmini`), `cargo build --release`, run from the repo root (`.env` with `AI_API_KEY` etc. lives there):
