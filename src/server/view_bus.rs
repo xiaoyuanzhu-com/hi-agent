@@ -36,7 +36,7 @@ use serde::{Deserialize, Serialize};
 use tokio::sync::{Mutex, Notify};
 
 use crate::memory::layout;
-use crate::types::{Scene, ViewEnvelope, ViewOp};
+use crate::types::{Geometry, Scene, ViewEnvelope, ViewOp};
 
 /// Cap on active views per scene. Bounds growth if the agent keeps showing
 /// distinct ids without dismissing; the oldest (bottom of the z-order) are
@@ -66,6 +66,11 @@ struct SceneAppearance {
 struct RetainedView {
     id: String,
     module_url: String,
+    /// Where/how this view sits on the stage. `#[serde(default)]` is the
+    /// back-compat lever: snapshots written before geometry existed reload as
+    /// `None` → the host's floor layout.
+    #[serde(default)]
+    geometry: Option<Geometry>,
 }
 
 /// On-disk whole-state snapshot of one scene's appearance at a moment. Carries
@@ -84,6 +89,9 @@ struct SceneSnapshot {
 pub struct WireView {
     pub id: String,
     pub module_url: String,
+    /// Where/how the view sits; absent = the client's floor layout (centered card).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub geometry: Option<Geometry>,
 }
 
 /// A scene's full appearance state — the body of one `GET /api/out/view`
@@ -141,6 +149,7 @@ impl ViewBus {
                 let view = RetainedView {
                     id: envelope.id.clone(),
                     module_url,
+                    geometry: envelope.geometry,
                 };
                 let pos = entry.views.iter().position(|v| v.id == envelope.id);
                 match (envelope.op, pos) {
@@ -196,6 +205,7 @@ impl ViewBus {
                         .map(|v| WireView {
                             id: v.id.clone(),
                             module_url: v.module_url.clone(),
+                            geometry: v.geometry,
                         })
                         .collect(),
                 };
@@ -302,6 +312,7 @@ mod tests {
             id: id.into(),
             op: ViewOp::Show,
             module_url: Some(url.into()),
+            geometry: None,
         }
     }
 
@@ -399,6 +410,7 @@ mod tests {
                 id: "a".into(),
                 op: ViewOp::Replace,
                 module_url: Some("/m/a2.mjs".into()),
+                geometry: None,
             },
         )
         .await;
@@ -418,6 +430,7 @@ mod tests {
                 id: "d".into(),
                 op: ViewOp::Replace,
                 module_url: Some("/m/d.mjs".into()),
+                geometry: None,
             },
         )
         .await;
@@ -430,6 +443,7 @@ mod tests {
                 id: "b".into(),
                 op: ViewOp::Dismiss,
                 module_url: None,
+                geometry: None,
             },
         )
         .await;
@@ -481,5 +495,59 @@ mod tests {
         let bus = ViewBus::load(tmp.path());
         let state = bus.wait_state(&s, None).await;
         assert_eq!(ids(&state), vec!["keep"]);
+    }
+
+    #[tokio::test]
+    async fn loads_pre_geometry_snapshot_as_floor() {
+        // A snapshot written before geometry existed has no `geometry` key in its
+        // views; `#[serde(default)]` must reload it as None (the floor layout)
+        // rather than failing the whole snapshot parse.
+        let tmp = tempfile::tempdir().unwrap();
+        let s = scene();
+        let dir = layout::appearance_day_dir(tmp.path(), &s, Utc::now());
+        std::fs::create_dir_all(&dir).unwrap();
+        let old = r#"{"scene":"boss","version":3,"as_of":"2026-06-21T12:00:00Z","views":[{"id":"a","module_url":"/m/a.mjs"}]}"#;
+        std::fs::write(dir.join("appearance-120000Z.json"), old).unwrap();
+
+        let bus = ViewBus::load(tmp.path());
+        let state = bus.wait_state(&s, None).await;
+        assert_eq!(state.version, 3);
+        assert_eq!(ids(&state), vec!["a"]);
+        assert!(state.views[0].geometry.is_none());
+    }
+
+    #[tokio::test]
+    async fn apply_carries_geometry_through_wire_and_reload() {
+        use crate::types::{Region, SizeClass};
+        let tmp = tempfile::tempdir().unwrap();
+        let s = scene();
+        let geo = Geometry {
+            region: Region::Right,
+            size: SizeClass::Wide,
+            owns_captions: true,
+        };
+
+        let version = {
+            let bus = ViewBus::load(tmp.path());
+            bus.apply(
+                &s,
+                ViewEnvelope {
+                    id: "g".into(),
+                    op: ViewOp::Show,
+                    module_url: Some("/m/g.mjs".into()),
+                    geometry: Some(geo),
+                },
+            )
+            .await;
+            let state = bus.wait_state(&s, None).await;
+            assert_eq!(state.views[0].geometry, Some(geo));
+            state.version
+        };
+
+        // Geometry rides the snapshot, so it survives a restart.
+        let bus = ViewBus::load(tmp.path());
+        let state = bus.wait_state(&s, None).await;
+        assert_eq!(state.version, version);
+        assert_eq!(state.views[0].geometry, Some(geo));
     }
 }

@@ -8,7 +8,7 @@ import {
   useState,
   type ReactNode,
 } from "react";
-import { subscribeViewState, clearViewState } from "../channels/out/view";
+import { subscribeViewState, clearViewState, type Geometry } from "../channels/out/view";
 import { usePresence, useScene, useWake } from "./session";
 
 // How long a newly appearing view waits for the voice before showing anyway.
@@ -19,28 +19,19 @@ import { usePresence, useScene, useWake } from "./session";
 // shows the view promptly rather than stalling on a beat that never sounds.
 const VOICE_GATE_FALLBACK_MS = 1000;
 
-/** One mounted agent view: a stable id and the compiled module URL to import. */
+/** One mounted agent view: a stable id, the compiled module URL to import, and
+ * the placement the server delivered with it (absent = floor layout). */
 export interface ActiveView {
   id: string;
   moduleUrl: string;
+  geometry?: Geometry;
 }
 
-/** Where the host should dock the live caption words while a view is on stage.
- * `"self"` = the view renders the words itself (via `useSpeech()`); the host
- * stands down. Declared by the view module as `export const captionAside`. */
-export type CaptionAside = "top" | "bottom" | "left" | "right" | "self";
-
-/** Whether the host frames the view's content. `"card"` (the default when a module
- * declares nothing) = the host centers the content in a safe-area clear of the
- * captions / camera / controls and paints a legible surface behind it. `"none"` =
- * full-bleed: the view fills the stage and owns its own background and layout (e.g.
- * a photo or a dark composition). Declared as `export const surface`. */
-export type ViewSurface = "card" | "none";
-
-/** What a view's module declared about itself, known only after import. */
+/** What a view's module declared about itself, known only after import — a
+ * fallback `Geometry` for inline `source` views that carry no wire geometry or
+ * sidecar. The wire geometry, when present, wins over this. */
 export interface ViewMeta {
-  captionAside?: CaptionAside;
-  surface?: ViewSurface;
+  geometry?: Geometry;
 }
 
 interface ViewsValue {
@@ -80,7 +71,9 @@ export function ViewsProvider({ children }: { children: ReactNode }) {
   const { reactive } = usePresence();
   const playingRef = useRef(false);
   const voiceWaitersRef = useRef<Set<() => void>>(new Set());
-  const [views, setViews] = useState<Map<string, string>>(new Map());
+  const [views, setViews] = useState<Map<string, { moduleUrl: string; geometry?: Geometry }>>(
+    new Map(),
+  );
   const [meta, setMeta] = useState<Map<string, ViewMeta>>(new Map());
 
   useEffect(() => {
@@ -147,8 +140,14 @@ export function ViewsProvider({ children }: { children: ReactNode }) {
             applied.clear();
             for (const v of state.views) applied.add(v.id);
             // Mirror the snapshot wholesale: array order = z-order. ViewSlot
-            // keys by id, so unchanged views keep their mounted component.
-            setViews(new Map(state.views.map((v) => [v.id, v.module_url])));
+            // keys by id, so unchanged views keep their mounted component. The
+            // geometry rides along so the compositor places each view; an absent
+            // one reads as the floor layout.
+            setViews(
+              new Map(
+                state.views.map((v) => [v.id, { moduleUrl: v.module_url, geometry: v.geometry }]),
+              ),
+            );
             const live = new Set(state.views.map((v) => v.id));
             setMeta((prev) => {
               if (![...prev.keys()].some((id) => !live.has(id))) return prev;
@@ -169,7 +168,12 @@ export function ViewsProvider({ children }: { children: ReactNode }) {
   }, [woken, scene]);
 
   const value = useMemo<ViewsValue>(
-    () => ({ views: [...views].map(([id, moduleUrl]) => ({ id, moduleUrl })), meta, reportMeta, clear }),
+    () => ({
+      views: [...views].map(([id, v]) => ({ id, moduleUrl: v.moduleUrl, geometry: v.geometry })),
+      meta,
+      reportMeta,
+      clear,
+    }),
     [views, meta, reportMeta, clear],
   );
   return <ViewsContext.Provider value={value}>{children}</ViewsContext.Provider>;

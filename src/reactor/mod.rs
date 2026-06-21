@@ -77,7 +77,7 @@ use crate::acp::{AcpSession, SessionOpts, SessionUpdate};
 use crate::agent::{AgentLayer, SessionRole};
 use crate::memory::{Memory, build_for_scene};
 use crate::observatory::{EventKind, Observatory, SessionKind};
-use crate::types::{Channel, JournalEntry, Origin, Scene, Signal, ViewEnvelope, ViewOp};
+use crate::types::{Channel, Geometry, JournalEntry, Origin, Scene, Signal, ViewEnvelope, ViewOp};
 use bytes::Bytes;
 use uuid::Uuid;
 
@@ -1513,8 +1513,8 @@ async fn perform(
                 let _ = tx.send(sentence).await;
             }
         }
-        interleave::Emit::ShowView { id, op, source } => {
-            emit_view(reactor, scene, id, op, source).await
+        interleave::Emit::ShowView { id, op, source, geometry } => {
+            emit_view(reactor, scene, id, op, source, geometry).await
         }
     }
 }
@@ -1621,7 +1621,14 @@ async fn forward_frames(
 /// preceding sentence has flushed, so it stays paced to narration); a `dismiss`
 /// carries no module. A compile failure is logged and the view is dropped — the
 /// turn's speech already went out, so a broken view never breaks the reply.
-async fn emit_view(reactor: &Reactor, scene: &Scene, id: String, op: ViewOp, source: String) {
+async fn emit_view(
+    reactor: &Reactor,
+    scene: &Scene,
+    id: String,
+    op: ViewOp,
+    source: String,
+    geometry: Option<Geometry>,
+) {
     let module_url = if op == ViewOp::Dismiss {
         None
     } else {
@@ -1648,7 +1655,7 @@ async fn emit_view(reactor: &Reactor, scene: &Scene, id: String, op: ViewOp, sou
         .out
         .send(OutboundSignal::View {
             scene: scene.clone(),
-            envelope: ViewEnvelope { id, op, module_url },
+            envelope: ViewEnvelope { id, op, module_url, geometry },
         })
         .await;
 }

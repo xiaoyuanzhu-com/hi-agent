@@ -215,6 +215,53 @@ pub enum JournalEntry {
 // ViewEnvelope — outbound agent-authored view module for the UI view slot
 // -----------------------------------------------------------------------------
 
+/// Where a participant's content sits on the stage. The host's layout maps the
+/// finite set of named regions to a position by lookup (no solver), so an omitted
+/// geometry degrades to `Center` — today's centered card. `Fill` owns the whole
+/// frame and its own background (what the old `surface = "none"` opt-out meant).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum Region {
+    #[default]
+    Center,
+    Top,
+    Bottom,
+    Left,
+    Right,
+    TopLeft,
+    TopRight,
+    BottomLeft,
+    BottomRight,
+    Fill,
+}
+
+/// How big a participant's content wants to be. `Auto` is the floor default and
+/// matches today's ≤680px card; `Fill` spreads to the frame.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum SizeClass {
+    Compact,
+    #[default]
+    Auto,
+    Wide,
+    Fill,
+}
+
+/// A participant's self-declared placement. `region` + `size` say where and how
+/// big; `owns_captions` is the ownership axis the old `captionAside = "self"`
+/// smuggled inside a position enum — when set, this view renders the live words
+/// itself and the host's caption participant stands down. Every field defaults,
+/// so an absent `Geometry` reads as today's centered card.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub struct Geometry {
+    #[serde(default)]
+    pub region: Region,
+    #[serde(default)]
+    pub size: SizeClass,
+    #[serde(default)]
+    pub owns_captions: bool,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ViewOp {
@@ -240,4 +287,8 @@ pub struct ViewEnvelope {
     pub op: ViewOp,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub module_url: Option<String>,
+    /// Where/how the view sits on the stage. `None` = the host's floor layout
+    /// (centered card). Absent on `dismiss`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub geometry: Option<Geometry>,
 }

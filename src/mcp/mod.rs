@@ -19,7 +19,7 @@ use serde_json::{Value, json};
 use base64::Engine as _;
 use crate::memory::people_vectors;
 use crate::reactor::{SceneControl, ToolRegistry};
-use crate::types::Scene;
+use crate::types::{Geometry, Region, Scene};
 
 /// MCP protocol version we advertise when the client doesn't pin one. We echo the
 /// client's requested version when present, so this is only the fallback.
@@ -203,6 +203,7 @@ fn tools_for_role(role: Option<&str>) -> Vec<Value> {
                         "id": { "type": "string", "description": "A stable name for this on-screen slot, so replace/dismiss can target it. Omit to auto-generate." },
                         "ref": { "type": "string", "description": "A view ref a builder reported (e.g. `project/view`) — the usual way to show a built view. Omit for dismiss." },
                         "source": { "type": "string", "description": "Raw JSX (default-exported component) for a trivial inline view, when not using a ref. Omit for dismiss." },
+                        "region": { "type": "string", "enum": ["center", "top", "bottom", "left", "right", "top_left", "top_right", "bottom_left", "bottom_right", "fill"], "description": "Optional: where on the stage to place this view. Omit to use the placement the builder chose — only set it to override, e.g. when arranging several views at once." },
                     },
                     "required": ["op"],
                 }),
@@ -348,15 +349,25 @@ async fn dispatch_tool(
             let op = args.get("op").and_then(Value::as_str).unwrap_or("show").to_string();
             // A view is normally shown by ref (one a worker built); resolve it to
             // source HERE, server-side, so the JSX never enters the mind's context.
-            // Inline `source` stays as a trivial-one-off escape hatch.
-            let source = match arg_opt("ref") {
+            // Inline `source` stays as a trivial-one-off escape hatch. The ref may
+            // carry a `.geom.json` sidecar — the placement the builder chose.
+            let (source, sidecar_geom) = match arg_opt("ref") {
                 Some(r) if !r.trim().is_empty() => match resolve_view_ref(data_dir, &r).await {
-                    Ok(src) => src,
+                    Ok(resolved) => resolved,
                     Err(err) => return tool_error(&format!("show_view ref `{r}`: {err}")),
                 },
-                _ => arg_str("source"),
+                _ => (arg_str("source"), None),
             };
-            sink.show_view(arg_opt("id"), op, source).await.map(|()| "shown")
+            // The mind may override where it goes (when arranging several at once);
+            // otherwise the builder's declared geometry stands. Absent both = floor.
+            let region_override = arg_opt("region").as_deref().and_then(parse_region);
+            let geometry = match (sidecar_geom, region_override) {
+                (Some(g), Some(region)) => Some(Geometry { region, ..g }),
+                (Some(g), None) => Some(g),
+                (None, Some(region)) => Some(Geometry { region, ..Default::default() }),
+                (None, None) => None,
+            };
+            sink.show_view(arg_opt("id"), op, source, geometry).await.map(|()| "shown")
         }
         "delegate" => {
             let task = arg_str("task");
@@ -667,15 +678,45 @@ fn valid_view_ref(view_ref: &str) -> bool {
         })
 }
 
-/// Resolve a view ref to its stored JSX source, read from the views tree. The agent
-/// passes only the tiny ref through `show_view`; this reads the component back.
-async fn resolve_view_ref(data_dir: &std::path::Path, view_ref: &str) -> Result<String, String> {
+/// Parse a `region` tool argument into a [`Region`]; unknown strings yield `None`.
+fn parse_region(s: &str) -> Option<Region> {
+    Some(match s {
+        "center" => Region::Center,
+        "top" => Region::Top,
+        "bottom" => Region::Bottom,
+        "left" => Region::Left,
+        "right" => Region::Right,
+        "top_left" => Region::TopLeft,
+        "top_right" => Region::TopRight,
+        "bottom_left" => Region::BottomLeft,
+        "bottom_right" => Region::BottomRight,
+        "fill" => Region::Fill,
+        _ => return None,
+    })
+}
+
+/// Resolve a view ref to its stored JSX source (and the builder's declared
+/// placement, if any), read from the views tree. The agent passes only the tiny
+/// ref through `show_view`; this reads the component back, plus an optional
+/// `<ref>.geom.json` sidecar the builder wrote next to it. A missing or
+/// unparseable sidecar is not an error — it just means the floor layout.
+async fn resolve_view_ref(
+    data_dir: &std::path::Path,
+    view_ref: &str,
+) -> Result<(String, Option<Geometry>), String> {
     let view_ref = view_ref.trim();
     if !valid_view_ref(view_ref) {
         return Err(format!("invalid ref `{view_ref}` (names and `/` only, no dots)"));
     }
-    let path = data_dir.join("views").join(format!("{view_ref}.jsx"));
-    tokio::fs::read_to_string(&path).await.map_err(|e| format!("no such view ({e})"))
+    let views = data_dir.join("views");
+    let source = tokio::fs::read_to_string(views.join(format!("{view_ref}.jsx")))
+        .await
+        .map_err(|e| format!("no such view ({e})"))?;
+    let geometry = match tokio::fs::read(views.join(format!("{view_ref}.geom.json"))).await {
+        Ok(bytes) => serde_json::from_slice::<Geometry>(&bytes).ok(),
+        Err(_) => None,
+    };
+    Ok((source, geometry))
 }
 
 #[cfg(test)]
@@ -701,10 +742,38 @@ mod view_store_tests {
         let proj = dir.path().join("views").join("deck");
         tokio::fs::create_dir_all(&proj).await.unwrap();
         tokio::fs::write(proj.join("leader.jsx"), "export default () => 1").await.unwrap();
-        assert_eq!(
-            resolve_view_ref(dir.path(), "deck/leader").await.unwrap(),
-            "export default () => 1"
-        );
+        let (source, geometry) = resolve_view_ref(dir.path(), "deck/leader").await.unwrap();
+        assert_eq!(source, "export default () => 1");
+        // No sidecar written → floor layout.
+        assert!(geometry.is_none());
+    }
+
+    #[tokio::test]
+    async fn resolve_reads_geometry_sidecar() {
+        let dir = tempfile::tempdir().unwrap();
+        let proj = dir.path().join("views").join("deck");
+        tokio::fs::create_dir_all(&proj).await.unwrap();
+        tokio::fs::write(proj.join("leader.jsx"), "export default () => 1").await.unwrap();
+        tokio::fs::write(
+            proj.join("leader.geom.json"),
+            r#"{"region":"right","size":"wide"}"#,
+        )
+        .await
+        .unwrap();
+        let (_, geometry) = resolve_view_ref(dir.path(), "deck/leader").await.unwrap();
+        let g = geometry.expect("sidecar geometry");
+        assert_eq!(g.region, Region::Right);
+        assert_eq!(g.size, crate::types::SizeClass::Wide);
+        assert!(!g.owns_captions); // defaulted field absent from the sidecar
+    }
+
+    #[test]
+    fn parse_region_reads_names_and_rejects_garbage() {
+        assert_eq!(parse_region("center"), Some(Region::Center));
+        assert_eq!(parse_region("bottom_left"), Some(Region::BottomLeft));
+        assert_eq!(parse_region("fill"), Some(Region::Fill));
+        assert_eq!(parse_region("middle"), None);
+        assert_eq!(parse_region(""), None);
     }
 
     #[tokio::test]

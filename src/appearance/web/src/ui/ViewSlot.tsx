@@ -1,8 +1,37 @@
 import { Component, useEffect, useState, type ComponentType, type ReactNode } from "react";
-import { useViews, type CaptionAside, type ViewSurface } from "../core/views";
+import { useViews } from "../core/views";
+import type { Region, SizeClass, Geometry } from "../channels/out/view";
+import type { Placement } from "../core/layout";
 
-const CAPTION_ASIDES: readonly CaptionAside[] = ["top", "bottom", "left", "right", "self"];
-const SURFACES: readonly ViewSurface[] = ["card", "none"];
+const REGIONS: readonly Region[] = [
+  "center",
+  "top",
+  "bottom",
+  "left",
+  "right",
+  "top_left",
+  "top_right",
+  "bottom_left",
+  "bottom_right",
+  "fill",
+];
+const SIZES: readonly SizeClass[] = ["compact", "auto", "wide", "fill"];
+
+/** Read a module's self-declared `export const geometry`, keeping only known
+ * enum values — a fallback placement for inline `source` views that carry no wire
+ * geometry. */
+function readDeclaredGeometry(mod: unknown): Geometry | undefined {
+  const g = (mod as { geometry?: unknown }).geometry;
+  if (!g || typeof g !== "object") return undefined;
+  const region = REGIONS.find((r) => r === (g as { region?: unknown }).region);
+  const size = SIZES.find((s) => s === (g as { size?: unknown }).size);
+  const ownsCaptions = (g as { owns_captions?: unknown }).owns_captions;
+  return {
+    ...(region ? { region } : {}),
+    ...(size ? { size } : {}),
+    ...(typeof ownsCaptions === "boolean" ? { owns_captions: ownsCaptions } : {}),
+  };
+}
 
 /**
  * Dynamically import a compiled agent view module and render its default export.
@@ -10,10 +39,9 @@ const SURFACES: readonly ViewSurface[] = ["card", "none"];
  * resolved by the page's import map to the host's shared instances. No props: a
  * view reads the live session through `@hi/core` hooks.
  *
- * A module may also declare host-framing hints (`export const captionAside`, where
- * the live captions dock; `export const surface`, whether the host frames + surfaces
- * its content). Both are reported up on every (re-)import so a `replace` under the
- * same id can't leave a stale hint behind.
+ * A module may also declare a fallback placement (`export const geometry`), used
+ * only when the wire carried none (an inline `source` view). It's reported up on
+ * every (re-)import so a `replace` under the same id can't leave a stale hint.
  */
 function ViewMount({ id, moduleUrl }: { id: string; moduleUrl: string }) {
   const { reportMeta } = useViews();
@@ -29,11 +57,7 @@ function ViewMount({ id, moduleUrl }: { id: string; moduleUrl: string }) {
       .then((mod) => {
         if (!alive) return;
         setComp(() => mod.default as ComponentType);
-        const declaredAside = (mod as { captionAside?: unknown }).captionAside;
-        const aside = CAPTION_ASIDES.find((a) => a === declaredAside);
-        const declaredSurface = (mod as { surface?: unknown }).surface;
-        const surface = SURFACES.find((s) => s === declaredSurface);
-        reportMeta(id, { ...(aside ? { captionAside: aside } : {}), ...(surface ? { surface } : {}) });
+        reportMeta(id, { geometry: readDeclaredGeometry(mod) });
       })
       .catch(() => {
         if (alive) setFailed(true);
@@ -67,27 +91,26 @@ class ViewErrorBoundary extends Component<{ children: ReactNode }, { crashed: bo
  * keeps the slot, so a motion-tagged element animates rather than remounting).
  * No default motion: a view appears/leaves instantly unless it opts into motion.
  *
- * The host frames each view unless it opts out (`surface: "none"`): a centered
- * safe-area (`.hi-view-frame`, kept clear of the captions / camera pip / controls)
- * and a legible surface (`.hi-view-surface`) — so a view that lays out nothing of
- * its own still lands centered and readable rather than flush at an edge. The
- * caption side it itself declared drives the reserved strip, so its content can't
- * collide with its own captions. `surface: "none"` returns the bare full-bleed
- * layer for views that own their whole frame.
+ * Placement comes from the compositor's floor (`floorLayout`), passed in by the
+ * host: a `region:"fill"` view gets the bare full-bleed layer (it owns its own
+ * background and layout); any other region gets a framed, surfaced layer whose
+ * `data-region`/`data-size` the CSS resolves to position + width — so a view that
+ * lays out nothing of its own still lands placed and legible. A view the floor
+ * didn't place falls back to the centered card.
  */
-export function ViewSlot() {
-  const { views, meta } = useViews();
+export function ViewSlot({ placements }: { placements: Map<string, Placement> }) {
+  const { views } = useViews();
   if (views.length === 0) return null;
   return (
     <div style={{ position: "fixed", inset: 0, zIndex: 50 }}>
       {views.map((v) => {
-        const m = meta.get(v.id);
+        const p = placements.get(v.id);
         const mount = (
           <ViewErrorBoundary>
             <ViewMount id={v.id} moduleUrl={v.moduleUrl} />
           </ViewErrorBoundary>
         );
-        if (m?.surface === "none") {
+        if (p?.region === "fill") {
           return (
             <div key={v.id} style={{ position: "absolute", inset: 0 }}>
               {mount}
@@ -95,8 +118,10 @@ export function ViewSlot() {
           );
         }
         return (
-          <div key={v.id} className="hi-view-frame" data-aside={m?.captionAside ?? "bottom"}>
-            <div className="hi-view-surface">{mount}</div>
+          <div key={v.id} className="hi-view-frame" data-region={p?.region ?? "center"}>
+            <div className="hi-view-surface" data-size={p?.size ?? "auto"}>
+              {mount}
+            </div>
           </div>
         );
       })}

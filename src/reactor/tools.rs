@@ -14,7 +14,7 @@ use std::sync::Arc;
 
 use tokio::sync::{Mutex, mpsc};
 
-use crate::types::Scene;
+use crate::types::{Geometry, Scene};
 
 use super::sequencer::Beat;
 
@@ -70,15 +70,17 @@ impl ToolSink {
 
     /// Show a view (the `show_view` tool): queue it onto the sequencer, which
     /// paces it to the surrounding narration. `op` is `show`/`replace`/`dismiss`;
-    /// `id` may be omitted (one is synthesized).
+    /// `id` may be omitted (one is synthesized). `geometry` is the view's declared
+    /// placement (or `None` for the host's floor layout).
     pub async fn show_view(
         &self,
         id: Option<String>,
         op: String,
         source: String,
+        geometry: Option<Geometry>,
     ) -> anyhow::Result<()> {
         self.beats
-            .send(Beat::Show { id, op, source })
+            .send(Beat::Show { id, op, source, geometry })
             .await
             .map_err(|_| anyhow::anyhow!("scene sequencer gone; show_view dropped"))
     }

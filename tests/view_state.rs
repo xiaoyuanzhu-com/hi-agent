@@ -48,6 +48,7 @@ async fn emit_view(seams: &ServerSeams, scene: &str, id: &str, op: ViewOp, url: 
                 id: id.to_string(),
                 op,
                 module_url: url.map(str::to_string),
+                geometry: None,
             },
         })
         .await

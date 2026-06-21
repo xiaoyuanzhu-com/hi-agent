@@ -30,21 +30,30 @@ is one idea — not a whole list crammed onto one slide. If the brief is a seque
 (a ranking, a timeline), build one view per item so the agent can walk them one at a
 time; give each its own id.
 
-**The host frames your view.** You don't lay out the whole screen. The host centers
-your content in a safe-area kept clear of the live captions, the camera self-view,
-and the on-screen controls, and paints a light surface behind it — so a view that
-lays out nothing of its own still lands centered and readable. Return your content
-directly (a `Stack`, a `Card`, your own elements); don't reach for the viewport,
-full-screen backgrounds, or absolute positioning to center yourself — that fights the
-frame. If your view *is* the full bleed — a photo, a map, a dark composition that owns
-the whole frame — opt out:
+**You declare where your content sits; the host places it.** You don't lay out the
+whole screen. Everything on the stage — your view, the live caption words, the camera
+self-view — is a *participant* the host arranges together so none sits on top of
+another. Your part is to declare two things about your content and let the host place
+it. Write them as a small `<name>.geom.json` beside your saved view (same base name as
+the `.jsx`):
 
 ```
-export const surface = "none"; // fill the stage; you own the background and layout
+{ "region": "center", "size": "auto" }
 ```
 
-With `"none"` the host steps back to a bare full-screen layer and the captions keep a
-dark scrim so they stay legible over whatever you paint.
+- **`region`** — where your content sits: `center` (the default), an edge (`top` /
+  `bottom` / `left` / `right`), a corner (`top_left` / `top_right` / `bottom_left` /
+  `bottom_right`), or `fill` (you own the whole frame and its own background — a photo,
+  a map, a dark composition).
+- **`size`** — how wide your content wants to be: `compact`, `auto` (a comfortable
+  default card), `wide`, or `fill`. Choose what makes *this* content look best — the
+  host no longer caps every view at one width.
+
+Return your content directly (a `Stack`, a `Card`, your own elements). For anything but
+`fill`, don't reach for the viewport, full-screen backgrounds, or absolute positioning
+to place yourself — that fights the frame. For `fill` the host steps back to a bare
+full-screen layer and you own the background and layout. No sidecar at all is fine too
+— you just get the centered default card.
 
 **Images: never hotlink.** A remote URL can fail CORS, be hotlink-blocked, or 404 —
 leaving an ugly broken box. Instead **download the image into your project folder**
@@ -54,19 +63,19 @@ views tree is served at `/views/<the same relative path>`, so a file you write t
 `badminton-top10/leader.jpg` is `<img src="/views/badminton-top10/leader.jpg">`.
 That path always loads and keeps your source small.
 
-**The live words ride above your view.** While your view is on stage, the host keeps
-showing the conversation's words — the person's transcribed speech and the agent's
-lines — as small caption pills docked bottom-center over your view (you don't render
-them). If your composition's main content lives there, move them aside by exporting a
-placement from the module:
+**The words are a participant too.** While your view is on stage the host keeps
+showing the conversation's words — the person's speech and the agent's lines — as
+small caption pills, and it places them on whatever edge your `region` leaves freest,
+clear of your content (you don't render them). If you'd rather fold the words into the
+composition yourself, declare it in the sidecar and render them with `useSpeech()`
+from `@hi/core`:
 
 ```
-export const captionAside = "top"; // "top" | "bottom" | "left" | "right" | "self"
+{ "region": "fill", "owns_captions": true }
 ```
 
-`"self"` means you fold the words into the composition yourself: render them with
-`useSpeech()` from `@hi/core` and the host's captions stand down. Only declare it if
-you actually render them — otherwise the person's speech goes invisible.
+With `owns_captions` the host's caption pills stand down. Only declare it if you
+actually render the words — otherwise the person's speech goes invisible.
 
 **It's theirs the moment they reach for it.** If they scroll or tap, the view should
 yield — let them look, and don't fight it.

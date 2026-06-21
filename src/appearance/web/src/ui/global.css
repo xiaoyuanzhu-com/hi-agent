@@ -195,11 +195,12 @@ button {
 }
 
 /* --- Captions over a view ---------------------------------------------
-   While an agent view fills the stage (ViewSlot, z-index 50), the words dock
-   aside and rise above it — a dark scrim pill keeps them legible over whatever
-   the view paints (the white text-shadow only works on light ground). The dock
-   side follows the topmost view's `export const captionAside` (default bottom;
-   "self" = the view hosts the words and this layer stands down). */
+   While something fills the stage (an agent view at z-index 50, or the camera
+   backdrop), the words dock as pills and rise above it — a dark scrim keeps them
+   legible over whatever is behind (the white text-shadow only works on light
+   ground). The dock side is the `region` the floor (`floorLayout`) placed the
+   words in — the edge the leading view leaves freest. A view that renders the
+   words itself hides this layer entirely (handled in the host, not here). */
 .hi-stage--captions {
   top: auto;
   bottom: calc(env(safe-area-inset-bottom, 0px) + 68px);
@@ -231,44 +232,64 @@ button {
   color: #b9d2f4;
 }
 
-.hi-stage--captions[data-aside="top"] {
+/* Caption dock side follows the region the floor placed the words in — the edge
+   the leading view leaves freest, or the lower-left over a bare camera. The
+   default (bottom-center) is the base rule above; these place the others. */
+.hi-stage--captions[data-region="top"],
+.hi-stage--captions[data-region="top_left"],
+.hi-stage--captions[data-region="top_right"] {
   top: calc(env(safe-area-inset-top, 0px) + 32px);
   bottom: auto;
 }
 
-.hi-stage--captions[data-aside="left"],
-.hi-stage--captions[data-aside="right"] {
+/* Left / right and their corners become a narrow column at the edge; the vertical
+   anchor stays the base bottom unless a top_* region lifted it above. */
+.hi-stage--captions[data-region="left"],
+.hi-stage--captions[data-region="top_left"],
+.hi-stage--captions[data-region="bottom_left"],
+.hi-stage--captions[data-region="right"],
+.hi-stage--captions[data-region="top_right"],
+.hi-stage--captions[data-region="bottom_right"] {
   width: min(420px, 38vw);
   transform: none;
 }
 
-.hi-stage--captions[data-aside="left"] {
+.hi-stage--captions[data-region="left"],
+.hi-stage--captions[data-region="top_left"],
+.hi-stage--captions[data-region="bottom_left"] {
   left: max(28px, env(safe-area-inset-left, 0px) + 16px);
+  right: auto;
   text-align: left;
 }
 
-.hi-stage--captions[data-aside="left"] .hi-speech {
+.hi-stage--captions[data-region="left"] .hi-speech,
+.hi-stage--captions[data-region="top_left"] .hi-speech,
+.hi-stage--captions[data-region="bottom_left"] .hi-speech {
   align-items: flex-start;
 }
 
-.hi-stage--captions[data-aside="right"] {
+.hi-stage--captions[data-region="right"],
+.hi-stage--captions[data-region="top_right"],
+.hi-stage--captions[data-region="bottom_right"] {
   left: auto;
   right: max(28px, env(safe-area-inset-right, 0px) + 16px);
   text-align: right;
 }
 
-.hi-stage--captions[data-aside="right"] .hi-speech {
+.hi-stage--captions[data-region="right"] .hi-speech,
+.hi-stage--captions[data-region="top_right"] .hi-speech,
+.hi-stage--captions[data-region="bottom_right"] .hi-speech {
   align-items: flex-end;
 }
 
 /* --- View stage (host frame around an agent view) --------------------
-   A view that declares no layout of its own still lands centered and legible:
-   the host centers its content in a safe-area kept clear of the caption dock (the
-   side the view itself declared), the camera pip (bottom-left, z55) and the
+   A view that declares no layout of its own still lands placed and legible: the
+   host positions its content per the view's `region` (the floor default is
+   centered) in a safe-area kept clear of the camera pip (bottom-left, z55) and the
    channel controls / keyboard (bottom corners + bottom-center, z60), and paints a
-   surface behind it so it reads over the live, variable backdrop. A view that
-   wants the whole frame opts out with `export const surface = "none"` — no frame,
-   no surface, the bare full-bleed layer (ViewSlot). */
+   surface behind it so it reads over the live, variable backdrop. A `region:"fill"`
+   view skips this frame entirely — the bare full-bleed layer (ViewSlot), owning its
+   own background and layout. */
 .hi-view-frame {
   position: absolute;
   inset: 0;
@@ -285,24 +306,42 @@ button {
     max(24px, env(safe-area-inset-left, 0px) + 16px);
 }
 
-/* Reserve the strip the view's own captions dock into, so the content centers
-   clear of them rather than under them (the upload-carrier collision). */
-.hi-view-frame[data-aside="top"] {
-  padding-top: calc(env(safe-area-inset-top, 0px) + 116px);
-}
-.hi-view-frame[data-aside="bottom"] {
+/* The view sits where it declared (center is the base center/center). */
+.hi-view-frame[data-region="top"] { align-items: flex-start; }
+.hi-view-frame[data-region="bottom"] { align-items: flex-end; }
+.hi-view-frame[data-region="left"] { justify-content: flex-start; }
+.hi-view-frame[data-region="right"] { justify-content: flex-end; }
+.hi-view-frame[data-region="top_left"] { align-items: flex-start; justify-content: flex-start; }
+.hi-view-frame[data-region="top_right"] { align-items: flex-start; justify-content: flex-end; }
+.hi-view-frame[data-region="bottom_left"] { align-items: flex-end; justify-content: flex-start; }
+.hi-view-frame[data-region="bottom_right"] { align-items: flex-end; justify-content: flex-end; }
+
+/* Reserve the strip the captions dock into — the complement of the view's region
+   (matches floorLayout's captionComplement): center/top → captions bottom;
+   bottom → captions top; left → captions right; right → captions left. */
+.hi-view-frame[data-region="center"],
+.hi-view-frame[data-region="top"],
+.hi-view-frame[data-region="top_left"],
+.hi-view-frame[data-region="top_right"] {
   padding-bottom: calc(env(safe-area-inset-bottom, 0px) + 140px);
 }
-.hi-view-frame[data-aside="left"] {
-  padding-left: min(440px, 42vw);
+.hi-view-frame[data-region="bottom"],
+.hi-view-frame[data-region="bottom_left"],
+.hi-view-frame[data-region="bottom_right"] {
+  padding-top: calc(env(safe-area-inset-top, 0px) + 116px);
 }
-.hi-view-frame[data-aside="right"] {
+.hi-view-frame[data-region="left"] {
   padding-right: min(440px, 42vw);
+}
+.hi-view-frame[data-region="right"] {
+  padding-left: min(440px, 42vw);
 }
 
 .hi-view-surface {
   pointer-events: auto;
   width: 100%;
+  /* Width follows the view's declared size class (set per data-size below); this
+     is the `auto` default — the same ≤680 card the host always framed. */
   max-width: min(680px, 100%);
   max-height: 100%;
   overflow: auto;
@@ -322,6 +361,18 @@ button {
    card before the view paints. */
 .hi-view-surface:empty {
   display: none;
+}
+
+/* Size class the builder declared — how wide the content wants to be. `auto` is
+   the base ≤680 above; the host no longer caps every view at one width. */
+.hi-view-surface[data-size="compact"] {
+  max-width: min(420px, 100%);
+}
+.hi-view-surface[data-size="wide"] {
+  max-width: min(1040px, 100%);
+}
+.hi-view-surface[data-size="fill"] {
+  max-width: 100%;
 }
 
 /* --- Wake gate -------------------------------------------------------- */

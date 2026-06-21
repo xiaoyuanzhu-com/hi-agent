@@ -1,5 +1,6 @@
 import { usePresence, useSpeech, useWake, useChannels, useSendText } from "../core";
 import { useViews } from "../core/views";
+import { floorLayout, CAPTIONS_ID, CAMERA_ID, type Participant } from "../core/layout";
 import { Atmosphere } from "./Atmosphere";
 import { Presence } from "./Presence";
 import { SpeechText } from "./SpeechText";
@@ -17,6 +18,14 @@ import { CameraPreview } from "./CameraPreview";
  *
  *   Atmosphere · Presence (the agent) · SpeechText (its words) · ViewSlot
  *   (agent-authored views) · the wake gate / channel controls / input line.
+ *
+ * Placement is one job: every participant — the agent views, the live captions,
+ * and the camera self-view — is laid out by a single `floorLayout` pass. But that
+ * unifies *placement*, never *lifecycle*: the captions `<div>` and `<CameraPreview>`
+ * are mounted ONCE here, above the swappable `ViewSlot`, and the layout only flips
+ * their props/classes. They must never move into `ViewSlot` or a participant
+ * `.map()` — re-mounting `<CameraPreview>` re-acquires the camera and blacks out
+ * the feed.
  */
 export function Shell() {
   const presence = usePresence();
@@ -26,26 +35,24 @@ export function Shell() {
   const sendText = useSendText();
   const { views, meta, clear } = useViews();
 
-  // The presence recedes while a view is on stage (the agent's content leads).
-  const overlaid = views.length > 0;
-  const demote = overlaid ? 0.72 : 0;
+  // Everything on screen is a participant. Views carry their declared geometry
+  // (wire-authoritative; a module-self-declared fallback fills in for inline
+  // `source` views with no wire geometry). The captions are always a participant;
+  // the camera joins only while its stream is live.
+  const participants: Participant[] = [
+    ...views.map((v) => ({
+      id: v.id,
+      kind: "view" as const,
+      geometry: v.geometry ?? meta.get(v.id)?.geometry,
+    })),
+    { id: CAPTIONS_ID, kind: "captions" as const },
+    ...(ch.visionStream ? [{ id: CAMERA_ID, kind: "camera" as const }] : []),
+  ];
+  const { demote, placements } = floorLayout(participants);
 
-  // The live camera fills the stage as a fullscreen backdrop only when no view
-  // leads (otherwise it shrinks to a pip).
-  const cameraBackdrop = !!ch.visionStream && !overlaid;
-
-  // The words dock as a caption pill whenever something fills the stage behind
-  // them — an agent view or the live camera — so they don't sit on top of it.
-  // Over a view the side follows the module's declared aside (undeclared docks
-  // bottom); over the camera they tuck into the lower-left, clear of a centred
-  // face. "self" = the view renders the words itself via useSpeech(), so the
-  // host's captions stand down.
-  const docked = overlaid || cameraBackdrop;
-  const topmost = overlaid ? views[views.length - 1] : undefined;
-  const aside = overlaid
-    ? (meta.get(topmost!.id)?.captionAside ?? "bottom")
-    : "left";
-  const selfHosted = overlaid && aside === "self";
+  const captions = placements.get(CAPTIONS_ID);
+  const camera = placements.get(CAMERA_ID);
+  const captionsDocked = captions?.docked ?? false;
 
   return (
     <div className="hi-root">
@@ -58,22 +65,25 @@ export function Shell() {
         demote={demote}
       />
 
-      {/* The user's self-view while the camera is on — a fullscreen backdrop
-          when nothing leads, shrinking to a corner thumbnail once a view does. */}
-      <CameraPreview stream={ch.visionStream} pip={overlaid} />
+      {/* PINNED participant — mounted once, here, across every layout. The layout
+          only flips `pip` (fullscreen backdrop ↔ corner thumbnail); the same
+          <video> stays mounted so the feed never re-attaches and blacks out. */}
+      <CameraPreview stream={ch.visionStream} pip={camera?.pip ?? false} />
 
-      {/* While a view holds the stage, the words dock as captions above it
-          (only the freshest lines, so the view stays the lead). */}
-      {!selfHosted && (
+      {/* PINNED participant — the conversation's words. Docks as caption pills
+          when something fills the stage behind them (a view or the camera), else
+          sits centered as the lead. Hidden only when the topmost view renders the
+          words itself. Stays at this mount site across every layout. */}
+      {captions && !captions.hidden && (
         <div
-          className={docked ? "hi-stage hi-stage--captions" : "hi-stage"}
-          data-aside={docked ? aside : undefined}
+          className={captionsDocked ? "hi-stage hi-stage--captions" : "hi-stage"}
+          data-region={captionsDocked ? captions.region : undefined}
         >
-          <SpeechText items={docked ? sentences.slice(-3) : sentences} />
+          <SpeechText items={captionsDocked ? sentences.slice(-3) : sentences} />
         </div>
       )}
 
-      <ViewSlot />
+      <ViewSlot placements={placements} />
 
       {!woken ? (
         <WakeGate onWake={wake} onTextOnly={startTextOnly} error={wakeError} busy={waking} />
