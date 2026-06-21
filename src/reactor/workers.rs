@@ -117,6 +117,17 @@ it landed — a click that changed nothing is yours to catch and retry, not to a
 it worked. Launch an app the way a person would — Spotlight (hold command, press \
 space), type the name, press return — then drive its real controls.\n\
 \n\
+When your task is to file a file the user handed the agent — to keep it in the \
+agent's drive — the bytes are already saved verbatim under the data dir, which is \
+the parent of `$HI_AGENT_PROMPTS_DIR`. Files for this scene land under \
+`$HI_AGENT_PROMPTS_DIR/../memory/raw/{scene}/file/` (in dated subfolders); the most \
+recently written file there is the one just handed over. Copy it into the drive at \
+`$HI_AGENT_PROMPTS_DIR/../drive/`, into a sensible spot — a folder by kind \
+(documents, ids, photos, …) with a clear, descriptive, dated filename — creating \
+folders as you need them and leaving the raw original untouched. Don't restructure \
+the rest of the drive around this one file. In your report, give the exact path you \
+filed it at and what it is, so the agent can find it later and tell the person.\n\
+\n\
 When your task is to build a view to show on screen, first read two files: \
 `$HI_AGENT_PROMPTS_DIR/appearance.md` — how views work (authoring, saving, refs, \
 images) — and `$HI_AGENT_PROMPTS_DIR/aesthetic.md` — the bar a view has to clear. \
