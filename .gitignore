@@ -6,3 +6,4 @@ src/appearance/web/dist/*
 .DS_Store
 .env
 .env.local
+.claude/
