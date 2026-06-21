@@ -139,17 +139,17 @@ fn tools_for_role(role: Option<&str>) -> Vec<Value> {
             ),
             tool(
                 "name_person",
-                "Attach a name to a person you've recognized. Faces in ⟨image⟩ signals are clustered \
-                 automatically and shown as `⟨faces: <id>⟩` — an opaque id like `ff32ce3w` for someone \
-                 not yet named. When a signal tells you who that id is (e.g. the person says their name, \
-                 or someone introduces them), call this with `id` = that face id and `name` = the name \
-                 (the `people/<name>` ref you'd use for their facet). It renames the whole cluster from \
-                 the id to the name, so you recognize them by name next time. If the name already \
-                 exists, the two are merged.",
+                "Attach a name to a person you've recognized. Faces and voices are clustered \
+                 automatically — a face shows as `⟨faces: <id>⟩`, a speaker as `⟨voice: <id>⟩`, \
+                 where an opaque id like `ff32ce3w` is someone not yet named. When a signal tells \
+                 you who an id is (e.g. the person says their name, or someone introduces them), \
+                 call this with `id` = that id and `name` = the name (the `people/<name>` ref you'd \
+                 use for their facet). It renames the whole cluster from the id to the name, so you \
+                 recognize them by name next time. If the name already exists, the two are merged.",
                 json!({
                     "type": "object",
                     "properties": {
-                        "id": { "type": "string", "description": "The face cluster's current key — the `⟨faces: …⟩` id (e.g. ff32ce3w), or an existing name to re-key." },
+                        "id": { "type": "string", "description": "The cluster's current key — a `⟨faces: …⟩` or `⟨voice: …⟩` id (e.g. ff32ce3w), or an existing name to re-key." },
                         "name": { "type": "string", "description": "The person's name to key them under (e.g. 赵力, alice)." },
                     },
                     "required": ["id", "name"],
@@ -157,9 +157,10 @@ fn tools_for_role(role: Option<&str>) -> Vec<Value> {
             ),
             tool(
                 "merge_people",
-                "Collapse two clusters that are the same person into one — when you realize a face id \
-                 (or a name) actually refers to someone you already model. Folds `from`'s face/voice \
-                 gallery into `into` and drops `from`.",
+                "Collapse two clusters that are the same person into one — when you realize a face \
+                 or voice id (or a name) actually refers to someone you already model, including \
+                 across senses (a `⟨voice: …⟩` id and a `⟨faces: …⟩` id that are one source). Folds \
+                 `from`'s face/voice gallery into `into` and drops `from`.",
                 json!({
                     "type": "object",
                     "properties": {
@@ -604,9 +605,9 @@ async fn reflection_update_facet(data_dir: &std::path::Path, args: &Value) -> Va
     }
 }
 
-/// `name_person`: rename a face cluster from its `id` (or current key) to a
-/// learned `name` — the structural side of "we now know who this is". Merges if
-/// the name already exists. See [`people_vectors::rename`].
+/// `name_person`: rename a person's cluster (face or voice) from its `id` (or
+/// current key) to a learned `name` — the structural side of "we now know who
+/// this is". Merges if the name already exists. See [`people_vectors::rename`].
 async fn reflection_name_person(data_dir: &std::path::Path, args: &Value) -> Value {
     let id = args.get("id").and_then(Value::as_str).unwrap_or_default();
     let name = args.get("name").and_then(Value::as_str).unwrap_or_default();
@@ -619,8 +620,9 @@ async fn reflection_name_person(data_dir: &std::path::Path, args: &Value) -> Val
     }
 }
 
-/// `merge_people`: fold the `from` cluster into `into` (same person, two keys).
-/// See [`people_vectors::rename`].
+/// `merge_people`: fold the `from` cluster into `into` (same person, two keys —
+/// across senses too, e.g. a voice id into an already-named face). See
+/// [`people_vectors::rename`].
 async fn reflection_merge_people(data_dir: &std::path::Path, args: &Value) -> Value {
     let from = args.get("from").and_then(Value::as_str).unwrap_or_default();
     let into = args.get("into").and_then(Value::as_str).unwrap_or_default();
@@ -734,6 +736,52 @@ mod name_tests {
             .await
             .unwrap();
         assert_eq!(got[0].subject, "赵力");
+    }
+
+    #[tokio::test]
+    async fn name_person_renames_a_voice_cluster_too() {
+        let dir = tempfile::tempdir().unwrap();
+        // A clustered-but-unnamed voice id with a gallery.
+        people_vectors::enroll(dir.path(), "ab12cd34", people_vectors::Modality::Voice, &[1.0, 0.0])
+            .await
+            .unwrap();
+        let r = reflection_name_person(
+            dir.path(),
+            &json!({ "id": "ab12cd34", "name": "赵力" }),
+        )
+        .await;
+        assert_eq!(r["isError"], false);
+        let got = people_vectors::nearest(dir.path(), people_vectors::Modality::Voice, &[1.0, 0.0], 1)
+            .await
+            .unwrap();
+        assert_eq!(got[0].subject, "赵力");
+    }
+
+    #[tokio::test]
+    async fn merge_people_ties_a_voice_id_to_a_named_face() {
+        let dir = tempfile::tempdir().unwrap();
+        // 赵力 is already known by face; their voice is still a separate opaque id.
+        people_vectors::enroll(dir.path(), "赵力", people_vectors::Modality::Face, &[1.0, 0.0])
+            .await
+            .unwrap();
+        people_vectors::enroll(dir.path(), "ab12cd34", people_vectors::Modality::Voice, &[0.0, 1.0])
+            .await
+            .unwrap();
+        let r = reflection_merge_people(
+            dir.path(),
+            &json!({ "from": "ab12cd34", "into": "赵力" }),
+        )
+        .await;
+        assert_eq!(r["isError"], false);
+        // 赵力 is now recognized by BOTH senses — the cross-modal bind.
+        let face = people_vectors::nearest(dir.path(), people_vectors::Modality::Face, &[1.0, 0.0], 1)
+            .await
+            .unwrap();
+        let voice = people_vectors::nearest(dir.path(), people_vectors::Modality::Voice, &[0.0, 1.0], 1)
+            .await
+            .unwrap();
+        assert_eq!(face[0].subject, "赵力");
+        assert_eq!(voice[0].subject, "赵力");
     }
 
     #[tokio::test]
