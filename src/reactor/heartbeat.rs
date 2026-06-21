@@ -15,6 +15,8 @@ use std::collections::HashMap;
 use std::path::Path;
 use std::sync::Arc;
 
+use chrono::{DateTime, Duration, Utc};
+
 use crate::acp::{AcpSession, SessionOpts};
 use crate::agent::SessionRole;
 use crate::capabilities::{face, voiceprint};
@@ -247,7 +249,10 @@ async fn run_reflection(reactor: &Reactor, scene: &Scene) -> anyhow::Result<()> 
 /// mind hands back a `count` into this list, never a raw id). Image signals are
 /// marked: `⟨faces: <id>…⟩` when clustering placed faces (the ids the mind can
 /// name), else `⟨image⟩`. Audio clips are marked `⟨voice: <id>…⟩` when voiceprint
-/// clustering placed a speaker — the same nameable handles, for voices.
+/// clustering placed a speaker — the same nameable handles, for voices. A voice
+/// turn that overlapped a face on camera also carries a co-occurrence hint (see
+/// [`cooccurring_faces`]) — the legibility that lets the mind bind a voice to a
+/// face across senses.
 fn build_reflection_prompt(
     tail: &[JournalEntry],
     prior: &[String],
@@ -270,6 +275,7 @@ fn build_reflection_prompt(
         s.push('\n');
     }
     s.push_str("## Unconsolidated signals (oldest first)\n");
+    let cooccur = cooccurring_faces(tail, face_ids);
     for (i, e) in tail.iter().enumerate() {
         let mut line = render_signal(e);
         match face_ids.get(&i).filter(|v| !v.is_empty()) {
@@ -281,6 +287,13 @@ fn build_reflection_prompt(
         }
         if let Some(ids) = voice_ids.get(&i).filter(|v| !v.is_empty()) {
             let _ = write!(line, " ⟨voice: {}⟩", ids.join(", "));
+        }
+        if let Some(faces) = cooccur.get(&i).filter(|v| !v.is_empty()) {
+            if faces.len() == 1 {
+                let _ = write!(line, " ⟨one face present: {}⟩", faces[0]);
+            } else {
+                let _ = write!(line, " ⟨faces present: {} (ambiguous)⟩", faces.join(", "));
+            }
         }
         let _ = writeln!(s, "[{}] {}", i + 1, line);
     }
@@ -306,6 +319,82 @@ fn render_signal(e: &JournalEntry) -> String {
 /// `⟨image⟩` even when face clustering found nothing or is unconfigured.
 fn is_image(e: &JournalEntry) -> bool {
     matches!(e, JournalEntry::SignalIn { media: Some(m), .. } if m.mime.starts_with("image/"))
+}
+
+/// How far a voice turn's window is padded, in seconds, when matching co-present
+/// faces. Deliberately small: a camera "minute" is itself a ~60s interval, so the
+/// overlap test already carries most of the slack; this just absorbs the seam
+/// between a clip and a neighbouring frame. We are **loose on alignment, strict on
+/// commitment** — co-occurrence is evidence for the mind, never an auto-bind.
+const COOCCUR_TOLERANCE_SECS: i64 = 2;
+
+/// For each Audio signal, the distinct face cluster ids whose vision interval
+/// overlapped that voice turn's window — making "the same person, the same
+/// moment" legible to the mind. This is the binding substrate from the design:
+/// humans tie a voice to a face by *correlation within a tolerant window*, not by
+/// a shared clock, so we match by **interval overlap** (each side is `[ts, ts +
+/// duration]`, the voice side padded by [`COOCCUR_TOLERANCE_SECS`]) rather than
+/// timestamp equality. The count is the ambiguity cue: exactly one face over a
+/// turn is near-certain evidence it is the speaker; several means the mind must
+/// judge (or wait for a clearer moment). We only surface the evidence — the
+/// cross-sense bind stays the mind's call (`merge_people`), per
+/// [[project-people-recognition-design]].
+fn cooccurring_faces(
+    tail: &[JournalEntry],
+    face_ids: &HashMap<usize, Vec<String>>,
+) -> HashMap<usize, Vec<String>> {
+    let tol = Duration::seconds(COOCCUR_TOLERANCE_SECS);
+
+    // The time interval each face-bearing vision signal covered: `[ts, ts + dur]`
+    // (a still is a point; a camera minute spans its duration).
+    let faces_at: Vec<(DateTime<Utc>, DateTime<Utc>, &[String])> = face_ids
+        .iter()
+        .filter_map(|(&i, ids)| {
+            let JournalEntry::SignalIn { ts, media, .. } = tail.get(i)? else {
+                return None;
+            };
+            if ids.is_empty() {
+                return None;
+            }
+            Some((*ts, *ts + media_dur(media.as_ref()), ids.as_slice()))
+        })
+        .collect();
+    if faces_at.is_empty() {
+        return HashMap::new();
+    }
+
+    let mut out: HashMap<usize, Vec<String>> = HashMap::new();
+    for (j, e) in tail.iter().enumerate() {
+        let JournalEntry::SignalIn { channel: Channel::Audio, ts, media, .. } = e else {
+            continue;
+        };
+        let win_start = *ts - tol;
+        let win_end = *ts + media_dur(media.as_ref()) + tol;
+        let mut seen: Vec<String> = Vec::new();
+        for (f_start, f_end, ids) in &faces_at {
+            // Two intervals overlap iff each starts no later than the other ends.
+            if win_start <= *f_end && *f_start <= win_end {
+                for id in *ids {
+                    if !seen.contains(id) {
+                        seen.push(id.clone());
+                    }
+                }
+            }
+        }
+        if !seen.is_empty() {
+            out.insert(j, seen);
+        }
+    }
+    out
+}
+
+/// A media payload's duration as a [`Duration`], or zero when absent (a still, or
+/// a media-less live-mic turn) — those are treated as instantaneous points.
+fn media_dur(media: Option<&crate::types::Media>) -> Duration {
+    media
+        .and_then(|m| m.duration_ms)
+        .map(|ms| Duration::milliseconds(ms as i64))
+        .unwrap_or_else(Duration::zero)
 }
 
 /// Mechanically cluster the faces in the frontier's vision signals: for each one,
@@ -460,5 +549,109 @@ fn salient(f: &crate::capabilities::face::DetectedFace) -> bool {
     let w = (f.bbox[2] - f.bbox[0]).max(0.0);
     let h = (f.bbox[3] - f.bbox[1]).max(0.0);
     f.score >= 0.6 && w >= 50.0 && h >= 50.0
+}
+
+#[cfg(test)]
+mod cooccur_tests {
+    use super::*;
+    use crate::types::Media;
+    use chrono::TimeZone;
+
+    fn at(secs: i64) -> DateTime<Utc> {
+        Utc.timestamp_opt(1_700_000_000 + secs, 0).unwrap()
+    }
+
+    fn vision(ts: DateTime<Utc>, dur_ms: Option<u64>) -> JournalEntry {
+        JournalEntry::SignalIn {
+            id: "v".into(),
+            ts,
+            channel: Channel::Vision,
+            scene: Scene("s".into()),
+            body: String::new(),
+            stream: None,
+            media: Some(Media {
+                file: "f".into(),
+                mime: "image/jpeg".into(),
+                duration_ms: dur_ms,
+                width: None,
+                height: None,
+            }),
+            origin: None,
+        }
+    }
+
+    fn audio(ts: DateTime<Utc>, dur_ms: Option<u64>) -> JournalEntry {
+        JournalEntry::SignalIn {
+            id: "a".into(),
+            ts,
+            channel: Channel::Audio,
+            scene: Scene("s".into()),
+            body: "hi".into(),
+            stream: None,
+            media: dur_ms.map(|ms| Media {
+                file: "f".into(),
+                mime: "audio/mp3".into(),
+                duration_ms: Some(ms),
+                width: None,
+                height: None,
+            }),
+            origin: None,
+        }
+    }
+
+    fn faces(pairs: &[(usize, &str)]) -> HashMap<usize, Vec<String>> {
+        let mut m: HashMap<usize, Vec<String>> = HashMap::new();
+        for (i, id) in pairs {
+            m.entry(*i).or_default().push((*id).to_string());
+        }
+        m
+    }
+
+    #[test]
+    fn sole_face_overlapping_a_voice_turn_is_one_face() {
+        // A still at t=0, a (media-less) live-mic turn at t=1 — within tolerance.
+        let tail = vec![vision(at(0), None), audio(at(1), None)];
+        let c = cooccurring_faces(&tail, &faces(&[(0, "ff32ce3w")]));
+        assert_eq!(c.get(&1).map(Vec::as_slice), Some(["ff32ce3w".to_string()].as_slice()));
+    }
+
+    #[test]
+    fn two_distinct_faces_in_window_are_ambiguous() {
+        let tail = vec![vision(at(0), None), vision(at(1), None), audio(at(1), None)];
+        let c = cooccurring_faces(&tail, &faces(&[(0, "aaa"), (1, "bbb")]));
+        let got = c.get(&2).unwrap();
+        assert_eq!(got.len(), 2);
+        assert!(got.contains(&"aaa".to_string()) && got.contains(&"bbb".to_string()));
+    }
+
+    #[test]
+    fn the_same_face_across_frames_counts_once() {
+        let tail = vec![vision(at(0), None), vision(at(1), None), audio(at(1), None)];
+        let c = cooccurring_faces(&tail, &faces(&[(0, "aaa"), (1, "aaa")]));
+        assert_eq!(c.get(&2).map(Vec::as_slice), Some(["aaa".to_string()].as_slice()));
+    }
+
+    #[test]
+    fn a_face_outside_the_window_does_not_co_occur() {
+        let tail = vec![vision(at(0), None), audio(at(100), None)];
+        let c = cooccurring_faces(&tail, &faces(&[(0, "aaa")]));
+        assert!(c.get(&1).is_none());
+    }
+
+    #[test]
+    fn a_camera_minute_overlaps_a_voice_turn_within_it() {
+        // A 60s vision minute from t=0; a voice turn at t=30 overlaps even though
+        // the minute's start is well before the turn — interval overlap, not equality.
+        let tail = vec![vision(at(0), Some(60_000)), audio(at(30), Some(2_000))];
+        let c = cooccurring_faces(&tail, &faces(&[(0, "aaa")]));
+        assert_eq!(c.get(&1).map(Vec::len), Some(1));
+    }
+
+    #[test]
+    fn prompt_annotates_a_sole_co_occurring_face() {
+        let tail = vec![vision(at(0), None), audio(at(1), None)];
+        let p = build_reflection_prompt(&tail, &[], &[], &faces(&[(0, "ff32ce3w")]), &HashMap::new());
+        assert!(p.contains("⟨one face present: ff32ce3w⟩"), "prompt was:\n{p}");
+    }
 }
 
