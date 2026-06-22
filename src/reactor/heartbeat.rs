@@ -127,8 +127,9 @@ pub(super) async fn swap(
         .unwrap_or_default();
 
     // Seed the replacement with the soul plus the briefing and recent tail, so it
-    // continues without a visible seam. self.md and hot.md are referenced by the
-    // soul, so the fresh session re-reads whatever the last reflection wrote.
+    // continues without a visible seam. self.md, commitments.md, and hot.md are
+    // referenced by the soul by path, so the fresh session re-reads the current
+    // duties and digest rather than a stale copy.
     let seeded_system_prompt = format!(
         "{}\n\n## Briefing from your earlier conversation\n{}\n\n{}",
         reactor.inner.soul,

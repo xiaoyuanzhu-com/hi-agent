@@ -28,8 +28,9 @@ This document is the **durable design contract** for memory, in the spirit of `a
 | **The interleaved timeline is derived, never stored** | A scene is one timeline but stored per-channel; the mind reads a merge built on read (ordered by uuidv7 `id`), so there is no second copy to drift |
 | **`appearance` is retained state, not an utterance stream** | The screen persists until changed, so it is recorded as timestamped whole-state snapshots; the newest is the current screen (no separate current-state file). View lifetime is the reactor's decision — no server-side auto-expiry |
 | **Workers are scenes too — a worker run is its own lossless `raw/` stream** | Uniform ("everything is a scene with a signal stream"), and `architecture.md` §7 already requires worker transcripts to be inspectable |
-| **The always-loaded core = `self.md` (stable identity) + `hot.md` (volatile activation)** | The two heat sources — permanence and recent-significance — kept as two files of different volatility |
-| **`self` is not a facet** | facets model *external* entities; `self` is the core modeling itself. It sits on the selfhood gradient `SOUL → self → hot`, not next to people/locations |
+| **The always-loaded core = `self.md` (authored identity) + `commitments.md` (standing duties) + `hot.md` (recent activation)** | Permanence, obligation, and recent-significance — three small files of different volatility, present in every session |
+| **Identity is authored, never self-written** | `core.md` (bundled) and `self.md` (per-install) are read-only to the agent; only an app update or operator edit moves them. The agent does not learn by rewriting who it is — it learns by accumulating facts it then reads (facets, incl. facts about itself); its one identity-adjacent write is `commitments.md` |
+| **`self` is not a facet** | facets model *external* entities; the authored `self` sits on the selfhood gradient `core → self → hot`, not next to people/locations |
 | **No privileged facet dimensions** | people/locations/projects/culture are seeds, not an enum; the subject space grows as structure emerges |
 
 ---
@@ -43,7 +44,7 @@ Two things make a memory "hot" (in the always-loaded working set):
 
 Depth also sets **plasticity**: deep memory has high inertia (a bad week cannot rewrite the soul), shallow memory turns over freely. This is why the same content can live at different depths — a one-off remark is shallow; a correction the person insisted on is deep "scar tissue."
 
-The on-disk layout is just this gradient made concrete: `raw/` (the unfiltered firehose) → `episodes/` (events) → `facets/` (durable understanding) → `self.md`/`hot.md` (the always-on core).
+The on-disk layout is just this gradient made concrete: `raw/` (the unfiltered firehose) → `episodes/` (events) → `facets/` (durable understanding) → `self.md`/`commitments.md`/`hot.md` (the always-on core).
 
 ## 2. Layout
 
@@ -51,7 +52,8 @@ All paths are under `<data_dir>/memory/`. The soul is *not* here: it ships insid
 
 ```
 memory/
-├── self.md                           ← evolving identity (core, always loaded)
+├── self.md                           ← per-install authored identity (optional, read-only to the agent)
+├── commitments.md                    ← standing duties the agent keeps (agent-written, always loaded)
 ├── hot.md                            ← working set (derived projection, always loaded)
 │
 ├── raw/                              ← LOSSLESS TRUTH, per scene — append-only, never edited
@@ -182,17 +184,18 @@ Facet dimensions are **open-ended**. people/locations/projects/culture are seeds
 
 A facet is regenerated whole, never patched: reflection reads the current file, folds in the new episodes, and writes the entire understanding back. Facets are **global** (one `people/alice.md`, not one per scene), so two scenes can touch the same file; the write is atomic (temp + rename) so a reader never sees a torn file, but a cross-scene read-modify-write is deliberately **last-writer-wins** — a facet is a regenerable cache whose truth lives in the episodes, so the next reflection re-derives anything a racing write dropped.
 
-## 6. `self` and `hot` — the always-loaded core
+## 6. The always-loaded core — authored identity, duties, and recency
 
 There is a **selfhood gradient by volatility**:
 
 ```
-prompts/core.md ← birth seed. Authored, ships in the binary, materialized on boot. Deepest, highest inertia.
-memory/self.md  ← the EVOLVING core: voice, learned manners, point of view. Slow-changing, sticky.
-memory/hot.md   ← the working set: self + standing commitments + recent significant episode gists.
+prompts/core.md       ← birth seed. Authored, ships in the binary, materialized on boot. Deepest, highest inertia.
+memory/self.md        ← per-install authored identity: a name, a persona this deployment was given. Optional, hand-authored, read-only to the agent.
+memory/commitments.md ← the standing duties the agent keeps (what it watches, runs, where its ledgers live). Agent-written; the restart-recovery ledger.
+memory/hot.md         ← the working set: recent significant episode gists.
 ```
 
-`self` is not a facet (facets model *external* entities; `self` is the subject modeling itself, and its plasticity — corrections as scar tissue — puts it next to the soul). Both `self.md` and `hot.md` load into every session: `self.md` is the stable identity (permanence-hot), `hot.md` is the recent activation (activation-hot). The **per-scene** activation layer is already handled by the existing recency snapshot (`memory/snapshot.rs`, `build_for_scene`) — so `hot.md` is global and slow; the snapshot stays per-scene and transient. Three tiers, no duplication: `hot.md` (global core, always) → snapshot (per-scene recent, per turn) → episodes/facets (cold, on demand via links).
+**Identity is authored, never self-written.** `core.md` and `self.md` are read-only to the agent — the bundled soul and an optional per-install persona; only an app update (or an operator's `core.local.md` / hand-written `self.md`) moves them. The agent does not learn by rewriting who it is; it learns by accumulating facts it then reads — facets, including facts it observes about itself. The one identity-adjacent file the agent *writes* is `commitments.md`: a duty noted the moment it is taken on and struck when it ends, so the obligation survives a restart. `self` is not a facet (facets model *external* entities; the authored `self` sits on the selfhood gradient next to the soul). All three (`self.md`, `commitments.md`, `hot.md`) load into every session: authored identity, standing obligation, recent activation. The **per-scene** activation layer is the existing recency snapshot (`memory/snapshot.rs`, `build_for_scene`) — so `hot.md` is global and slow; the snapshot stays per-scene and transient. Tiers, no duplication: the always-loaded core (global) → snapshot (per-scene recent, per turn) → episodes/facets (cold, on demand via links).
 
 ## 7. Reflection — the mind consolidating ("sleep")
 
@@ -226,18 +229,20 @@ Reflection also **tends the old store**, not just the frontier: alongside consol
 - **Appearance state channel** (`src/server/view_bus.rs`): each screen mutation appends a whole-state snapshot to `raw/<scene>/appearance/<date>/appearance-<HHMMSSZ>.json`; the newest restores the live screen on boot. No server-side TTL — view lifetime is the reactor's call (the `ttl_ms` envelope field and client/server expiry were removed).
 - **Live mic capture** (`src/server/audio.rs`): the streaming mic's PCM is persisted on the wall-clock-minute grid as `audio/<date>/<HH>/<MM>.wav` (raw 16 kHz mono + a WAV header), flushed at each minute rollover and at close. The bytes are an un-journaled tape; utterance lines correlate to a minute by ts.
 - **Vision capture + placeholder perception** (`src/server/vision.rs`): camera WebM is persisted per minute (`vision/<date>/<HH>/<MM>.webm`, init segment prefixed so each file decodes standalone); stills persist as one-offs. Each is **perceived** — `capabilities::vision::understand` captions it (Image for a still, Video for a camera minute), or a placeholder caption when no `VISION_PROVIDER` is set — and the caption is journaled as the vision signal's `body`. Perception runs detached so capture never blocks.
-- **Core loading** (`src/memory/core.rs`): every reactor session loads `self.md` + `hot.md` on top of the soul — at session open and at each heartbeat hot-swap.
+- **Always-loaded core, by reference** (`src/reactor/mod.rs::load_soul`, `src/memory/core.rs`): the soul seed hands every session `self.md` (per-install authored identity), `commitments.md` (the agent-written duty ledger), and `hot.md` (recency) by absolute path, and the mind Reads them itself — at session open and again after each heartbeat hot-swap; nothing is inlined. `core.rs` only (re)builds `hot.md`.
 - **Reflection — episodes + facets** (`src/reactor/heartbeat.rs::reflect`, `src/memory/{episodes,facets,journal}.rs`, `src/mcp/mod.rs`): on **one adaptive clock** (`reactor::next_reflection_at`) anchored on the last reflection — fresh input → fire the base cadence (`HI_AGENT_REFLECT_EVERY`, default 1m); caught up and quiet → the gap backs off (doubling) up to `HI_AGENT_REFLECT_MAX` (default 8h); any turn snaps it back to the base. `HI_AGENT_REFLECT=off` disables it — a **detached reflection session** (`SessionRole::Reflection`, its own subprocess, never the live mind) reads `raw/` after the per-scene cursor (`journal::after_cursor` + `episodes::scene_cursor` = `max(to_id)`), and through reflection-only tools segments the frontier into episodes (`record_episode(count, …)` — sequential count-cuts, range auto-filled) and regenerates the facets they touch (`read_facet`/`update_facet`, atomic, last-writer-wins). Facets cite episode refs; episodes cite the raw range. The reflection session's own instructions are the operator-overridable `prompts/reflection.md` (embedded base materialised at boot, like `core.md`/`speaking.md`, but **inlined** as the session's system prompt rather than Read by the agent — see `reactor::reflection_prompt`). The compact hot-swap no longer writes episodes (the briefing is now only the replacement seed); `hot.md` refreshes at the end of each reflection.
 - **hot.md** (`refresh_hot`): regenerated from recent episode gists after each reflection — a mechanical projection, not yet an agent-curated working set.
 
 **Still to build:**
-- **`self.md` curation** — reflection writes episodes and facets but does not yet evolve the identity core; that (corrections as "scar tissue") is the deepest, most plasticity-resistant layer, deferred.
 - **Agent-curated `hot.md`** — still a mechanical projection of recent gists, not a working set the mind shapes.
 - **Semantic trigger** — reflection now fires on one adaptive time/activity clock (base cadence when there's fresh input, exponential backoff to a cap while quiet); a true *semantic* trigger (detecting the topic/event actually changed, not just that the base gap of silence passed) remains future. Same per-scene loop, so the guard stays a loop-local handle.
 - **Episode attachments + per-claim citations** — an episode is just its `episode.md` today (no materialized thumbnails/deliverables); claims cite at episode granularity, not per-signal.
 - **Vision attention policy** — perception currently fires on every still and every camera minute; a real cadence/salience policy (when to actually look) is the deliberate placeholder left open.
 - **Forgetting (media fading)** — the three-layer fade (full → keepsakes → text) is not built; raw bytes are kept indefinitely (`src/memory/media.rs` flags the absent GC). Needs the reflection-delegated forgetting sub-agent, the `keep_and_fade` cut tool (judge spans → slice + unlink), and the cursor safety gate. §3 *Forgetting* is the spec.
 - **Workers as raw streams**, **`files/`**, **content index** (§3, §8) — still open.
+
+**Decided against:**
+- **`self.md` self-curation** — an earlier plan had reflection evolve an identity core ("corrections as scar tissue"). Dropped: identity is authored, never self-written (§6). The agent's cross-session learning lives in the facets it reads (including facts it observes about itself); its only durable identity-adjacent write is `commitments.md`. The standing duties that once lived in `self.md` moved to `commitments.md`, leaving `self.md` as the optional, read-only, per-install authored persona.
 
 ## References
 

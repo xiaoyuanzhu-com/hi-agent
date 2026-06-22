@@ -1,5 +1,5 @@
 //! The recency digest `hot.md` — a regenerable projection of the most recent
-//! episodes. The soul seed references `hot.md` (and `self.md`) by absolute path and
+//! episodes. The soul seed references `hot.md` (and `self.md`, `commitments.md`) by absolute path and
 //! the mind Reads them itself, so nothing here is inlined into a prompt. This module
 //! only (re)builds `hot.md`: every refresh rewrites it wholesale (regenerate, don't
 //! patch).

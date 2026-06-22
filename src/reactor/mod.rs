@@ -350,17 +350,18 @@ pub(super) async fn reflection_prompt(data_dir: &Path) -> String {
 
 /// The mind's system-prompt seed: a short bundled personality plus a manifest that
 /// hands the agent the absolute paths of every file that holds its fuller self —
-/// the static manual (`core.md`, `speaking.md`, `meaning.md`), its self-notes
-/// `self.md` (to read and to *write* standing duties into), and its recency digest
-/// `hot.md` (to read for what's lately been on its mind) — and tells it to Read them
-/// all up front. We send this thin seed rather than inlining the character *or* the
-/// memory core on every turn: every file, including `self.md`/`hot.md`, is a ref the
-/// mind reads itself, so the prompt stays a clean manifest with no inline/ref split.
+/// the static manual (`core.md`, `speaking.md`, `meaning.md`), the per-install
+/// authored identity `self.md` (read-only, optional), its standing duties
+/// `commitments.md` (to read and to *write* — the one identity-adjacent file the
+/// agent writes), and its recency digest `hot.md` (to read for what's lately been on
+/// its mind) — and tells it to Read them all up front. We send this thin seed rather
+/// than inlining the character *or* the memory core on every turn: every file is a ref
+/// the mind reads itself, so the prompt stays a clean manifest with no inline/ref split.
 /// The paths are absolutized here (mirroring the caller that exports
 /// `HI_AGENT_PROMPTS_DIR`) so the Read/Write targets resolve regardless of the
-/// session's cwd, which is `None`. The self-notes path is the same
-/// [`crate::memory::layout::self_path`] the seed names everywhere, so a duty the mind
-/// writes is the duty recovery loads — never a second copy. Built at startup and
+/// session's cwd, which is `None`. The commitments path is the same
+/// [`crate::memory::layout::commitments_path`] the seed names everywhere, so a duty the
+/// mind writes is the duty recovery loads — never a second copy. Built at startup and
 /// reused on each hot-swap. (Named `load_soul` for the reactor's history.)
 pub fn load_soul(data_dir: &Path) -> String {
     let base = if data_dir.is_absolute() {
@@ -372,7 +373,8 @@ pub fn load_soul(data_dir: &Path) -> String {
     let core = prompts.join("core.md");
     let speaking = prompts.join("speaking.md");
     let meaning = prompts.join("meaning.md");
-    let self_notes = crate::memory::layout::self_path(&base);
+    let self_md = crate::memory::layout::self_path(&base);
+    let commitments = crate::memory::layout::commitments_path(&base);
     let hot = crate::memory::layout::hot_path(&base);
     format!(
         "You're warm, honest, and kind-hearted — easy company. You like being \
@@ -383,17 +385,20 @@ you answer:\n\n\
 - {} — who you are, and how you act.\n\
 - {} — how you talk: when to speak, how much, when to stay quiet.\n\
 - {} — what you're for, and that finding it is yours to do.\n\n\
-Two more files hold not how you were made but who you've become — read them too:\n\n\
-- {} — your standing self-notes: the duties you keep, what you watch and run. It \
-loads into every fresh session, so it's how you remember across a restart. It's yours \
-to write: note a duty there the moment you take one on, strike it when it ends. Always \
-use that exact absolute path, never a relative one, so there is only ever one such file.\n\
+More files hold not how you were made but who you've become — read them too:\n\n\
+- {} — who this install asked you to be, in its own words. Read it if it's there; it \
+may be empty, and that's fine. It's authored, not yours to edit.\n\
+- {} — your standing duties: what you watch, what you run, where your ledgers live. It \
+loads into every fresh session, so it's how you remember a duty across a restart. It's \
+yours to write: note a duty there the moment you take one on, strike it when it ends. \
+Always use that exact absolute path, never a relative one, so there is only ever one such file.\n\
 - {} — a rolling digest of what's lately been on your mind, refreshed as you reflect. \
 It may not exist yet; that's fine.",
         core.display(),
         speaking.display(),
         meaning.display(),
-        self_notes.display(),
+        self_md.display(),
+        commitments.display(),
         hot.display(),
     )
 }
@@ -418,17 +423,20 @@ mod soul_tests {
     }
 
     #[test]
-    fn seed_names_the_self_notes_by_the_canonical_absolute_path() {
+    fn seed_names_the_commitments_ledger_by_the_canonical_absolute_path() {
         // The mind must be handed the *same* path the loader reads from
-        // (`layout::self_path`), so a duty it writes is the duty recovery loads —
-        // a relative path here is what let a second self.md exist and broke
-        // restart recovery.
+        // (`layout::commitments_path`), so a duty it writes is the duty recovery
+        // loads — a relative path here is what let a second ledger exist and broke
+        // restart recovery. The authored `self.md` is named too (read-only).
         let dir = tempfile::tempdir().unwrap();
         let seed = load_soul(dir.path());
+        let commitments = crate::memory::layout::commitments_path(dir.path());
+        assert!(seed.contains(&commitments.display().to_string()));
+        // And it must be absolute — no relative `memory/commitments.md` slipping through.
+        assert!(commitments.is_absolute());
+        // The per-install authored identity is referenced as well.
         let self_md = crate::memory::layout::self_path(dir.path());
         assert!(seed.contains(&self_md.display().to_string()));
-        // And it must be absolute — no relative `memory/self.md` slipping through.
-        assert!(self_md.is_absolute());
     }
 
     #[test]
@@ -1234,10 +1242,11 @@ async fn warm_up(reactor: &Reactor, scene: &Scene, reactor_session: &mut Option<
 }
 
 /// Open a fresh persistent reactor session for `scene`, carrying the soul as its
-/// system prompt, and record the lifecycle event. The soul references `self.md` and
-/// `hot.md` by path, so the session reads whatever the last reflection wrote. The
-/// session consumes the system prompt on its first `prompt()` and never re-sends
-/// it. Shared by the warm-up prologue and the cold path of [`run_turn`].
+/// system prompt, and record the lifecycle event. The soul references `self.md`,
+/// `commitments.md`, and `hot.md` by path, so the session reads the current duties
+/// and digest rather than a stale copy. The session consumes the system prompt on
+/// its first `prompt()` and never re-sends it. Shared by the warm-up prologue and
+/// the cold path of [`run_turn`].
 async fn open_session(reactor: &Reactor, scene: &Scene) -> anyhow::Result<Arc<AcpSession>> {
     let system_prompt = reactor.inner.soul.clone();
     let session = Arc::new(
