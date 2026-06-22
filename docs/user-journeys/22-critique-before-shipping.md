@@ -39,4 +39,14 @@
 - **自评到几版收手?** 给个粗略上限(一两版)还是全交给 worker 判断?怎么避免既不 dumb 也不无限磨。
 - **与 21 的耦合**:范例既是开工前的参照、又是收工前的标尺——要不要在 guidance 里把这条线点明,让 worker 把"开工查的范例"留到收工当尺用?
 
-_机制:现有种子——core.md "离手前先看 / succeeded≠right"、[03](03-feishu-flash-cards.md) 交付必检、[aesthetic.md](../../src/reactor/aesthetic.md) 给 views 的 bar。本 journey 把"对不对"推到"好不好",主体在 worker prompt + core.md 加 guidance(对着范例自评 + 过线即止)。成熟度:**correctness 自检的种子在,quality 批判反射未写**;worker prompt 现偏"work to completion",需补一道"好不好"的过线闸。_
+_机制:现有种子——core.md "离手前先看 / succeeded≠right"、[03](03-feishu-flash-cards.md) 交付必检、[aesthetic.md](../../src/reactor/aesthetic.md) 给 views 的 bar。本 journey 把"对不对"推到"好不好",主体在 worker prompt + core.md 加 guidance(对着范例自评 + 过线即止)。成熟度:**guidance 已写,机制实测到、审美过线闸未单独隔离**(见下);worker prompt 原偏"work to completion",已补一道"好不好"的过线闸。_
+
+## 实测 2026-06-22 · 分支 worktree-acquisition-reflexes(基 origin/main 422d268)
+
+环境同 [21](21-research-before-stale-answer.md);先挂 `/api/out/view` 长轮询当"屏幕在场",再一句 **"show me those top 5 languages as a clean card"**(不点破质量、不引导自评)。Ground truth 取自 build worker(session 787c10da)的 `tool_use` 全序列 + 最终 show_view + 口播。
+
+- ✅ **worker 看自己做出来的东西,不止"编过了"**:写完 `top5.jsx` 后,它**真把视图渲染成图**(esbuild 编 + Playwright/Chromium 截图 `preview.png`)、`Read` 那张 png **看实际成品**,发现问题 → `Edit` 修 → 重渲 → 再 `Read` 看一遍,才报回 ref。"离手前看 the thing itself"在 build 路径上真实发生。
+- ✅ **端到端落地**:mind 收到 ref 后 `show_view{ref: lang-rankings/top5}` 上屏,收尾口播 *"There it is — each language in its own brand color, with the TIOBE and Stack Overflow numbers on the right."*——交付的是看过的成品。
+- ⚠️ **"好不好"未被单独隔离**:本次观察到的迭代是修**渲染环节的 bug**(react-dom/client、CORS),不是"这版太平、重做"的**审美**判断;而且 render+截图自检脚手架本就部分在 [appearance.md](../../src/reactor/appearance.md) 里。我加的"对着范例打分 / 过线即止"这层**没被干净地单独压出来**。旁证:worker 在技能笔记里顺手留了一段"design notes for ranked list cards"(深色背景、品牌色大号名次、glow 点、错落入场),说明它确有"好看"意识——但这是顺带,不是被逼出来的一次"翻车重做"。
+
+复核:**批判反射的"看实际成品 + 迭代"机制 = 实测到**(接 core.md 的 succeeded≠right 种子);**"appealing vs functional 的审美过线闸" = 未单独证成**,需一个首版明显 dull 的探针,看能否触发为审美原因的重做来复测。

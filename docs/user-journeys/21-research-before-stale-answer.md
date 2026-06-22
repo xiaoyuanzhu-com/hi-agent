@@ -42,4 +42,15 @@
 - 现查来的"当下剪法"要不要落进 skill 复用(连 [23](23-skill-improves-and-refreshes.md)),还是每次都现看?——本条的答案是**每次都重核 transient**,但范例本身可作技能的一部分。
 - 研究与开剪**并行**(边查边试)还是**串行**(看完范例再动手)?时延 vs 返工的权衡。
 
-_机制:research 能力已在(worker = Claude Code agent,web + code-exec),缺的是**反射的触发**——core.md 现在只给"别空场"的**时延**理由让你把搜索甩给 worker([core.md](../../src/reactor/core.md) "a quick web search is not a quick thing"),从没给"你其实不知道、去看"的**认知**理由。本 journey 主体是 guidance:core.md + worker prompt 加"味道触发 + 先看范例 + 限定快过期层"。成熟度:**能力具备、反射 guidance 未写**——这是三条反射里最便宜、最该先落的一条。_
+_机制:research 能力已在(worker = Claude Code agent,web + code-exec),缺的是**反射的触发**——core.md 现在只给"别空场"的**时延**理由让你把搜索甩给 worker([core.md](../../src/reactor/core.md) "a quick web search is not a quick thing"),从没给"你其实不知道、去看"的**认知**理由。本 journey 主体是 guidance:core.md + worker prompt 加"味道触发 + 先看范例 + 限定快过期层"。成熟度:**guidance 已写并实测通过**(见下)——这是三条反射里最便宜、最该先落的一条。_
+
+## 实测 2026-06-22 · 分支 worktree-acquisition-reflexes(基 origin/main 422d268)
+
+环境:Mac mini,隔离实例(`--data-dir /tmp/hi-reflex-test`,`:8099`,system runtime),boss 文字通道。一句易过期的随口问,不点破、不引导:**"whats a solid open-source tts these days? want to add a voice to a side project"**。Ground truth 取自两个 session 的 transcript `tool_use` + boss 通道实际口播。
+
+- ✅ **研究反射端到端触发**:mind 先接话 *"Good question — the space moves fast, let me pull up what's current."*——**把"味道"说出了口**(认出这是"当下什么好"的易过期问题),随即 `delegate` 一个 "search the best open-source TTS … as of mid-2026 … what's actually popular right now" 的研究活,并设 90s alarm 自查。**没有**从记忆里背一份旧榜。
+- ✅ **worker 真去看**:worker session 跑了 **2 次 WebSearch**(`…2026`、`…kokoro piper coqui`)+ **2 次 WebFetch**(2026 的 TTS 测评页),不是凭空作答。
+- ✅ **答案是当下的**:回来推荐 **Kokoro**(82M 参数、Apache、CPU 可跑、54 voice presets、`pip install kokoro-onnx`、无 voice cloning 的取舍)——一个晚于常见训练截止的模型,只可能来自现查;递减压缩(先给易选项 + 取舍),口播简洁。
+- ✅ **异步节奏对**:holding line 即时(00:50:22),答案在 worker ~25s 返回后口播(00:50:47),早于 90s alarm,alarm 自然作废("work 已回就不再多嘴"),符合 [speaking.md](../../src/reactor/speaking.md)。
+
+复核:**研究反射 = 实测通过**——易过期问题 → 说出味道 → 委托现查 → 当下答案,正是要堵的"能搜却给陈货"。范围限定("durable 不查")与"先看范例"两点本次未单独施压(问的是事实型推荐,非 make-something),留待后续 build 类探针复测。
