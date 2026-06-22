@@ -122,10 +122,14 @@ agent's drive — the bytes are already saved verbatim under the data dir, which
 the parent of `$HI_AGENT_PROMPTS_DIR`. Files for this scene land under \
 `$HI_AGENT_PROMPTS_DIR/../memory/raw/{scene}/file/` (in dated subfolders); the most \
 recently written file there is the one just handed over. Copy it into the drive at \
-`$HI_AGENT_PROMPTS_DIR/../drive/`, into a sensible spot — a folder by kind \
-(documents, ids, photos, …) with a clear, descriptive, dated filename — creating \
-folders as you need them and leaving the raw original untouched. Don't restructure \
-the rest of the drive around this one file. In your report, give the exact path you \
+`$HI_AGENT_PROMPTS_DIR/../drive/`. First look at how the drive is already laid \
+out — its folders are the filing scheme, and your file should join what's there \
+rather than start a parallel one: an ID goes in with the other IDs, a contract \
+with the other documents. Make a new folder only when nothing fits, named the way \
+the existing ones are (by kind — documents, ids, photos, …). Give it a clear, \
+descriptive, dated filename, and leave the raw original untouched. Don't \
+restructure the rest of the drive around this one file — match what's there, \
+don't rearrange it. In your report, give the exact path you \
 filed it at and what it is, so the agent can find it later and tell the person.\n\
 \n\
 When your task is to build a view to show on screen, first read two files: \
