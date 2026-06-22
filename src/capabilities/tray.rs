@@ -41,3 +41,13 @@ pub fn run(url: String, shutdown: Arc<Notify>) -> anyhow::Result<()> {
         anyhow::bail!("menu-bar status item is not supported on this platform")
     }
 }
+
+/// Briefly pulse the menu-bar icon to acknowledge that a user gesture was received
+/// — today, the double-tap-Command "come and see this" ([`crate::gesture`]). Meant
+/// as an *instant* ack of the gesture itself, not a signal that whatever it kicked
+/// off has finished. Best-effort: a no-op off macOS, or when no status item is up
+/// (headless, or before the tray has loaded).
+pub fn flash() {
+    #[cfg(target_os = "macos")]
+    crate::vendors::macos_tray::flash();
+}

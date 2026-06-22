@@ -12,15 +12,16 @@
 //! Objective-C action target for the menu clicks; this uses the `objc2` family,
 //! whose `define_class!` generates that target safely. Only compiled on macOS.
 
-use std::sync::Arc;
+use std::cell::Cell;
+use std::sync::{Arc, OnceLock};
 
 use anyhow::anyhow;
 use objc2::rc::Retained;
 use objc2::runtime::{AnyObject, NSObject, NSObjectProtocol};
-use objc2::{define_class, msg_send, sel, DefinedClass, MainThreadOnly};
+use objc2::{define_class, msg_send, sel, ClassType, DefinedClass, MainThreadOnly};
 use objc2_app_kit::{
     NSApplication, NSApplicationActivationPolicy, NSImage, NSMenu, NSMenuItem, NSStatusBar,
-    NSVariableStatusItemLength,
+    NSStatusBarButton, NSVariableStatusItemLength,
 };
 use objc2_foundation::{MainThreadMarker, NSString};
 use tokio::sync::Notify;
@@ -72,6 +73,138 @@ impl TrayTarget {
     }
 }
 
+/// The gesture-ack pulse: on a received gesture the menu-bar icon blinks between
+/// its resting `sparkles` and an `eye` ("the agent looks") a few times over ~half a
+/// second — long enough to read as a deliberate acknowledgement, short enough not to
+/// linger. `STEPS` is the number of toggles after the initial lit frame.
+const PULSE_STEPS: u32 = 4;
+const PULSE_INTERVAL: f64 = 0.1;
+
+/// What [`Blinker`] needs to animate the icon, plus the little pulse state. Touched
+/// only on the main thread (the pulse self-schedules onto the main run loop), so
+/// plain `Cell`s suffice.
+struct BlinkIvars {
+    button: Retained<NSStatusBarButton>,
+    idle: Retained<NSImage>,
+    active: Retained<NSImage>,
+    lit: Cell<bool>,
+    remaining: Cell<u32>,
+}
+
+define_class!(
+    // Owns the status-item button and drives the brief icon pulse that acknowledges
+    // a received gesture. Lives on the main thread for the process life; reached from
+    // other threads only via `performSelectorOnMainThread:`.
+    #[unsafe(super(NSObject))]
+    #[thread_kind = MainThreadOnly]
+    #[name = "HiAgentTrayBlinker"]
+    #[ivars = BlinkIvars]
+    struct Blinker;
+
+    unsafe impl NSObjectProtocol for Blinker {}
+
+    impl Blinker {
+        /// Start (or restart) the pulse. Invoked on the main thread via
+        /// `performSelectorOnMainThread:`; rapid re-taps coalesce by cancelling any
+        /// in-flight steps before re-arming.
+        #[unsafe(method(flash:))]
+        fn flash(&self, _arg: Option<&AnyObject>) {
+            let iv = self.ivars();
+            unsafe {
+                let _: () = msg_send![
+                    Self::class(),
+                    cancelPreviousPerformRequestsWithTarget: self,
+                    selector: sel!(step:),
+                    object: core::ptr::null_mut::<AnyObject>()
+                ];
+            }
+            iv.lit.set(true);
+            iv.remaining.set(PULSE_STEPS);
+            iv.button.setImage(Some(&iv.active));
+            self.schedule_step();
+        }
+
+        /// One toggle of the pulse, re-scheduling itself until the budget runs out,
+        /// then settling back to the resting icon.
+        #[unsafe(method(step:))]
+        fn step(&self, _arg: Option<&AnyObject>) {
+            let iv = self.ivars();
+            let r = iv.remaining.get();
+            if r == 0 {
+                iv.button.setImage(Some(&iv.idle));
+                iv.lit.set(false);
+                return;
+            }
+            let now_lit = !iv.lit.get();
+            iv.lit.set(now_lit);
+            iv.button.setImage(Some(if now_lit { &iv.active } else { &iv.idle }));
+            iv.remaining.set(r - 1);
+            self.schedule_step();
+        }
+    }
+);
+
+impl Blinker {
+    fn new(
+        mtm: MainThreadMarker,
+        button: Retained<NSStatusBarButton>,
+        idle: Retained<NSImage>,
+        active: Retained<NSImage>,
+    ) -> Retained<Self> {
+        let this = Self::alloc(mtm).set_ivars(BlinkIvars {
+            button,
+            idle,
+            active,
+            lit: Cell::new(false),
+            remaining: Cell::new(0),
+        });
+        unsafe { msg_send![super(this), init] }
+    }
+
+    /// Re-arm `step:` after [`PULSE_INTERVAL`]. Schedules onto the current run loop,
+    /// so it must run on the main thread (it always does — see [`flash`]).
+    fn schedule_step(&self) {
+        unsafe {
+            let _: () = msg_send![
+                self,
+                performSelector: sel!(step:),
+                withObject: core::ptr::null_mut::<AnyObject>(),
+                afterDelay: PULSE_INTERVAL
+            ];
+        }
+    }
+}
+
+/// A raw pointer to the leaked [`Blinker`] so [`flash`] can reach it from any
+/// thread. The object is main-thread-only, but we only ever message it via
+/// `performSelectorOnMainThread:` — the sanctioned cross-thread call — so holding
+/// and sharing the bare pointer is sound.
+struct BlinkerPtr(*const Blinker);
+unsafe impl Send for BlinkerPtr {}
+unsafe impl Sync for BlinkerPtr {}
+
+static BLINKER: OnceLock<BlinkerPtr> = OnceLock::new();
+
+/// Briefly pulse the menu-bar icon to acknowledge a received gesture. Safe to call
+/// from any thread; a no-op until the status item is up — so before the tray loads,
+/// or when running headless, it simply does nothing.
+pub fn flash() {
+    let Some(blinker) = BLINKER.get() else { return };
+    // SAFETY: `blinker.0` is the leaked Blinker, alive for the whole process. It is a
+    // main-thread object, but `performSelectorOnMainThread:` is documented to be
+    // callable from any thread — it hops `flash:` onto the main run loop, where the
+    // pulse actually runs. We pass nil for the unused argument and don't block.
+    unsafe {
+        let obj: &Blinker = &*blinker.0;
+        let _: () = msg_send![
+            obj,
+            performSelectorOnMainThread: sel!(flash:),
+            withObject: core::ptr::null_mut::<AnyObject>(),
+            waitUntilDone: false
+        ];
+    }
+}
+
 /// Build the status item + menu and run the AppKit loop on the current (main)
 /// thread. **Blocks for the process lifetime.** Errors only if we are not on the
 /// main thread; a missing window-server session surfaces as the item simply not
@@ -96,12 +229,30 @@ pub fn run(url: String, shutdown: Arc<Notify>) -> anyhow::Result<()> {
         // The button carries the icon. Prefer an SF Symbol as a *template* image so
         // the menu bar auto-tints it for light/dark; fall back to a short title.
         if let Some(button) = status_item.button(mtm) {
-            let symbol = NSString::from_str("sparkles");
             let desc = NSString::from_str("hi-agent");
-            match NSImage::imageWithSystemSymbolName_accessibilityDescription(&symbol, Some(&desc)) {
-                Some(image) => {
-                    image.setTemplate(true);
-                    button.setImage(Some(&image));
+            let idle = NSImage::imageWithSystemSymbolName_accessibilityDescription(
+                &NSString::from_str("sparkles"),
+                Some(&desc),
+            );
+            match idle {
+                Some(idle) => {
+                    idle.setTemplate(true);
+                    button.setImage(Some(&idle));
+                    // The "looking" frame of the come-and-see ack pulse. Falls back to
+                    // the resting icon if the symbol is missing, so the pulse still
+                    // runs (just without the eye morph).
+                    let active = NSImage::imageWithSystemSymbolName_accessibilityDescription(
+                        &NSString::from_str("eye"),
+                        Some(&desc),
+                    )
+                    .unwrap_or_else(|| idle.clone());
+                    active.setTemplate(true);
+                    // Build the blinker, leak it (lives as long as the menu bar), and
+                    // publish a pointer so the gesture can pulse it from its thread.
+                    let blinker = Blinker::new(mtm, button, idle, active);
+                    let ptr: *const Blinker = &*blinker;
+                    std::mem::forget(blinker);
+                    let _ = BLINKER.set(BlinkerPtr(ptr));
                 }
                 None => button.setTitle(&NSString::from_str("hi")),
             }

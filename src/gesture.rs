@@ -32,6 +32,10 @@ pub fn install(state: Arc<AppState>, scene: Scene) {
         .name("hotkey-gesture".to_string())
         .spawn(move || {
             let on_fire = move || {
+                // Instant visual ack that the double-tap registered: a quick pulse of
+                // the menu-bar icon. Fired before the (async) capture, so it confirms
+                // the *gesture*, not the screenshot. Best-effort; no-op without a tray.
+                crate::capabilities::tray::flash();
                 let state = state.clone();
                 let scene = scene.clone();
                 // The tap callback runs on the OS run-loop thread; hop onto the
