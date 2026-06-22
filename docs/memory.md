@@ -23,7 +23,8 @@ This document is the **durable design contract** for memory, in the spirit of `a
 | **Capture is mechanical & lossless; episodes/facets are reflection-time judgments** | A topic boundary or a "what I now believe" is a judgment; judgment lives in the mind, not in a Rust filter |
 | **One `raw/` slice per scene, stored by channel** | The scene is the isolation unit; within it each modality is its own day-sharded folder, so a channel is a complete, bounded, separately-fadeable record |
 | **A signal = a text surface (always) + an optional media payload** | Text and multimodal are one record type, not two systems. Every modality has a text surface (words / transcript / caption); bytes are an attachment |
-| **The text surface is permanent; media bytes fade** | The `.jsonl` lines are lossless forever and nearly free; sensory blobs are vividness that degrades with age. This bounds size without losing the memory |
+| **Text is permanent; media fades to chosen keepsakes** | Three depths — text (forever) / full bytes (recent) / a keepsake frame-or-seconds — and no in-place transcoding (no low-res/low-bitrate rung). Bounds size without losing the memory |
+| **Forgetting is delegated judgment, not a rule** | *When* and *what* to fade is a content call made by a forgetting sub-agent (informed by byte-pressure), not an age-sweep; the only hard rail is never fading bytes a reflection hasn't consolidated |
 | **The interleaved timeline is derived, never stored** | A scene is one timeline but stored per-channel; the mind reads a merge built on read (ordered by uuidv7 `id`), so there is no second copy to drift |
 | **`appearance` is retained state, not an utterance stream** | The screen persists until changed, so it is recorded as timestamped whole-state snapshots; the newest is the current screen (no separate current-state file). View lifetime is the reactor's decision — no server-side auto-expiry |
 | **Workers are scenes too — a worker run is its own lossless `raw/` stream** | Uniform ("everything is a scene with a signal stream"), and `architecture.md` §7 already requires worker transcripts to be inspectable |
@@ -123,12 +124,29 @@ Continuous channels (mic, camera) are **segmented at capture on the wall-clock m
 
 Direction and streams: **input is the default** and writes bare under `<channel>/<date>/`; **output writes under `output/`**; when a channel carries more than one of either, the extras get an id-suffixed folder (`input-<id>/`, `output-<id>/`). Direction is also the `kind` field on the line.
 
-### The text surface is forever; media fades
+### Forgetting: full → keepsakes → text
 
-Two different lifetimes — and this is what bounds size:
+Media is not kept forever, and this is what bounds size. A signal has three depths of vividness, and it sheds them with age — but it **never degrades in place**: a blob is either its full self, a chosen keepsake, or gone. There is no low-res or low-bitrate middle rung.
 
-- **The surface log is lossless and permanent.** The `.jsonl` lines — what was said, heard, seen-as-caption — are never edited or deleted. They are KBs/day; *the log is the memory.*
-- **Media bytes are vividness, and vividness fades.** Recent days keep full fidelity; with age, blobs degrade (keyframes, compression) and may eventually drop while the line that references them remains. Output bytes (TTS, generated frames) are the most disposable — regenerable from the text/prompt that produced them. Fading and cold-archival operate per channel / direction / day, all of which are directory boundaries.
+- **Text — permanent.** The `.jsonl` surface (words / transcript / caption) is never edited or deleted. KBs/day, nearly free; *the log is the memory.* Nothing ever fades below it.
+- **Full bytes — the recent vivid window.** The originally-captured audio/video, kept verbatim while a memory is fresh enough to replay in detail.
+- **Keepsakes — content-chosen survivors.** Between the two: a frame or a few seconds judged worth keeping vivid. Sparse, and often there are none — most moments rightly survive as words alone. *What* to keep is never a fixed rule (no "first N seconds", no per-minute thumbnail); it is a content judgment.
+
+**Forgetting is delegated judgment, not a timer.** "When is a memory ripe to fade, and which moments survive it" is a judgment, so it lives in a cognition session — an age-sweep in Rust would be the one hardcoded heuristic the rest of the subsystem refuses. So reflection grows a second, backward-looking faculty beyond consolidating the frontier — **tending the old store** — and does it by **delegating to a forgetting sub-agent**. Being a worker, that sub-agent is itself a scene, so the run is inspectable like any other (§3 *Files and workers*). The split mirrors `record_episode` — soft judgment, exact hands:
+
+- **The sub-agent makes the soft calls.** Shown the *pressure* on a scene — per-channel byte weight, age, consolidation status — it judges which cold windows are ripe to fade and, content-aware, which frame or seconds of each to keep. Informed by real pressure, never reduced to a rule.
+- **A deterministic tool does the cut.** `keep_and_fade(scene, channel, window, spans_to_keep[])` slices the kept spans into clip files and unlinks the full bytes. The mind never reasons about byte offsets.
+
+Slowness comes from the judgment, not a clock: reflection can dispatch the pass on its own cadence, and most runs it finds nothing ripe — a cheap near-no-op — so a given memory sheds its bytes **once**, when it has genuinely gone cold, not on every consolidation.
+
+**One hard rail, the rest soft.** Exactly one rule is not the sub-agent's to bend: **never fade bytes a reflection has not yet consolidated** — the window must lie entirely behind the scene cursor (`max(episode.to_id)`), so un-summarized detail is never lost. That is a safety invariant, not a forgetting policy; *when*, *what*, and *how much* are all the sub-agent's call.
+
+Exemptions and mechanics:
+- **`files/` never fade** — exchanged/produced artifacts are kept verbatim forever (the passport scan stays whole).
+- **Output bytes** (TTS, generated frames) are the most disposable — regenerable from the text/prompt that made them — so they fade to text early unless explicitly kept.
+- **`appearance`** is ~text JSON; old days thin to the newest snapshot.
+- Forgetting only ever rewrites or removes *blobs* — never a `.jsonl` line (§8 holds). The line keeps naming its original byte path; a reader resolves **best-available** — original, else the kept keepsake, else caption-only.
+- One consequence is accepted: once full bytes are gone, a kept keepsake is itself small permanent evidence, no longer regenerable — while the episode *gist* stays regenerable from the permanent text beneath it.
 
 ### `appearance` — the one state channel
 
@@ -186,6 +204,8 @@ It is **triggered on its own clock**, decoupled from the compact hot-swap, so co
 
 The backoff also subsumes the old fixed cooldown (the minimum spacing between passes *is* the base) and the old fixed idle trigger (a quiet scene's first backed-off gap is the base). It runs **detached**: nothing is held on it, so a slow consolidation never stalls the floor; the cursor makes it idempotent, and a tick that fires while a prior round is still running simply skips (the anchor advances on every fired tick, spawn or not, so a busy guard never hot-spins the wait loop). New input after a long idle re-anchors on the hours-old reflection, so the catch-up pass is due immediately — fine, it's detached and a sub-`MIN_REFLECT_SIGNALS` frontier no-ops cheaply. One consequence is accepted: a hot-swap firing between reflections may seed its replacement session from a `hot.md`/facets one cycle behind — fine, since those are projections. *Cadence* is the only knob, and it is a cost choice (every round is a paid cognition turn, plus a subprocess spawn) — not a judgment problem. A tiny frontier (< `MIN_REFLECT_SIGNALS`) is skipped rather than spending a session to file a handful of lines; `HI_AGENT_REFLECT=off` disables it entirely.
 
+Reflection also **tends the old store**, not just the frontier: alongside consolidating new signals it can fade cold media down to its keepsakes, delegating that to a forgetting sub-agent. This is the same session's backward-looking half; the mechanism — three-layer fade, the `keep_and_fade` cut tool, the byte-pressure it judges on, and the single safety rail (never fade un-consolidated bytes) — lives in §3 *Forgetting*.
+
 *(The clock fires on time/activity, not yet on a true semantic boundary — detecting that the topic/event changed, rather than just that the base gap of silence passed, remains a future refinement. It would live in the same per-scene loop, so the reflection guard stays a loop-local handle.)*
 
 ## 8. Invariants
@@ -194,6 +214,8 @@ The backoff also subsumes the old fixed cooldown (the minimum spacing between pa
 - **Regenerate, don't patch.** Episodes and facets are rebuilt from raw, never hand-edited in place.
 - **Every derived claim cites source signal ids.** A facet line without a citation is a bug.
 - **Lossy projections are fine** precisely because the log under them is lossless.
+- **Forgetting fades blobs, never signals.** Media may shed to a chosen keepsake or drop entirely, but a `.jsonl` line is never edited and never falls below its text surface.
+- **Never fade un-consolidated bytes.** A window may only fade once it lies entirely behind the scene cursor (`max(episode.to_id)`), so reflection has always seen the detail before it can be lost.
 - **No privileged dimensions.** Materialize hot slices on demand; let facet types emerge.
 - **The observatory is not memory.** `sessions.jsonl` (lifecycle/debug events) stays separate; `raw/` holds only signals and exchanged artifacts.
 
@@ -214,6 +236,7 @@ The backoff also subsumes the old fixed cooldown (the minimum spacing between pa
 - **Semantic trigger** — reflection now fires on one adaptive time/activity clock (base cadence when there's fresh input, exponential backoff to a cap while quiet); a true *semantic* trigger (detecting the topic/event actually changed, not just that the base gap of silence passed) remains future. Same per-scene loop, so the guard stays a loop-local handle.
 - **Episode attachments + per-claim citations** — an episode is just its `episode.md` today (no materialized thumbnails/deliverables); claims cite at episode granularity, not per-signal.
 - **Vision attention policy** — perception currently fires on every still and every camera minute; a real cadence/salience policy (when to actually look) is the deliberate placeholder left open.
+- **Forgetting (media fading)** — the three-layer fade (full → keepsakes → text) is not built; raw bytes are kept indefinitely (`src/memory/media.rs` flags the absent GC). Needs the reflection-delegated forgetting sub-agent, the `keep_and_fade` cut tool (judge spans → slice + unlink), and the cursor safety gate. §3 *Forgetting* is the spec.
 - **Workers as raw streams**, **`files/`**, **content index** (§3, §8) — still open.
 
 ## References
