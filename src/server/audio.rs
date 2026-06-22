@@ -654,13 +654,8 @@ fn resolve_speaker(
                 return;
             }
         };
-        match people_vectors::assign(&data_dir, Modality::Voice, &embedding).await {
+        match people_vectors::assign(&data_dir, Modality::Voice, &embedding, &wav, "wav").await {
             Ok(subject) => {
-                if let Err(err) =
-                    people_vectors::save_preview(&data_dir, &subject, Modality::Voice, &wav, "wav").await
-                {
-                    tracing::warn!(error = %err, "live voice preview save failed");
-                }
                 names.lock().unwrap().insert(speaker_id, subject);
             }
             Err(err) => tracing::warn!(error = %err, "live voice assign failed"),

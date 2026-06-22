@@ -7,10 +7,10 @@
 //! truth.
 //!
 //! Each subject is a **directory** (`<dim>/<subject>/`) holding the prose
-//! `facet.md` and, for `people`, the biometric gallery sidecars
-//! ([`super::people_vectors`] writes `face.f32` / `voice.f32` into the same dir).
+//! `facet.md` and, for `people`, the biometric recognition samples
+//! ([`super::people_vectors`] keeps per-sample `face/`,`voice/` subdirs there).
 //! One dir per subject mirrors the episodes layout (`<id>/episode.md`) and keeps a
-//! person's prose and galleries grouped, so naming/merging is a directory move.
+//! person's prose and samples grouped, so naming/merging is a directory move.
 //!
 //! Dimensions are open-ended: `people`/`locations`/`projects`/`culture` are seeds,
 //! not an enum. The mind supplies the dimension and subject; this module only does

@@ -455,16 +455,17 @@ async fn cluster_faces(
             }
         };
         for f in faces.iter().filter(|f| salient(f)) {
-            match people_vectors::assign(data_dir, people_vectors::Modality::Face, &f.embedding).await {
+            // The crop is the sample's canonical media; without it there's no 1:1
+            // pair to store, so skip this face rather than enroll a bare vector.
+            let jpg = match face::crop_to_jpeg(image.as_ref(), f.bbox, 0.3) {
+                Ok(jpg) => jpg,
+                Err(err) => {
+                    tracing::warn!(scene = %scene, error = %err, "cluster: face crop failed");
+                    continue;
+                }
+            };
+            match people_vectors::assign(data_dir, people_vectors::Modality::Face, &f.embedding, &jpg, "jpg").await {
                 Ok(id) => {
-                    // Keep a viewable crop of this face beside the gallery.
-                    if let Ok(jpg) = face::crop_to_jpeg(image.as_ref(), f.bbox, 0.3)
-                        && let Err(err) = people_vectors::save_preview(
-                            data_dir, &id, people_vectors::Modality::Face, &jpg, "jpg",
-                        ).await
-                    {
-                        tracing::warn!(scene = %scene, error = %err, "cluster: face preview save failed");
-                    }
                     out.entry(i).or_default().push(id);
                 }
                 Err(err) => tracing::warn!(scene = %scene, error = %err, "cluster: assign failed"),
@@ -525,16 +526,10 @@ async fn cluster_voices(
                 continue;
             }
         };
-        match people_vectors::assign(data_dir, people_vectors::Modality::Voice, &embedding).await {
+        // The clip is the sample's canonical media, stored 1:1 with its voiceprint.
+        let ext = std::path::Path::new(&m.file).extension().and_then(|e| e.to_str()).unwrap_or("wav");
+        match people_vectors::assign(data_dir, people_vectors::Modality::Voice, &embedding, &bytes, ext).await {
             Ok(id) => {
-                // Keep the clip itself beside the gallery as a playable preview.
-                let ext = std::path::Path::new(&m.file).extension().and_then(|e| e.to_str()).unwrap_or("wav");
-                if let Err(err) = people_vectors::save_preview(
-                    data_dir, &id, people_vectors::Modality::Voice, &bytes, ext,
-                ).await
-                {
-                    tracing::warn!(scene = %scene, error = %err, "cluster: voice preview save failed");
-                }
                 out.entry(i).or_default().push(id);
             }
             Err(err) => tracing::warn!(scene = %scene, error = %err, "cluster: voice assign failed"),
