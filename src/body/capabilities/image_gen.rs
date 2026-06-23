@@ -13,7 +13,7 @@
 
 use std::sync::OnceLock;
 
-use crate::vendors::doubao_image_gen;
+use crate::foundation::vendors::doubao_image_gen;
 
 /// How the vendor should return a generated image: a hosted `url` (the default;
 /// cheaper on the wire but expires upstream, so a caller persists it promptly)

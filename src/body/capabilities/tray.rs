@@ -4,7 +4,7 @@
 //!
 //! Like [`super::desktop_context`], [`super::hotkey`], [`super::input`], and
 //! [`super::screencast`], the vendor is the operating system, selected at compile
-//! time ([`crate::vendors::macos_tray`]) — there is nothing for the operator to
+//! time ([`crate::foundation::vendors::macos_tray`]) — there is nothing for the operator to
 //! configure. Unlike those, this isn't a *sense*: it's an articulation/lifecycle
 //! surface, so it has no place in a perception loop. It's driven once from the
 //! macOS entry point ([`crate::run_with_tray`]).
@@ -33,7 +33,7 @@ pub fn available() -> bool {
 pub fn run(url: String, shutdown: Arc<Notify>) -> anyhow::Result<()> {
     #[cfg(target_os = "macos")]
     {
-        crate::vendors::macos_tray::run(url, shutdown)
+        crate::foundation::vendors::macos_tray::run(url, shutdown)
     }
     #[cfg(not(target_os = "macos"))]
     {
@@ -49,5 +49,5 @@ pub fn run(url: String, shutdown: Arc<Notify>) -> anyhow::Result<()> {
 /// (headless, or before the tray has loaded).
 pub fn flash() {
     #[cfg(target_os = "macos")]
-    crate::vendors::macos_tray::flash();
+    crate::foundation::vendors::macos_tray::flash();
 }

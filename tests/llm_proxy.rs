@@ -4,7 +4,7 @@ use std::net::SocketAddr;
 
 use axum::routing::post;
 use axum::{Router, extract::State};
-use hi_agent::llm_proxy::LlmProxy;
+use hi_agent::foundation::llm_proxy::LlmProxy;
 
 /// Minimal mock upstream: asserts the injected key, echoes a canned SSE body.
 async fn spawn_mock_upstream() -> (SocketAddr, tokio::task::JoinHandle<()>) {

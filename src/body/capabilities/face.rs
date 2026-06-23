@@ -11,7 +11,7 @@
 //! detect→align→embed pipeline, so there is no cross-capability reference (the
 //! same way `vision` is one capability). Like the others it is a module of free
 //! functions over a process-global, once-initialized config: [`init`] loads the
-//! local ONNX pair (auto-provisioned by [`crate::models`]), [`available`] reports
+//! local ONNX pair (auto-provisioned by [`crate::foundation::models`]), [`available`] reports
 //! whether it is loaded, and [`detect_and_embed`] dispatches. There is only one
 //! implementation and no meaningful choice to expose, so it is built-in (on
 //! whenever the models provision) rather than a provider toggle — there is
@@ -20,7 +20,7 @@
 //! runs on a blocking thread.
 //!
 //! Callers: posted stills and camera-stream keyframes are recognized in
-//! [`crate::server::vision`], and reflection clusters faces into the people store
+//! [`crate::foundation::server::vision`], and reflection clusters faces into the people store
 //! in [`crate::body::reactor::heartbeat`].
 
 use std::path::PathBuf;
@@ -29,7 +29,7 @@ use std::sync::OnceLock;
 use anyhow::Context;
 use bytes::Bytes;
 
-use crate::vendors::insightface_face;
+use crate::foundation::vendors::insightface_face;
 
 /// One detected face: bounding box and 5 landmarks in **original-image pixels**,
 /// the detector's confidence, and an L2-normalized 512-d identity embedding.

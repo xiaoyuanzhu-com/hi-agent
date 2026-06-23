@@ -73,10 +73,10 @@ use chrono::Utc;
 use tokio::sync::{Mutex, mpsc, oneshot};
 use tokio::time::{Instant, sleep_until, timeout};
 
-use crate::acp::{AcpSession, SessionOpts, SessionUpdate};
-use crate::agent::{AgentLayer, SessionRole};
+use crate::foundation::acp::{AcpSession, SessionOpts, SessionUpdate};
+use crate::foundation::agent::{AgentLayer, SessionRole};
 use crate::mind::memory::{Memory, build_for_scene};
-use crate::observatory::{EventKind, Observatory, SessionKind};
+use crate::foundation::observatory::{EventKind, Observatory, SessionKind};
 use crate::types::{Channel, Geometry, JournalEntry, Origin, Scene, Signal, ViewEnvelope, ViewOp};
 use bytes::Bytes;
 use uuid::Uuid;
@@ -111,7 +111,7 @@ const DEFAULT_PULSE: Duration = Duration::from_secs(1800);
 /// Resolve the pulse interval: `HI_AGENT_PULSE` in alarm-delay grammar if set
 /// (`None` for `0`/`off` — pulses disabled), else [`DEFAULT_PULSE`].
 fn pulse_interval() -> Option<Duration> {
-    match std::env::var(crate::config::ENV_PULSE) {
+    match std::env::var(crate::foundation::config::ENV_PULSE) {
         Ok(v) => {
             let v = v.trim().to_owned();
             if v.is_empty() {
@@ -134,7 +134,7 @@ fn pulse_interval() -> Option<Duration> {
 /// is `off` — a master escape hatch to disable consolidation without touching the
 /// cadence (see [`reflect_interval`]).
 fn reflect_enabled() -> bool {
-    !std::env::var(crate::config::ENV_REFLECT)
+    !std::env::var(crate::foundation::config::ENV_REFLECT)
         .map(|v| v.trim().eq_ignore_ascii_case("off"))
         .unwrap_or(false)
 }
@@ -175,7 +175,7 @@ fn duration_env(var: &str, default: Duration) -> Option<Duration> {
 /// here up to [`reflect_max_interval`].
 fn reflect_interval() -> Option<Duration> {
     reflect_enabled()
-        .then(|| duration_env(crate::config::ENV_REFLECT_EVERY, DEFAULT_REFLECT_EVERY))
+        .then(|| duration_env(crate::foundation::config::ENV_REFLECT_EVERY, DEFAULT_REFLECT_EVERY))
         .flatten()
 }
 
@@ -183,7 +183,7 @@ fn reflect_interval() -> Option<Duration> {
 /// the base each pass but never past this. Always returns a value (no `off`); a
 /// `0`/blank `HI_AGENT_REFLECT_MAX` falls back to the default.
 fn reflect_max_interval() -> Duration {
-    duration_env(crate::config::ENV_REFLECT_MAX, DEFAULT_REFLECT_MAX).unwrap_or(DEFAULT_REFLECT_MAX)
+    duration_env(crate::foundation::config::ENV_REFLECT_MAX, DEFAULT_REFLECT_MAX).unwrap_or(DEFAULT_REFLECT_MAX)
 }
 
 /// The soonest a reflection may fire for a scene, or `None` when reflection is

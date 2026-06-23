@@ -9,7 +9,7 @@ use std::time::Duration;
 
 use hi_agent::mind::memory::Memory;
 use hi_agent::body::reactor::OutboundSignal;
-use hi_agent::server::{self, ServerSeams};
+use hi_agent::foundation::server::{self, ServerSeams};
 use hi_agent::types::{Scene, ViewEnvelope, ViewOp};
 use tempfile::tempdir;
 use tokio::net::TcpListener;
@@ -17,12 +17,12 @@ use tokio::net::TcpListener;
 async fn spawn_server_at(dir: &Path) -> (String, ServerSeams) {
     let memory = Memory::open(dir).await.expect("memory");
     let observatory =
-        hi_agent::observatory::Observatory::new(None, hi_agent::body::reactor::swap_budget_chars());
+        hi_agent::foundation::observatory::Observatory::new(None, hi_agent::body::reactor::swap_budget_chars());
     let (router, seams) = server::build(
         memory,
         dir.to_path_buf(),
         observatory,
-        hi_agent::acp::AcpTap::new(),
+        hi_agent::foundation::acp::AcpTap::new(),
         hi_agent::body::reactor::ToolRegistry::new(),
         hi_agent::body::reactor::InterruptRegistry::new(),
         hi_agent::body::presence::Presence::new(),

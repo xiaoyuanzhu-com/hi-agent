@@ -17,7 +17,7 @@ use std::sync::OnceLock;
 
 use bytes::Bytes;
 
-use crate::vendors::doubao_vision;
+use crate::foundation::vendors::doubao_vision;
 
 /// A piece of visual input to understand. The two variants map to the two
 /// content-part kinds the upstream distinguishes (`image_url` vs `video_url`);

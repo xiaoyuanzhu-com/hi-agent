@@ -1,6 +1,6 @@
 //! Smoke test for the HTTP route surface.
 //!
-//! Builds the axum router via [`hi_agent::server::build`] directly. The
+//! Builds the axum router via [`hi_agent::foundation::server::build`] directly. The
 //! reactor seams are returned alongside so the test holds them past the
 //! handlers' send into `inbound` — otherwise the receiver drops and
 //! POST /api/in/text returns 503.
@@ -8,7 +8,7 @@
 use std::time::Duration;
 
 use hi_agent::mind::memory::Memory;
-use hi_agent::server::{self, ServerSeams};
+use hi_agent::foundation::server::{self, ServerSeams};
 use hi_agent::types::{Channel, JournalEntry};
 use tempfile::tempdir;
 use tokio::net::TcpListener;
@@ -16,12 +16,12 @@ use tokio::net::TcpListener;
 async fn spawn_server() -> (String, tempfile::TempDir, ServerSeams) {
     let dir = tempdir().expect("tempdir");
     let memory = Memory::open(dir.path()).await.expect("memory");
-    let observatory = hi_agent::observatory::Observatory::new(None, hi_agent::body::reactor::swap_budget_chars());
+    let observatory = hi_agent::foundation::observatory::Observatory::new(None, hi_agent::body::reactor::swap_budget_chars());
     let (router, seams) = server::build(
         memory,
         dir.path().to_path_buf(),
         observatory,
-        hi_agent::acp::AcpTap::new(),
+        hi_agent::foundation::acp::AcpTap::new(),
         hi_agent::body::reactor::ToolRegistry::new(),
         hi_agent::body::reactor::InterruptRegistry::new(),
         hi_agent::body::presence::Presence::new(),

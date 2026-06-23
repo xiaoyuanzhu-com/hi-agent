@@ -17,7 +17,7 @@ use std::sync::OnceLock;
 
 use bytes::Bytes;
 
-use crate::vendors::doubao_video_gen;
+use crate::foundation::vendors::doubao_video_gen;
 
 /// A reference image for image-to-video (e.g. the first frame). Either an
 /// already-usable URL passed through untouched, or raw bytes the vendor

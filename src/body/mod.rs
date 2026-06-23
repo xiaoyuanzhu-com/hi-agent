@@ -4,7 +4,7 @@
 //! Factory-sealed code, peer to the agent-grown `identity`/`mind` and the engine
 //! `foundation`. Holds:
 //! - `capabilities` — the senses and actions (STT/TTS, vision, input, screen, …),
-//!   over the vendor adapters in `crate::vendors`.
+//!   over the vendor adapters in `crate::foundation::vendors`.
 //! - `reactor` — the per-scene loops: turn-taking, the pulse and reflection clocks,
 //!   the loader/assembler, the output sequencer, and delegated workers.
 //! - `reflex` — taught teach-and-fire quick actions that run with no model in the

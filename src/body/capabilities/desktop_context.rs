@@ -54,7 +54,7 @@ pub fn available() -> bool {
 pub async fn capture() -> anyhow::Result<ContextSnapshot> {
     #[cfg(target_os = "macos")]
     {
-        Ok(crate::vendors::macos_desktop_context::capture().await)
+        Ok(crate::foundation::vendors::macos_desktop_context::capture().await)
     }
     #[cfg(not(target_os = "macos"))]
     {

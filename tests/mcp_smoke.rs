@@ -1,12 +1,12 @@
 //! Protocol smoke test for the `/mcp` tool endpoint.
 //!
-//! Builds the axum router via [`hi_agent::server::build`] and exercises the
+//! Builds the axum router via [`hi_agent::foundation::server::build`] and exercises the
 //! hand-rolled MCP "Streamable HTTP" surface directly: the initialize handshake,
 //! role-gated `tools/list`, the `202` for notifications, the `405` for the GET
 //! SSE stream we decline, and a `tools/call` whose scene has no live loop.
 
 use hi_agent::mind::memory::Memory;
-use hi_agent::server::{self, ServerSeams};
+use hi_agent::foundation::server::{self, ServerSeams};
 use serde_json::{Value, json};
 use tempfile::tempdir;
 use tokio::net::TcpListener;
@@ -15,12 +15,12 @@ async fn spawn_server() -> (String, tempfile::TempDir, ServerSeams) {
     let dir = tempdir().expect("tempdir");
     let memory = Memory::open(dir.path()).await.expect("memory");
     let observatory =
-        hi_agent::observatory::Observatory::new(None, hi_agent::body::reactor::swap_budget_chars());
+        hi_agent::foundation::observatory::Observatory::new(None, hi_agent::body::reactor::swap_budget_chars());
     let (router, seams) = server::build(
         memory,
         dir.path().to_path_buf(),
         observatory,
-        hi_agent::acp::AcpTap::new(),
+        hi_agent::foundation::acp::AcpTap::new(),
         hi_agent::body::reactor::ToolRegistry::new(),
         hi_agent::body::reactor::InterruptRegistry::new(),
         hi_agent::body::presence::Presence::new(),

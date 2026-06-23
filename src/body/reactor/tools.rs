@@ -1,7 +1,7 @@
 //! The bridge between the MCP tool server and each scene's reactor loop.
 //!
 //! The mind (and its workers) express side-effects as MCP tool calls over the
-//! `/mcp` HTTP endpoint (see [`crate::mcp`]). Those calls arrive on a different
+//! `/mcp` HTTP endpoint (see [`crate::foundation::mcp`]). Those calls arrive on a different
 //! task than the per-scene loop, so they cannot touch the loop's private state
 //! directly. Instead each scene registers a [`ToolSink`] — a control-channel
 //! sender — into a shared [`ToolRegistry`] keyed by scene. The MCP handler looks

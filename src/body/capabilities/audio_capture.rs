@@ -5,7 +5,7 @@
 //! press-and-hold-⌘ attention ([`crate::body::gesture`]) — can listen with no page open.
 //! The frames it yields match the pipeline's contract exactly (16 kHz mono signed
 //! 16-bit little-endian PCM), so they feed
-//! [`crate::server::audio::ingest_pcm_stream`] the same as the browser mic.
+//! [`crate::foundation::server::audio::ingest_pcm_stream`] the same as the browser mic.
 //!
 //! Like the other desktop capabilities ([`super::hotkey`], [`super::screencast`],
 //! [`super::input`]) the vendor is the operating system, selected at compile time;
@@ -16,11 +16,11 @@ use bytes::Bytes;
 use tokio::sync::mpsc;
 
 /// A live capture. **Dropping it stops the mic** and ends the frame stream, which
-/// lets a downstream [`ingest_pcm_stream`](crate::server::audio::ingest_pcm_stream)
+/// lets a downstream [`ingest_pcm_stream`](crate::foundation::server::audio::ingest_pcm_stream)
 /// finalize on its own.
 pub struct Capture {
     #[cfg(target_os = "macos")]
-    _vendor: crate::vendors::macos_audio_capture::Capture,
+    _vendor: crate::foundation::vendors::macos_audio_capture::Capture,
 }
 
 /// Whether this build can capture the mic natively. Compile-time, not a permission
@@ -35,7 +35,7 @@ pub fn available() -> bool {
 pub fn start() -> anyhow::Result<(Capture, mpsc::Receiver<Bytes>)> {
     #[cfg(target_os = "macos")]
     {
-        let (vendor, frames) = crate::vendors::macos_audio_capture::start()?;
+        let (vendor, frames) = crate::foundation::vendors::macos_audio_capture::start()?;
         Ok((Capture { _vendor: vendor }, frames))
     }
     #[cfg(not(target_os = "macos"))]

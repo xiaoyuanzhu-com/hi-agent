@@ -17,15 +17,15 @@ use std::sync::Arc;
 
 use chrono::{DateTime, Duration, Utc};
 
-use crate::acp::{AcpSession, SessionOpts};
-use crate::agent::SessionRole;
+use crate::foundation::acp::{AcpSession, SessionOpts};
+use crate::foundation::agent::SessionRole;
 use crate::body::capabilities::{face, voiceprint};
 use crate::mind::memory::journal::after_cursor;
-use crate::pcm;
+use crate::foundation::pcm;
 use crate::mind::memory::{Snapshot, build_for_scene, decay, episodes, facets, layout, people_vectors, refresh_hot};
-use crate::observatory::EventKind;
+use crate::foundation::observatory::EventKind;
 use crate::types::{Channel, JournalEntry, Scene};
-use crate::vendors::ffmpeg_frame;
+use crate::foundation::vendors::ffmpeg_frame;
 
 use super::Reactor;
 
@@ -41,7 +41,7 @@ pub(crate) const DEFAULT_SWAP_AFTER_CHARS: usize = 48_000;
 /// integer, else [`DEFAULT_SWAP_AFTER_CHARS`]. Read fresh so the observatory
 /// denominator and a budget opened mid-run agree on the same value.
 pub(crate) fn swap_after_chars() -> usize {
-    std::env::var(crate::config::ENV_COMPACT)
+    std::env::var(crate::foundation::config::ENV_COMPACT)
         .ok()
         .and_then(|v| v.trim().parse::<usize>().ok())
         .filter(|&n| n > 0)
@@ -142,7 +142,7 @@ pub(super) async fn swap(
         .agent
         .session(
             scene,
-            crate::agent::SessionRole::Reactor,
+            crate::foundation::agent::SessionRole::Reactor,
             None,
             SessionOpts {
                 system_prompt: Some(seeded_system_prompt),
@@ -234,7 +234,7 @@ async fn run_reflection(reactor: &Reactor, scene: &Scene) -> anyhow::Result<()> 
         .record(
             scene,
             EventKind::SessionOpened {
-                kind: crate::observatory::SessionKind::Reflection,
+                kind: crate::foundation::observatory::SessionKind::Reflection,
                 id: session.id().0.to_string(),
             },
         )

@@ -23,7 +23,7 @@ use anyhow::{Context, bail};
 use chrono::{DateTime, Duration, NaiveDate, TimeZone, Utc};
 
 use crate::types::{Channel, Scene};
-use crate::vendors::ffmpeg_frame;
+use crate::foundation::vendors::ffmpeg_frame;
 
 use super::{episodes, journal, layout};
 

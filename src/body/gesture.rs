@@ -4,7 +4,7 @@
 //! - **Double-tap ⌘ → "come and see this":** hands the agent a screenshot of the
 //!   current screen. It is *not a new sense* — the screenshot lands exactly like a
 //!   drag-dropped image (a handed file on the `file` channel) and wakes the mind
-//!   ([`crate::server::files::receive_screenshot`]).
+//!   ([`crate::foundation::server::files::receive_screenshot`]).
 //! - **Press-and-hold ⌘ → continuous attention:** for as long as Command is held,
 //!   the agent listens (native mic capture → the same audio ingest the browser mic
 //!   uses) and may look at the screen (its existing `look` tool); on release it
@@ -21,7 +21,7 @@
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use crate::server::AppState;
+use crate::foundation::server::AppState;
 use crate::types::Scene;
 
 /// Arm the gestures: from now on a double-tap of Command hands the agent a
@@ -151,7 +151,7 @@ fn glance(state: &Arc<AppState>, scene: &Scene) {
     tokio::spawn(async move {
         match crate::body::capabilities::screencast::grab_screen_png().await {
             Ok(png) => {
-                if let Err(e) = crate::server::files::receive_screenshot(&state, &scene, &png).await {
+                if let Err(e) = crate::foundation::server::files::receive_screenshot(&state, &scene, &png).await {
                     tracing::warn!(error = %e, "gesture: handing screenshot to the agent failed");
                 }
             }
@@ -197,7 +197,7 @@ fn start_attention(state: &Arc<AppState>, scene: &Scene, session: &mut Option<Mi
             let state = state.clone();
             let scene = scene.clone();
             tokio::spawn(async move {
-                crate::server::audio::ingest_pcm_stream(
+                crate::foundation::server::audio::ingest_pcm_stream(
                     state,
                     scene,
                     None,

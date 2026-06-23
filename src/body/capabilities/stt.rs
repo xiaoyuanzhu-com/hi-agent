@@ -13,7 +13,7 @@ use std::sync::OnceLock;
 use bytes::Bytes;
 use tokio::sync::mpsc;
 
-use crate::vendors::volcengine_stt;
+use crate::foundation::vendors::volcengine_stt;
 
 /// One transcript update from a streaming recognition.
 ///

@@ -8,31 +8,20 @@ use anyhow::Context;
 use tokio::net::TcpListener;
 use tokio::sync::Notify;
 
-pub mod acp;
-pub mod agent;
 pub mod appearance;
 pub mod body;
-pub mod channel_log;
-pub mod config;
+pub mod foundation;
 pub mod identity;
-pub mod llm_proxy;
-pub mod mcp;
 pub mod mind;
-pub mod models;
-pub mod observatory;
-pub mod pcm;
 pub mod runtime;
-pub mod segment;
-pub mod server;
 pub mod types;
-pub mod vendors;
 
 
 #[derive(Debug, Clone)]
 pub struct Config {
     pub port: u16,
     pub data_dir: PathBuf,
-    pub agent: config::AgentConfig,
+    pub agent: foundation::config::AgentConfig,
 }
 
 /// Absolutize `dir` against the current working directory (if relative) and
@@ -126,7 +115,7 @@ async fn run_with_shutdown(config: Config, shutdown: Arc<Notify>) -> anyhow::Res
     // Structured visibility into the ACP session lifecycle. The agent layer,
     // reactor, workers and heartbeat feed it; `GET /api/sessions` reads the live
     // mirror and `GET /api/sessions/events` streams the history over SSE.
-    let observatory = observatory::Observatory::new(
+    let observatory = foundation::observatory::Observatory::new(
         Some(config.data_dir.join("sessions.jsonl")),
         body::reactor::swap_budget_chars(),
     );
@@ -134,7 +123,7 @@ async fn run_with_shutdown(config: Config, shutdown: Arc<Notify>) -> anyhow::Res
     // Raw ACP wire tap — every JSON-RPC frame, business-logic agnostic. The agent
     // layer hands it to each scene's subprocess; `GET /api/acp/frames/events`
     // streams it to the raw session inspector.
-    let acp_tap = acp::AcpTap::new();
+    let acp_tap = foundation::acp::AcpTap::new();
 
     // Resolve all capabilities from the environment. Unconfigured capabilities
     // are fine; gates affect /audio (STT) and the speak path (TTS) only.
@@ -164,7 +153,7 @@ async fn run_with_shutdown(config: Config, shutdown: Arc<Notify>) -> anyhow::Res
     // each turn as human-model facts ("no screen is attached").
     let presence = body::presence::Presence::new();
 
-    let (router, seams) = server::build(
+    let (router, seams) = foundation::server::build(
         memory.clone(),
         config.data_dir.clone(),
         observatory.clone(),
@@ -179,7 +168,7 @@ async fn run_with_shutdown(config: Config, shutdown: Arc<Notify>) -> anyhow::Res
     tracing::info!(origin = runtime.origin, "runtime resolved");
 
     // Start the local LLM proxy; the adapter talks to it instead of the upstream.
-    let proxy = llm_proxy::LlmProxy::start(
+    let proxy = foundation::llm_proxy::LlmProxy::start(
         config.agent.upstream_base_url.clone(),
         config.agent.upstream_key.clone(),
     )
@@ -252,8 +241,8 @@ async fn run_with_shutdown(config: Config, shutdown: Arc<Notify>) -> anyhow::Res
         .to_str()
         .ok_or_else(|| anyhow::anyhow!("adapter path not UTF-8"))?
         .to_string();
-    let agent = agent::AgentLayer::new(
-        agent::SpawnConfig {
+    let agent = foundation::agent::AgentLayer::new(
+        foundation::agent::SpawnConfig {
             program: runtime.node_bin.clone(),
             args: vec![adapter_entry],
             env: child_env,

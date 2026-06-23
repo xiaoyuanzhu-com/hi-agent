@@ -16,7 +16,7 @@ use std::sync::OnceLock;
 use bytes::Bytes;
 use tokio::sync::mpsc;
 
-use crate::vendors::volcengine_tts;
+use crate::foundation::vendors::volcengine_tts;
 
 /// A live synthesis session. Feed text via [`text`](Self::text) as it becomes
 /// available; drop the sender to signal end-of-input (the provider flushes any

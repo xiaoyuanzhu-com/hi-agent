@@ -41,9 +41,9 @@ use tokio::sync::{Mutex, Notify, mpsc};
 use tokio::task::JoinHandle;
 use tokio::time::timeout;
 
-use crate::acp::{AcpSession, SessionOpts, SessionUpdate};
-use crate::agent::SessionRole;
-use crate::observatory::{EventKind, Observatory, WorkerState};
+use crate::foundation::acp::{AcpSession, SessionOpts, SessionUpdate};
+use crate::foundation::agent::SessionRole;
+use crate::foundation::observatory::{EventKind, Observatory, WorkerState};
 use crate::types::Scene;
 
 use super::{LoopInput, Reactor};
@@ -180,7 +180,7 @@ one-off; a workshop you can't find anything in is no workshop.";
 /// The worker's system prompt, with its scene interpolated so it can tag every
 /// input-channel request with the right `X-HI-Scene`. The server base URL is
 /// delivered out-of-band in the subprocess env
-/// ([`crate::config::ENV_SERVER_BASE_URL`]), which the prompt references as
+/// ([`crate::foundation::config::ENV_SERVER_BASE_URL`]), which the prompt references as
 /// `$HI_AGENT_BASE_URL`. Output side-effects (the `ask` tool) ride the MCP attach,
 /// which carries the scene/role/worker-id headers for the worker automatically.
 fn worker_system_prompt(scene: &Scene) -> String {

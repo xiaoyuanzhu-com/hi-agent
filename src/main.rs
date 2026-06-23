@@ -58,7 +58,7 @@ fn main() -> anyhow::Result<()> {
         });
     }
 
-    let agent = hi_agent::config::AgentConfig::load()?;
+    let agent = hi_agent::foundation::config::AgentConfig::load()?;
     // Read on every platform (so the flag is never dead code); only consulted on
     // macOS, where it selects the headless/server-owns-main-thread path.
     let no_tray = cli.no_tray;

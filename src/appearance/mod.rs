@@ -19,7 +19,7 @@
 //!
 //! Step 1 owns `src/server/mod.rs` and the `AppState` type. To stay
 //! independent of that timing, `router()` is generic over `S`. When Step 1
-//! lands, `crate::server::AppState` can be substituted in directly without
+//! lands, `crate::foundation::server::AppState` can be substituted in directly without
 //! touching this file.
 //!
 //! ## Future seam: agent-authored, runtime-swappable skins (NOT built yet)

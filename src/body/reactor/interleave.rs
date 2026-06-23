@@ -10,7 +10,7 @@
 
 use std::time::Instant;
 
-use crate::segment::{Segmenter, Terminator};
+use crate::foundation::segment::{Segmenter, Terminator};
 use crate::types::{Geometry, ViewOp};
 
 /// One release action the policy decides on. `Speak` goes to TTS only (the raw

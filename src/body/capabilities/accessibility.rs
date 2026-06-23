@@ -90,7 +90,7 @@ pub fn available() -> bool {
 pub async fn inspect() -> anyhow::Result<Vec<Element>> {
     #[cfg(target_os = "macos")]
     {
-        crate::vendors::macos_accessibility::inspect().await
+        crate::foundation::vendors::macos_accessibility::inspect().await
     }
     #[cfg(not(target_os = "macos"))]
     {

@@ -21,7 +21,7 @@ use tokio::task::JoinHandle;
 use uuid::Uuid;
 
 use crate::body::capabilities::tts::{self, TtsStream};
-use crate::segment::{Segmenter, Terminator};
+use crate::foundation::segment::{Segmenter, Terminator};
 use crate::types::{Channel, Geometry, Scene, ViewOp};
 
 use super::{OutboundSignal, Reactor, interleave};
@@ -157,7 +157,7 @@ pub(super) async fn run_sequencer(reactor: Reactor, scene: Scene, mut beats: mps
                     super::emit_end_of_utterance(&reactor, &scene).await;
                 }
                 if !full_reply.trim().is_empty() {
-                    crate::channel_log::outbound(Channel::Text, &scene, full_reply.trim());
+                    crate::foundation::channel_log::outbound(Channel::Text, &scene, full_reply.trim());
                 }
                 let _ = done.send(std::mem::take(&mut full_reply));
             }

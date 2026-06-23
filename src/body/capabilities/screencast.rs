@@ -1,6 +1,6 @@
 //! Window-capture capability — find an application's on-screen windows and grab
 //! one as an image, on the machine this process runs on. The outbound visual twin
-//! of the inbound camera ([`crate::server::vision`]): where that ingests a camera
+//! of the inbound camera ([`crate::foundation::server::vision`]): where that ingests a camera
 //! the user points at the agent, this captures the screen the agent is driving —
 //! the building block for casting an app window into a view, and a frame source
 //! for a look→act loop.
@@ -58,7 +58,7 @@ pub fn available() -> bool {
 pub async fn list_windows(app: Option<&str>) -> anyhow::Result<Vec<WindowRef>> {
     #[cfg(target_os = "macos")]
     {
-        let all = crate::vendors::macos_screencast::list_windows().await?;
+        let all = crate::foundation::vendors::macos_screencast::list_windows().await?;
         Ok(filter_by_app(all, app))
     }
     #[cfg(not(target_os = "macos"))]
@@ -72,7 +72,7 @@ pub async fn list_windows(app: Option<&str>) -> anyhow::Result<Vec<WindowRef>> {
 pub async fn grab_window_png(window_id: u32) -> anyhow::Result<Bytes> {
     #[cfg(target_os = "macos")]
     {
-        crate::vendors::macos_screencast::grab_window_png(window_id).await
+        crate::foundation::vendors::macos_screencast::grab_window_png(window_id).await
     }
     #[cfg(not(target_os = "macos"))]
     {
@@ -88,7 +88,7 @@ pub async fn grab_window_png(window_id: u32) -> anyhow::Result<Bytes> {
 pub async fn grab_screen_png() -> anyhow::Result<Bytes> {
     #[cfg(target_os = "macos")]
     {
-        crate::vendors::macos_screencast::grab_screen_png().await
+        crate::foundation::vendors::macos_screencast::grab_screen_png().await
     }
     #[cfg(not(target_os = "macos"))]
     {

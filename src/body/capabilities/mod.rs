@@ -5,7 +5,7 @@
 //! once-initialized config. A capability function reads its global, picks the
 //! configured vendor, and dispatches; the config is transparent to the caller
 //! and never appears in a signature. The vendor impls live under
-//! [`crate::vendors`].
+//! [`crate::foundation::vendors`].
 //!
 //! The capabilities are deliberately independent: no shared-vendor umbrella, no
 //! cross-capability references. A vendor that happens to back several
@@ -16,7 +16,7 @@
 //! (unknown name, missing key) fails fast at startup rather than as an error at
 //! first use. The two recognition capabilities (voiceprint, face) are not
 //! env-configured — they run pinned local ONNX models that [`init_recognition`]
-//! auto-provisions on first run (see [`crate::models`]), so they have no provider
+//! auto-provisions on first run (see [`crate::foundation::models`]), so they have no provider
 //! toggle and nothing for the operator to set.
 //!
 //! [`accessibility`], [`audio_capture`], [`desktop_context`], [`hotkey`],
@@ -24,7 +24,7 @@
 //! pattern: their vendor is the operating system, selected at compile time, so they
 //! have no `init_from_env` and do not appear in the composition root.
 
-use crate::models;
+use crate::foundation::models;
 
 pub mod accessibility;
 pub mod audio_capture;

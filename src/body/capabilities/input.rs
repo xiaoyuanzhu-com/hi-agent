@@ -144,7 +144,7 @@ pub fn available() -> bool {
 pub async fn perform(action: Action) -> anyhow::Result<()> {
     #[cfg(target_os = "macos")]
     {
-        crate::vendors::macos_input::perform(action).await
+        crate::foundation::vendors::macos_input::perform(action).await
     }
     #[cfg(not(target_os = "macos"))]
     {
@@ -159,7 +159,7 @@ pub async fn perform(action: Action) -> anyhow::Result<()> {
 pub fn main_display_point_size() -> anyhow::Result<(f64, f64)> {
     #[cfg(target_os = "macos")]
     {
-        crate::vendors::macos_input::main_display_point_size()
+        crate::foundation::vendors::macos_input::main_display_point_size()
     }
     #[cfg(not(target_os = "macos"))]
     {

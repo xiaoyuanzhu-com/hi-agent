@@ -9,7 +9,7 @@
 //!
 //! Like the other capabilities it is a module of free functions over a
 //! process-global, once-initialized config: [`init`] loads the local CAM++ ONNX
-//! (auto-provisioned by [`crate::models`]), [`available`] reports whether it is
+//! (auto-provisioned by [`crate::foundation::models`]), [`available`] reports whether it is
 //! loaded, and [`embed`] dispatches to it. There is only one implementation and
 //! no meaningful choice to expose, so it is built-in (on whenever the model
 //! provisions) rather than a provider toggle — there is nothing to configure.
@@ -17,7 +17,7 @@
 //! blocking thread.
 //!
 //! Callers: the audio channel voiceprints posted clips and live-mic speaker
-//! turns ([`crate::server::audio`]), and reflection clusters clip voices into the
+//! turns ([`crate::foundation::server::audio`]), and reflection clusters clip voices into the
 //! people store ([`crate::body::reactor::heartbeat`]).
 
 use std::path::PathBuf;
@@ -25,7 +25,7 @@ use std::sync::OnceLock;
 
 use anyhow::Context;
 
-use crate::vendors::campplus;
+use crate::foundation::vendors::campplus;
 
 enum Backend {
     CamPlusPlus(campplus::Config),

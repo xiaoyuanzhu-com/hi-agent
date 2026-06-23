@@ -7,7 +7,7 @@
 //!
 //! The pure recognizers live here so they are unit-testable off-macOS; the OS event
 //! tap that feeds them real key presses is the vendor
-//! ([`crate::vendors::macos_hotkey`]), selected at compile time like the other
+//! ([`crate::foundation::vendors::macos_hotkey`]), selected at compile time like the other
 //! desktop capabilities ([`super::input`], [`super::screencast`]). The vendor only
 //! translates raw key events into [`Edge`]s; the recognizers — and the hold's
 //! threshold timer — are driven from [`crate::body::gesture`] against one monotonic clock.
@@ -178,7 +178,7 @@ pub fn available() -> bool {
 pub fn listen(on_edge: impl Fn(Edge) + Send + 'static) -> anyhow::Result<()> {
     #[cfg(target_os = "macos")]
     {
-        crate::vendors::macos_hotkey::run(on_edge)
+        crate::foundation::vendors::macos_hotkey::run(on_edge)
     }
     #[cfg(not(target_os = "macos"))]
     {
