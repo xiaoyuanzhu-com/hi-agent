@@ -147,24 +147,32 @@ Frictions to resolve during migration: `server/` tangles transport (foundation) 
 channel semantics (body); identity is smeared through the hot reactor loop; and the
 "mind" term collides with `architecture.md` (below).
 
-## Migration order
+## Migration — status
 
-Incremental — each slice keeps the build green; no repo-wide import storm:
+The grouping shipped to `main` in four build-green, tested commits:
 
-1. **Consolidate identity** into `src/identity/` — give the scattered `load_soul` /
-   prompt-cascade / `self`+`commitments`+`hot` code one home, fronted by a thin port
-   that owns the cascade and the slow (reflection-only) write path. Highest value,
-   most contained.
-2. **Front the mind** with a `src/mind/` port over `memory` + `views`: gate *writes*
-   through it (provenance, append, seed-shadowing); leave *reads* as the worker
-   greps the tree.
-3. **Split `server/`** into transport (foundation) and channel semantics (body).
-4. **Group the engine** modules under `foundation` and the perceive/act modules under
-   `body`, last (the largest mechanical move).
-5. **Reconcile vocabulary** with `architecture.md` and merge (the "mind" rename).
+1. **`identity`** ✅ — `load_soul`, the prompt cascade, and the `self`/`commitments`
+   path helpers moved out of `reactor`/`memory` into `src/identity/`.
+2. **`mind`** ✅ — `memory` + `views` moved under `src/mind/` (the faculty's home and
+   namespace; the provenance-tagged, seed-shadowing write *port* is still future work).
+3. **`body`** ✅ — `capabilities`, `reactor`, `reflex`, `presence`, `gesture` under
+   `src/body/` (the always-on apparatus + loops).
+4. **`foundation`** ✅ — the 12 pure-Rust engine modules (`acp`, `agent`, `llm_proxy`,
+   `mcp`, `vendors`, `config`, `models`, `observatory`, `channel_log`, `pcm`, `segment`,
+   `server`) under `src/foundation/`.
 
-Until the ports land, the "agent's pen only touches `data/`" rule is enforced by
-convention; the ports are what make it structural.
+`src/` is now `body/ foundation/ identity/ mind/` plus three deliberate **root
+exceptions**:
+- **`appearance`** and **`runtime`** carry build assets behind hardcoded paths (the SPA's
+  RustEmbed `dist/` folder; the runtime's `CARGO_MANIFEST_DIR` npm includes) — relocating
+  them would break the Makefile / dev server / embed, so they stay at root.
+- **`types`** — shared cross-faculty vocabulary, not engine machinery.
+
+Still deferred (future work):
+- **Split `server/`** into transport (foundation) vs. channel semantics (body).
+- **The `mind` write-port** — provenance tags + seed-shadowing; reads stay grep-the-tree.
+  Until it lands, the "agent's pen only touches `data/`" rule is convention, not structure.
+- **Reconcile vocabulary** with `architecture.md` and merge the two docs (the "mind" rename).
 
 ## Merge notes
 
