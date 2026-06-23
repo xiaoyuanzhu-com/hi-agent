@@ -299,10 +299,11 @@ fn build_reflection_prompt(
             };
             let _ = writeln!(
                 s,
-                "- {} {}  ({}d old, {}){}",
+                "- {} {}  ({}d old, {} events since, {}){}",
                 d.channel.as_str(),
                 d.date,
                 d.age_days,
+                d.episodes_since,
                 human_bytes(d.bytes),
                 eps
             );

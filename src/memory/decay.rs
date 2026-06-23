@@ -52,6 +52,10 @@ pub struct FadeDay {
     pub date: String,
     pub bytes: u64,
     pub age_days: i64,
+    /// How many of the scene's episodes began *after* this day — its burial depth.
+    /// The interference signal (how much life has piled on since), which matters
+    /// more than the calendar: a day buried under many events has truly receded.
+    pub episodes_since: usize,
     pub episodes: Vec<String>,
 }
 
@@ -147,6 +151,9 @@ pub async fn fade_pressure(
     let Some(through) = consolidated_through_day(data_dir, scene).await? else {
         return Ok(Vec::new());
     };
+    // The scene's episode start-dates (sorted), to weigh each cold day's burial
+    // depth — how many events have piled on since — without rescanning per day.
+    let from_dates = episodes::scene_from_dates(data_dir, scene).await.unwrap_or_default();
     let mut out = Vec::new();
     for channel in FADEABLE {
         let root = layout::scene_dir(data_dir, scene).join(channel.as_str());
@@ -171,10 +178,13 @@ pub async fn fade_pressure(
             let age_days = day_start(&date)
                 .map(|d| (now - d).num_days())
                 .unwrap_or(0);
+            // Episodes whose start-date is strictly after this day (sorted list).
+            let episodes_since =
+                from_dates.len() - from_dates.partition_point(|d| d.as_str() <= date.as_str());
             let episodes = episodes::names_overlapping_day(data_dir, scene, &date)
                 .await
                 .unwrap_or_default();
-            out.push(FadeDay { channel, date, bytes, age_days, episodes });
+            out.push(FadeDay { channel, date, bytes, age_days, episodes_since, episodes });
         }
     }
     out.sort_by(|a, b| b.bytes.cmp(&a.bytes)); // heaviest first
@@ -448,6 +458,8 @@ mod tests {
         assert_eq!(pressure.len(), 1);
         assert_eq!(pressure[0].date, "2000-01-01");
         assert_eq!(pressure[0].bytes, 2048);
+        // One episode (today's) began after the old day → buried one deep.
+        assert_eq!(pressure[0].episodes_since, 1);
     }
 
     #[test]

@@ -249,6 +249,39 @@ pub async fn names_overlapping_day(
     Ok(names)
 }
 
+/// The start-date (`from_ts`, `YYYY-MM-DD`) of every episode in `scene`, sorted
+/// ascending — the forgetting pass uses it to weigh a cold day's burial depth
+/// (how many events began after it) with a single scan. Episodes without a
+/// parseable `from_ts` are skipped.
+pub async fn scene_from_dates(data_dir: &Path, scene: &Scene) -> anyhow::Result<Vec<String>> {
+    let dir = layout::episodes_dir(data_dir);
+    let mut rd = match tokio::fs::read_dir(&dir).await {
+        Ok(rd) => rd,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(err) => return Err(err.into()),
+    };
+    let mut dates = Vec::new();
+    while let Some(ent) = rd.next_entry().await? {
+        if !ent.file_type().await?.is_dir() {
+            continue;
+        }
+        let content = match tokio::fs::read_to_string(ent.path().join("episode.md")).await {
+            Ok(c) => c,
+            Err(_) => continue,
+        };
+        if frontmatter_field(&content, "scene").as_deref() != Some(scene.0.as_str()) {
+            continue;
+        }
+        if let Some(from) = frontmatter_field(&content, "from_ts")
+            && let Some(d) = from.get(..10)
+        {
+            dates.push(d.to_owned());
+        }
+    }
+    dates.sort();
+    Ok(dates)
+}
+
 /// One frontmatter scalar by key, JSON-decoding a quoted value (so a colon inside
 /// it survives) and returning a bare value as-is. `None` if there's no
 /// frontmatter block or the key is absent. Splits on the first `:` so an RFC3339
