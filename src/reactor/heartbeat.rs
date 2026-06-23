@@ -216,7 +216,7 @@ async fn run_reflection(reactor: &Reactor, scene: &Scene) -> anyhow::Result<()> 
     let pressure = decay::fade_pressure(data_dir, scene, Utc::now()).await.unwrap_or_default();
 
     let prompt = build_reflection_prompt(&tail, &prior, &subjects, &face_ids, &voice_ids, &pressure);
-    let system_prompt = super::reflection_prompt(data_dir).await;
+    let system_prompt = crate::identity::reflection_prompt(data_dir).await;
 
     let session = reactor
         .inner

@@ -16,7 +16,7 @@ const UPLOAD: &str = include_str!("builtin/upload.jsx");
 
 /// Write the bundled built-in views into `<data_dir>/views/_builtin/`, overwriting
 /// each on every boot so a binary update reseeds the latest (mirrors
-/// [`crate::reactor::install_prompts`]). The views tree is disposable, so
+/// [`crate::identity::install_prompts`]). The views tree is disposable, so
 /// re-seeding is the point, not a hazard.
 pub fn install_builtin_views(data_dir: &Path) -> io::Result<()> {
     let dir = data_dir.join("views").join("_builtin");

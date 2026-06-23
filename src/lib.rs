@@ -15,6 +15,7 @@ pub mod capabilities;
 pub mod channel_log;
 pub mod config;
 pub mod gesture;
+pub mod identity;
 pub mod llm_proxy;
 pub mod mcp;
 pub mod memory;
@@ -92,7 +93,7 @@ async fn run_with_shutdown(config: Config, shutdown: Arc<Notify>) -> anyhow::Res
     // disk, composed with any `*.local.md` operator overrides. Absolutize the dir:
     // it rides to the child as HI_AGENT_PROMPTS_DIR, and the child may run with a
     // different cwd than us.
-    reactor::install_prompts(&config.data_dir).context("installing bundled prompts")?;
+    identity::install_prompts(&config.data_dir).context("installing bundled prompts")?;
     let prompts_dir = {
         let d = config.data_dir.join("prompts");
         if d.is_absolute() {
@@ -271,7 +272,7 @@ async fn run_with_shutdown(config: Config, shutdown: Arc<Notify>) -> anyhow::Res
     let agent_for_shutdown = agent.clone();
 
 
-    let soul = reactor::load_soul(&config.data_dir);
+    let soul = identity::load_soul(&config.data_dir);
     // The reactor compiles view source to ESM via esbuild; modules land under
     // data_dir/views/_compiled. esbuild is hi-agent's own tool (not the
     // adapter's) — `ensure_view_esbuild` guarantees one whether the runtime came

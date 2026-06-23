@@ -49,20 +49,6 @@ pub fn raw_root(data_dir: &Path) -> PathBuf {
     memory_dir(data_dir).join("raw")
 }
 
-/// `<memory>/self.md` — per-install authored identity (optional). Hand-written by
-/// the operator if at all; the agent only ever *reads* it, never writes it.
-pub fn self_path(data_dir: &Path) -> PathBuf {
-    memory_dir(data_dir).join("self.md")
-}
-
-/// `<memory>/commitments.md` — the agent's standing duties (what it watches, runs,
-/// where its ledgers live). The one identity-adjacent file the agent *writes*: it
-/// loads into every fresh session, so it is how a duty survives a restart. Named
-/// everywhere by this single absolute path, so the duty written is the duty recovered.
-pub fn commitments_path(data_dir: &Path) -> PathBuf {
-    memory_dir(data_dir).join("commitments.md")
-}
-
 /// `<memory>/hot.md` — the always-loaded working set (a regenerable projection).
 pub fn hot_path(data_dir: &Path) -> PathBuf {
     memory_dir(data_dir).join("hot.md")
