@@ -7,7 +7,7 @@
 use std::path::Path;
 use std::time::Duration;
 
-use hi_agent::memory::Memory;
+use hi_agent::mind::memory::Memory;
 use hi_agent::reactor::OutboundSignal;
 use hi_agent::server::{self, ServerSeams};
 use hi_agent::types::{Scene, ViewEnvelope, ViewOp};

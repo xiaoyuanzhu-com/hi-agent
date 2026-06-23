@@ -33,8 +33,8 @@ use chrono::Utc;
 use serde::Deserialize;
 use uuid::Uuid;
 
-use crate::memory::layout::MediaSlot;
-use crate::memory::media;
+use crate::mind::memory::layout::MediaSlot;
+use crate::mind::memory::media;
 use crate::server::headers::SceneHeader;
 use crate::server::AppState;
 use crate::types::{Channel, JournalEntry, Media, Origin, Scene, Signal};

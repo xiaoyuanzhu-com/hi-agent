@@ -351,7 +351,7 @@ fn jarr(v: &[String]) -> String {
 #[cfg(test)]
 mod reflection_tests {
     use super::*;
-    use crate::memory::journal::Journal;
+    use crate::mind::memory::journal::Journal;
     use crate::types::{Channel, JournalEntry};
     use chrono::Utc;
 

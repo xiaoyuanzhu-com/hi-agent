@@ -2,7 +2,7 @@
 
 use chrono::{DateTime, Duration, Utc};
 
-use crate::memory::Memory;
+use crate::mind::memory::Memory;
 use crate::types::{Channel, JournalEntry, Scene};
 
 pub const RECENT_WINDOW_MIN: i64 = 30;

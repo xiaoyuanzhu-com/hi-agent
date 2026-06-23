@@ -29,7 +29,7 @@ use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
 use crate::capabilities::accessibility::Element;
-use crate::memory::layout;
+use crate::mind::memory::layout;
 
 /// The AX role a reflex targets when its trigger doesn't pin one — a text field is
 /// the overwhelmingly common fill target.
@@ -79,7 +79,7 @@ pub enum Recognition {
 /// The on-disk id (and filename stem) for a reflex of this name — a path-safe slug.
 /// Empty if `name` has no usable character.
 pub fn id_for(name: &str) -> String {
-    crate::memory::facets::slug(name)
+    crate::mind::memory::facets::slug(name)
 }
 
 /// Whether the coarse window gate passes for the current desktop context.

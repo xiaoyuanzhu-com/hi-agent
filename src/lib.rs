@@ -18,7 +18,7 @@ pub mod gesture;
 pub mod identity;
 pub mod llm_proxy;
 pub mod mcp;
-pub mod memory;
+pub mod mind;
 pub mod models;
 pub mod observatory;
 pub mod pcm;
@@ -30,7 +30,7 @@ pub mod segment;
 pub mod server;
 pub mod types;
 pub mod vendors;
-pub mod views;
+
 
 #[derive(Debug, Clone)]
 pub struct Config {
@@ -84,7 +84,7 @@ async fn run_with_shutdown(config: Config, shutdown: Arc<Notify>) -> anyhow::Res
         .context("resolving cwd to absolutize data dir")?;
     tracing::debug!(?config, "starting hi-agent");
 
-    let memory = memory::Memory::open(&config.data_dir).await?;
+    let memory = mind::memory::Memory::open(&config.data_dir).await?;
     tracing::info!(data_dir = %config.data_dir.display(), "memory opened");
 
     // Materialise the bundled prompts under <data_dir>/prompts/ so the mind's
@@ -120,7 +120,7 @@ async fn run_with_shutdown(config: Config, shutdown: Arc<Notify>) -> anyhow::Res
     // Seed the bundled built-in views (the file-upload entry) into the tree so the
     // agent can show them by ref like any view. Overwritten each boot — the tree is
     // disposable, so a binary update reseeds the latest.
-    views::install_builtin_views(&config.data_dir).context("installing built-in views")?;
+    mind::views::install_builtin_views(&config.data_dir).context("installing built-in views")?;
 
     // The agent's precious drive — where it files artifacts worth keeping (a user's
     // handed-over documents, its own kept work). Created here so it always exists;
@@ -280,7 +280,7 @@ async fn run_with_shutdown(config: Config, shutdown: Arc<Notify>) -> anyhow::Res
     let esbuild_bin = runtime::ensure_view_esbuild(&runtime)
         .await
         .context("resolving esbuild for the view compiler")?;
-    let view_compiler = views::ViewCompiler::new(esbuild_bin, &config.data_dir);
+    let view_compiler = mind::views::ViewCompiler::new(esbuild_bin, &config.data_dir);
     let _reactor = reactor::start(
         memory,
         agent,

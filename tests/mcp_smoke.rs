@@ -5,7 +5,7 @@
 //! role-gated `tools/list`, the `202` for notifications, the `405` for the GET
 //! SSE stream we decline, and a `tools/call` whose scene has no live loop.
 
-use hi_agent::memory::Memory;
+use hi_agent::mind::memory::Memory;
 use hi_agent::server::{self, ServerSeams};
 use serde_json::{Value, json};
 use tempfile::tempdir;

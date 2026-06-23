@@ -52,7 +52,7 @@ fn main() -> anyhow::Result<()> {
         let data_dir = cli.data_dir.clone();
         let rt = tokio::runtime::Runtime::new()?;
         return rt.block_on(async move {
-            let removed = hi_agent::memory::people_vectors::purge_voice(&data_dir).await?;
+            let removed = hi_agent::mind::memory::people_vectors::purge_voice(&data_dir).await?;
             tracing::info!(removed, data_dir = %data_dir.display(), "purged voice galleries");
             Ok(())
         });

@@ -148,7 +148,7 @@ pub async fn after_cursor(
 /// The wall-clock timestamp embedded in a uuidv7 string, or `None` if it doesn't
 /// parse / isn't a v7. Used to pick the first day-folder [`after_cursor`] must
 /// scan — an id greater than the cursor cannot predate the cursor's millisecond —
-/// and by [`crate::memory::decay`] to turn the consolidation cursor into a day.
+/// and by [`crate::mind::memory::decay`] to turn the consolidation cursor into a day.
 pub fn uuidv7_ts(id: &str) -> Option<DateTime<Utc>> {
     let (secs, nanos) = Uuid::parse_str(id).ok()?.get_timestamp()?.to_unix();
     DateTime::from_timestamp(secs as i64, nanos)

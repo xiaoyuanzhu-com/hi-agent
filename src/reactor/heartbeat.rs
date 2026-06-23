@@ -20,9 +20,9 @@ use chrono::{DateTime, Duration, Utc};
 use crate::acp::{AcpSession, SessionOpts};
 use crate::agent::SessionRole;
 use crate::capabilities::{face, voiceprint};
-use crate::memory::journal::after_cursor;
+use crate::mind::memory::journal::after_cursor;
 use crate::pcm;
-use crate::memory::{Snapshot, build_for_scene, decay, episodes, facets, layout, people_vectors, refresh_hot};
+use crate::mind::memory::{Snapshot, build_for_scene, decay, episodes, facets, layout, people_vectors, refresh_hot};
 use crate::observatory::EventKind;
 use crate::types::{Channel, JournalEntry, Scene};
 use crate::vendors::ffmpeg_frame;
@@ -357,7 +357,7 @@ fn human_bytes(n: u64) -> String {
 /// One frontier signal as a transcript line, reusing the snapshot's renderer so
 /// the speaker glyph and channel formatting match what the reactor sees.
 fn render_signal(e: &JournalEntry) -> String {
-    use crate::memory::snapshot::{Speaker, transcript_line};
+    use crate::mind::memory::snapshot::{Speaker, transcript_line};
     match e {
         JournalEntry::SignalIn { channel, body, stream, .. } => {
             transcript_line(Speaker::Them, &channel.with_stream(stream.as_deref()), body.as_str())

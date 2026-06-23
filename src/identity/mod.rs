@@ -131,7 +131,7 @@ pub fn load_soul(data_dir: &Path) -> String {
     let meaning = prompts.join("meaning.md");
     let self_md = self_path(&base);
     let commitments = commitments_path(&base);
-    let hot = crate::memory::layout::hot_path(&base);
+    let hot = crate::mind::memory::layout::hot_path(&base);
     format!(
         "You're warm, honest, and kind-hearted — easy company. You like being \
 useful, and when there's a hand to lend you're glad to lend it.\n\n\
@@ -172,7 +172,7 @@ mod soul_tests {
         assert!(seed.contains(&prompts.join("speaking.md").display().to_string()));
         assert!(seed.contains(&prompts.join("meaning.md").display().to_string()));
         // The recency digest is referenced by path too, never inlined.
-        let hot = crate::memory::layout::hot_path(dir.path());
+        let hot = crate::mind::memory::layout::hot_path(dir.path());
         assert!(seed.contains(&hot.display().to_string()));
         // It tells the mind to read them up front.
         assert!(seed.contains("read them all now"));

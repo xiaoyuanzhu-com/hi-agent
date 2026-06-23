@@ -8,7 +8,7 @@
 //! codec the client can produce. One keyframe per minute-file is all the face path
 //! needs — recognition is soft evidence, not surveillance.
 //!
-//! The forgetting pass ([`crate::memory::decay`]) reuses the same binary to cut a
+//! The forgetting pass ([`crate::mind::memory::decay`]) reuses the same binary to cut a
 //! keepsake out of cold media before it drops the full bytes: [`still_at`] for a
 //! single vision frame, [`clip_audio`] for a few seconds of sound.
 //!

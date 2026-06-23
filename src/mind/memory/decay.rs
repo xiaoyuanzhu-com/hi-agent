@@ -370,7 +370,7 @@ async fn sum_full_bytes(dir: &Path, channel: Channel) -> anyhow::Result<u64> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::memory::journal::Journal;
+    use crate::mind::memory::journal::Journal;
     use crate::types::JournalEntry;
     use uuid::Uuid;
 

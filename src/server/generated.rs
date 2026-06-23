@@ -1,6 +1,6 @@
 //! `GET /views/<path>` — serve a file from the agent's view workshop on disk (where
 //! `AppState.data_dir` is in scope, unlike the embed-only appearance router):
-//! compiled view modules ([`crate::views::ViewCompiler`] writes them under
+//! compiled view modules ([`crate::mind::views::ViewCompiler`] writes them under
 //! `_compiled/`), images a build sub-agent downloaded, and anything else it
 //! authored. Single-user and trusted, so served whole, guarded only against `..`.
 

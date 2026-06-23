@@ -3,9 +3,9 @@
 //! needs STT configured, which these tests deliberately avoid.
 
 use chrono::{DateTime, TimeZone, Utc};
-use hi_agent::memory::layout::{self, MediaSlot};
-use hi_agent::memory::media::store_blob;
-use hi_agent::memory::Memory;
+use hi_agent::mind::memory::layout::{self, MediaSlot};
+use hi_agent::mind::memory::media::store_blob;
+use hi_agent::mind::memory::Memory;
 use hi_agent::types::{Channel, JournalEntry, Media, Origin, Scene};
 use tempfile::tempdir;
 

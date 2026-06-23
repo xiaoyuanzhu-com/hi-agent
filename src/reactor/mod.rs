@@ -75,7 +75,7 @@ use tokio::time::{Instant, sleep_until, timeout};
 
 use crate::acp::{AcpSession, SessionOpts, SessionUpdate};
 use crate::agent::{AgentLayer, SessionRole};
-use crate::memory::{Memory, build_for_scene};
+use crate::mind::memory::{Memory, build_for_scene};
 use crate::observatory::{EventKind, Observatory, SessionKind};
 use crate::types::{Channel, Geometry, JournalEntry, Origin, Scene, Signal, ViewEnvelope, ViewOp};
 use bytes::Bytes;
@@ -411,7 +411,7 @@ struct ReactorInner {
     /// Compiles agent-authored `[[view]]` source into an ESM module the browser
     /// imports. Invoked just-in-time when a view segment is released, so the
     /// compiled module URL is what rides the /view channel.
-    view_compiler: crate::views::ViewCompiler,
+    view_compiler: crate::mind::views::ViewCompiler,
     /// Scene→tool-sink table the `/mcp` server routes tool calls through. Each
     /// scene loop registers its sink here as it stands up; shared (cloneable)
     /// with the HTTP front. See [`tools`].
@@ -448,7 +448,7 @@ pub fn start(
     mut warm_rx: mpsc::Receiver<Scene>,
     out: mpsc::Sender<OutboundSignal>,
     observatory: Observatory,
-    view_compiler: crate::views::ViewCompiler,
+    view_compiler: crate::mind::views::ViewCompiler,
     tools: ToolRegistry,
     interrupts: InterruptRegistry,
     presence: crate::presence::Presence,
@@ -1331,7 +1331,7 @@ fn render_batch(batch: &[LoopInput]) -> String {
     for input in batch {
         match input {
             LoopInput::Human(sig) => {
-                use crate::memory::snapshot::{Speaker, transcript_line};
+                use crate::mind::memory::snapshot::{Speaker, transcript_line};
                 let chan = sig.channel.with_stream(sig.stream.as_deref());
                 let _ = writeln!(s, "{}", transcript_line(Speaker::Them, &chan, &sig.body));
             }

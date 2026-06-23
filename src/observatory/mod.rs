@@ -17,7 +17,7 @@
 //! journal and broadcasts it — all under one lock so an SSE subscriber that
 //! snapshots-then-subscribes can neither miss an event nor see a duplicate.
 //!
-//! [`Memory`]: crate::memory::Memory
+//! [`Memory`]: crate::mind::memory::Memory
 //! [`TextBus`]: crate::server::TextBus
 
 use std::collections::{HashMap, VecDeque};

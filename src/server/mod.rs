@@ -14,7 +14,7 @@ use chrono::{DateTime, Utc};
 use tokio::sync::{broadcast, mpsc};
 use tower_http::trace::TraceLayer;
 
-use crate::memory::Memory;
+use crate::mind::memory::Memory;
 use crate::acp::AcpTap;
 use crate::observatory::Observatory;
 use crate::reactor::{InterruptRegistry, OutboundSignal, ToolRegistry};

@@ -25,7 +25,7 @@
 //! snapshots double as the scene's appearance history (the screen as
 //! expression, for later reflection). Module URLs stay valid across restarts
 //! because compiled views are content-addressed on disk and never collected
-//! (see [`crate::views`]).
+//! (see [`crate::mind::views`]).
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -35,7 +35,7 @@ use chrono::{DateTime, Duration, Utc};
 use serde::{Deserialize, Serialize};
 use tokio::sync::{Mutex, Notify};
 
-use crate::memory::layout;
+use crate::mind::memory::layout;
 use crate::types::{Geometry, Scene, ViewEnvelope, ViewOp};
 
 /// Cap on active views per scene. Bounds growth if the agent keeps showing

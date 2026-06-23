@@ -63,9 +63,9 @@ use tokio::sync::mpsc;
 
 use crate::capabilities::stt::{self, Transcript};
 use crate::capabilities::voiceprint;
-use crate::memory::layout::MediaSlot;
-use crate::memory::media;
-use crate::memory::people_vectors::{self, Modality};
+use crate::mind::memory::layout::MediaSlot;
+use crate::mind::memory::media;
+use crate::mind::memory::people_vectors::{self, Modality};
 use crate::pcm;
 use crate::server::headers::{AuthBearer, RequiredScene, SceneHeader, StreamHeader};
 use crate::server::{AppState, AudioEvent, AudioInEvent};

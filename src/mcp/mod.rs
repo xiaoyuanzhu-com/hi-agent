@@ -17,7 +17,7 @@
 use serde_json::{Value, json};
 
 use base64::Engine as _;
-use crate::memory::people_vectors;
+use crate::mind::memory::people_vectors;
 use crate::reactor::{SceneControl, ToolRegistry};
 use crate::types::{Geometry, Region, Scene};
 
@@ -612,7 +612,7 @@ fn parse_mods(v: Option<&Value>) -> Vec<crate::capabilities::input::Modifier> {
 }
 
 /// `record_episode`: file the first `count` of the scene's unconsolidated signals
-/// as one episode (see [`crate::memory::episodes::record_episode`]). Returns the
+/// as one episode (see [`crate::mind::memory::episodes::record_episode`]). Returns the
 /// episode ref for the session to cite when it updates a facet.
 async fn reflection_record_episode(
     data_dir: &std::path::Path,
@@ -635,7 +635,7 @@ async fn reflection_record_episode(
         .and_then(Value::as_array)
         .map(|a| a.iter().filter_map(|v| v.as_str().map(str::to_owned)).collect())
         .unwrap_or_default();
-    match crate::memory::episodes::record_episode(data_dir, scene, count as usize, title, gist, &subjects)
+    match crate::mind::memory::episodes::record_episode(data_dir, scene, count as usize, title, gist, &subjects)
         .await
     {
         Ok(name) => tool_ok(&format!("recorded episode {name}")),
@@ -651,7 +651,7 @@ async fn reflection_read_facet(data_dir: &std::path::Path, args: &Value) -> Valu
     if dim.trim().is_empty() || subject.trim().is_empty() {
         return tool_error("read_facet requires `dimension` and `subject`");
     }
-    match crate::memory::facets::read_facet(data_dir, dim, subject).await {
+    match crate::mind::memory::facets::read_facet(data_dir, dim, subject).await {
         Ok(Some(content)) => tool_ok(&content),
         Ok(None) => tool_ok("(no facet yet — this subject has no recorded understanding)"),
         Err(err) => tool_error(&err.to_string()),
@@ -659,7 +659,7 @@ async fn reflection_read_facet(data_dir: &std::path::Path, args: &Value) -> Valu
 }
 
 /// `update_facet`: write the whole regenerated understanding of a subject (see
-/// [`crate::memory::facets::update_facet`]). Returns the `<dim>/<subject>` ref.
+/// [`crate::mind::memory::facets::update_facet`]). Returns the `<dim>/<subject>` ref.
 async fn reflection_update_facet(data_dir: &std::path::Path, args: &Value) -> Value {
     let dim = args.get("dimension").and_then(Value::as_str).unwrap_or_default();
     let subject = args.get("subject").and_then(Value::as_str).unwrap_or_default();
@@ -670,7 +670,7 @@ async fn reflection_update_facet(data_dir: &std::path::Path, args: &Value) -> Va
     if content.trim().is_empty() {
         return tool_error("update_facet requires non-empty `content`");
     }
-    match crate::memory::facets::update_facet(data_dir, dim, subject, content).await {
+    match crate::mind::memory::facets::update_facet(data_dir, dim, subject, content).await {
         Ok(refname) => tool_ok(&format!("updated facet {refname}")),
         Err(err) => tool_error(&err.to_string()),
     }
@@ -751,7 +751,7 @@ async fn reflection_merge_people(data_dir: &std::path::Path, args: &Value) -> Va
 }
 
 /// `keep_and_fade`: let a cold consolidated day's media fade to text, keeping the
-/// spans the mind chose (see [`crate::memory::decay::keep_and_fade`]). The safety
+/// spans the mind chose (see [`crate::mind::memory::decay::keep_and_fade`]). The safety
 /// gate lives in the tool, so an attempt on an un-consolidated day comes back as a
 /// tool error the session can read, not a panic.
 async fn reflection_keep_and_fade(data_dir: &std::path::Path, scene: &Scene, args: &Value) -> Value {
@@ -779,10 +779,10 @@ async fn reflection_keep_and_fade(data_dir: &std::path::Path, scene: &Scene, arg
                     "keep_and_fade: keep[{i}] needs RFC3339 `start` and `end`"
                 ));
             };
-            spans.push(crate::memory::decay::KeepSpan { start, end });
+            spans.push(crate::mind::memory::decay::KeepSpan { start, end });
         }
     }
-    match crate::memory::decay::keep_and_fade(data_dir, scene, channel, date, &spans).await {
+    match crate::mind::memory::decay::keep_and_fade(data_dir, scene, channel, date, &spans).await {
         Ok(r) => tool_ok(&format!(
             "faded {} {date}: kept {} keepsake(s), freed {} bytes",
             channel.as_str(),
