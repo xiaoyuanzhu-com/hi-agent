@@ -13,6 +13,8 @@ pub mod doubao_vision;
 pub mod ffmpeg_frame;
 pub mod insightface_face;
 #[cfg(target_os = "macos")]
+pub mod macos_accessibility;
+#[cfg(target_os = "macos")]
 pub mod macos_desktop_context;
 #[cfg(target_os = "macos")]
 pub mod macos_hotkey;
