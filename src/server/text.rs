@@ -102,7 +102,7 @@ pub async fn get_out_text(
     state.warm_scene(&scene);
 
     // Count this reader as live presence for as long as its body stream exists.
-    let presence = state.presence.connect(&scene, crate::presence::OutChannel::Text);
+    let presence = state.presence.connect(&scene, crate::body::presence::OutChannel::Text);
     let stream = state.text_bus.subscribe(scene).map(move |item| {
         let _held = &presence;
         item

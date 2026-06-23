@@ -11,7 +11,7 @@
 //!   stops. No new processing path — the held speech rides the normal pipeline,
 //!   carrying only a context note that it came from this headless gesture.
 //!
-//! The OS tap only emits raw [`Edge`](crate::capabilities::hotkey::Edge)s; the
+//! The OS tap only emits raw [`Edge`](crate::body::capabilities::hotkey::Edge)s; the
 //! recognizers and the hold's threshold timer run here, on the runtime, against one
 //! clock. Observing the keys needs the **Accessibility / Input Monitoring** grant,
 //! the screenshot needs **Screen Recording**, and the hold's mic needs
@@ -32,7 +32,7 @@ use crate::types::Scene;
 /// capture/ingest off the (blocking) event-loop thread.
 #[cfg(target_os = "macos")]
 pub fn install(state: Arc<AppState>, scene: Scene) {
-    use crate::capabilities::hotkey;
+    use crate::body::capabilities::hotkey;
 
     let scene_label = scene.to_string();
     let handle = tokio::runtime::Handle::current();
@@ -74,9 +74,9 @@ pub fn install(state: Arc<AppState>, scene: Scene) {
 async fn recognizer_loop(
     state: Arc<AppState>,
     scene: Scene,
-    mut edges: tokio::sync::mpsc::UnboundedReceiver<crate::capabilities::hotkey::Edge>,
+    mut edges: tokio::sync::mpsc::UnboundedReceiver<crate::body::capabilities::hotkey::Edge>,
 ) {
-    use crate::capabilities::hotkey::{self, Edge, GestureEvent};
+    use crate::body::capabilities::hotkey::{self, Edge, GestureEvent};
 
     let start = Instant::now();
     let mut dt = hotkey::DoubleTap::new(hotkey::DEFAULT_WINDOW);
@@ -145,11 +145,11 @@ async fn recognizer_loop(
 /// spawns the capture + carrier ingest so a slow grab never stalls the recognizer.
 #[cfg(target_os = "macos")]
 fn glance(state: &Arc<AppState>, scene: &Scene) {
-    crate::capabilities::tray::flash();
+    crate::body::capabilities::tray::flash();
     let state = state.clone();
     let scene = scene.clone();
     tokio::spawn(async move {
-        match crate::capabilities::screencast::grab_screen_png().await {
+        match crate::body::capabilities::screencast::grab_screen_png().await {
             Ok(png) => {
                 if let Err(e) = crate::server::files::receive_screenshot(&state, &scene, &png).await {
                     tracing::warn!(error = %e, "gesture: handing screenshot to the agent failed");
@@ -176,7 +176,7 @@ const ATTENTION_TAG: &str =
 /// finalizes its last utterance on its own.
 #[cfg(target_os = "macos")]
 struct MicSession {
-    _capture: crate::capabilities::audio_capture::Capture,
+    _capture: crate::body::capabilities::audio_capture::Capture,
 }
 
 /// Open continuous attention: start native mic capture and feed it into the same
@@ -187,13 +187,13 @@ fn start_attention(state: &Arc<AppState>, scene: &Scene, session: &mut Option<Mi
     if session.is_some() {
         return; // already attending
     }
-    if !crate::capabilities::audio_capture::available() {
+    if !crate::body::capabilities::audio_capture::available() {
         tracing::warn!("press-hold attention: native mic capture unavailable; nothing to listen with");
         return;
     }
-    match crate::capabilities::audio_capture::start() {
+    match crate::body::capabilities::audio_capture::start() {
         Ok((capture, frames)) => {
-            crate::capabilities::tray::flash();
+            crate::body::capabilities::tray::flash();
             let state = state.clone();
             let scene = scene.clone();
             tokio::spawn(async move {

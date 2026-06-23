@@ -10,7 +10,7 @@
 //! as a co-located `audio-<id>.<ext>` blob beside the scene's day-log, publish
 //! them on the inbound-audio broadcast (so `GET /api/in/audio` can play the
 //! clip), transcribe via the configured STT capability
-//! ([`crate::capabilities::stt`]), and feed the transcript into the same
+//! ([`crate::body::capabilities::stt`]), and feed the transcript into the same
 //! per-scene path that `POST /api/in/text` uses. The journal records a
 //! `SignalIn { channel: Text, body: <transcript>, media: Some(..) }` — the
 //! agent reads text, while the media reference (sharing the blob's id) links
@@ -61,8 +61,8 @@ use serde::{Deserialize, Serialize};
 use tokio::sync::broadcast::error::RecvError;
 use tokio::sync::mpsc;
 
-use crate::capabilities::stt::{self, Transcript};
-use crate::capabilities::voiceprint;
+use crate::body::capabilities::stt::{self, Transcript};
+use crate::body::capabilities::voiceprint;
 use crate::mind::memory::layout::MediaSlot;
 use crate::mind::memory::media;
 use crate::mind::memory::people_vectors::{self, Modality};
@@ -840,7 +840,7 @@ pub async fn get_out_audio(
 ) -> impl IntoResponse {
     let mut rx = state.audio_out.subscribe();
     // A held audio long-poll = their ears are on; counted while we wait for a turn.
-    let _presence = state.presence.connect(&scene, crate::presence::OutChannel::Audio);
+    let _presence = state.presence.connect(&scene, crate::body::presence::OutChannel::Audio);
 
     tracing::info!(scene = %scene, auth = ?auth, "GET /api/out/audio long-poll opened");
 

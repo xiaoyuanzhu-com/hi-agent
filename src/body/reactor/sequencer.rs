@@ -20,7 +20,7 @@ use tokio::sync::{mpsc, oneshot};
 use tokio::task::JoinHandle;
 use uuid::Uuid;
 
-use crate::capabilities::tts::{self, TtsStream};
+use crate::body::capabilities::tts::{self, TtsStream};
 use crate::segment::{Segmenter, Terminator};
 use crate::types::{Channel, Geometry, Scene, ViewOp};
 

@@ -113,7 +113,7 @@ async fn receive_file(
 }
 
 /// Receive a screenshot pushed with the "come and see this" gesture (double-tap
-/// Command; see [`crate::gesture`]). Same `file` channel, same wake — only the
+/// Command; see [`crate::body::gesture`]). Same `file` channel, same wake — only the
 /// framing differs: this is the user's current screen / working context, handed
 /// over for the agent to look at and help with, not a neutral document.
 pub(crate) async fn receive_screenshot(

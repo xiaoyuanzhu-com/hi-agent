@@ -62,7 +62,7 @@ use tokio_tungstenite::tungstenite::Message;
 use tokio_tungstenite::{MaybeTlsStream, WebSocketStream};
 use uuid::Uuid;
 
-use crate::capabilities::stt::{DiarizedSpan, Transcript};
+use crate::body::capabilities::stt::{DiarizedSpan, Transcript};
 
 // Defaults target the recommended async (optimized) endpoint + doubao 2.0
 // hour version. Override the resource id to point at concurrent variants or

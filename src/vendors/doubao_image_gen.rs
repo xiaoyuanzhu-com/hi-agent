@@ -20,7 +20,7 @@ use anyhow::Context;
 use serde::Deserialize;
 use serde_json::{Value, json};
 
-use crate::capabilities::image_gen::{GeneratedImage, ImageFormat, ImageRequest};
+use crate::body::capabilities::image_gen::{GeneratedImage, ImageFormat, ImageRequest};
 
 /// The plan endpoint. The bare `/api/v3` variant bills as extra (per the docs),
 /// so it is intentionally not the default.

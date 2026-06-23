@@ -18,7 +18,7 @@
 //!
 //! Callers: the audio channel voiceprints posted clips and live-mic speaker
 //! turns ([`crate::server::audio`]), and reflection clusters clip voices into the
-//! people store ([`crate::reactor::heartbeat`]).
+//! people store ([`crate::body::reactor::heartbeat`]).
 
 use std::path::PathBuf;
 use std::sync::OnceLock;

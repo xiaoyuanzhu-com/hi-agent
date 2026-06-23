@@ -21,7 +21,7 @@
 //!
 //! Callers: posted stills and camera-stream keyframes are recognized in
 //! [`crate::server::vision`], and reflection clusters faces into the people store
-//! in [`crate::reactor::heartbeat`].
+//! in [`crate::body::reactor::heartbeat`].
 
 use std::path::PathBuf;
 use std::sync::OnceLock;

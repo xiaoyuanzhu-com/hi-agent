@@ -1,5 +1,5 @@
 //! macOS desktop context — captures the screen, clipboard, and frontmost-app
-//! state for [`crate::capabilities::desktop_context`].
+//! state for [`crate::body::capabilities::desktop_context`].
 //!
 //! The "API" here is the OS's stable CLI surface rather than framework
 //! bindings — zero extra crate dependencies, and each tool degrades cleanly
@@ -25,7 +25,7 @@ use bytes::Bytes;
 use chrono::Utc;
 use tokio::process::Command;
 
-use crate::capabilities::desktop_context::ContextSnapshot;
+use crate::body::capabilities::desktop_context::ContextSnapshot;
 
 /// Take a best-effort snapshot. Never fails: each field is independently
 /// captured and a failed field is `None`.

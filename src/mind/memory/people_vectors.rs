@@ -34,7 +34,7 @@
 //! Callers: the perception paths that produce embeddings — face recognition on
 //! posted stills and camera-stream keyframes, voiceprints of posted clips and
 //! live-mic speaker turns ([`crate::server`]) — and reflection clustering
-//! ([`crate::reactor::heartbeat`]).
+//! ([`crate::body::reactor::heartbeat`]).
 
 use std::path::{Path, PathBuf};
 

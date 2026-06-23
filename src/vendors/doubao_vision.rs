@@ -32,7 +32,7 @@ use base64::Engine as _;
 use serde::Deserialize;
 use serde_json::{Value, json};
 
-use crate::capabilities::vision::{MediaSource, VisualMedia};
+use crate::body::capabilities::vision::{MediaSource, VisualMedia};
 
 const DEFAULT_API_BASE: &str = "https://ark.cn-beijing.volces.com/api/v3";
 const DEFAULT_PRESET: &str = "balanced";

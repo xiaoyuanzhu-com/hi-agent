@@ -6,7 +6,7 @@
 //! it the calls still return `Ok` but the system silently drops the events.
 //!
 //! The pure mapping (keycodes, modifier bits) lives in
-//! [`crate::capabilities::input`] so it stays unit-testable off-macOS; this file
+//! [`crate::body::capabilities::input`] so it stays unit-testable off-macOS; this file
 //! is the thin FFI that turns an action into posted events and is only compiled
 //! on macOS.
 
@@ -18,7 +18,7 @@ use core_graphics::event_source::{CGEventSource, CGEventSourceStateID};
 use core_graphics::geometry::CGPoint;
 use core_graphics::display::CGDisplay;
 
-use crate::capabilities::input::{Action, Key, Point, modifier_mask};
+use crate::body::capabilities::input::{Action, Key, Point, modifier_mask};
 
 /// Synthesize one action. The CGEvent calls are blocking, so they run on a
 /// blocking thread to keep the async runtime free (matching the other vendors).
@@ -104,7 +104,7 @@ fn type_text(text: &str) -> anyhow::Result<()> {
 }
 
 /// Press a named key while holding modifiers (a chord like ⌘A), then release.
-fn press(key: Key, mods: &[crate::capabilities::input::Modifier]) -> anyhow::Result<()> {
+fn press(key: Key, mods: &[crate::body::capabilities::input::Modifier]) -> anyhow::Result<()> {
     let code = key
         .key_code()
         .ok_or_else(|| anyhow!("no keycode for {key:?}; use Type for arbitrary text"))?;

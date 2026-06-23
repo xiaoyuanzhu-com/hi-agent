@@ -28,7 +28,7 @@ use image::RgbImage;
 use ort::session::Session;
 use ort::value::Tensor;
 
-use crate::capabilities::face::DetectedFace;
+use crate::body::capabilities::face::DetectedFace;
 
 /// SCRFD square input edge. InsightFace's standard detector input.
 const DET_SIZE: usize = 640;

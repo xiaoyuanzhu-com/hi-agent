@@ -423,7 +423,7 @@ struct ReactorInner {
     /// Scene→live-subscriber counts, shared with the HTTP front. Rendered into
     /// each turn as one human-model presence sentence, so the mind knows which
     /// channels actually reach the person right now.
-    presence: crate::presence::Presence,
+    presence: crate::body::presence::Presence,
     /// Absolute path to the agent's view workshop (`<data_dir>/views`).
     /// Handed to every worker session as its `cwd`, so a build sub-agent works in a
     /// real project dir — `ls`-ing existing projects, writing source — like a human
@@ -451,7 +451,7 @@ pub fn start(
     view_compiler: crate::mind::views::ViewCompiler,
     tools: ToolRegistry,
     interrupts: InterruptRegistry,
-    presence: crate::presence::Presence,
+    presence: crate::body::presence::Presence,
     views_dir: PathBuf,
 ) -> Reactor {
     let reactor = Reactor {

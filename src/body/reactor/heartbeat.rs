@@ -19,7 +19,7 @@ use chrono::{DateTime, Duration, Utc};
 
 use crate::acp::{AcpSession, SessionOpts};
 use crate::agent::SessionRole;
-use crate::capabilities::{face, voiceprint};
+use crate::body::capabilities::{face, voiceprint};
 use crate::mind::memory::journal::after_cursor;
 use crate::pcm;
 use crate::mind::memory::{Snapshot, build_for_scene, decay, episodes, facets, layout, people_vectors, refresh_hot};
@@ -593,7 +593,7 @@ async fn cluster_voices(
 
 /// Skip incidental/background faces: require a confident detection and a face big
 /// enough (in original-image pixels) to embed reliably.
-fn salient(f: &crate::capabilities::face::DetectedFace) -> bool {
+fn salient(f: &crate::body::capabilities::face::DetectedFace) -> bool {
     let w = (f.bbox[2] - f.bbox[0]).max(0.0);
     let h = (f.bbox[3] - f.bbox[1]).max(0.0);
     f.score >= 0.6 && w >= 50.0 && h >= 50.0

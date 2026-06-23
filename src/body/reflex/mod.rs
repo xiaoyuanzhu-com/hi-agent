@@ -7,9 +7,9 @@
 //! explicit invoke — recognize the field, click it, type the value — without ever
 //! waking the LLM.
 //!
-//! Recognition reuses the [`accessibility`](crate::capabilities::accessibility)
-//! tree as the field-level signal and [`desktop_context`](crate::capabilities::desktop_context)
-//! as the coarse app/window gate; the effect reuses [`input`](crate::capabilities::input).
+//! Recognition reuses the [`accessibility`](crate::body::capabilities::accessibility)
+//! tree as the field-level signal and [`desktop_context`](crate::body::capabilities::desktop_context)
+//! as the coarse app/window gate; the effect reuses [`input`](crate::body::capabilities::input).
 //! There is no new perception or actuation here — a reflex is just a stored
 //! [`Trigger`] + value composed over capabilities that already exist.
 //!
@@ -28,7 +28,7 @@ use std::path::Path;
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
-use crate::capabilities::accessibility::Element;
+use crate::body::capabilities::accessibility::Element;
 use crate::mind::memory::layout;
 
 /// The AX role a reflex targets when its trigger doesn't pin one — a text field is
@@ -154,9 +154,9 @@ pub fn recognize(
 /// Fire a recognized reflex: click the target field's centre to focus it, then type
 /// the value. The element's bounds are 0..1 fractions of the main display (the same
 /// space `act` uses), so the centre maps straight to a display point. macOS-only at
-/// runtime via [`input`](crate::capabilities::input); errors cleanly elsewhere.
+/// runtime via [`input`](crate::body::capabilities::input); errors cleanly elsewhere.
 pub async fn fire(reflex: &Reflex, target: &Element) -> anyhow::Result<()> {
-    use crate::capabilities::input::{self, Action, Point};
+    use crate::body::capabilities::input::{self, Action, Point};
     let (w, h) = input::main_display_point_size()?;
     let center = Point {
         x: (target.bounds.x + target.bounds.w / 2.0) * w,
@@ -217,7 +217,7 @@ pub async fn load_all(data_dir: &Path) -> anyhow::Result<Vec<Reflex>> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::capabilities::accessibility::Rect;
+    use crate::body::capabilities::accessibility::Rect;
 
     fn el(id: usize, role: &str, label: Option<&str>) -> Element {
         Element {

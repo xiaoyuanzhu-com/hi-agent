@@ -1,5 +1,5 @@
 //! macOS microphone capture vendor (cpal) — the OS-side half of
-//! [`crate::capabilities::audio_capture`].
+//! [`crate::body::capabilities::audio_capture`].
 //!
 //! Opens the default input device and yields raw **16 kHz mono signed 16-bit
 //! little-endian PCM** — the exact format the audio pipeline expects, so the frames

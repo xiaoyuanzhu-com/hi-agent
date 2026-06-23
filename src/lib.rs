@@ -11,10 +11,9 @@ use tokio::sync::Notify;
 pub mod acp;
 pub mod agent;
 pub mod appearance;
-pub mod capabilities;
+pub mod body;
 pub mod channel_log;
 pub mod config;
-pub mod gesture;
 pub mod identity;
 pub mod llm_proxy;
 pub mod mcp;
@@ -22,10 +21,7 @@ pub mod mind;
 pub mod models;
 pub mod observatory;
 pub mod pcm;
-pub mod presence;
 pub mod runtime;
-pub mod reactor;
-pub mod reflex;
 pub mod segment;
 pub mod server;
 pub mod types;
@@ -132,7 +128,7 @@ async fn run_with_shutdown(config: Config, shutdown: Arc<Notify>) -> anyhow::Res
     // mirror and `GET /api/sessions/events` streams the history over SSE.
     let observatory = observatory::Observatory::new(
         Some(config.data_dir.join("sessions.jsonl")),
-        reactor::swap_budget_chars(),
+        body::reactor::swap_budget_chars(),
     );
 
     // Raw ACP wire tap — every JSON-RPC frame, business-logic agnostic. The agent
@@ -142,31 +138,31 @@ async fn run_with_shutdown(config: Config, shutdown: Arc<Notify>) -> anyhow::Res
 
     // Resolve all capabilities from the environment. Unconfigured capabilities
     // are fine; gates affect /audio (STT) and the speak path (TTS) only.
-    capabilities::init_from_env()?;
+    body::capabilities::init_from_env()?;
     // Voice/face recognition need no env config — provision their pinned local
     // ONNX models on first run (cached thereafter) and load them. Best-effort:
     // a failed provision leaves the capability disabled, never blocks startup.
-    capabilities::init_recognition().await;
+    body::capabilities::init_recognition().await;
     tracing::info!(
-        stt = capabilities::stt::available(),
-        tts = capabilities::tts::available(),
-        voiceprint = capabilities::voiceprint::available(),
-        face = capabilities::face::available(),
+        stt = body::capabilities::stt::available(),
+        tts = body::capabilities::tts::available(),
+        voiceprint = body::capabilities::voiceprint::available(),
+        face = body::capabilities::face::available(),
         "capabilities resolved"
     );
 
     // Scene→tool-sink table shared between the HTTP front's `/mcp` handler and the
     // reactor that registers each scene's sink. The mind drives output and
     // side-effects by calling tools on `/mcp`; they route here.
-    let tool_registry = reactor::ToolRegistry::new();
+    let tool_registry = body::reactor::ToolRegistry::new();
     // Scene→barge-in table, shared the same way: the server's STT relay reports
     // recognized speech, the reactor stamps voice spans and folds the inferred
     // "what went unheard" note into the next prompt. No cancel, no endpoint.
-    let interrupts = reactor::InterruptRegistry::new();
+    let interrupts = body::reactor::InterruptRegistry::new();
     // Scene→live-subscriber counts, shared the same way: the server's out-channel
     // handlers hold a guard per connection, the reactor renders the counts into
     // each turn as human-model facts ("no screen is attached").
-    let presence = presence::Presence::new();
+    let presence = body::presence::Presence::new();
 
     let (router, seams) = server::build(
         memory.clone(),
@@ -281,7 +277,7 @@ async fn run_with_shutdown(config: Config, shutdown: Arc<Notify>) -> anyhow::Res
         .await
         .context("resolving esbuild for the view compiler")?;
     let view_compiler = mind::views::ViewCompiler::new(esbuild_bin, &config.data_dir);
-    let _reactor = reactor::start(
+    let _reactor = body::reactor::start(
         memory,
         agent,
         soul,
@@ -301,7 +297,7 @@ async fn run_with_shutdown(config: Config, shutdown: Arc<Notify>) -> anyhow::Res
     // a screenshot of the current screen as a file (macOS only, best-effort — needs
     // the Accessibility + Screen Recording grants, else it stays inert). One
     // desktop, one person showing one agent, so it lands in a single fixed scene.
-    gesture::install(seams.state, crate::types::Scene("desktop".to_string()));
+    body::gesture::install(seams.state, crate::types::Scene("desktop".to_string()));
 
     let addr = ("0.0.0.0", config.port);
     let listener = TcpListener::bind(addr).await?;
@@ -394,7 +390,7 @@ pub fn run_with_tray(config: Config) -> anyhow::Result<()> {
     // Blocks on the AppKit run loop until the process exits via the server thread
     // above. Returns early only if the status item can't be created — in which
     // case fall back to running headless by joining the server.
-    if let Err(e) = capabilities::tray::run(url, shutdown) {
+    if let Err(e) = body::capabilities::tray::run(url, shutdown) {
         tracing::warn!(error = %e, "menu-bar item unavailable; running without it");
     }
     let _ = server.join();

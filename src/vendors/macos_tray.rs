@@ -1,5 +1,5 @@
 //! macOS tray vendor — a menu-bar `NSStatusItem` with an "Open" / "Quit" menu, the
-//! visible affordance of the desktop install shape ([`crate::capabilities::tray`]).
+//! visible affordance of the desktop install shape ([`crate::body::capabilities::tray`]).
 //!
 //! AppKit (`NSApplication`, `NSStatusItem`, `NSMenu`) **must run on the process
 //! main thread**, which must own the AppKit event loop — so [`run`] takes a

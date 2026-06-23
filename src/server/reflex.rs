@@ -2,7 +2,7 @@
 //!
 //! `POST /api/reflex/invoke` is the v1 trigger (a later global hotkey/gesture would
 //! call the same path). It reads the current desktop context + accessibility tree,
-//! asks [`crate::reflex::recognize`] whether exactly one taught reflex applies, and
+//! asks [`crate::body::reflex::recognize`] whether exactly one taught reflex applies, and
 //! if so fires it. The whole path is deterministic and LLM-free.
 
 use std::sync::Arc;
@@ -11,7 +11,7 @@ use axum::Json;
 use axum::extract::State;
 use serde_json::{Value, json};
 
-use crate::reflex::{self, Recognition};
+use crate::body::reflex::{self, Recognition};
 use crate::server::AppState;
 
 /// Recognize the current moment against taught reflexes and, if exactly one applies,
@@ -31,12 +31,12 @@ pub async fn post_invoke(State(state): State<Arc<AppState>>) -> Json<Value> {
 
     // Coarse window gate — best-effort: an unavailable context just means there's no
     // app/window to match on (a reflex that gates on app then can't match).
-    let ctx = crate::capabilities::desktop_context::capture().await.ok();
+    let ctx = crate::body::capabilities::desktop_context::capture().await.ok();
     let app = ctx.as_ref().and_then(|c| c.frontmost_app.as_deref());
     let title = ctx.as_ref().and_then(|c| c.frontmost_window_title.as_deref());
 
     // Field-level recognition over the accessibility tree.
-    let elements = match crate::capabilities::accessibility::inspect().await {
+    let elements = match crate::body::capabilities::accessibility::inspect().await {
         Ok(e) => e,
         Err(err) => {
             return Json(json!({ "fired": false, "reason": format!("accessibility unavailable: {err}") }));

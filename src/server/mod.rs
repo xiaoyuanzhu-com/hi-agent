@@ -17,7 +17,7 @@ use tower_http::trace::TraceLayer;
 use crate::mind::memory::Memory;
 use crate::acp::AcpTap;
 use crate::observatory::Observatory;
-use crate::reactor::{InterruptRegistry, OutboundSignal, ToolRegistry};
+use crate::body::reactor::{InterruptRegistry, OutboundSignal, ToolRegistry};
 use crate::types::{Channel, Scene, Signal, ViewEnvelope};
 
 pub mod acp;
@@ -302,19 +302,19 @@ pub struct AppState {
 
     /// Scene→tool-sink table. The `/mcp` handler looks a scene up here to route a
     /// tool call to its reactor loop; the reactor registers each scene's sink as
-    /// it stands the loop up. See [`crate::reactor::ToolRegistry`].
+    /// it stands the loop up. See [`crate::body::reactor::ToolRegistry`].
     pub tool_registry: ToolRegistry,
 
     /// Scene→barge-in state, shared with the reactor. The STT relay reports
-    /// recognized speech here ([`crate::reactor::InterruptRegistry::note_speech`]);
+    /// recognized speech here ([`crate::body::reactor::InterruptRegistry::note_speech`]);
     /// nothing else on the HTTP side touches it — there is no interrupt
     /// endpoint, the mind infers interruptions from its own clock.
     pub interrupts: InterruptRegistry,
 
     /// Scene→live-subscriber counts, shared with the reactor. Out-channel
-    /// handlers hold a [`crate::presence::PresenceGuard`] per connection; the
+    /// handlers hold a [`crate::body::presence::PresenceGuard`] per connection; the
     /// reactor renders the counts into each turn as human-model facts.
-    pub presence: crate::presence::Presence,
+    pub presence: crate::body::presence::Presence,
 
     /// Scene-scoped phone-upload tokens for the file-upload carrier. A QR encodes
     /// `/up/<token>`; the token resolves to the scene so a phone with no
@@ -358,7 +358,7 @@ pub fn build(
     acp_tap: AcpTap,
     tool_registry: ToolRegistry,
     interrupts: InterruptRegistry,
-    presence: crate::presence::Presence,
+    presence: crate::body::presence::Presence,
 ) -> (Router, ServerSeams) {
     let (inbound_tx, inbound_rx) = mpsc::channel::<Signal>(1024);
     // Scene warm-up requests: a presence GET asks the reactor to stand a scene up

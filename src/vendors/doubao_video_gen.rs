@@ -24,7 +24,7 @@ use base64::Engine as _;
 use serde::Deserialize;
 use serde_json::{Value, json};
 
-use crate::capabilities::video_gen::{ImageRef, VideoRequest, VideoStatus, VideoTask};
+use crate::body::capabilities::video_gen::{ImageRef, VideoRequest, VideoStatus, VideoTask};
 
 /// The plan endpoint. The bare `/api/v3` variant bills as extra (per the docs),
 /// so it is intentionally not the default.

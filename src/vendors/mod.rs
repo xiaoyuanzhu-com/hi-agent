@@ -4,7 +4,7 @@
 //! wire protocol (HTTP/websocket, auth, request/response structs) and exposes
 //! **stateless free functions** that take their config as an explicit `&Config`
 //! parameter, so they stay pure and unit-testable without touching any global.
-//! The matching `crate::capabilities` module selects and dispatches to them.
+//! The matching `crate::body::capabilities` module selects and dispatches to them.
 
 pub mod campplus;
 pub mod doubao_image_gen;

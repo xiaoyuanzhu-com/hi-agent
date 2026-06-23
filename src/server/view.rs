@@ -29,7 +29,7 @@ pub async fn get_out_view(
     AuthBearer(auth): AuthBearer,
 ) -> impl IntoResponse {
     // A held view long-poll = a screen is attached; counted until this handler returns.
-    let _presence = state.presence.connect(&scene, crate::presence::OutChannel::View);
+    let _presence = state.presence.connect(&scene, crate::body::presence::OutChannel::View);
 
     tracing::info!(scene = %scene, since = ?query.since, auth = ?auth, "GET /api/out/view long-poll opened");
 

@@ -10,7 +10,7 @@
 //! ([`crate::vendors::macos_hotkey`]), selected at compile time like the other
 //! desktop capabilities ([`super::input`], [`super::screencast`]). The vendor only
 //! translates raw key events into [`Edge`]s; the recognizers — and the hold's
-//! threshold timer — are driven from [`crate::gesture`] against one monotonic clock.
+//! threshold timer — are driven from [`crate::body::gesture`] against one monotonic clock.
 //! Observing global key events needs the **Accessibility / Input Monitoring** grant;
 //! without it the tap can't be created and the gestures are simply inert — never fatal.
 
@@ -62,7 +62,7 @@ impl DoubleTap {
 pub const DEFAULT_HOLD: Duration = Duration::from_millis(450);
 
 /// One raw Command-key edge from the OS tap. The vendor emits these (it does no
-/// timing); [`crate::gesture`] stamps each on arrival against its own clock and
+/// timing); [`crate::body::gesture`] stamps each on arrival against its own clock and
 /// drives the recognizers — so host and recognizer share one clock and the vendor
 /// stays a dumb translator.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

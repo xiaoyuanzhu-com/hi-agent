@@ -2,7 +2,7 @@
 //!
 //! An episode is a coherent event within a scene, a **derived projection** over
 //! the raw log: regenerable, never the source of truth. Reflection (the "sleep"
-//! pass; see [`crate::reactor::heartbeat`]) segments the scene's unconsolidated
+//! pass; see [`crate::body::reactor::heartbeat`]) segments the scene's unconsolidated
 //! frontier into episodes — each a gist under frontmatter recording the scene,
 //! the signal-id range it covers, and the subjects it touched.
 //!

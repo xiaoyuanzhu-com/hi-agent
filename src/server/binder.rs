@@ -15,7 +15,7 @@
 use chrono::Utc;
 use tokio::sync::{broadcast, mpsc};
 
-use crate::reactor::OutboundSignal;
+use crate::body::reactor::OutboundSignal;
 use crate::server::{AudioEvent, OutputEcho, TextBus, ViewBus, ViewEvent};
 use crate::types::Channel;
 

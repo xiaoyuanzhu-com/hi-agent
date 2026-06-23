@@ -59,7 +59,7 @@ use tokio_tungstenite::tungstenite::http::HeaderValue;
 use tokio_tungstenite::tungstenite::Message;
 use uuid::Uuid;
 
-use crate::capabilities::tts::TtsStream;
+use crate::body::capabilities::tts::TtsStream;
 
 const DEFAULT_ENDPOINT: &str = "wss://openspeech.bytedance.com/api/v3/tts/bidirection";
 const DEFAULT_RESOURCE_ID: &str = "seed-tts-2.0";

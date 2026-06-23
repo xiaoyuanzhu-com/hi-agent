@@ -2,7 +2,7 @@
 //!
 //! Inbound speech normally arrives over the WebSocket from a page's `getUserMedia`.
 //! This captures the mic **in-process** instead, so a headless gesture — the
-//! press-and-hold-⌘ attention ([`crate::gesture`]) — can listen with no page open.
+//! press-and-hold-⌘ attention ([`crate::body::gesture`]) — can listen with no page open.
 //! The frames it yields match the pipeline's contract exactly (16 kHz mono signed
 //! 16-bit little-endian PCM), so they feed
 //! [`crate::server::audio::ingest_pcm_stream`] the same as the browser mic.

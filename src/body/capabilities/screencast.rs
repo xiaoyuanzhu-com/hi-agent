@@ -83,7 +83,7 @@ pub async fn grab_window_png(window_id: u32) -> anyhow::Result<Bytes> {
 
 /// Grab the **whole current screen** (the main display) as PNG bytes — the user's
 /// working context, not one window. The frame behind the "come and see this"
-/// gesture (see [`crate::gesture`]): the user double-taps Command and is handed
+/// gesture (see [`crate::body::gesture`]): the user double-taps Command and is handed
 /// this back as a file.
 pub async fn grab_screen_png() -> anyhow::Result<Bytes> {
     #[cfg(target_os = "macos")]

@@ -14,7 +14,7 @@
 //!
 //! Best-effort by contract: a missing binary, an undecodable clip, or an empty
 //! result is an `Err` the caller logs and skips. A frame comes back as JPEG bytes,
-//! ready for [`crate::capabilities::face::detect_and_embed`].
+//! ready for [`crate::body::capabilities::face::detect_and_embed`].
 
 use std::path::{Path, PathBuf};
 use std::process::Stdio;

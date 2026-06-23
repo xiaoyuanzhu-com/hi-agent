@@ -10,7 +10,7 @@
 //! without it (or with no GUI session) the frontmost app resolves to null and we
 //! return an empty list, never an error.
 //!
-//! The geometry normalization lives in [`crate::capabilities::accessibility`] so
+//! The geometry normalization lives in [`crate::body::capabilities::accessibility`] so
 //! it stays unit-testable off-macOS; this file only walks the tree and reads
 //! attributes. The walk is bounded ([`MAX_ELEMENTS`], [`MAX_DEPTH`]) so a deep or
 //! pathological tree can't run away. The attribute readers take a raw AX
@@ -25,7 +25,7 @@ use core_foundation::string::{CFString, CFStringRef};
 use core_graphics::display::CGDisplay;
 use core_graphics::geometry::{CGPoint, CGSize};
 
-use crate::capabilities::accessibility::{Element, Rect};
+use crate::body::capabilities::accessibility::{Element, Rect};
 
 /// An opaque CoreFoundation / Accessibility object pointer — `CFTypeRef`,
 /// `AXUIElementRef`, and `AXValueRef` all alias to this.

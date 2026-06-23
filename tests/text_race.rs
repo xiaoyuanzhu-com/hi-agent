@@ -19,15 +19,15 @@ use tokio::net::TcpListener;
 async fn spawn_server() -> (String, tempfile::TempDir, ServerSeams) {
     let dir = tempdir().expect("tempdir");
     let memory = Memory::open(dir.path()).await.expect("memory");
-    let observatory = hi_agent::observatory::Observatory::new(None, hi_agent::reactor::swap_budget_chars());
+    let observatory = hi_agent::observatory::Observatory::new(None, hi_agent::body::reactor::swap_budget_chars());
     let (router, seams) = server::build(
         memory,
         dir.path().to_path_buf(),
         observatory,
         hi_agent::acp::AcpTap::new(),
-        hi_agent::reactor::ToolRegistry::new(),
-        hi_agent::reactor::InterruptRegistry::new(),
-        hi_agent::presence::Presence::new(),
+        hi_agent::body::reactor::ToolRegistry::new(),
+        hi_agent::body::reactor::InterruptRegistry::new(),
+        hi_agent::body::presence::Presence::new(),
     );
 
     let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");

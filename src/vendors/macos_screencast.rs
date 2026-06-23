@@ -22,7 +22,7 @@ use core_graphics::window::{
 };
 use tokio::process::Command;
 
-use crate::capabilities::screencast::WindowRef;
+use crate::body::capabilities::screencast::WindowRef;
 
 /// Enumerate on-screen windows (excluding desktop elements). Runs the blocking
 /// CoreGraphics call on a blocking thread.

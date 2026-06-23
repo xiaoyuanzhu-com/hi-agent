@@ -1,12 +1,12 @@
 //! macOS hotkey vendor — a listen-only Quartz event tap that turns raw Command-key
 //! events into [`Edge`]s and drives a `CFRunLoop`. The OS trigger behind the
-//! Command-key gestures ([`crate::gesture`]).
+//! Command-key gestures ([`crate::body::gesture`]).
 //!
 //! A `CGEventTap` observes `FlagsChanged` (modifier transitions, to see Command
 //! press *and* release edges) and `KeyDown` (an `Other` edge, to break a pending
 //! tap / disarm a pending hold on a chord like ⌘C). All recognition — double-tap,
-//! hold, and the hold's threshold timing — lives in [`crate::capabilities::hotkey`]
-//! and [`crate::gesture`]; this file is the FFI that emits edges and runs the loop,
+//! hold, and the hold's threshold timing — lives in [`crate::body::capabilities::hotkey`]
+//! and [`crate::body::gesture`]; this file is the FFI that emits edges and runs the loop,
 //! doing no timing of its own. The tap is **ListenOnly** — it never consumes events,
 //! so the user's own Command shortcuts are untouched.
 //!
@@ -23,7 +23,7 @@ use core_graphics::event::{
     CGEventType,
 };
 
-use crate::capabilities::hotkey::Edge;
+use crate::body::capabilities::hotkey::Edge;
 
 /// Run the event tap on the **current thread**, calling `on_edge` for each raw
 /// Command-key edge. **Blocks forever** — it drives this thread's run loop — so call

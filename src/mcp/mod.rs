@@ -12,13 +12,13 @@
 //! This module is transport-free: it turns a parsed JSON-RPC message plus the
 //! routing identity (scene/role/worker id from headers) into an [`McpReply`]. The
 //! HTTP glue lives in `crate::server::mcp`. Tool calls are forwarded to the right
-//! scene loop through the [`ToolRegistry`]; see [`crate::reactor::tools`].
+//! scene loop through the [`ToolRegistry`]; see [`crate::body::reactor::tools`].
 
 use serde_json::{Value, json};
 
 use base64::Engine as _;
 use crate::mind::memory::people_vectors;
-use crate::reactor::{SceneControl, ToolRegistry};
+use crate::body::reactor::{SceneControl, ToolRegistry};
 use crate::types::{Geometry, Region, Scene};
 
 /// MCP protocol version we advertise when the client doesn't pin one. We echo the
@@ -464,7 +464,7 @@ async fn dispatch_tool(
 /// which `claude-agent-acp` forwards to the multimodal model. Errors when capture
 /// is unavailable (non-macOS, or Screen Recording not granted).
 async fn do_look() -> Value {
-    let snap = match crate::capabilities::desktop_context::capture().await {
+    let snap = match crate::body::capabilities::desktop_context::capture().await {
         Ok(s) => s,
         Err(e) => return tool_error(&format!("screen capture not available here: {e}")),
     };
@@ -496,7 +496,7 @@ async fn do_look() -> Value {
 /// image) and are mapped to the main display's points here, so the pixel-vs-point
 /// Retina detail never reaches the model.
 async fn do_act(args: &Value) -> Value {
-    use crate::capabilities::input::{self, Action, Point};
+    use crate::body::capabilities::input::{self, Action, Point};
     let action = args.get("action").and_then(Value::as_str).unwrap_or_default();
 
     let act = match action {
@@ -564,11 +564,11 @@ fn png_dimensions(png: &[u8]) -> Option<(u32, u32)> {
     Some((w, h))
 }
 
-/// Map an `act` `key` string to a [`crate::capabilities::input::Key`]. Named keys
+/// Map an `act` `key` string to a [`crate::body::capabilities::input::Key`]. Named keys
 /// are case-insensitive; anything else is taken as a single character (so `a`, `/`,
 /// `7` work). `None` for an empty or multi-character unknown name.
-fn parse_key(s: &str) -> Option<crate::capabilities::input::Key> {
-    use crate::capabilities::input::Key;
+fn parse_key(s: &str) -> Option<crate::body::capabilities::input::Key> {
+    use crate::body::capabilities::input::Key;
     Some(match s.to_ascii_lowercase().as_str() {
         "return" | "enter" => Key::Return,
         "tab" => Key::Tab,
@@ -592,8 +592,8 @@ fn parse_key(s: &str) -> Option<crate::capabilities::input::Key> {
 
 /// Map an `act` `mods` array to modifiers, accepting common aliases. Unknown
 /// entries are dropped.
-fn parse_mods(v: Option<&Value>) -> Vec<crate::capabilities::input::Modifier> {
-    use crate::capabilities::input::Modifier;
+fn parse_mods(v: Option<&Value>) -> Vec<crate::body::capabilities::input::Modifier> {
+    use crate::body::capabilities::input::Modifier;
     v.and_then(Value::as_array)
         .map(|arr| {
             arr.iter()
@@ -676,7 +676,7 @@ async fn reflection_update_facet(data_dir: &std::path::Path, args: &Value) -> Va
     }
 }
 
-/// `record_reflex`: teach a quick-action reflex (see [`crate::reflex`]). Stores the
+/// `record_reflex`: teach a quick-action reflex (see [`crate::body::reflex`]). Stores the
 /// fill value and how to find its field so a later invoke types it with no model in
 /// the loop. The value itself is never echoed back in the ack.
 async fn reflex_record(data_dir: &std::path::Path, args: &Value) -> Value {
@@ -699,14 +699,14 @@ async fn reflex_record(data_dir: &std::path::Path, args: &Value) -> Value {
             .filter(|s| !s.is_empty())
             .map(str::to_owned)
     };
-    let id = crate::reflex::id_for(name);
+    let id = crate::body::reflex::id_for(name);
     if id.is_empty() {
         return tool_error("record_reflex `name` must contain a usable character");
     }
-    let reflex = crate::reflex::Reflex {
+    let reflex = crate::body::reflex::Reflex {
         id,
         name: name.to_string(),
-        trigger: crate::reflex::Trigger {
+        trigger: crate::body::reflex::Trigger {
             app: opt("app"),
             title_contains: opt("title_contains"),
             role: opt("role"),
@@ -714,7 +714,7 @@ async fn reflex_record(data_dir: &std::path::Path, args: &Value) -> Value {
         },
         value: value.to_string(),
     };
-    match crate::reflex::save(data_dir, &reflex).await {
+    match crate::body::reflex::save(data_dir, &reflex).await {
         Ok(id) => tool_ok(&format!("learned reflex '{name}' ({id})")),
         Err(err) => tool_error(&err.to_string()),
     }
@@ -1011,7 +1011,7 @@ mod name_tests {
 #[cfg(test)]
 mod screen_tool_tests {
     use super::*;
-    use crate::capabilities::input::{Key, Modifier};
+    use crate::body::capabilities::input::{Key, Modifier};
 
     #[test]
     fn png_dimensions_reads_ihdr() {

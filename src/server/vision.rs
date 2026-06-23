@@ -42,8 +42,8 @@ use tokio::sync::broadcast::error::RecvError;
 use chrono::{DateTime, Utc};
 use uuid::Uuid;
 
-use crate::capabilities::face;
-use crate::capabilities::vision::{self as vision_cap, VisualMedia};
+use crate::body::capabilities::face;
+use crate::body::capabilities::vision::{self as vision_cap, VisualMedia};
 use crate::vendors::ffmpeg_frame;
 use crate::mind::memory::layout::MediaSlot;
 use crate::mind::memory::media;
