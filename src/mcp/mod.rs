@@ -274,6 +274,31 @@ fn tools_for_role(role: Option<&str>) -> Vec<Value> {
                     "required": ["delay", "note"],
                 }),
             ),
+            tool(
+                "record_reflex",
+                "Teach a quick-action reflex the user can later fire instantly, with no model in \
+                 the loop. Use it when they ask you to remember filling a specific field with a \
+                 specific value — e.g. \"on this signup page my ID number is 11010119…\". It stores \
+                 the value and how to find the field, so a later invoke clicks that field and types \
+                 it straight in. `name` is a short handle (e.g. \"fill my ID\"). `value` is exactly \
+                 what to type. `label_contains` is text from the field's on-screen label (e.g. \"ID \
+                 number\", \"身份证\"). Optionally narrow the situation with `app` (frontmost app, e.g. \
+                 \"Safari\"), `title_contains` (a window-title substring), and `role` (the control's \
+                 accessibility role; defaults to AXTextField). Keep the label/app specific enough \
+                 that only the intended field can match — it fires only when exactly one field matches.",
+                json!({
+                    "type": "object",
+                    "properties": {
+                        "name": { "type": "string", "description": "Short handle for the reflex, e.g. \"fill my ID\"." },
+                        "value": { "type": "string", "description": "Exactly the text to type into the field." },
+                        "label_contains": { "type": "string", "description": "A substring of the target field's on-screen label, e.g. \"ID number\" or \"身份证\"." },
+                        "app": { "type": "string", "description": "Optional: require this frontmost app (substring), e.g. \"Safari\"." },
+                        "title_contains": { "type": "string", "description": "Optional: require this substring in the frontmost window title." },
+                        "role": { "type": "string", "description": "Optional: the target control's accessibility role; defaults to AXTextField." },
+                    },
+                    "required": ["name", "value", "label_contains"],
+                }),
+            ),
         ],
     }
 }
@@ -358,6 +383,7 @@ async fn dispatch_tool(
         "name_person" => return reflection_name_person(data_dir, args).await,
         "merge_people" => return reflection_merge_people(data_dir, args).await,
         "keep_and_fade" => return reflection_keep_and_fade(data_dir, scene, args).await,
+        "record_reflex" => return reflex_record(data_dir, args).await,
         "look" => return do_look().await,
         "act" => return do_act(args).await,
         _ => {}
@@ -646,6 +672,50 @@ async fn reflection_update_facet(data_dir: &std::path::Path, args: &Value) -> Va
     }
     match crate::memory::facets::update_facet(data_dir, dim, subject, content).await {
         Ok(refname) => tool_ok(&format!("updated facet {refname}")),
+        Err(err) => tool_error(&err.to_string()),
+    }
+}
+
+/// `record_reflex`: teach a quick-action reflex (see [`crate::reflex`]). Stores the
+/// fill value and how to find its field so a later invoke types it with no model in
+/// the loop. The value itself is never echoed back in the ack.
+async fn reflex_record(data_dir: &std::path::Path, args: &Value) -> Value {
+    let name = args.get("name").and_then(Value::as_str).unwrap_or_default();
+    let value = args.get("value").and_then(Value::as_str).unwrap_or_default();
+    let label_contains = args.get("label_contains").and_then(Value::as_str).unwrap_or_default();
+    if name.trim().is_empty() {
+        return tool_error("record_reflex requires a non-empty `name`");
+    }
+    if value.trim().is_empty() {
+        return tool_error("record_reflex requires a non-empty `value`");
+    }
+    if label_contains.trim().is_empty() {
+        return tool_error("record_reflex requires a non-empty `label_contains`");
+    }
+    let opt = |k: &str| {
+        args.get(k)
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(str::to_owned)
+    };
+    let id = crate::reflex::id_for(name);
+    if id.is_empty() {
+        return tool_error("record_reflex `name` must contain a usable character");
+    }
+    let reflex = crate::reflex::Reflex {
+        id,
+        name: name.to_string(),
+        trigger: crate::reflex::Trigger {
+            app: opt("app"),
+            title_contains: opt("title_contains"),
+            role: opt("role"),
+            label_contains: label_contains.to_string(),
+        },
+        value: value.to_string(),
+    };
+    match crate::reflex::save(data_dir, &reflex).await {
+        Ok(id) => tool_ok(&format!("learned reflex '{name}' ({id})")),
         Err(err) => tool_error(&err.to_string()),
     }
 }

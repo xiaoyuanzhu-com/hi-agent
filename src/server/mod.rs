@@ -29,6 +29,7 @@ pub mod generated;
 pub mod headers;
 pub mod mcp;
 pub mod observe;
+pub mod reflex;
 pub mod sessions;
 pub mod stubs;
 pub mod text;
@@ -455,6 +456,10 @@ pub fn build(
         // mind drives output and side-effects by calling tools here; routing is by
         // the X-HI-Scene/X-HI-Role headers the attach carries.
         .route("/mcp", post(mcp::post_mcp).get(mcp::get_mcp))
+        // Fire a taught quick-action reflex — recognize the current field via the
+        // accessibility tree and type the stored value, no model in the loop. The
+        // v1 trigger (a later hotkey/gesture would call the same path).
+        .route("/api/reflex/invoke", post(reflex::post_invoke))
         // A scene's channels, observed live as one merged presence stream — the
         // channel inspector's window onto every in/out channel of one scene.
         .route("/api/scenes/{scene}/channels", get(channels::get_scene_channels))

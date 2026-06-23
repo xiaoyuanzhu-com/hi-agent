@@ -78,6 +78,13 @@ pub fn facets_dir(data_dir: &Path) -> PathBuf {
     memory_dir(data_dir).join("facets")
 }
 
+/// `<memory>/reflexes` — taught quick-action reflexes (one `<id>.json` each). The
+/// deepest stage of the memory gradient: a grooved action the fast-path fires
+/// without the mind. Written by the `record_reflex` tool, read by the invoke path.
+pub fn reflexes_dir(data_dir: &Path) -> PathBuf {
+    memory_dir(data_dir).join("reflexes")
+}
+
 /// `<raw>/<scene_enc>` — one slice per scene.
 pub fn scene_dir(data_dir: &Path, scene: &Scene) -> PathBuf {
     raw_root(data_dir).join(encode_scene(scene))
