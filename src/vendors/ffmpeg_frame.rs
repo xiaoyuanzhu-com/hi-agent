@@ -1,4 +1,4 @@
-//! Extract a single still frame from a video clip by shelling out to `ffmpeg`.
+//! Still-frame and clip extraction by shelling out to `ffmpeg`.
 //!
 //! The vision input channel is video (fragmented MP4 with hardware HEVC/H.264, or
 //! WebM with VP8/VP9 — negotiated client-side). The face pipeline, like `vision`,
@@ -8,10 +8,15 @@
 //! codec the client can produce. One keyframe per minute-file is all the face path
 //! needs — recognition is soft evidence, not surveillance.
 //!
+//! The forgetting pass ([`crate::memory::decay`]) reuses the same binary to cut a
+//! keepsake out of cold media before it drops the full bytes: [`still_at`] for a
+//! single vision frame, [`clip_audio`] for a few seconds of sound.
+//!
 //! Best-effort by contract: a missing binary, an undecodable clip, or an empty
-//! result is an `Err` the caller logs and skips. The frame comes back as JPEG
-//! bytes, ready for [`crate::capabilities::face::detect_and_embed`].
+//! result is an `Err` the caller logs and skips. A frame comes back as JPEG bytes,
+//! ready for [`crate::capabilities::face::detect_and_embed`].
 
+use std::path::{Path, PathBuf};
 use std::process::Stdio;
 
 use anyhow::{Context, bail};
@@ -66,4 +71,59 @@ pub async fn first_frame(video: Bytes) -> anyhow::Result<Bytes> {
         bail!("ffmpeg produced no frame");
     }
     Ok(Bytes::from(out.stdout))
+}
+
+/// Decode one frame at `offset_secs` into the video file `input` to JPEG bytes —
+/// the keepsake form for a vision moment the mind chose to keep. Seeks before
+/// decoding (`-ss` before `-i`) for speed; ffmpeg clamps a past-the-end offset to
+/// the last frame, so a slightly-off timestamp still yields an image.
+pub async fn still_at(input: &Path, offset_secs: f64) -> anyhow::Result<Bytes> {
+    let out = Command::new(ffmpeg_bin())
+        .args(["-hide_banner", "-loglevel", "error", "-ss", &format!("{offset_secs:.3}"), "-i"])
+        .arg(input)
+        .args(["-frames:v", "1", "-f", "image2", "-c:v", "mjpeg", "pipe:1"])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .output()
+        .await
+        .with_context(|| format!("spawning {} failed (is it installed?)", ffmpeg_bin()))?;
+    if !out.status.success() {
+        bail!("ffmpeg still extraction failed: {}", String::from_utf8_lossy(&out.stderr).trim());
+    }
+    if out.stdout.is_empty() {
+        bail!("ffmpeg produced no still");
+    }
+    Ok(Bytes::from(out.stdout))
+}
+
+/// Cut `[ss, ss+dur)` out of the concatenation of `inputs` (same-format audio —
+/// the wav minute files a span crosses, in order) and write it to `out` as
+/// lossless PCM wav — the keepsake form for a few seconds of sound. Re-encoding to
+/// `pcm_s16le` is not the rejected low-bitrate "fade in place": it is a short,
+/// full-quality excerpt of the same samples. A single input is the common case;
+/// `concat:` joins several when a span straddles a minute boundary.
+pub async fn clip_audio(inputs: &[PathBuf], ss: f64, dur: f64, out: &Path) -> anyhow::Result<()> {
+    if inputs.is_empty() {
+        bail!("clip_audio: no input files");
+    }
+    let joined = inputs
+        .iter()
+        .map(|p| p.to_string_lossy().into_owned())
+        .collect::<Vec<_>>()
+        .join("|");
+    let input_arg = if inputs.len() == 1 { joined } else { format!("concat:{joined}") };
+    let status = Command::new(ffmpeg_bin())
+        .args(["-hide_banner", "-loglevel", "error", "-i"])
+        .arg(&input_arg)
+        .args(["-ss", &format!("{ss:.3}"), "-t", &format!("{dur:.3}"), "-c:a", "pcm_s16le"])
+        .arg(out)
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .output()
+        .await
+        .with_context(|| format!("spawning {} failed (is it installed?)", ffmpeg_bin()))?;
+    if !status.status.success() {
+        bail!("ffmpeg clip failed: {}", String::from_utf8_lossy(&status.stderr).trim());
+    }
+    Ok(())
 }

@@ -170,6 +170,39 @@ fn tools_for_role(role: Option<&str>) -> Vec<Value> {
                     "required": ["from", "into"],
                 }),
             ),
+            tool(
+                "keep_and_fade",
+                "Let a cold day's media fade to the text, keeping only the moments worth keeping \
+                 vivid. Use it on a day from the old-store list you're shown — one genuinely old and \
+                 settled, heaviest first — when the raw bytes are vividness the words have outlived. \
+                 `channel` is `audio` or `vision`, `date` the `YYYY-MM-DD` day. `keep` is the spans to \
+                 preserve, each `{start, end}` in RFC3339 — a vision keepsake is a still at `start`, an \
+                 audio keepsake the clip `[start, end)`. Keep almost nothing: a frame or a few seconds, \
+                 often none — pass `keep: []` to fade straight to text (which always remains). Keep only \
+                 what the transcript can't carry (a face, a place, the sound of a voice), never someone \
+                 merely talking. You can only fade a day already behind your consolidation; the tool \
+                 refuses the rest.",
+                json!({
+                    "type": "object",
+                    "properties": {
+                        "channel": { "type": "string", "enum": ["audio", "vision"], "description": "Which sense's media to fade for this day." },
+                        "date": { "type": "string", "description": "The day to fade, YYYY-MM-DD (UTC), from the old-store list." },
+                        "keep": {
+                            "type": "array",
+                            "description": "Spans to keep vivid; omit or [] to fade straight to text. Each is one keepsake.",
+                            "items": {
+                                "type": "object",
+                                "properties": {
+                                    "start": { "type": "string", "description": "Span start, RFC3339 (the instant, for a vision still)." },
+                                    "end": { "type": "string", "description": "Span end, RFC3339 (equal to start for a still; later for an audio clip)." },
+                                },
+                                "required": ["start", "end"],
+                            },
+                        },
+                    },
+                    "required": ["channel", "date"],
+                }),
+            ),
         ],
         // Default to the reactor surface (the soul describes these).
         _ => vec![
@@ -324,6 +357,7 @@ async fn dispatch_tool(
         "update_facet" => return reflection_update_facet(data_dir, args).await,
         "name_person" => return reflection_name_person(data_dir, args).await,
         "merge_people" => return reflection_merge_people(data_dir, args).await,
+        "keep_and_fade" => return reflection_keep_and_fade(data_dir, scene, args).await,
         "look" => return do_look().await,
         "act" => return do_act(args).await,
         _ => {}
@@ -642,6 +676,49 @@ async fn reflection_merge_people(data_dir: &std::path::Path, args: &Value) -> Va
     }
     match people_vectors::rename(data_dir, from, into).await {
         Ok(()) => tool_ok(&format!("merged people/{from} → people/{into}")),
+        Err(err) => tool_error(&err.to_string()),
+    }
+}
+
+/// `keep_and_fade`: let a cold consolidated day's media fade to text, keeping the
+/// spans the mind chose (see [`crate::memory::decay::keep_and_fade`]). The safety
+/// gate lives in the tool, so an attempt on an un-consolidated day comes back as a
+/// tool error the session can read, not a panic.
+async fn reflection_keep_and_fade(data_dir: &std::path::Path, scene: &Scene, args: &Value) -> Value {
+    let Some(channel) = args.get("channel").and_then(Value::as_str) else {
+        return tool_error("keep_and_fade requires `channel` (audio|vision)");
+    };
+    let Ok(channel) = channel.parse::<crate::types::Channel>() else {
+        return tool_error(&format!("keep_and_fade: unknown channel {channel:?}"));
+    };
+    let date = args.get("date").and_then(Value::as_str).unwrap_or_default();
+    if date.trim().is_empty() {
+        return tool_error("keep_and_fade requires `date` (YYYY-MM-DD)");
+    }
+    let mut spans = Vec::new();
+    if let Some(arr) = args.get("keep").and_then(Value::as_array) {
+        for (i, item) in arr.iter().enumerate() {
+            let parse = |k: &str| {
+                item.get(k)
+                    .and_then(Value::as_str)
+                    .and_then(|s| chrono::DateTime::parse_from_rfc3339(s).ok())
+                    .map(|t| t.with_timezone(&chrono::Utc))
+            };
+            let (Some(start), Some(end)) = (parse("start"), parse("end")) else {
+                return tool_error(&format!(
+                    "keep_and_fade: keep[{i}] needs RFC3339 `start` and `end`"
+                ));
+            };
+            spans.push(crate::memory::decay::KeepSpan { start, end });
+        }
+    }
+    match crate::memory::decay::keep_and_fade(data_dir, scene, channel, date, &spans).await {
+        Ok(r) => tool_ok(&format!(
+            "faded {} {date}: kept {} keepsake(s), freed {} bytes",
+            channel.as_str(),
+            r.kept,
+            r.bytes_freed
+        )),
         Err(err) => tool_error(&err.to_string()),
     }
 }

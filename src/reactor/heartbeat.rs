@@ -22,7 +22,7 @@ use crate::agent::SessionRole;
 use crate::capabilities::{face, voiceprint};
 use crate::memory::journal::after_cursor;
 use crate::pcm;
-use crate::memory::{Snapshot, build_for_scene, episodes, facets, layout, people_vectors, refresh_hot};
+use crate::memory::{Snapshot, build_for_scene, decay, episodes, facets, layout, people_vectors, refresh_hot};
 use crate::observatory::EventKind;
 use crate::types::{Channel, JournalEntry, Scene};
 use crate::vendors::ffmpeg_frame;
@@ -209,7 +209,13 @@ async fn run_reflection(reactor: &Reactor, scene: &Scene) -> anyhow::Result<()> 
     // face capability.
     let face_ids = cluster_faces(data_dir, scene, &tail).await;
     let voice_ids = cluster_voices(data_dir, scene, &tail).await;
-    let prompt = build_reflection_prompt(&tail, &prior, &subjects, &face_ids, &voice_ids);
+
+    // The old-store pressure — consolidated days still holding full media — lets
+    // the same session also tend the past, fading what's gone cold. Empty most
+    // passes; never blocks (best-effort).
+    let pressure = decay::fade_pressure(data_dir, scene, Utc::now()).await.unwrap_or_default();
+
+    let prompt = build_reflection_prompt(&tail, &prior, &subjects, &face_ids, &voice_ids, &pressure);
     let system_prompt = super::reflection_prompt(data_dir).await;
 
     let session = reactor
@@ -260,6 +266,7 @@ fn build_reflection_prompt(
     subjects: &[String],
     face_ids: &HashMap<usize, Vec<String>>,
     voice_ids: &HashMap<usize, Vec<String>>,
+    pressure: &[decay::FadeDay],
 ) -> String {
     use std::fmt::Write as _;
     let mut s = String::new();
@@ -273,6 +280,33 @@ fn build_reflection_prompt(
     if !subjects.is_empty() {
         s.push_str("## Subjects you already model (reuse these refs)\n");
         let _ = writeln!(s, "{}", subjects.join(", "));
+        s.push('\n');
+    }
+    // Old-store pressure: consolidated days that still hold full media, heaviest
+    // first. Only surface days weighty enough to be worth the mind's attention —
+    // a cheap visibility gate, not a forgetting decision.
+    let heavy: Vec<&decay::FadeDay> =
+        pressure.iter().filter(|d| d.bytes >= FADE_SURFACE_FLOOR).collect();
+    if !heavy.is_empty() {
+        s.push_str(
+            "## Older media still at full fidelity (all already settled — fade what's gone cold)\n",
+        );
+        for d in heavy {
+            let eps = if d.episodes.is_empty() {
+                String::new()
+            } else {
+                format!("  episodes: {}", d.episodes.join(", "))
+            };
+            let _ = writeln!(
+                s,
+                "- {} {}  ({}d old, {}){}",
+                d.channel.as_str(),
+                d.date,
+                d.age_days,
+                human_bytes(d.bytes),
+                eps
+            );
+        }
         s.push('\n');
     }
     s.push_str("## Unconsolidated signals (oldest first)\n");
@@ -300,6 +334,23 @@ fn build_reflection_prompt(
     }
     s.push_str("\nConsolidate these now.");
     s
+}
+
+/// Below this, a cold day's leftover media isn't worth surfacing to the mind — the
+/// visibility gate on the old-store section. A cheap mechanical threshold on what
+/// to *show*, never a decision about what to forget.
+const FADE_SURFACE_FLOOR: u64 = 8 * 1024 * 1024;
+
+/// A byte count as a short human string (`1.8 GB`) for the old-store list.
+fn human_bytes(n: u64) -> String {
+    const UNITS: [&str; 4] = ["B", "KB", "MB", "GB"];
+    let mut v = n as f64;
+    let mut i = 0;
+    while v >= 1024.0 && i < UNITS.len() - 1 {
+        v /= 1024.0;
+        i += 1;
+    }
+    if i == 0 { format!("{n} B") } else { format!("{v:.1} {}", UNITS[i]) }
 }
 
 /// One frontier signal as a transcript line, reusing the snapshot's renderer so
@@ -646,7 +697,7 @@ mod cooccur_tests {
     #[test]
     fn prompt_annotates_a_sole_co_occurring_face() {
         let tail = vec![vision(at(0), None), audio(at(1), None)];
-        let p = build_reflection_prompt(&tail, &[], &[], &faces(&[(0, "ff32ce3w")]), &HashMap::new());
+        let p = build_reflection_prompt(&tail, &[], &[], &faces(&[(0, "ff32ce3w")]), &HashMap::new(), &[]);
         assert!(p.contains("⟨one face present: ff32ce3w⟩"), "prompt was:\n{p}");
     }
 }

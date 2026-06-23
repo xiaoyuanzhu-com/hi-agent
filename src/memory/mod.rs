@@ -8,6 +8,7 @@
 use std::path::Path;
 
 pub mod core;
+pub mod decay;
 pub mod episodes;
 pub mod facets;
 pub mod journal;

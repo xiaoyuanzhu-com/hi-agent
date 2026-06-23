@@ -202,6 +202,53 @@ pub async fn recent_gists(
     Ok(gists)
 }
 
+/// Episode dir-names for `scene` whose covered day-range intersects `day`
+/// (`YYYY-MM-DD`), newest first — a hint the forgetting pass shows the mind: which
+/// events a cold day held, so it can judge what's worth keeping. Best-effort; an
+/// episode with no parseable `from_ts`/`to_ts` is skipped.
+pub async fn names_overlapping_day(
+    data_dir: &Path,
+    scene: &Scene,
+    day: &str,
+) -> anyhow::Result<Vec<String>> {
+    let dir = layout::episodes_dir(data_dir);
+    let mut rd = match tokio::fs::read_dir(&dir).await {
+        Ok(rd) => rd,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(err) => return Err(err.into()),
+    };
+    let mut names = Vec::new();
+    while let Some(ent) = rd.next_entry().await? {
+        if !ent.file_type().await?.is_dir() {
+            continue;
+        }
+        let content = match tokio::fs::read_to_string(ent.path().join("episode.md")).await {
+            Ok(c) => c,
+            Err(_) => continue,
+        };
+        if frontmatter_field(&content, "scene").as_deref() != Some(scene.0.as_str()) {
+            continue;
+        }
+        let (Some(from), Some(to)) =
+            (frontmatter_field(&content, "from_ts"), frontmatter_field(&content, "to_ts"))
+        else {
+            continue;
+        };
+        // The RFC3339 values lead with the date, so a 10-char prefix compare is a
+        // date compare: include when from_date <= day <= to_date.
+        let from_d = from.get(..10).unwrap_or("");
+        let to_d = to.get(..10).unwrap_or("");
+        if from_d <= day && day <= to_d
+            && let Ok(name) = ent.file_name().into_string()
+        {
+            names.push(name);
+        }
+    }
+    names.sort();
+    names.reverse();
+    Ok(names)
+}
+
 /// One frontmatter scalar by key, JSON-decoding a quoted value (so a colon inside
 /// it survives) and returning a bare value as-is. `None` if there's no
 /// frontmatter block or the key is absent. Splits on the first `:` so an RFC3339
