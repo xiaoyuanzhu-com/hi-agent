@@ -39,7 +39,7 @@
 ## Open questions
 
 - "味道"识别给到多细——列一组典型触发(best / latest / 现在 / 哪个 / 流行)够不够,还是更靠语义判断?会不会触发过密?
-- 现查来的"当下剪法"要不要落进 skill 复用(连 [23](23-skill-improves-and-refreshes.md)),还是每次都现看?——本条的答案是**每次都重核 transient**,但范例本身可作技能的一部分。
+- 现查来的"当下剪法"要不要落进 skill 复用(连 [24](24-skill-improves-and-refreshes.md)),还是每次都现看?——本条的答案是**每次都重核 transient**,但范例本身可作技能的一部分。
 - 研究与开剪**并行**(边查边试)还是**串行**(看完范例再动手)?时延 vs 返工的权衡。
 
 _机制:research 能力已在(worker = Claude Code agent,web + code-exec),缺的是**反射的触发**——core.md 现在只给"别空场"的**时延**理由让你把搜索甩给 worker([core.md](../../src/reactor/core.md) "a quick web search is not a quick thing"),从没给"你其实不知道、去看"的**认知**理由。本 journey 主体是 guidance:core.md + worker prompt 加"味道触发 + 先看范例 + 限定快过期层"。成熟度:**guidance 已写并实测通过**(见下)——这是三条反射里最便宜、最该先落的一条。_

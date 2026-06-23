@@ -11,8 +11,8 @@
 ## Steps & expected UX
 
 1. **第二次"再剪个集锦"** → agent 动手前先**翻工坊**:这活我干过吗?有,**起点拿来**(连 [20](20-reuse-built-views.md) 的"看工具箱再动手")。
-2. **worker 从技能笔记起步**:流程 / 工具 / 坑直接复用,**不从头摸**;但笔记里标着"剪法 / 配乐是会过期的" → 这半**重新现查**(连 [21](21-research-before-stale-answer.md)),其余照旧。
-3. **观感**:明显更快(省掉首次的研究 + 试错 + 翻车),且起点就在 bar 上(批判的标尺一并记着,连 [22](22-critique-before-shipping.md));该重核的重核了,不是拿几年前的剪法硬套。
+2. **worker 从技能笔记起步**:流程 / 工具 / 坑直接复用,**不从头摸**;但笔记里标着"剪法 / 配乐是会过期的" → 这半**重新现查**(连 [22](22-research-before-stale-answer.md)),其余照旧。
+3. **观感**:明显更快(省掉首次的研究 + 试错 + 翻车),且起点就在 bar 上(批判的标尺一并记着,连 [23](23-critique-before-shipping.md));该重核的重核了,不是拿几年前的剪法硬套。
 4. **(沉淀这步本身)** 第一次干完、reflection 时:把"剪集锦"这件**难 + 会再来 + 干成了**的事,策展成 `skills/` 下一条干净笔记;重复的合并,过时的(依赖的工具变了)修剪——就像它已经在给 facets / drive 做的策展。
 
 ## Expected outcome
@@ -24,7 +24,7 @@
 ## UX principles this journey establishes
 
 - **一次难活 → 一条可复用技能**;门槛是判断:**难 + 会再来 + 干成了**才存,不是每活都存。
-- **技能是起点,不是真理。** 它装着两半:durable 的"我怎么干"稳着用,transient 的"当下什么好 / 哪个工具"**每次被研究反射(21)重核**。技能 = 把一次研究+批判的贵成本**结晶**成起点,不是省掉再看的**替代**。
+- **技能是起点,不是真理。** 它装着两半:durable 的"我怎么干"稳着用,transient 的"当下什么好 / 哪个工具"**每次被研究反射(22)重核**。技能 = 把一次研究+批判的贵成本**结晶**成起点,不是省掉再看的**替代**。
 - **动手前先翻工坊**(连 [20](20-reuse-built-views.md)):干过的别从头摸。
 - **reflection 策展技能**:跟它策展 facts(facets)、收拾 drive(d4af1be)同一趟手艺——promote 一次性成功成干净笔记、合并重复、修剪过时。
 - **自己攒的东西自己管**:技能按"它是什么"命名(非按今天的任务),日后按主题找得回——复用的前提(连 [20](20-reuse-built-views.md))。
@@ -43,15 +43,15 @@
 - **统一在记忆梯度里讲?** 技能、view 工具箱([20](20-reuse-built-views.md))、drive(d4af1be)同属"agent 自己攒的东西"——要不要都顺着 raw→episodes→facets→hot.md 讲,而非另起炉灶?
 - **capability-gap**("我连个剪辑工具都没有 → 装 / 建 / 问")并到这条线,还是另起(连 [13](13-equip-a-capability.md))?本条假设工具已在,只沉淀**怎么用**。
 
-_机制:复用现成模式——`skills/` 工坊照 [views/](20-reuse-built-views.md) + self.md;reflection 策展照它给 facets / drive(d4af1be)的策展;reuse-before-start 照 [appearance.md](../../src/reactor/appearance.md)。新结构只有 `skills/` 工坊 + reflection 多策展一类。本 journey 的**核心主张**——技能与研究反射(21)的"重核 transient 半"耦合——是把"越用越快"和"不固化陈货"两件事拧成一股,正面解 [11](11-china-tax.md) 的悬案。成熟度:**guidance 已写;contribute 路径实测通过,reuse / reflection 策展 / transient 标记未验**(见下)。_
+_机制:复用现成模式——`skills/` 工坊照 [views/](20-reuse-built-views.md) + self.md;reflection 策展照它给 facets / drive(d4af1be)的策展;reuse-before-start 照 [appearance.md](../../src/reactor/appearance.md)。新结构只有 `skills/` 工坊 + reflection 多策展一类。本 journey 的**核心主张**——技能与研究反射(22)的"重核 transient 半"耦合——是把"越用越快"和"不固化陈货"两件事拧成一股,正面解 [11](11-china-tax.md) 的悬案。成熟度:**guidance 已写;contribute 路径实测通过,reuse / reflection 策展 / transient 标记未验**(见下)。_
 
 ## 实测 2026-06-22 · 分支 worktree-acquisition-reflexes(基 origin/main 422d268)
 
-环境同 [21](21-research-before-stale-answer.md);三个有分量的任务跑完(TTS 现查、语言榜现查、做语言卡片)。Ground truth:`/tmp/hi-reflex-test/skills/` 实际文件 + 写它的 session + `facets/`。
+环境同 [22](22-research-before-stale-answer.md);三个有分量的任务跑完(TTS 现查、语言榜现查、做语言卡片)。Ground truth:`/tmp/hi-reflex-test/skills/` 实际文件 + 写它的 session + `facets/`。
 
 - ✅ **"沉淀一条技能"路径真触发**:build worker(session 787c10da)做完卡片后,**自己往 `skills/` 写了 `views-preview.md`**——正是它刚啃下来的硬骨头(预览脚手架:fetch import map → esbuild 编 → 本地 server 代理 assets 避 CORS → Chromium 截图),连**坑**(CORS、react-dom/client 缺键、动画 settle ~900ms)和**审美 design notes** 都记了。这是 journey 主张的"难 + 会再来 + 干成了 → 留一条笔记",**直接归功于新加的 worker 工坊 guidance**(改前 worker 根本不知道有 `skills/`)。门槛也对:同跑的两个**一次性现查**(TTS、语言榜)**没**留技能笔记。
 - ✅ **知识 vs 技能分流正确**:两个现查的**内容**进了 `facets/`(`topics/tts`、`topics/programming-languages`),不是 `skills/`;`skills/` 收的是**怎么做**(预览视图的流程)。事实归记忆、流程归技能,正是知识模型要的分法。
-- ⚠️ **transient 半未显式标**:`views-preview.md` 有耐用机制 + design notes,但**没明确圈出"哪部分会过期、下次该重核"**(我那条"flag the fast-moving parts"没干净落地)——21↔23 的"重核耦合"这次因此没法验。
+- ⚠️ **transient 半未显式标**:`views-preview.md` 有耐用机制 + design notes,但**没明确圈出"哪部分会过期、下次该重核"**(我那条"flag the fast-moving parts"没干净落地)——22↔24 的"重核耦合"这次因此没法验。
 - ⚠️ **reuse 路径 + reflection 策展未验**:单轮只验了"写";第二次同类活是否**先翻工坊起步**、reflection 是否**策展**(合并 / 修剪 / 补标),要二轮 + 等 reflection 时钟,本次未做。
 
 复核:**技能沉淀的 contribute 路径 = 实测通过(归功新 guidance);reuse + reflection 策展 + transient 标记 = 未验 / 部分缺**,与正文成熟度一致。

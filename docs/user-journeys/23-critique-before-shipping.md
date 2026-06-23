@@ -2,11 +2,11 @@
 
 **Persona:** 同一段集锦活,镜头对准**交付前的自检**。普通用户在等成片。
 **Goal:** worker 把东西交回、agent 把东西上屏**之前**,先**冷眼**看一遍成品——对着现查来的好范例比一比:这是"能用"还是"真好看"?不到位就再来一版,**过线即止**,然后才出手。
-**Preconditions:** 有范例当标尺(连 [21](21-research-before-stale-answer.md) 现查的范例);worker 能真看自己的产物(看片 / 读文件,不是"命令成功了"就算)。**core.md 已有种子:"东西离手前先看它本身;'命令成功'不是'结果对'"([core.md](../../src/reactor/core.md))——本条把它从「对不对」推到「好不好」。** 与 [03](03-feishu-flash-cards.md)(样稿校准的翻车与重做)、[12](12-play-with-child.md)(够精致才上 views/)相连。
+**Preconditions:** 有范例当标尺(连 [22](22-research-before-stale-answer.md) 现查的范例);worker 能真看自己的产物(看片 / 读文件,不是"命令成功了"就算)。**core.md 已有种子:"东西离手前先看它本身;'命令成功'不是'结果对'"([core.md](../../src/reactor/core.md))——本条把它从「对不对」推到「好不好」。** 与 [03](03-feishu-flash-cards.md)(样稿校准的翻车与重做)、[12](12-play-with-child.md)(够精致才上 views/)相连。
 
 ---
 
-研究反射(21)管的是**开工前**别拿陈货;批判反射管的是**收工前**别把 dumb 的交出去。一刀切出来的"能放"初稿——节奏拖、精彩点平、转场土——技术上**成功**了,却**不好看**。差别就在有没有人**冷眼**再看一遍。当前 worker prompt 偏"make the reasonable assumption, keep going, work to completion"([workers.rs](../../src/reactor/workers.rs)),那是冲着**做完**去的,不是**做好**。
+研究反射(22)管的是**开工前**别拿陈货;批判反射管的是**收工前**别把 dumb 的交出去。一刀切出来的"能放"初稿——节奏拖、精彩点平、转场土——技术上**成功**了,却**不好看**。差别就在有没有人**冷眼**再看一遍。当前 worker prompt 偏"make the reasonable assumption, keep going, work to completion"([workers.rs](../../src/reactor/workers.rs)),那是冲着**做完**去的,不是**做好**。
 
 ## Steps & expected UX
 
@@ -22,7 +22,7 @@
 
 ## UX principles this journey establishes
 
-- **交付前冷眼自评,对着好范例打分。** 不是"跑通了吗",是"好看吗、对得上那几个好例子吗"。研究反射在**开工前**铺下范例,批判反射在**收工前**拿它当尺——同一条线的两头(连 [21](21-research-before-stale-answer.md))。
+- **交付前冷眼自评,对着好范例打分。** 不是"跑通了吗",是"好看吗、对得上那几个好例子吗"。研究反射在**开工前**铺下范例,批判反射在**收工前**拿它当尺——同一条线的两头(连 [22](22-research-before-stale-answer.md))。
 - **"能用"不等于"好"。** 把 core.md 现有的**对不对**自检("succeeded≠right")推到**好不好**;这一步直接堵掉"works but dumb"。
 - **过线即止,不是封顶。** 在 worker"做完就走"的偏向前加一道"做好了吗"的闸——但闸是**过线**(够好就停),不是**无限打磨**。
 
@@ -43,7 +43,7 @@ _机制:现有种子——core.md "离手前先看 / succeeded≠right"、[03](0
 
 ## 实测 2026-06-22 · 分支 worktree-acquisition-reflexes(基 origin/main 422d268)
 
-环境同 [21](21-research-before-stale-answer.md);先挂 `/api/out/view` 长轮询当"屏幕在场",再一句 **"show me those top 5 languages as a clean card"**(不点破质量、不引导自评)。Ground truth 取自 build worker(session 787c10da)的 `tool_use` 全序列 + 最终 show_view + 口播。
+环境同 [22](22-research-before-stale-answer.md);先挂 `/api/out/view` 长轮询当"屏幕在场",再一句 **"show me those top 5 languages as a clean card"**(不点破质量、不引导自评)。Ground truth 取自 build worker(session 787c10da)的 `tool_use` 全序列 + 最终 show_view + 口播。
 
 - ✅ **worker 看自己做出来的东西,不止"编过了"**:写完 `top5.jsx` 后,它**真把视图渲染成图**(esbuild 编 + Playwright/Chromium 截图 `preview.png`)、`Read` 那张 png **看实际成品**,发现问题 → `Edit` 修 → 重渲 → 再 `Read` 看一遍,才报回 ref。"离手前看 the thing itself"在 build 路径上真实发生。
 - ✅ **端到端落地**:mind 收到 ref 后 `show_view{ref: lang-rankings/top5}` 上屏,收尾口播 *"There it is — each language in its own brand color, with the TIOBE and Stack Overflow numbers on the right."*——交付的是看过的成品。
