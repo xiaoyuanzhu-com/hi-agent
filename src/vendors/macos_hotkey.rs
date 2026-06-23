@@ -1,20 +1,20 @@
-//! macOS hotkey vendor — a listen-only Quartz event tap that recognizes a
-//! double-tap of the Command key and calls back. The OS trigger behind the "come
-//! and see this" gesture ([`crate::gesture`]).
+//! macOS hotkey vendor — a listen-only Quartz event tap that turns raw Command-key
+//! events into [`Edge`]s and drives a `CFRunLoop`. The OS trigger behind the
+//! Command-key gestures ([`crate::gesture`]).
 //!
 //! A `CGEventTap` observes `FlagsChanged` (modifier transitions, to see Command
-//! press *edges*) and `KeyDown` (to break a pending double-tap on a chord like
-//! ⌘C). The pure recognition lives in [`crate::capabilities::hotkey::DoubleTap`];
-//! this file is the FFI that turns real key events into its inputs and drives a
-//! `CFRunLoop`. The tap is **ListenOnly** — it never consumes events, so the
-//! user's own Command shortcuts are untouched.
+//! press *and* release edges) and `KeyDown` (an `Other` edge, to break a pending
+//! tap / disarm a pending hold on a chord like ⌘C). All recognition — double-tap,
+//! hold, and the hold's threshold timing — lives in [`crate::capabilities::hotkey`]
+//! and [`crate::gesture`]; this file is the FFI that emits edges and runs the loop,
+//! doing no timing of its own. The tap is **ListenOnly** — it never consumes events,
+//! so the user's own Command shortcuts are untouched.
 //!
 //! Creating the tap needs the **Accessibility / Input Monitoring** grant; without
-//! it `CGEventTapCreate` returns null and [`run`] errors, leaving the gesture
+//! it `CGEventTapCreate` returns null and [`run`] errors, leaving the gestures
 //! inert (never fatal). Only compiled on macOS.
 
-use std::cell::{Cell, RefCell};
-use std::time::{Duration, Instant};
+use std::cell::Cell;
 
 use anyhow::anyhow;
 use core_foundation::runloop::{kCFRunLoopCommonModes, CFRunLoop};
@@ -23,20 +23,16 @@ use core_graphics::event::{
     CGEventType,
 };
 
-use crate::capabilities::hotkey::DoubleTap;
+use crate::capabilities::hotkey::Edge;
 
-/// Run the event tap on the **current thread**, calling `on_fire` on each
-/// double-tap of Command. **Blocks forever** — it drives this thread's run loop —
-/// so call it from a thread dedicated to the gesture. Returns `Err` only if the
-/// tap can't be created (missing grant) or its run-loop source can't be made.
-pub fn run(window: Duration, on_fire: impl Fn() + 'static) -> anyhow::Result<()> {
-    // Monotonic clock base + the pure recognizer. Both live for this thread's
-    // life (the run loop below never returns in practice), so the tap callback
-    // may borrow them.
-    let base = Instant::now();
-    let detector = RefCell::new(DoubleTap::new(window));
-    // The Command bit's last observed state, to turn FlagsChanged — which reports
-    // the whole modifier set — into press edges.
+/// Run the event tap on the **current thread**, calling `on_edge` for each raw
+/// Command-key edge. **Blocks forever** — it drives this thread's run loop — so call
+/// it from a thread dedicated to the gesture. Returns `Err` only if the tap can't be
+/// created (missing grant) or its run-loop source can't be made.
+pub fn run(on_edge: impl Fn(Edge) + 'static) -> anyhow::Result<()> {
+    // The Command bit's last observed state, to turn FlagsChanged — which reports the
+    // whole modifier set — into press/release edges. Lives for this thread's life
+    // (the run loop below never returns in practice), so the tap callback may borrow it.
     let cmd_held = Cell::new(false);
 
     let current = CFRunLoop::get_current();
@@ -50,16 +46,14 @@ pub fn run(window: Duration, on_fire: impl Fn() + 'static) -> anyhow::Result<()>
                 CGEventType::FlagsChanged => {
                     let cmd_now = event.get_flags().contains(CGEventFlags::CGEventFlagCommand);
                     let was = cmd_held.replace(cmd_now);
-                    // Act only on a press edge (up→down); releases and other
-                    // modifiers changing are ignored.
+                    // Emit the Command edge; other modifiers changing produce neither.
                     if cmd_now && !was {
-                        let t = base.elapsed().as_millis() as u64;
-                        if detector.borrow_mut().on_command_down(t) {
-                            on_fire();
-                        }
+                        on_edge(Edge::CmdDown);
+                    } else if !cmd_now && was {
+                        on_edge(Edge::CmdUp);
                     }
                 }
-                CGEventType::KeyDown => detector.borrow_mut().on_other_input(),
+                CGEventType::KeyDown => on_edge(Edge::Other),
                 _ => {}
             }
             // ListenOnly: the return is ignored; pass the event through untouched.

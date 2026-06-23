@@ -98,6 +98,12 @@ objc2-app-kit = { version = "0.3", features = [
     "NSImage",
 ] }
 
+# Native microphone capture for the press-and-hold-⌘ attention gesture
+# (`crate::vendors::macos_audio_capture`): opens the default input device and yields
+# the 16 kHz mono 16-bit PCM the audio pipeline expects, so the gesture can listen
+# with no browser page open. Target-gated like the other desktop capabilities.
+cpal = "0.15"
+
 [dev-dependencies]
 # tempfile is used by integration tests for throwaway data dirs.
 tempfile = "3"

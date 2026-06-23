@@ -374,8 +374,50 @@ async fn stream_audio_in(
     stream: Option<String>,
     mut socket: axum::extract::ws::WebSocket,
 ) {
-    // PCM client → STT; Transcripts STT → dispatch. Bounded so a stalled
-    // upstream exerts backpressure rather than buffering unboundedly.
+    // The WS is just one source of PCM frames. Forward its binary frames into the
+    // shared ingest; when the socket closes the sender drops, the ingest sees the
+    // stream end, and it finalizes. A browser mic carries no source tag.
+    let (tx, rx) = mpsc::channel::<Bytes>(64);
+    let pump = tokio::spawn(async move {
+        while let Some(msg) = socket.recv().await {
+            match msg {
+                Ok(WsMessage::Binary(b)) => {
+                    if tx.send(b).await.is_err() {
+                        break;
+                    }
+                }
+                Ok(WsMessage::Close(_)) | Err(_) => break,
+                Ok(_) => {}
+            }
+        }
+    });
+
+    ingest_pcm_stream(state, scene.clone(), stream, None, rx).await;
+    pump.abort();
+    tracing::info!(scene = %scene, "WS /api/in/audio/stream closed");
+}
+
+/// Ingest a stream of raw 16 kHz mono 16-bit PCM frames as live inbound speech,
+/// from any source — the browser mic over a WebSocket ([`stream_audio_in`]) or a
+/// native capture (the press-hold-⌘ attention gesture). Frames flow through the
+/// same path regardless: republished on the inbound-audio broadcast (so
+/// `GET /api/in/audio` plays the live mic), persisted on the wall-clock-minute grid,
+/// fed to streaming STT, segmented into sentences, voiceprint-tagged, and dispatched
+/// on the audio channel. Returns when the `frames` sender drops (the source closed).
+///
+/// `source_tag`, when present, rides the **first** delivered sentence as a context
+/// note (e.g. press-hold attention is headless, screen-aware) using the same `⟨…⟩`
+/// convention as the voiceprint tag — so the mind knows where this speech came from
+/// without any branch downstream. The browser mic passes `None`.
+pub async fn ingest_pcm_stream(
+    state: Arc<AppState>,
+    scene: Scene,
+    stream: Option<String>,
+    source_tag: Option<String>,
+    mut frames: mpsc::Receiver<Bytes>,
+) {
+    // PCM source → STT; Transcripts STT → dispatch. Bounded so a stalled upstream
+    // exerts backpressure rather than buffering unboundedly.
     let (audio_tx, audio_rx) = mpsc::channel::<Bytes>(64);
     let (tr_tx, mut tr_rx) = mpsc::channel::<Transcript>(64);
 
@@ -401,6 +443,7 @@ async fn stream_audio_in(
     let relay_stream = stream.clone();
     let relay_pcm = timeline.clone();
     let relay_names = speaker_names.clone();
+    let relay_tag = source_tag.clone();
     let out_task = tokio::spawn(async move {
         let mut seg = Segmenter::new(Speech::default(), Instant::now());
         let mut ticker = tokio::time::interval(Duration::from_millis(150));
@@ -409,6 +452,8 @@ async fn stream_audio_in(
         // a sentence with — so we mark turn changes, not every line.
         let mut current_speaker: Option<String> = None;
         let mut last_tagged: Option<String> = None;
+        // The source note rides the first sentence only.
+        let mut source_noted = false;
         loop {
             let cuts = tokio::select! {
                 msg = tr_rx.recv() => match msg {
@@ -476,17 +521,29 @@ async fn stream_audio_in(
                     line.push_str(&format!(" ⟨voice: {subject}⟩"));
                     last_tagged = Some(subject);
                 }
+                if let Some(tag) = &relay_tag
+                    && !source_noted
+                {
+                    line.push_str(&format!(" ⟨{tag}⟩"));
+                    source_noted = true;
+                }
                 deliver_transcript(&relay_state, &relay_scene, relay_stream.clone(), &line, None).await;
             }
         }
         // Flush any trailing words as a final sentence when the session ends.
         if let Some(sentence) = seg.flush() {
-            deliver_transcript(&relay_state, &relay_scene, relay_stream.clone(), &sentence, None).await;
+            let mut line = sentence;
+            if let Some(tag) = &relay_tag
+                && !source_noted
+            {
+                line.push_str(&format!(" ⟨{tag}⟩"));
+            }
+            deliver_transcript(&relay_state, &relay_scene, relay_stream.clone(), &line, None).await;
         }
     });
 
-    // One WS connection is one inbound-audio source: its frames carry a shared
-    // `turn` so a `GET /api/in/audio` listener stays bound to this mic alone.
+    // One source is one inbound-audio source: its frames carry a shared `turn` so a
+    // `GET /api/in/audio` listener stays bound to this mic alone.
     let turn = state.audio_in_turn.fetch_add(1, Ordering::Relaxed);
     let mut started = false;
 
@@ -498,60 +555,54 @@ async fn stream_audio_in(
     let mut cap_ts = Utc::now();
     let mut cap_buf: Vec<u8> = Vec::new();
 
-    // Pump inbound PCM until the client closes or the STT session ends (a send
+    // Pump inbound PCM until the source closes or the STT session ends (a send
     // error means `audio_rx` was dropped because `transcribe_streaming` returned).
-    while let Some(msg) = socket.recv().await {
-        match msg {
-            Ok(WsMessage::Binary(b)) => {
-                // Republish the raw PCM for `GET /api/in/audio` listeners. The
-                // `Start` (carrying the format) precedes the first frame.
-                if !started {
-                    started = true;
-                    let _ = state.audio_in.send(AudioInEvent::Start {
-                        scene: Some(scene.clone()),
-                        turn,
-                        mime: PCM_MIME.to_owned(),
-                    });
-                }
-                let _ = state.audio_in.send(AudioInEvent::Frame {
-                    scene: Some(scene.clone()),
-                    turn,
-                    bytes: b.clone(),
-                });
-                // Fold the frame into the current minute's WAV buffer, flushing
-                // the completed minute when the wall clock rolls over.
-                let now = Utc::now();
-                let minute = now.format("%Y-%m-%dT%H:%M").to_string();
-                match &cap_minute {
-                    Some(m) if *m != minute => {
-                        flush_mic_minute(&state, &scene, cap_ts, &cap_buf).await;
-                        cap_buf.clear();
-                        cap_minute = Some(minute);
-                        cap_ts = now;
-                    }
-                    None => {
-                        cap_minute = Some(minute);
-                        cap_ts = now;
-                    }
-                    _ => {}
-                }
-                cap_buf.extend_from_slice(&b);
-                // Feed the voiceprint timeline (same raw 16 kHz mono PCM). Push the
-                // samples actually decoded (le_i16 drops a trailing odd byte, so a
-                // byte-derived clock would drift), then prune audio the out task has
-                // already consumed — bounded so a stalled diarized pass can't grow it.
-                if vp_on {
-                    let samples = pcm::le_i16(&b);
-                    let mut tl = timeline.lock().unwrap();
-                    tl.push(&samples);
-                    tl.prune(VP_PRUNE_MARGIN_SAMPLES, VP_RETAIN_CEILING_SAMPLES);
-                }
-                if audio_tx.send(b).await.is_err() {
-                    break;
-                }
+    while let Some(b) = frames.recv().await {
+        // Republish the raw PCM for `GET /api/in/audio` listeners. The `Start`
+        // (carrying the format) precedes the first frame.
+        if !started {
+            started = true;
+            let _ = state.audio_in.send(AudioInEvent::Start {
+                scene: Some(scene.clone()),
+                turn,
+                mime: PCM_MIME.to_owned(),
+            });
+        }
+        let _ = state.audio_in.send(AudioInEvent::Frame {
+            scene: Some(scene.clone()),
+            turn,
+            bytes: b.clone(),
+        });
+        // Fold the frame into the current minute's WAV buffer, flushing the
+        // completed minute when the wall clock rolls over.
+        let now = Utc::now();
+        let minute = now.format("%Y-%m-%dT%H:%M").to_string();
+        match &cap_minute {
+            Some(m) if *m != minute => {
+                flush_mic_minute(&state, &scene, cap_ts, &cap_buf).await;
+                cap_buf.clear();
+                cap_minute = Some(minute);
+                cap_ts = now;
             }
-            Ok(WsMessage::Close(_)) | Err(_) => break,
-            Ok(_) => {}
+            None => {
+                cap_minute = Some(minute);
+                cap_ts = now;
+            }
+            _ => {}
+        }
+        cap_buf.extend_from_slice(&b);
+        // Feed the voiceprint timeline (same raw 16 kHz mono PCM). Push the samples
+        // actually decoded (le_i16 drops a trailing odd byte, so a byte-derived
+        // clock would drift), then prune audio the out task has already consumed —
+        // bounded so a stalled diarized pass can't grow it.
+        if vp_on {
+            let samples = pcm::le_i16(&b);
+            let mut tl = timeline.lock().unwrap();
+            tl.push(&samples);
+            tl.prune(VP_PRUNE_MARGIN_SAMPLES, VP_RETAIN_CEILING_SAMPLES);
+        }
+        if audio_tx.send(b).await.is_err() {
+            break;
         }
     }
 
@@ -567,12 +618,11 @@ async fn stream_audio_in(
     // Closing the audio side lets the STT session flush its last utterance.
     drop(audio_tx);
     match tokio::time::timeout(Duration::from_secs(5), stt_task).await {
-        Ok(Ok(Err(err))) => tracing::warn!(scene = %scene, error = %err, "audio stream STT ended"),
-        Err(_) => tracing::warn!(scene = %scene, "audio stream STT did not finalize in time"),
+        Ok(Ok(Err(err))) => tracing::warn!(scene = %scene, error = %err, "audio ingest STT ended"),
+        Err(_) => tracing::warn!(scene = %scene, "audio ingest STT did not finalize in time"),
         _ => {}
     }
     out_task.abort();
-    tracing::info!(scene = %scene, "WS /api/in/audio/stream closed");
 }
 
 /// Deliver one finalized transcript on the **audio** channel — journal it, echo
