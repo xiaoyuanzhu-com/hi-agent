@@ -359,6 +359,7 @@ pub fn build(
     tool_registry: ToolRegistry,
     interrupts: InterruptRegistry,
     presence: crate::body::presence::Presence,
+    auth: Option<Arc<crate::foundation::auth::AuthState>>,
 ) -> (Router, ServerSeams) {
     let (inbound_tx, inbound_rx) = mpsc::channel::<Signal>(1024);
     // Scene warm-up requests: a presence GET asks the reactor to stand a scene up
@@ -469,8 +470,17 @@ pub fn build(
         .route("/views/{*path}", get(generated::views_file))
         .with_state(state.clone())
         .merge(crate::appearance::router())
-        .fallback(not_found)
-        .layer(TraceLayer::new_for_http());
+        .fallback(not_found);
+
+    // Gate the browser-facing routes behind the OIDC login when auth is enabled.
+    // Applied beneath `TraceLayer` (so auth outcomes are still traced); a disabled
+    // instance is byte-for-byte the historical router. The gate itself leaves the
+    // machine/token carriers (`/mcp`, phone-upload) public — see `auth::is_public`.
+    let router = match auth {
+        Some(auth) => crate::foundation::auth::apply(router, auth),
+        None => router,
+    };
+    let router = router.layer(TraceLayer::new_for_http());
 
     let seams = ServerSeams {
         inbound_rx,

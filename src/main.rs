@@ -119,6 +119,9 @@ fn main() -> anyhow::Result<()> {
     }
 
     let agent = hi_agent::foundation::config::AgentConfig::load()?;
+    // Auth gate config (HI_AGENT_AUTH + OIDC/owner vars). Off by default; when
+    // enabled, a missing OIDC var is a hard startup error (fail closed).
+    let auth = hi_agent::foundation::auth::AuthConfig::from_env()?;
     // Read on every platform (so the flag is never dead code); only consulted on
     // macOS, where it selects the headless/server-owns-main-thread path.
     let no_tray = cli.no_tray;
@@ -126,6 +129,7 @@ fn main() -> anyhow::Result<()> {
         port: cli.port,
         data_dir,
         agent,
+        auth,
     };
 
     // On macOS the default install shape is a desktop app: AppKit owns the main

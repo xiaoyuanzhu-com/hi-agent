@@ -3,7 +3,12 @@ import { createRoot } from "react-dom/client";
 import { App } from "./App";
 import { Inspect } from "./inspect/Inspect";
 import { usePath } from "./inspect/router";
+import { installAuthGate } from "./lib/authGate";
 import "./ui/global.css";
+
+// If the login gate is on, a 401 (session expired) bounces the tab to sign-in.
+// No-op when auth is disabled.
+installAuthGate();
 
 const rootEl = document.getElementById("root");
 if (!rootEl) {

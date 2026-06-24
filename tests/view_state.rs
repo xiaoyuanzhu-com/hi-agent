@@ -26,6 +26,7 @@ async fn spawn_server_at(dir: &Path) -> (String, ServerSeams) {
         hi_agent::body::reactor::ToolRegistry::new(),
         hi_agent::body::reactor::InterruptRegistry::new(),
         hi_agent::body::presence::Presence::new(),
+        None,
     );
 
     let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");

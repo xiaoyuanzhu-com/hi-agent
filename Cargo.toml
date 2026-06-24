@@ -50,6 +50,17 @@ qrcode = { version = "0.14", default-features = false, features = ["svg"] }
 
 directories = "5"
 
+# Browser login gate (optional; only active with HI_AGENT_AUTH=on). hi-agent is
+# an OIDC relying party to an external IdP — in the intended deployment, the
+# Authentik at xiaoyuanzhu.com, whose login screen fronts the WeChat QR scan.
+# `openidconnect` does discovery + authorization-code exchange + ID-token (JWT)
+# verification; `axum-extra`'s PrivateCookieJar holds the AEAD-encrypted session
+# cookie; `time` is the `cookie` crate's duration type, named here for max-age.
+# rustls only (no native-tls/openssl), matching the rest of the tree.
+openidconnect = { version = "4", default-features = false, features = ["reqwest", "rustls-tls"] }
+axum-extra = { version = "0.10", features = ["cookie", "cookie-private"] }
+time = "0.3"
+
 # Local ONNX capabilities (voiceprint, face): on-device inference, no network.
 # `ort` is the ONNX Runtime; its default `download-binaries` feature fetches the
 # native onnxruntime, so no system install is needed (consistent with the

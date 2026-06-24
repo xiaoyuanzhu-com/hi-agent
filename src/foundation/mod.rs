@@ -20,6 +20,7 @@
 
 pub mod acp;
 pub mod agent;
+pub mod auth;
 pub mod channel_log;
 pub mod config;
 pub mod llm_proxy;

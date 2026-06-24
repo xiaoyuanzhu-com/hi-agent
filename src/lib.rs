@@ -24,6 +24,7 @@ pub struct Config {
     pub port: u16,
     pub data_dir: PathBuf,
     pub agent: foundation::config::AgentConfig,
+    pub auth: foundation::auth::AuthConfig,
 }
 
 /// Absolutize `dir` against the current working directory (if relative) and
@@ -155,6 +156,12 @@ async fn run_with_shutdown(config: Config, shutdown: Arc<Notify>) -> anyhow::Res
     // each turn as human-model facts ("no screen is attached").
     let presence = body::presence::Presence::new();
 
+    // Build the auth gate (None when HI_AGENT_AUTH is off — the historical
+    // wide-open server). Fallible: it generates/reads the cookie key under
+    // <data_dir>/auth/, so a bad key file surfaces here rather than mid-request.
+    let auth_state = foundation::auth::AuthState::from_config(config.auth.clone(), &config.data_dir)
+        .context("initializing auth gate")?;
+
     let (router, seams) = foundation::server::build(
         memory.clone(),
         config.data_dir.clone(),
@@ -163,6 +170,7 @@ async fn run_with_shutdown(config: Config, shutdown: Arc<Notify>) -> anyhow::Res
         tool_registry.clone(),
         interrupts.clone(),
         presence.clone(),
+        auth_state,
     );
 
     // Resolve the runtime: prefer system tools on PATH, else install on first run.
