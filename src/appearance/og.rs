@@ -16,7 +16,7 @@ impl OgTags {
     /// and feed it to `render`.
     pub fn default_for_agent() -> Self {
         Self {
-            title: "hi-agent".to_string(),
+            title: "Hi Agent".to_string(),
             description:
                 "A reference implementation of the human-interface spec.".to_string(),
             image: None,
@@ -45,7 +45,7 @@ pub fn render(tags: &OgTags) -> String {
     push_meta(&mut out, "og:type", "website");
     push_meta(&mut out, "og:title", &tags.title);
     push_meta(&mut out, "og:description", &tags.description);
-    push_meta(&mut out, "og:site_name", "hi-agent");
+    push_meta(&mut out, "og:site_name", "Hi Agent");
     if let Some(url) = &tags.url {
         push_meta(&mut out, "og:url", url);
     }
@@ -102,7 +102,7 @@ mod tests {
         let tags = OgTags::default_for_agent();
         let html = render(&tags);
         assert!(html.contains("og:title"));
-        assert!(html.contains("hi-agent"));
+        assert!(html.contains("Hi Agent"));
         assert!(html.contains("twitter:card"));
     }
 

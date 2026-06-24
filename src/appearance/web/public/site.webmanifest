@@ -1,5 +1,5 @@
 {
-  "name": "hi-agent",
+  "name": "Hi Agent",
   "short_name": "hi",
   "icons": [
     { "src": "/android-chrome-192x192.png", "sizes": "192x192", "type": "image/png", "purpose": "any maskable" },

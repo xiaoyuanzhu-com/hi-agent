@@ -230,7 +230,7 @@ pub fn run(url: String, shutdown: Arc<Notify>) -> anyhow::Result<()> {
         // *template* image (the menu bar auto-tints it for light/dark); fall back
         // to a short title if the embedded PNG ever fails to decode.
         if let Some(button) = status_item.button(mtm) {
-            let desc = NSString::from_str("hi-agent");
+            let desc = NSString::from_str("Hi Agent");
             let idle = {
                 let data = NSData::with_bytes(include_bytes!("assets/tray-hi.png"));
                 NSImage::initWithData(NSImage::alloc(), &data)
@@ -267,7 +267,7 @@ pub fn run(url: String, shutdown: Arc<Notify>) -> anyhow::Result<()> {
 
         let open_item = NSMenuItem::initWithTitle_action_keyEquivalent(
             NSMenuItem::alloc(mtm),
-            &NSString::from_str("Open hi-agent"),
+            &NSString::from_str("Open Hi Agent"),
             Some(sel!(open:)),
             &NSString::from_str(""),
         );
@@ -278,7 +278,7 @@ pub fn run(url: String, shutdown: Arc<Notify>) -> anyhow::Result<()> {
 
         let quit_item = NSMenuItem::initWithTitle_action_keyEquivalent(
             NSMenuItem::alloc(mtm),
-            &NSString::from_str("Quit hi-agent"),
+            &NSString::from_str("Quit Hi Agent"),
             Some(sel!(quit:)),
             &NSString::from_str("q"),
         );

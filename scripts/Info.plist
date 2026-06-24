@@ -2,8 +2,8 @@
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0">
 <dict>
-    <key>CFBundleName</key><string>hi-agent</string>
-    <key>CFBundleDisplayName</key><string>hi-agent</string>
+    <key>CFBundleName</key><string>Hi Agent</string>
+    <key>CFBundleDisplayName</key><string>Hi Agent</string>
     <key>CFBundleIdentifier</key><string>dev.human-interface.hi-agent</string>
     <key>CFBundleExecutable</key><string>hi-agent</string>
     <key>CFBundleIconFile</key><string>AppIcon</string>
@@ -15,8 +15,8 @@
     <!-- Menu-bar (status item) app, no Dock icon — matches run_with_tray. -->
     <key>LSUIElement</key><true/>
     <key>NSMicrophoneUsageDescription</key>
-    <string>hi-agent listens when you hold the attention gesture so it can hear you.</string>
+    <string>Hi Agent listens when you hold the attention gesture so it can hear you.</string>
     <key>NSCameraUsageDescription</key>
-    <string>hi-agent uses the camera to recognize who it is talking with.</string>
+    <string>Hi Agent uses the camera to recognize who it is talking with.</string>
 </dict>
 </plist>

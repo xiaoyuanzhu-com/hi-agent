@@ -117,7 +117,7 @@ rm -rf "$DMGROOT" "$DMG"
 mkdir -p "$DMGROOT"
 cp -R "$APP" "$DMGROOT/"
 ln -s /Applications "$DMGROOT/Applications"
-hdiutil create -volname "hi-agent" -srcfolder "$DMGROOT" -ov -format UDZO "$DMG" >/dev/null
+hdiutil create -volname "Hi Agent" -srcfolder "$DMGROOT" -ov -format UDZO "$DMG" >/dev/null
 rm -rf "$DMGROOT"
 
 if $notarize; then

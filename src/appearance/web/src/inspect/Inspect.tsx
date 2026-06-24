@@ -36,7 +36,7 @@ export function Inspect() {
   return (
     <div className="inspect">
       <header className="inspect-bar">
-        <h1>hi-agent <span className="muted">inspect</span></h1>
+        <h1>Hi Agent <span className="muted">inspect</span></h1>
         <nav className="tabs">
           {TABS.map((t) => (
             <button
