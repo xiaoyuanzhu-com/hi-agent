@@ -21,7 +21,6 @@ use crate::body::reactor::{InterruptRegistry, OutboundSignal, ToolRegistry};
 use crate::types::{Channel, Scene, Signal, ViewEnvelope};
 
 pub mod acp;
-pub mod attention;
 pub mod audio;
 pub mod binder;
 pub mod channels;
@@ -286,13 +285,6 @@ pub struct AppState {
     /// so the channel inspector can observe outbound text live.
     pub output_echo: broadcast::Sender<OutputEcho>,
 
-    /// Attention overlay broadcast — the events that animate the native menu-bar
-    /// overlay (the ⌘ gestures' visual feedback). The gesture layer publishes
-    /// glance/listen-start/transcript/reply/listen-stop here; the overlay's
-    /// `WKWebView` subscribes via `GET /api/out/attention`. Desktop-singleton,
-    /// not scene-scoped. Presence, lossy, no replay (see [`attention::AttentionEvent`]).
-    pub attention_out: broadcast::Sender<attention::AttentionEvent>,
-
     /// Memory substrate — journal. Cloneable handle.
     pub memory: Memory,
 
@@ -353,14 +345,6 @@ impl AppState {
     pub fn warm_scene(&self, scene: &Scene) {
         let _ = self.warm.try_send(scene.clone());
     }
-
-    /// Publish one attention-overlay event to its `WKWebView` subscriber(s).
-    /// Best-effort and non-blocking: with no overlay connected the send is simply
-    /// dropped (no replay), matching the live-presence semantics of the other
-    /// outbound broadcasts.
-    pub fn emit_attention(&self, event: attention::AttentionEvent) {
-        let _ = self.attention_out.send(event);
-    }
 }
 
 /// Max body for a handed-file upload. Generous enough for photos/scans/PDFs;
@@ -395,9 +379,6 @@ pub fn build(
     let (input_echo_tx, _) = broadcast::channel::<InputEcho>(64);
     // Output text echo: the binder's non-draining mirror (see `OutputEcho`).
     let (output_echo_tx, _) = broadcast::channel::<OutputEcho>(64);
-    // Attention overlay: the ⌘ gestures' visual-feedback events. Lossy, no
-    // replay (see `attention::AttentionEvent`).
-    let (attention_tx, _) = broadcast::channel::<attention::AttentionEvent>(64);
 
     // The reactor's single transport-free outbound seam. A binder task fans each
     // `OutboundSignal` out to the HTTP-shaped carriers above — assigning
@@ -427,7 +408,6 @@ pub fn build(
         video_in_live: Mutex::new(HashMap::new()),
         input_echo: input_echo_tx.clone(),
         output_echo: output_echo_tx.clone(),
-        attention_out: attention_tx.clone(),
         memory,
         observatory,
         acp_tap,
@@ -448,9 +428,6 @@ pub fn build(
         .route("/api/in/audio", post(audio::post_audio).get(audio::get_in_audio))
         .route("/api/in/audio/stream", get(audio::get_audio_stream))
         .route("/api/out/audio", get(audio::get_out_audio))
-        // The attention overlay's event feed — the ⌘ gestures' visual feedback,
-        // streamed as NDJSON to the native menu-bar overlay's WKWebView.
-        .route("/api/out/attention", get(attention::get_out_attention))
         // The view channel — a scene's retained appearance, served as versioned
         // whole-state snapshots (long-poll on `?since=`).
         .route("/api/out/view", get(view::get_out_view).delete(view::clear_out_view))

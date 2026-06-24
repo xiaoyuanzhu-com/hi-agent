@@ -89,6 +89,9 @@ struct BlinkIvars {
     active: Retained<NSImage>,
     lit: Cell<bool>,
     remaining: Cell<u32>,
+    /// While true (⌘ held for press-hold attention), the icon stays at its full
+    /// colour and the glance pulse settles to colour instead of the resting mark.
+    holding: Cell<bool>,
 }
 
 define_class!(
@@ -131,8 +134,10 @@ define_class!(
             let iv = self.ivars();
             let r = iv.remaining.get();
             if r == 0 {
-                iv.button.setImage(Some(&iv.idle));
-                iv.lit.set(false);
+                // Settle: hold at full colour while listening, else the resting mark.
+                let holding = iv.holding.get();
+                iv.button.setImage(Some(if holding { &iv.active } else { &iv.idle }));
+                iv.lit.set(holding);
                 return;
             }
             let now_lit = !iv.lit.get();
@@ -140,6 +145,44 @@ define_class!(
             iv.button.setImage(Some(if now_lit { &iv.active } else { &iv.idle }));
             iv.remaining.set(r - 1);
             self.schedule_step();
+        }
+
+        /// Enter the sustained "listening" state: the icon holds at its full
+        /// colour for as long as ⌘ is held (the press-hold attention gesture).
+        /// Cancels any in-flight glance pulse.
+        #[unsafe(method(listenOn:))]
+        fn listen_on(&self, _arg: Option<&AnyObject>) {
+            let iv = self.ivars();
+            unsafe {
+                let _: () = msg_send![
+                    Self::class(),
+                    cancelPreviousPerformRequestsWithTarget: self,
+                    selector: sel!(step:),
+                    object: core::ptr::null_mut::<AnyObject>()
+                ];
+            }
+            iv.holding.set(true);
+            iv.lit.set(true);
+            iv.remaining.set(0);
+            iv.button.setImage(Some(&iv.active));
+        }
+
+        /// Leave the listening state: settle back to the resting icon.
+        #[unsafe(method(listenOff:))]
+        fn listen_off(&self, _arg: Option<&AnyObject>) {
+            let iv = self.ivars();
+            unsafe {
+                let _: () = msg_send![
+                    Self::class(),
+                    cancelPreviousPerformRequestsWithTarget: self,
+                    selector: sel!(step:),
+                    object: core::ptr::null_mut::<AnyObject>()
+                ];
+            }
+            iv.holding.set(false);
+            iv.lit.set(false);
+            iv.remaining.set(0);
+            iv.button.setImage(Some(&iv.idle));
         }
     }
 );
@@ -157,6 +200,7 @@ impl Blinker {
             active,
             lit: Cell::new(false),
             remaining: Cell::new(0),
+            holding: Cell::new(false),
         });
         unsafe { msg_send![super(this), init] }
     }
@@ -205,6 +249,27 @@ pub fn flash() {
     }
 }
 
+/// Enter (`true`) or leave (`false`) the sustained "listening" tray state for the
+/// press-hold attention gesture — the icon holds at its full colour while ⌘ is
+/// held, then settles back. Safe to call from any thread; a no-op until the status
+/// item is up (headless / before the tray loads).
+pub fn set_listening(on: bool) {
+    let Some(blinker) = BLINKER.get() else { return };
+    // SAFETY: same contract as `flash` — `blinker.0` is the leaked, process-lived
+    // Blinker, messaged only via `performSelectorOnMainThread:` (callable from any
+    // thread), which hops the toggle onto the main run loop.
+    unsafe {
+        let obj: &Blinker = &*blinker.0;
+        let sel = if on { sel!(listenOn:) } else { sel!(listenOff:) };
+        let _: () = msg_send![
+            obj,
+            performSelectorOnMainThread: sel,
+            withObject: core::ptr::null_mut::<AnyObject>(),
+            waitUntilDone: false
+        ];
+    }
+}
+
 /// Build the status item + menu and run the AppKit loop on the current (main)
 /// thread. **Blocks for the process lifetime.** Errors only if we are not on the
 /// main thread; a missing window-server session surfaces as the item simply not
@@ -216,11 +281,6 @@ pub fn run(url: String, shutdown: Arc<Notify>) -> anyhow::Result<()> {
     let app = NSApplication::sharedApplication(mtm);
     // Accessory: live in the menu bar only — no Dock icon, no app menu.
     app.setActivationPolicy(NSApplicationActivationPolicy::Accessory);
-
-    // Stand up the ⌘-attention overlay on this same main thread before the AppKit
-    // loop runs. Best-effort: it falls back to no overlay when there's no window
-    // server, just like the status item below. Borrows `url` before it moves.
-    super::macos_overlay::install(mtm, &url);
 
     let target = TrayTarget::new(mtm, url, shutdown);
 
@@ -235,7 +295,6 @@ pub fn run(url: String, shutdown: Arc<Notify>) -> anyhow::Result<()> {
         // *template* image (the menu bar auto-tints it for light/dark); fall back
         // to a short title if the embedded PNG ever fails to decode.
         if let Some(button) = status_item.button(mtm) {
-            let desc = NSString::from_str("Hi Agent");
             let idle = {
                 let data = NSData::with_bytes(include_bytes!("assets/tray-hi.png"));
                 NSImage::initWithData(NSImage::alloc(), &data)
@@ -248,15 +307,23 @@ pub fn run(url: String, shutdown: Arc<Notify>) -> anyhow::Result<()> {
                         height: 18.0,
                     });
                     button.setImage(Some(&idle));
-                    // The "looking" frame of the come-and-see ack pulse: the hi mark
-                    // briefly morphs to an eye and back. Falls back to the resting
-                    // mark if the symbol is missing, so the pulse still runs.
-                    let active = NSImage::imageWithSystemSymbolName_accessibilityDescription(
-                        &NSString::from_str("eye"),
-                        Some(&desc),
-                    )
+                    // The "lit" frame of the gesture ack: the hi mark briefly
+                    // blooms to its full colour (red "h" + blue "i") and blinks
+                    // back to the resting template — the menu-bar echo of the
+                    // double-tap glance. Falls back to the resting mark if the
+                    // colour PNG ever fails to decode, so the pulse still runs.
+                    let active = {
+                        let data = NSData::with_bytes(include_bytes!("assets/tray-hi-color.png"));
+                        NSImage::initWithData(NSImage::alloc(), &data)
+                    }
                     .unwrap_or_else(|| idle.clone());
-                    active.setTemplate(true);
+                    // Colourful, NOT a template — keep the red/blue (a template
+                    // would be flattened to a single menu-bar tint).
+                    active.setTemplate(false);
+                    active.setSize(NSSize {
+                        width: 18.0,
+                        height: 18.0,
+                    });
                     // Build the blinker, leak it (lives as long as the menu bar), and
                     // publish a pointer so the gesture can pulse it from its thread.
                     let blinker = Blinker::new(mtm, button, idle, active);

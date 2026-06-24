@@ -24,8 +24,6 @@ pub mod macos_hotkey;
 #[cfg(target_os = "macos")]
 pub mod macos_input;
 #[cfg(target_os = "macos")]
-pub mod macos_overlay;
-#[cfg(target_os = "macos")]
 pub mod macos_screencast;
 #[cfg(target_os = "macos")]
 pub mod macos_tray;

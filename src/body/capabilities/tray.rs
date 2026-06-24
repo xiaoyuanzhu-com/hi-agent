@@ -51,3 +51,14 @@ pub fn flash() {
     #[cfg(target_os = "macos")]
     crate::foundation::vendors::macos_tray::flash();
 }
+
+/// Enter (`true`) / leave (`false`) the sustained "listening" tray state — the
+/// menu-bar icon holds at its full colour while the user holds ⌘ for the
+/// press-hold attention gesture ([`crate::body::gesture`]), then settles back.
+/// Best-effort: a no-op off macOS or before the status item is up.
+pub fn set_listening(on: bool) {
+    #[cfg(target_os = "macos")]
+    crate::foundation::vendors::macos_tray::set_listening(on);
+    #[cfg(not(target_os = "macos"))]
+    let _ = on;
+}
