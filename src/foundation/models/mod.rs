@@ -156,6 +156,26 @@ pub async fn ensure_into(dir: &Path, spec: &ModelSpec) -> anyhow::Result<PathBuf
     Ok(path)
 }
 
+/// Provision `spec`'s model into `dir` for a packaged `.app`, reusing the shared
+/// content-addressed model cache so a repeat `make dmg` (or a prior dev run)
+/// downloads nothing. Resolves the model in the OS cache — downloading + verifying
+/// only on a miss — then copies it into `dir` under the same digest-addressed name
+/// [`ensure`] looks for, so the bundled file is byte-identical to a cached one.
+pub async fn provision_into(dir: &Path, spec: &ModelSpec) -> anyhow::Result<()> {
+    let cached = ensure_into(&models_dir()?, spec).await?;
+    tokio::fs::create_dir_all(dir)
+        .await
+        .with_context(|| format!("creating {}", dir.display()))?;
+    let name = cached
+        .file_name()
+        .ok_or_else(|| anyhow!("cached model path {} has no file name", cached.display()))?;
+    let dest = dir.join(name);
+    tokio::fs::copy(&cached, &dest)
+        .await
+        .with_context(|| format!("copying {} -> {}", cached.display(), dest.display()))?;
+    Ok(())
+}
+
 /// Download `spec` to `tmp`, streaming to disk while computing the SHA-256, and
 /// fail if the final length or digest disagrees with the pin (so `tmp` is never
 /// trusted on a mismatch — the caller removes it).

@@ -316,14 +316,51 @@ fn runtime_fingerprint() -> String {
 }
 
 /// Provision a complete managed runtime into `dir` — used at package time to
-/// populate a `.app`'s `Contents/Resources/runtime`. Unlike [`ensure`], this
-/// **always** performs the managed download (Node + `npm ci` of the adapter +
-/// `claude`); it never short-circuits to a system runtime on `PATH`, because the
+/// populate a `.app`'s `Contents/Resources/runtime`. Reuses the same fingerprinted
+/// cache as [`ensure`]'s auto-install tier, so a repeat `make dmg` (or a prior
+/// `make dev`) downloads nothing; only a cold cache pays the Node + `npm ci` cost.
+/// Unlike [`ensure`] it never short-circuits to a system runtime on `PATH` — the
 /// packaging host (a dev Mac with node/claude installed) would otherwise stage
-/// nothing. Writes a `.complete` marker so the shipped app's [`ensure`] picks it
-/// up as the bundled tier.
+/// nothing. The bundle gets a *copy* of the cache, not a link: `make dmg` codesigns
+/// the bundle's Mach-O in place, which must never reach back into the shared cache.
 pub async fn provision_into(dir: &Path) -> anyhow::Result<()> {
-    install(dir).await.map(|_| ())
+    let cache = runtime_dir()?;
+    if cache.join(".complete").exists() {
+        tracing::debug!(path = %cache.display(), "reusing cached runtime for the bundle");
+    } else {
+        install(&cache).await?;
+    }
+    copy_tree(&cache, dir)
+        .await
+        .with_context(|| format!("copying the cached runtime into {}", dir.display()))?;
+    if !dir.join(".complete").exists() {
+        bail!("runtime copied to {} but its .complete marker is missing", dir.display());
+    }
+    Ok(())
+}
+
+/// Recursively copy `src` to `dst` via the system `cp -Rp`, preserving symlinks
+/// (npm's `.bin/*`) and the execute bits on `node`/`claude`. `dst` is removed first
+/// so `cp` creates it as an exact copy rather than nesting `src` inside an existing
+/// dir. Used to stamp a bundle's runtime from the shared cache.
+async fn copy_tree(src: &Path, dst: &Path) -> anyhow::Result<()> {
+    let _ = tokio::fs::remove_dir_all(dst).await;
+    if let Some(parent) = dst.parent() {
+        tokio::fs::create_dir_all(parent)
+            .await
+            .with_context(|| format!("creating {}", parent.display()))?;
+    }
+    let status = Command::new("cp")
+        .arg("-Rp")
+        .arg(src)
+        .arg(dst)
+        .status()
+        .await
+        .context("running `cp` to copy the cached runtime (is `cp` present?)")?;
+    if !status.success() {
+        bail!("`cp -Rp {} {}` failed", src.display(), dst.display());
+    }
+    Ok(())
 }
 
 /// Install the pinned Node + adapter into `target`. Builds in a sibling temp dir

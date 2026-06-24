@@ -59,10 +59,11 @@ fn default_data_dir() -> PathBuf {
     PathBuf::from("./data")
 }
 
-/// Package-time: download + lay out the full managed runtime, the three
-/// recognition models, and the static ffmpeg under `into` (a `.app`'s
-/// `Contents/Resources`), so the shipped app runs hermetically. Each provisioner
-/// targets its own subdir, matching where the runtime resolvers look at launch.
+/// Package-time: lay out the full managed runtime, the three recognition models,
+/// and the static ffmpeg under `into` (a `.app`'s `Contents/Resources`), so the
+/// shipped app runs hermetically. Each provisioner targets its own subdir, matching
+/// where the runtime resolvers look at launch, and reuses a shared content-addressed
+/// cache — so a repeat `make dmg` (or a prior `make dev`) downloads nothing.
 async fn provision(into: PathBuf) -> anyhow::Result<()> {
     hi_agent::runtime::provision_into(&into.join("runtime"))
         .await
@@ -72,7 +73,7 @@ async fn provision(into: PathBuf) -> anyhow::Result<()> {
         &hi_agent::foundation::models::SCRFD,
         &hi_agent::foundation::models::ARCFACE,
     ] {
-        hi_agent::foundation::models::ensure_into(&into.join("models"), spec)
+        hi_agent::foundation::models::provision_into(&into.join("models"), spec)
             .await
             .with_context(|| format!("provisioning model {}", spec.name))?;
     }

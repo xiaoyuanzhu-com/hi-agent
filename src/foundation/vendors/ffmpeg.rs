@@ -64,12 +64,13 @@ pub fn bundled_bin() -> Option<PathBuf> {
     p.is_file().then_some(p)
 }
 
-/// Provision the pinned static ffmpeg into `<dir>/ffmpeg` (binary named `ffmpeg`,
-/// made executable), plus its `LICENSE` beside it. Used at package time to fill a
-/// `.app`'s `Contents/Resources/ffmpeg`. Verifies size + SHA-256 before
-/// publishing via temp-then-rename, so an interrupted run never leaves a partial
-/// binary. Errors if the host target has no pin (so packaging fails loudly rather
-/// than silently shipping a model-less, ffmpeg-less app).
+/// Provision the pinned static ffmpeg into `<dir>/ffmpeg` (made executable) plus
+/// its `LICENSE`, for a packaged `.app`'s `Contents/Resources/ffmpeg`. The binary
+/// is resolved through a content-addressed cache (keyed by tag + SHA-256), so a
+/// repeat `make dmg` reuses it and downloads nothing; the bundle gets a *copy*, so
+/// codesigning it in place never touches the shared cache. Verifies size + SHA-256
+/// before the cache is trusted. Errors if the host target has no pin (so packaging
+/// fails loudly rather than silently shipping an ffmpeg-less app).
 pub async fn provision_into(dir: &Path) -> anyhow::Result<()> {
     let pin = pin().ok_or_else(|| {
         anyhow!(
@@ -79,43 +80,85 @@ pub async fn provision_into(dir: &Path) -> anyhow::Result<()> {
         )
     })?;
 
+    let cached = ensure_cached(&pin).await?;
+
     tokio::fs::create_dir_all(dir)
         .await
         .with_context(|| format!("creating {}", dir.display()))?;
-
     let bin = dir.join("ffmpeg");
-    if let Ok(meta) = tokio::fs::metadata(&bin).await {
-        if meta.len() == pin.size {
-            return Ok(()); // already provisioned (size matches the pin)
-        }
-        let _ = tokio::fs::remove_file(&bin).await;
-    }
-
-    hint(&format!("downloading static ffmpeg {RELEASE_TAG} (~{} MB)…", pin.size / 1_000_000));
-
-    let tmp = dir.join(format!(".ffmpeg.tmp.{}", std::process::id()));
-    if let Err(e) = crate::net::with_retries("ffmpeg", || download_verify(&pin, &tmp)).await {
-        let _ = tokio::fs::remove_file(&tmp).await;
-        return Err(e);
-    }
-    make_executable(&tmp).await?;
-
-    tokio::fs::rename(&tmp, &bin)
+    tokio::fs::copy(&cached.bin, &bin)
         .await
-        .with_context(|| format!("publishing ffmpeg to {}", bin.display()))?;
-
-    // License text beside the binary — best-effort (distribution hygiene, not a
-    // gate): a missing/changed asset must not fail the bundle.
-    if let Ok(resp) = crate::net::http_client().get(pin.license_url).send().await {
-        if let Ok(resp) = resp.error_for_status() {
-            if let Ok(bytes) = resp.bytes().await {
-                let _ = tokio::fs::write(dir.join("LICENSE"), &bytes).await;
-            }
-        }
+        .with_context(|| format!("copying ffmpeg into {}", bin.display()))?;
+    make_executable(&bin).await?;
+    if let Some(license) = &cached.license {
+        let _ = tokio::fs::copy(license, dir.join("LICENSE")).await;
     }
 
     tracing::info!(path = %bin.display(), "static ffmpeg ready");
     Ok(())
+}
+
+/// A static ffmpeg in the content-addressed cache: the verified binary and, when
+/// present, its upstream license text (best-effort, so it may be absent).
+struct CachedFfmpeg {
+    bin: PathBuf,
+    license: Option<PathBuf>,
+}
+
+/// Ensure the pinned ffmpeg (and, best-effort, its `LICENSE`) exist in a
+/// content-addressed cache dir, downloading + verifying only on a miss, and return
+/// their paths. Reused across `make dmg` runs so the binary is fetched at most once
+/// per pin per machine. Publishes via temp-then-rename so an interrupted run never
+/// leaves a partial binary in the cache.
+async fn ensure_cached(pin: &FfmpegPin) -> anyhow::Result<CachedFfmpeg> {
+    let dir = cache_dir(pin)?;
+    tokio::fs::create_dir_all(&dir)
+        .await
+        .with_context(|| format!("creating {}", dir.display()))?;
+    let bin = dir.join("ffmpeg");
+    let license = dir.join("LICENSE");
+
+    let fresh = matches!(tokio::fs::metadata(&bin).await, Ok(m) if m.len() == pin.size);
+    if !fresh {
+        let _ = tokio::fs::remove_file(&bin).await;
+        hint(&format!("downloading static ffmpeg {RELEASE_TAG} (~{} MB)…", pin.size / 1_000_000));
+        let tmp = dir.join(format!(".ffmpeg.tmp.{}", std::process::id()));
+        if let Err(e) = crate::net::with_retries("ffmpeg", || download_verify(pin, &tmp)).await {
+            let _ = tokio::fs::remove_file(&tmp).await;
+            return Err(e);
+        }
+        make_executable(&tmp).await?;
+        tokio::fs::rename(&tmp, &bin)
+            .await
+            .with_context(|| format!("publishing ffmpeg to {}", bin.display()))?;
+
+        // License text beside the binary — best-effort (distribution hygiene, not
+        // a gate): a missing/changed asset must not fail the bundle.
+        if let Ok(resp) = crate::net::http_client().get(pin.license_url).send().await {
+            if let Ok(resp) = resp.error_for_status() {
+                if let Ok(bytes) = resp.bytes().await {
+                    let _ = tokio::fs::write(&license, &bytes).await;
+                }
+            }
+        }
+    }
+
+    Ok(CachedFfmpeg {
+        bin,
+        license: license.exists().then_some(license),
+    })
+}
+
+/// Content-addressed cache dir for the pinned static ffmpeg, keyed by the upstream
+/// tag + SHA-256 prefix so a pin bump lands in a fresh dir instead of reusing a
+/// stale binary. Mirrors the runtime/model/esbuild caches under the OS cache dir.
+fn cache_dir(pin: &FfmpegPin) -> anyhow::Result<PathBuf> {
+    let dirs = directories::ProjectDirs::from("dev", "human-interface", "hi-agent")
+        .ok_or_else(|| anyhow!("cannot determine OS cache dir"))?;
+    Ok(dirs
+        .cache_dir()
+        .join("ffmpeg")
+        .join(format!("{RELEASE_TAG}-{}", &pin.sha256[..16])))
 }
 
 /// Stream `pin.url` to `tmp`, hashing as we go; fail if the final length or digest
