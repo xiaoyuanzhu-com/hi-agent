@@ -168,11 +168,25 @@ exceptions**:
   them would break the Makefile / dev server / embed, so they stay at root.
 - **`types`** — shared cross-faculty vocabulary, not engine machinery.
 
-Still deferred (future work):
-- **Split `server/`** into transport (foundation) vs. channel semantics (body).
-- **The `mind` write-port** — provenance tags + seed-shadowing; reads stay grep-the-tree.
-  Until it lands, the "agent's pen only touches `data/`" rule is convention, not structure.
-- **Reconcile vocabulary** with `architecture.md` and merge the two docs (the "mind" rename).
+**Already satisfied — no work needed:**
+- The **`server/` transport-vs-channel-semantics split** the model implies is already
+  realized by the existing boundary. `server/` (now `foundation/server`) *is* the HTTP
+  transport adapter — handlers bind wires ⇄ transport-free `Signal`s and the binder does
+  the framing/Content-Type — while the channel *semantics* (turn-taking, fan-in to one
+  prompt, when-to-speak) live in `reactor` (now `body/reactor`). No mislocated chunk to move.
+
+**Intentionally not built — infrastructure ahead of need:**
+- The **`mind` write-port** (provenance tags + seed-shadowing over the memory write
+  path). Deferred on purpose, not blocked: nothing consumes provenance yet; there is no
+  mind-seed store to shadow (`world.md` is a prompt the agent *reads*, not a shadowed
+  store); and the write-discipline already holds by convention (memory is written via
+  scoped MCP tools, not free filesystem writes). Build it when a concrete consumer exists
+  — answering "did you tell me this, or did I infer it?", or a shadowed `world.md` — not
+  before. Until then the "agent's pen only touches `data/`" rule stays convention.
+
+**Genuine future work:**
+- **Reconcile vocabulary** with `architecture.md` and merge the two docs (the "mind"
+  rename — see below).
 
 ## Merge notes
 
