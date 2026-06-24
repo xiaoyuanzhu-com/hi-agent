@@ -10,6 +10,7 @@ use tokio::sync::Notify;
 
 pub mod appearance;
 pub mod body;
+pub mod bundle;
 pub mod foundation;
 pub mod identity;
 pub mod mind;

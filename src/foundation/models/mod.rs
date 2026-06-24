@@ -80,12 +80,36 @@ fn models_dir() -> anyhow::Result<PathBuf> {
     Ok(dirs.cache_dir().join("models"))
 }
 
-/// Ensure `spec`'s model is present in the cache and return its path. A cached
-/// file of the right size at the digest-addressed path is reused (its digest was
-/// verified before it was published); otherwise the model is downloaded, its
-/// size + SHA-256 verified, and atomically published.
+/// Ensure `spec`'s model is available and return its path. Resolution: a
+/// **bundled** copy inside a packaged `.app` wins first (no env override in
+/// play); otherwise fall back to the cache, downloading + verifying on a miss
+/// ([`ensure_into`]).
 pub async fn ensure(spec: &ModelSpec) -> anyhow::Result<PathBuf> {
-    let dir = models_dir()?;
+    // A shipped `.app` carries the models under its Resources, provisioned by the
+    // same code, so they're addressed by the identical digest-prefixed name. Use
+    // one directly when present. Skipped if `HI_AGENT_MODELS_DIR` overrides the
+    // dir (an explicit operator choice that must win over the bundle).
+    if std::env::var_os("HI_AGENT_MODELS_DIR").is_none() {
+        if let Some(res) = crate::bundle::resources_dir() {
+            let bundled = res.join("models").join(format!("{}-{}.onnx", spec.name, &spec.sha256[..16]));
+            if let Ok(meta) = tokio::fs::metadata(&bundled).await {
+                if meta.len() == spec.size {
+                    tracing::debug!(model = spec.name, path = %bundled.display(), "using bundled model");
+                    return Ok(bundled);
+                }
+            }
+        }
+    }
+    ensure_into(&models_dir()?, spec).await
+}
+
+/// Ensure `spec`'s model exists in `dir` (download + size/SHA-256 verify +
+/// atomic publish on a miss) and return its digest-addressed path. Factored from
+/// [`ensure`] so packaging can populate a bundle's `Resources/models` and the
+/// running app can read the cache through the very same code — guaranteeing the
+/// bundled file name matches what [`ensure`] looks for. A cached file of the
+/// right size is reused (its digest was verified before it was published).
+pub async fn ensure_into(dir: &Path, spec: &ModelSpec) -> anyhow::Result<PathBuf> {
     // Address by a digest prefix: a pin bump changes the name, so a new model
     // lands beside the old rather than colliding with a stale file.
     let path = dir.join(format!("{}-{}.onnx", spec.name, &spec.sha256[..16]));
@@ -98,7 +122,7 @@ pub async fn ensure(spec: &ModelSpec) -> anyhow::Result<PathBuf> {
         let _ = tokio::fs::remove_file(&path).await;
     }
 
-    tokio::fs::create_dir_all(&dir)
+    tokio::fs::create_dir_all(dir)
         .await
         .with_context(|| format!("creating {}", dir.display()))?;
 

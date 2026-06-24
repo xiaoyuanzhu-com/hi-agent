@@ -1,4 +1,4 @@
-.PHONY: help build dev run test docker
+.PHONY: help build dev run test docker dmg
 
 help:
 	@grep -E '^[a-zA-Z_-]+:.*?## .*$$' $(MAKEFILE_LIST) | awk 'BEGIN {FS = ":.*?## "}; {printf "  %-8s %s\n", $$1, $$2}'
@@ -22,3 +22,6 @@ test: ## run rust + web tests
 
 docker: ## build the docker image
 	docker build -t hi-agent:dev .
+
+dmg: ## build a hermetic HiAgent.app + .dmg (Apple Silicon macOS only)
+	./scripts/make-dmg.sh

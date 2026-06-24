@@ -66,9 +66,21 @@ impl ResolvedRuntime {
     }
 }
 
-/// Resolve the runtime: use the system tools if all are present, otherwise
-/// install on first run and reuse thereafter.
+/// Resolve the runtime: prefer one bundled inside a packaged `.app`, else the
+/// system tools if all are present, else install on first run and reuse after.
 pub async fn ensure() -> anyhow::Result<ResolvedRuntime> {
+    // A shipped `.app` carries a complete managed runtime under its Resources;
+    // use it so the packaged app runs with no download and is unaffected by
+    // whatever node/claude happen to be on the user's PATH. Absent (dev/Docker/
+    // Linux), this is `None` and we fall through to the existing tiers.
+    if let Some(res) = crate::bundle::resources_dir() {
+        let rt = res.join("runtime");
+        if rt.join(".complete").exists() {
+            tracing::debug!(path = %rt.display(), "using bundled runtime");
+            return resolve_bundled(&rt);
+        }
+    }
+
     // Prefer what the system already offers — no download when the user has
     // node + the ACP adapter + claude on PATH.
     if let Some(system) = resolve_system() {
@@ -303,6 +315,17 @@ fn runtime_fingerprint() -> String {
     format!("{h:016x}")
 }
 
+/// Provision a complete managed runtime into `dir` — used at package time to
+/// populate a `.app`'s `Contents/Resources/runtime`. Unlike [`ensure`], this
+/// **always** performs the managed download (Node + `npm ci` of the adapter +
+/// `claude`); it never short-circuits to a system runtime on `PATH`, because the
+/// packaging host (a dev Mac with node/claude installed) would otherwise stage
+/// nothing. Writes a `.complete` marker so the shipped app's [`ensure`] picks it
+/// up as the bundled tier.
+pub async fn provision_into(dir: &Path) -> anyhow::Result<()> {
+    install(dir).await.map(|_| ())
+}
+
 /// Install the pinned Node + adapter into `target`. Builds in a sibling temp dir
 /// and atomically renames into place, so concurrent or interrupted starts never
 /// observe a half-installed runtime.
@@ -380,6 +403,15 @@ fn resolve(target: &Path) -> anyhow::Result<ResolvedRuntime> {
         claude_bin: target.join(claude_rel),
         origin: "managed",
     })
+}
+
+/// Same as [`resolve`] but stamped `origin = "bundled"` — the layout of a
+/// provisioned `.app` runtime is identical to a managed-cache one (it was built
+/// by the same [`install`]), so only the origin label differs (for logging).
+fn resolve_bundled(target: &Path) -> anyhow::Result<ResolvedRuntime> {
+    let mut r = resolve(target)?;
+    r.origin = "bundled";
+    Ok(r)
 }
 
 /// Download the pinned Node release and extract it into `<dir>/node`, returning

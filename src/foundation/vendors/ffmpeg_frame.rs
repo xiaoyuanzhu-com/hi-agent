@@ -27,8 +27,21 @@ use tokio::process::Command;
 /// Env override for the ffmpeg binary; defaults to `ffmpeg` on `PATH`.
 const ENV_FFMPEG_BIN: &str = "FFMPEG_BIN";
 
+/// Resolve which `ffmpeg` to run: explicit `FFMPEG_BIN` override → the static
+/// ffmpeg bundled in a packaged `.app` ([`super::ffmpeg::bundled_bin`]) → plain
+/// `ffmpeg` on `PATH`. The bundle tier is what makes a shipped app work without
+/// the user installing ffmpeg; dev/Docker have no bundle and fall through to PATH.
 fn ffmpeg_bin() -> String {
-    std::env::var(ENV_FFMPEG_BIN).ok().filter(|s| !s.trim().is_empty()).unwrap_or_else(|| "ffmpeg".to_string())
+    if let Ok(s) = std::env::var(ENV_FFMPEG_BIN) {
+        let s = s.trim();
+        if !s.is_empty() {
+            return s.to_string();
+        }
+    }
+    if let Some(p) = super::ffmpeg::bundled_bin() {
+        return p.to_string_lossy().into_owned();
+    }
+    "ffmpeg".to_string()
 }
 
 /// Decode the first frame of `video` (a self-contained clip — init segment

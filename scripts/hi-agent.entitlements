@@ -1,0 +1,24 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  Hardened-runtime entitlements for the bundled HiAgent.app.
+
+  The app embeds and spawns Node (the ACP adapter + claude) and esbuild, and loads
+  native `.node` addons — so under the hardened runtime it needs:
+    - allow-jit / allow-unsigned-executable-memory : V8's JIT.
+    - disable-library-validation : load `.node` / dylibs not signed with our Team ID.
+
+  Microphone / camera / Accessibility / Screen Recording are TCC grants the user
+  approves at first use (driven by the Info.plist usage strings + runtime prompts),
+  not entitlements — so they are intentionally absent here.
+-->
+<plist version="1.0">
+<dict>
+    <key>com.apple.security.cs.allow-jit</key>
+    <true/>
+    <key>com.apple.security.cs.allow-unsigned-executable-memory</key>
+    <true/>
+    <key>com.apple.security.cs.disable-library-validation</key>
+    <true/>
+</dict>
+</plist>
