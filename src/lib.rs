@@ -14,6 +14,7 @@ pub mod bundle;
 pub mod foundation;
 pub mod identity;
 pub mod mind;
+pub mod net;
 pub mod runtime;
 pub mod types;
 

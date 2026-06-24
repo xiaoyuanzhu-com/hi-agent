@@ -132,10 +132,11 @@ pub async fn ensure_into(dir: &Path, spec: &ModelSpec) -> anyhow::Result<PathBuf
         spec.size / 1_000_000
     ));
 
-    // Stream to a sibling temp, hashing as we go, then publish atomically.
+    // Stream to a sibling temp, hashing as we go, then publish atomically. A few
+    // attempts let a transient stall (idle connection, mirror hiccup) heal in
+    // place rather than failing the whole provision.
     let tmp = dir.join(format!(".{}.tmp.{}", spec.name, std::process::id()));
-    let _ = tokio::fs::remove_file(&tmp).await;
-    if let Err(e) = download_verify(spec, &tmp).await {
+    if let Err(e) = crate::net::with_retries(spec.name, || download_verify(spec, &tmp)).await {
         let _ = tokio::fs::remove_file(&tmp).await;
         return Err(e);
     }
@@ -159,7 +160,9 @@ pub async fn ensure_into(dir: &Path, spec: &ModelSpec) -> anyhow::Result<PathBuf
 /// fail if the final length or digest disagrees with the pin (so `tmp` is never
 /// trusted on a mismatch — the caller removes it).
 async fn download_verify(spec: &ModelSpec, tmp: &Path) -> anyhow::Result<()> {
-    let resp = reqwest::get(spec.url)
+    let resp = crate::net::http_client()
+        .get(spec.url)
+        .send()
         .await
         .with_context(|| format!("requesting {}", spec.url))?
         .error_for_status()

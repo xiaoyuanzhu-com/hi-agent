@@ -414,6 +414,22 @@ fn resolve_bundled(target: &Path) -> anyhow::Result<ResolvedRuntime> {
     Ok(r)
 }
 
+/// GET `url` and buffer the whole body through the shared timeout client, so a
+/// connect failure or a mid-stream stall surfaces as an error (lettable
+/// [`crate::net::with_retries`] re-attempt) instead of hanging.
+async fn fetch_url_bytes(client: &reqwest::Client, url: &str) -> anyhow::Result<bytes::Bytes> {
+    let resp = client
+        .get(url)
+        .send()
+        .await
+        .with_context(|| format!("requesting {url}"))?
+        .error_for_status()
+        .with_context(|| format!("downloading from {url}"))?;
+    resp.bytes()
+        .await
+        .with_context(|| format!("reading the download body from {url}"))
+}
+
 /// Download the pinned Node release and extract it into `<dir>/node`, returning
 /// the path to its `node` binary. Uses the system `tar` (handles strip,
 /// symlinks, hardlinks, and permissions correctly).
@@ -429,14 +445,8 @@ async fn fetch_node(dir: &Path) -> anyhow::Result<PathBuf> {
 
     hint(&format!("first run — downloading Node {NODE_VERSION} (~30 MB)…"));
     tracing::debug!(%url, "downloading Node");
-    let bytes = reqwest::get(url.as_str())
-        .await
-        .with_context(|| format!("requesting {url}"))?
-        .error_for_status()
-        .with_context(|| format!("downloading Node from {url}"))?
-        .bytes()
-        .await
-        .context("reading the Node download body")?;
+    let client = crate::net::http_client();
+    let bytes = crate::net::with_retries("node", || fetch_url_bytes(&client, url.as_str())).await?;
 
     let tarball = dir.join("node.tar.gz");
     tokio::fs::write(&tarball, &bytes)

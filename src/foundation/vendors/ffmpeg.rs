@@ -94,8 +94,7 @@ pub async fn provision_into(dir: &Path) -> anyhow::Result<()> {
     hint(&format!("downloading static ffmpeg {RELEASE_TAG} (~{} MB)…", pin.size / 1_000_000));
 
     let tmp = dir.join(format!(".ffmpeg.tmp.{}", std::process::id()));
-    let _ = tokio::fs::remove_file(&tmp).await;
-    if let Err(e) = download_verify(&pin, &tmp).await {
+    if let Err(e) = crate::net::with_retries("ffmpeg", || download_verify(&pin, &tmp)).await {
         let _ = tokio::fs::remove_file(&tmp).await;
         return Err(e);
     }
@@ -107,7 +106,7 @@ pub async fn provision_into(dir: &Path) -> anyhow::Result<()> {
 
     // License text beside the binary — best-effort (distribution hygiene, not a
     // gate): a missing/changed asset must not fail the bundle.
-    if let Ok(resp) = reqwest::get(pin.license_url).await {
+    if let Ok(resp) = crate::net::http_client().get(pin.license_url).send().await {
         if let Ok(resp) = resp.error_for_status() {
             if let Ok(bytes) = resp.bytes().await {
                 let _ = tokio::fs::write(dir.join("LICENSE"), &bytes).await;
@@ -122,7 +121,9 @@ pub async fn provision_into(dir: &Path) -> anyhow::Result<()> {
 /// Stream `pin.url` to `tmp`, hashing as we go; fail if the final length or digest
 /// disagrees with the pin so `tmp` is never trusted on a mismatch.
 async fn download_verify(pin: &FfmpegPin, tmp: &Path) -> anyhow::Result<()> {
-    let resp = reqwest::get(pin.url)
+    let resp = crate::net::http_client()
+        .get(pin.url)
+        .send()
         .await
         .with_context(|| format!("requesting {}", pin.url))?
         .error_for_status()
