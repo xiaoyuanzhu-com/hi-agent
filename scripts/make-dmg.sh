@@ -53,30 +53,9 @@ rm -rf "$APP"
 mkdir -p "$MACOS" "$RES"
 cp "$BIN" "$MACOS/hi-agent"
 
-cat > "$APP/Contents/Info.plist" <<PLIST
-<?xml version="1.0" encoding="UTF-8"?>
-<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
-<plist version="1.0">
-<dict>
-    <key>CFBundleName</key><string>hi-agent</string>
-    <key>CFBundleDisplayName</key><string>hi-agent</string>
-    <key>CFBundleIdentifier</key><string>dev.human-interface.hi-agent</string>
-    <key>CFBundleExecutable</key><string>hi-agent</string>
-    <key>CFBundleIconFile</key><string>AppIcon</string>
-    <key>CFBundlePackageType</key><string>APPL</string>
-    <key>CFBundleShortVersionString</key><string>$VERSION</string>
-    <key>CFBundleVersion</key><string>$VERSION</string>
-    <key>LSMinimumSystemVersion</key><string>13.0</string>
-    <key>NSHighResolutionCapable</key><true/>
-    <!-- Menu-bar (status item) app, no Dock icon — matches run_with_tray. -->
-    <key>LSUIElement</key><true/>
-    <key>NSMicrophoneUsageDescription</key>
-    <string>hi-agent listens when you hold the attention gesture so it can hear you.</string>
-    <key>NSCameraUsageDescription</key>
-    <string>hi-agent uses the camera to recognize who it is talking with.</string>
-</dict>
-</plist>
-PLIST
+# Static bundle metadata. The version it carries is committed and bumped via
+# `make bump-version` — packaging does nothing version-related.
+cp "$ROOT/scripts/Info.plist" "$APP/Contents/Info.plist"
 
 # --- 3. provision the bundled dependencies ---------------------------------
 # Run the just-built binary to download + lay out runtime/models/ffmpeg into
