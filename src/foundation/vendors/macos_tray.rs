@@ -18,12 +18,12 @@ use std::sync::{Arc, OnceLock};
 use anyhow::anyhow;
 use objc2::rc::Retained;
 use objc2::runtime::{AnyObject, NSObject, NSObjectProtocol};
-use objc2::{define_class, msg_send, sel, ClassType, DefinedClass, MainThreadOnly};
+use objc2::{define_class, msg_send, sel, AnyThread, ClassType, DefinedClass, MainThreadOnly};
 use objc2_app_kit::{
     NSApplication, NSApplicationActivationPolicy, NSImage, NSMenu, NSMenuItem, NSStatusBar,
     NSStatusBarButton, NSVariableStatusItemLength,
 };
-use objc2_foundation::{MainThreadMarker, NSString};
+use objc2_foundation::{MainThreadMarker, NSData, NSSize, NSString};
 use tokio::sync::Notify;
 
 /// State the menu actions close over: where to point the browser, and the trigger
@@ -226,21 +226,26 @@ pub fn run(url: String, shutdown: Arc<Notify>) -> anyhow::Result<()> {
         let status_bar = NSStatusBar::systemStatusBar();
         let status_item = status_bar.statusItemWithLength(NSVariableStatusItemLength);
 
-        // The button carries the icon. Prefer an SF Symbol as a *template* image so
-        // the menu bar auto-tints it for light/dark; fall back to a short title.
+        // The button carries the icon. The resting icon is the hi mark as a
+        // *template* image (the menu bar auto-tints it for light/dark); fall back
+        // to a short title if the embedded PNG ever fails to decode.
         if let Some(button) = status_item.button(mtm) {
             let desc = NSString::from_str("hi-agent");
-            let idle = NSImage::imageWithSystemSymbolName_accessibilityDescription(
-                &NSString::from_str("sparkles"),
-                Some(&desc),
-            );
+            let idle = {
+                let data = NSData::with_bytes(include_bytes!("assets/tray-hi.png"));
+                NSImage::initWithData(NSImage::alloc(), &data)
+            };
             match idle {
                 Some(idle) => {
                     idle.setTemplate(true);
+                    idle.setSize(NSSize {
+                        width: 18.0,
+                        height: 18.0,
+                    });
                     button.setImage(Some(&idle));
-                    // The "looking" frame of the come-and-see ack pulse. Falls back to
-                    // the resting icon if the symbol is missing, so the pulse still
-                    // runs (just without the eye morph).
+                    // The "looking" frame of the come-and-see ack pulse: the hi mark
+                    // briefly morphs to an eye and back. Falls back to the resting
+                    // mark if the symbol is missing, so the pulse still runs.
                     let active = NSImage::imageWithSystemSymbolName_accessibilityDescription(
                         &NSString::from_str("eye"),
                         Some(&desc),

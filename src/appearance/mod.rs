@@ -9,6 +9,7 @@
 //! - `GET /`            — index.html with OG tags injected
 //! - `GET /assets/*`    — hashed JS/CSS bundles from Vite
 //! - `GET /favicon.ico` — favicon if present in dist/
+//! - icon set + `GET /site.webmanifest` — brand icons & PWA manifest
 //! - `GET /vite.svg`    — Vite's default logo if shipped
 //!
 //! Step 1's server module is expected to mount this router at `/` after
@@ -82,6 +83,26 @@ where
         .route("/inspect", get(index))
         .route("/inspect/{*path}", get(index))
         .route("/favicon.ico", get(favicon))
+        // Brand icon set + PWA manifest. The router only serves paths it names,
+        // so each root-level asset Vite copies from `public/` needs an explicit
+        // route or it 404s. All are embedded from dist/ and served verbatim.
+        .route("/icon.svg", get(|| async { serve_embedded("icon.svg") }))
+        .route("/favicon-16x16.png", get(|| async { serve_embedded("favicon-16x16.png") }))
+        .route("/favicon-32x32.png", get(|| async { serve_embedded("favicon-32x32.png") }))
+        .route("/apple-touch-icon.png", get(|| async { serve_embedded("apple-touch-icon.png") }))
+        .route(
+            "/apple-touch-icon-precomposed.png",
+            get(|| async { serve_embedded("apple-touch-icon.png") }),
+        )
+        .route(
+            "/android-chrome-192x192.png",
+            get(|| async { serve_embedded("android-chrome-192x192.png") }),
+        )
+        .route(
+            "/android-chrome-512x512.png",
+            get(|| async { serve_embedded("android-chrome-512x512.png") }),
+        )
+        .route("/site.webmanifest", get(|| async { serve_embedded("site.webmanifest") }))
         .route("/vite.svg", get(vite_svg))
         .route("/assets/{*path}", get(asset))
 }
