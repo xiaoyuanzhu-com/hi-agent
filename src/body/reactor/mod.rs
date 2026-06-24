@@ -807,7 +807,7 @@ async fn per_scene_loop(
                         } else {
                             let up_m = (now - loop_started).as_secs() / 60;
                             format!(
-                                "nothing new here for {idle_m}m (host process started {up_m}m ago)"
+                                "nothing new here for {idle_m}m — you've just come back up (host process started {up_m}m ago)"
                             )
                         };
                         pulsed_once = true;
