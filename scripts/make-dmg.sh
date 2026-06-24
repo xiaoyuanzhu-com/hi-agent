@@ -62,6 +62,7 @@ cat > "$APP/Contents/Info.plist" <<PLIST
     <key>CFBundleDisplayName</key><string>hi-agent</string>
     <key>CFBundleIdentifier</key><string>dev.human-interface.hi-agent</string>
     <key>CFBundleExecutable</key><string>hi-agent</string>
+    <key>CFBundleIconFile</key><string>AppIcon</string>
     <key>CFBundlePackageType</key><string>APPL</string>
     <key>CFBundleShortVersionString</key><string>$VERSION</string>
     <key>CFBundleVersion</key><string>$VERSION</string>
@@ -91,6 +92,11 @@ else
   echo ">> provisioning runtime + models + ffmpeg into Resources (large download)…"
   "$BIN" --provision-into "$RES"
 fi
+
+# App icon: drop in the .icns generated from the hi logo. Placed after
+# provisioning so the REUSE_RESOURCES path (which replaces Resources) can't
+# clobber it, and before codesign so it gets sealed into the bundle.
+cp "$ROOT/scripts/HiAgent.icns" "$RES/AppIcon.icns"
 
 # --- 4. codesign, inside-out -----------------------------------------------
 sign_one() {
