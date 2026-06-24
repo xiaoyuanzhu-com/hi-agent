@@ -1,4 +1,4 @@
-.PHONY: help build dev run test docker dmg exe bump-version
+.PHONY: help build dev run test docker dmg exe installer bump-version
 
 # Windows target for the `exe` build check. MSVC (not gnu) because `ort`'s
 # prebuilt ONNX Runtime ships for MSVC only.
@@ -52,6 +52,9 @@ exe: ## cross-compile a Windows .exe build check (see WIN_TARGET; needs cargo-xw
 	PATH="$(WIN_LLVM_BIN):$$PATH" RUSTFLAGS="-Lnative=$(WIN_SHIM)" XWIN_ACCEPT_LICENSE=1 \
 		cargo xwin build --release --target $(WIN_TARGET)
 	@echo "built target/$(WIN_TARGET)/release/hi-agent.exe"
+
+installer: ## build the Windows NSIS Setup.exe (cross-compiles via `exe`; needs makensis)
+	./scripts/make-installer.sh
 
 bump-version: ## set the committed version everywhere (usage: make bump-version VERSION=x.y.z)
 	@test -n "$(VERSION)" || { echo "usage: make bump-version VERSION=x.y.z" >&2; exit 1; }
