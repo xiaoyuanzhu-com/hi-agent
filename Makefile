@@ -23,7 +23,7 @@ test: ## run rust + web tests
 docker: ## build the docker image
 	docker build -t hi-agent:dev .
 
-dmg: ## build a hermetic HiAgent.app + .dmg (Apple Silicon macOS only)
+dmg: ## build a hermetic Hi Agent.app + styled .dmg (Apple Silicon macOS only)
 	./scripts/make-dmg.sh
 
 bump-version: ## set the committed version everywhere (usage: make bump-version VERSION=x.y.z)

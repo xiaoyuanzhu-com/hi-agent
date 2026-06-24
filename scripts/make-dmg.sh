@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 #
-# Build a hermetic HiAgent.app and wrap it in a .dmg.
+# Build a hermetic Hi Agent.app and wrap it in a styled drag-to-Applications .dmg.
 #
 # Produces an app whose managed runtime (Node + ACP adapter + claude), recognition
 # models, and static ffmpeg all live under Contents/Resources — so it launches and
@@ -16,7 +16,7 @@
 #   REUSE_RESOURCES=DIR  Copy an already-provisioned Resources tree (with
 #                      runtime/.complete) instead of downloading again.
 #
-# Output: target/dmg/HiAgent.app and target/dmg/hi-agent-<version>-arm64.dmg
+# Output: "target/dmg/Hi Agent.app" and target/dmg/hi-agent-<version>-arm64.dmg
 set -euo pipefail
 
 cd "$(dirname "$0")/.."
@@ -34,7 +34,7 @@ ENT="$ROOT/scripts/hi-agent.entitlements"
 VERSION="$(awk -F'"' '/^version *=/ {print $2; exit}' Cargo.toml)"
 
 OUT="$ROOT/target/dmg"
-APP="$OUT/HiAgent.app"
+APP="$OUT/Hi Agent.app"
 RES="$APP/Contents/Resources"
 MACOS="$APP/Contents/MacOS"
 DMG="$OUT/hi-agent-$VERSION-arm64.dmg"
@@ -111,14 +111,93 @@ if [ "$IDENTITY" != "-" ] && [ -n "${NOTARY_PROFILE:-}" ]; then
 fi
 
 # --- 6. build the .dmg ------------------------------------------------------
-echo ">> building $DMG …"
-DMGROOT="$OUT/dmgroot"
-rm -rf "$DMGROOT" "$DMG"
-mkdir -p "$DMGROOT"
-cp -R "$APP" "$DMGROOT/"
-ln -s /Applications "$DMGROOT/Applications"
-hdiutil create -volname "Hi Agent" -srcfolder "$DMGROOT" -ov -format UDZO "$DMG" >/dev/null
-rm -rf "$DMGROOT"
+APPNAME="$(basename "$APP")"          # "Hi Agent.app" — Finder shows it as "Hi Agent"
+BG_DIR="$ROOT/scripts/dmg"
+
+# Plain image: the .app + an Applications symlink, no window styling. Used
+# everywhere the styled path can't run (headless/SSH) so a build never fails.
+build_plain_dmg() {
+  echo ">> building plain $DMG …"
+  local DMGROOT="$OUT/dmgroot"
+  rm -rf "$DMGROOT" "$DMG"; mkdir -p "$DMGROOT"
+  cp -R "$APP" "$DMGROOT/"
+  ln -s /Applications "$DMGROOT/Applications"
+  hdiutil create -volname "Hi Agent" -srcfolder "$DMGROOT" -ov -format UDZO "$DMG" >/dev/null
+  rm -rf "$DMGROOT"
+}
+
+# Styled image: brand background (scripts/dmg/background*.png) with the app and
+# Applications icons pinned either side of a drag arrow. Driving Finder needs a
+# real desktop session (window server + Automation permission), so this is
+# skipped over SSH and falls back to the plain image. Window math: the art is
+# 660x400 (the content area); TITLEBAR pads the outer window bounds so the
+# content matches the art exactly. Icon centers are in content coordinates and
+# line up with the empty slots baked into the background.
+build_styled_dmg() {
+  local VOL="Hi Agent" W=660 H=400 TITLEBAR=23 ICON=112
+  local STAGE="$OUT/dmgroot" RW="$OUT/rw.dmg" MNT="/Volumes/$VOL"
+  rm -rf "$STAGE" "$RW" "$DMG"; mkdir -p "$STAGE/.background"
+  cp -R "$APP" "$STAGE/" || return 1
+  ln -s /Applications "$STAGE/Applications" || return 1
+  # Multi-resolution TIFF so Finder stays crisp on Retina and non-Retina.
+  tiffutil -cathidpicheck "$BG_DIR/background.png" "$BG_DIR/background@2x.png" \
+    -out "$STAGE/.background/background.tiff" >/dev/null 2>&1 \
+    || cp "$BG_DIR/background@2x.png" "$STAGE/.background/background.tiff" || return 1
+
+  hdiutil create -volname "$VOL" -srcfolder "$STAGE" -fs HFS+ -format UDRW -ov "$RW" >/dev/null || return 1
+  hdiutil attach "$RW" -mountpoint "$MNT" -nobrowse -noverify -noautoopen >/dev/null || return 1
+
+  osascript - "$VOL" "$APPNAME" "$W" "$H" "$TITLEBAR" "$ICON" <<'APPLESCRIPT' || { hdiutil detach "$MNT" >/dev/null 2>&1 || true; return 1; }
+on run argv
+  set {volName, appName} to {item 1 of argv, item 2 of argv}
+  set {w, h, tb, iconSize} to {item 3 of argv as integer, item 4 of argv as integer, item 5 of argv as integer, item 6 of argv as integer}
+  tell application "Finder"
+    tell disk volName
+      open
+      set theWindow to container window
+      set current view of theWindow to icon view
+      set toolbar visible of theWindow to false
+      set statusbar visible of theWindow to false
+      set the bounds of theWindow to {300, 140, 300 + w, 140 + h + tb}
+      set opts to the icon view options of theWindow
+      set arrangement of opts to not arranged
+      set icon size of opts to iconSize
+      set text size of opts to 12
+      set background picture of opts to file ".background:background.tiff"
+      set position of item appName of theWindow to {175, 205}
+      set position of item "Applications" of theWindow to {485, 205}
+      close
+      open
+      update without registering applications
+      delay 1
+    end tell
+  end tell
+end run
+APPLESCRIPT
+
+  sync
+  local tries=0
+  until hdiutil detach "$MNT" >/dev/null 2>&1; do
+    tries=$((tries + 1))
+    [ "$tries" -ge 5 ] && { hdiutil detach "$MNT" -force >/dev/null 2>&1 || true; break; }
+    sleep 1
+  done
+  hdiutil convert "$RW" -format UDZO -imagekey zlib-level=9 -o "$DMG" >/dev/null || return 1
+  rm -f "$RW"; rm -rf "$STAGE"
+}
+
+styled=false
+if [ -n "${SSH_CONNECTION:-}" ]; then
+  echo ">> styled DMG skipped (headless / SSH — no window server); building plain image."
+elif [ ! -f "$BG_DIR/background.png" ] || [ ! -f "$BG_DIR/background@2x.png" ]; then
+  echo ">> styled DMG skipped (missing scripts/dmg/background*.png); building plain image."
+elif build_styled_dmg; then
+  styled=true
+  echo ">> styled DMG built (brand background + drag-to-Applications layout)."
+else
+  echo "warn: styled DMG build failed; falling back to plain image." >&2
+fi
+$styled || build_plain_dmg
 
 if $notarize; then
   echo ">> notarizing $DMG (profile: $NOTARY_PROFILE)…"
