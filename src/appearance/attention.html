@@ -1,0 +1,235 @@
+<!DOCTYPE html>
+<html lang="zh">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>hi · attention</title>
+<!--
+  The ⌘ attention overlay. Loaded by the native menu-bar overlay window
+  (a transparent, click-through, always-on-top WKWebView spanning the top of
+  the screen) from GET /attention, and driven by GET /api/out/attention.
+
+  In production the body is transparent (the native panel is transparent), the
+  centre is left empty for the physical notch (the conversation's divider), and
+  the overlay's own "hi" stays hidden at idle so it never duplicates the native
+  tray icon — it appears only during a glance or a hold.
+
+  Append ?demo to the URL to preview in a plain browser: a dark backdrop, a faux
+  notch, and trigger buttons stand in for the hardware + the event stream.
+-->
+<style>
+  :root{
+    --human:#fd605e;   /* 红 = 人 = 用户侧 */
+    --ai:#13a7f5;      /* 蓝 = AI = agent 侧 */
+    --ink:#F5F5F7;
+    --dim:#8E8E93;
+    --mb:32px;             /* 菜单栏高度 = 反馈高度 */
+    --notch:200px;         /* 物理刘海宽度（设备相关，可调） */
+    --tray-right:14px;     /* 概览“hi”停靠位 ≈ 原生 tray 图标位 */
+  }
+  *{box-sizing:border-box;margin:0;padding:0}
+  html,body{height:100%;width:100%}
+  body{
+    font:13px/1.4 -apple-system,"SF Pro Text","PingFang SC",system-ui,sans-serif;
+    color:var(--ink);background:transparent;overflow:hidden;-webkit-font-smoothing:antialiased;
+  }
+  /* demo 预览：给透明覆盖层一个深色背景 + 假刘海，方便在浏览器里看 */
+  body.demo{background:#0b0b0d}
+  .demo-notch{display:none}
+  body.demo .demo-notch{display:block;position:fixed;top:0;left:50%;transform:translateX(-50%);width:var(--notch);height:var(--mb);background:#000;border-radius:0 0 16px 16px;z-index:50}
+
+  /* 覆盖条：占满顶部一行 */
+  .bar{position:fixed;top:0;left:0;right:0;height:var(--mb);z-index:30;display:flex;align-items:center}
+
+  /* hi 字形 */
+  .glyph{height:19px;width:auto;display:block;overflow:visible}
+  .glyph path{fill:#f3f4f6;transition:fill .3s}              /* 模板白 */
+  .bar.convo .hg path{fill:var(--human)}                     /* 聆听：绽放 */
+  .bar.convo .ig path{fill:var(--ai)}
+  .tray.flip .hg path{fill:var(--human)}                     /* 双击：翻色 */
+  .tray.flip .ig path{fill:var(--ai)}
+
+  /* 概览“hi”：默认隐藏（原生 tray 图标负责静息态），glance/聆听时才现身 */
+  .tray{position:absolute;top:50%;right:var(--tray-right);transform:translateY(-50%);
+    display:flex;align-items:center;gap:2px;opacity:0;transition:opacity .2s;z-index:42}
+  .tray.show{opacity:1}
+  .tray .hg{transition:transform .46s cubic-bezier(.2,.9,.25,1)}   /* h 飞 */
+  .tray.blink{animation:blink .46s ease both}
+  @keyframes blink{28%{transform:scaleY(.14)}58%{transform:scaleY(1)}}
+
+  /* 小脑快路径：抽屉文字（纯文本，无色无 emoji） */
+  .drawer{position:absolute;top:50%;right:calc(var(--tray-right) + 26px);transform:translateY(-50%);
+    display:flex;align-items:center;gap:8px;max-width:0;overflow:hidden;white-space:nowrap;opacity:0;
+    font-size:12px;color:var(--ink);transition:max-width .34s cubic-bezier(.2,.85,.2,1),opacity .25s;z-index:41}
+  .drawer.show{max-width:320px;opacity:1}
+  .drawer .sep,.drawer .t{color:var(--dim)}
+  .drawer .t{font-variant-numeric:tabular-nums}
+
+  /* 对话内联层（聆听） */
+  .convoLay{position:absolute;inset:0;height:var(--mb);display:flex;align-items:center;pointer-events:none}
+  .convoLay .fill{position:absolute;inset:0;background:linear-gradient(rgba(16,18,30,.55),rgba(16,18,30,.18));
+    transform:scaleX(0);transform-origin:100% 0;transition:transform .42s cubic-bezier(.2,.9,.25,1)}
+  .bar.convo .convoLay .fill{transform:scaleX(1)}
+  .convoLay .uline{position:absolute;left:0;right:0;bottom:0;height:1.5px;opacity:0;transition:opacity .25s .15s;
+    background:linear-gradient(90deg,var(--human) 0%,var(--human) 40%,transparent 47%,transparent 53%,var(--ai) 60%,var(--ai) 100%)}
+  .bar.convo .convoLay .uline{opacity:.85}
+  .convoLay .half{flex:1;min-width:0;display:flex;align-items:center;gap:8px;height:100%;opacity:0;transition:opacity .22s .16s}
+  .bar.convo .convoLay .half{opacity:1}
+  .convoLay .gap{width:var(--notch);flex:none}     /* 让位给物理刘海 */
+  .half.user{justify-content:flex-start;padding-left:52px}
+  .half.agent{justify-content:flex-end;padding-right:48px}
+
+  .mic{width:18px;height:18px;border-radius:50%;display:grid;place-items:center;background:rgba(253,96,94,.16);flex:none}
+  .mic svg{width:10px;height:10px;fill:var(--human)}
+  .wave{display:flex;align-items:center;gap:2px;height:16px;flex:none}
+  .wave i{width:2.5px;height:5px;border-radius:2px;background:var(--human);animation:eq 1s ease-in-out infinite}
+  .wave i:nth-child(2){animation-delay:.12s}.wave i:nth-child(3){animation-delay:.24s}
+  .wave i:nth-child(4){animation-delay:.36s}.wave i:nth-child(5){animation-delay:.18s}
+  @keyframes eq{0%,100%{height:4px}50%{height:14px}}
+  .bar.paused .wave i{animation-play-state:paused;height:4px;opacity:.4}
+  .text{font-size:12.5px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+  .user .text{color:#ffe1e0}.agent .text{color:#d9efff}
+  .dots{display:inline-flex;gap:3px}.dots b{width:4px;height:4px;border-radius:50%;background:var(--ai);animation:bp 1s infinite}
+  .dots b:nth-child(2){animation-delay:.2s}.dots b:nth-child(3){animation-delay:.4s}
+  @keyframes bp{0%,100%{opacity:.25}50%{opacity:1}}
+
+  /* demo 控制台 */
+  .panel{display:none}
+  body.demo .panel{display:flex;gap:8px;justify-content:center;flex-wrap:wrap;position:fixed;left:0;right:0;bottom:18px;z-index:60}
+  .panel button{font:inherit;font-size:13px;color:var(--ink);cursor:pointer;background:#1c1c1f;border:1px solid rgba(255,255,255,.12);border-radius:11px;padding:9px 14px}
+  .panel button:hover{background:#2a2a2e}
+</style>
+</head>
+<body>
+  <div class="demo-notch"></div>
+
+  <div class="bar" id="bar">
+    <div class="convoLay">
+      <div class="fill"></div>
+      <div class="half user">
+        <div class="mic"><svg viewBox="0 0 24 24"><path d="M12 14a3 3 0 0 0 3-3V5a3 3 0 0 0-6 0v6a3 3 0 0 0 3 3zm5-3a5 5 0 0 1-10 0H5a7 7 0 0 0 6 6.9V21h2v-3.1A7 7 0 0 0 19 11h-2z"/></svg></div>
+        <div class="wave"><i></i><i></i><i></i><i></i><i></i></div>
+        <span class="text" id="utext">在听…</span>
+      </div>
+      <div class="gap"></div>
+      <div class="half agent"><span class="text" id="atext"></span></div>
+      <div class="uline"></div>
+    </div>
+
+    <span class="drawer" id="drawer"><span id="drawerText">填表·身份证</span></span>
+
+    <div class="tray" id="tray">
+      <svg class="glyph hg" id="hg" viewBox="34 -725 552 745"><path d="M148 10Q98 10 71.0 -17.0Q44 -44 44 -95V-610Q44 -661 71.0 -688.0Q98 -715 148 -715Q198 -715 225.0 -688.0Q252 -661 252 -610V-415H236Q261 -458 304.5 -482.0Q348 -506 403 -506Q462 -506 500.0 -482.5Q538 -459 557.0 -410.5Q576 -362 576 -287V-95Q576 -44 549.0 -17.0Q522 10 472 10Q422 10 395.0 -17.0Q368 -44 368 -95V-279Q368 -317 356.0 -332.5Q344 -348 322 -348Q291 -348 271.5 -327.5Q252 -307 252 -272V-95Q252 10 148 10Z"/></svg>
+      <svg class="glyph ig" id="ig" viewBox="25 -766 246 786"><path d="M148 10Q98 10 71.0 -19.0Q44 -48 44 -103V-391Q44 -446 71.0 -475.0Q98 -504 148 -504Q198 -504 225.0 -475.0Q252 -446 252 -391V-103Q252 -48 225.5 -19.0Q199 10 148 10ZM148 -562Q93 -562 64.0 -587.0Q35 -612 35 -659Q35 -706 64.0 -731.0Q93 -756 148 -756Q203 -756 232.0 -731.0Q261 -706 261 -659Q261 -612 232.0 -587.0Q203 -562 148 -562Z"/></svg>
+    </div>
+  </div>
+
+  <div class="panel">
+    <button data-ev="glance">glance</button>
+    <button data-ev="listen_start">listen_start</button>
+    <button data-ev="transcript">transcript</button>
+    <button data-ev="reply">reply</button>
+    <button data-ev="listen_stop">listen_stop</button>
+  </div>
+
+<script>
+const $=s=>document.querySelector(s);
+const bar=$('#bar'),tray=$('#tray'),hg=$('#hg'),utext=$('#utext'),atext=$('#atext'),drawer=$('#drawer');
+
+// The reply typically lands AFTER the user releases ⌘, so listen_stop must not
+// collapse the strip — it pauses the waveform and starts a dwell timer that each
+// reply chunk refreshes; the strip collapses only once things go quiet.
+const REPLY_DWELL=2800, STOP_DWELL=4000;
+let active=false, replyBuf='', collapseTimer=null;
+const clearCollapse=()=>{if(collapseTimer){clearTimeout(collapseTimer);collapseTimer=null}};
+const scheduleCollapse=ms=>{clearCollapse();collapseTimer=setTimeout(collapse,ms)};
+
+/* 双击 · 翻色 + 眨眼（原生 tray 也会 flash，这里是覆盖层的同步表现） */
+function glance(){
+  tray.classList.add('show');
+  tray.classList.remove('blink');void tray.offsetWidth;
+  tray.classList.add('blink','flip');
+  clearTimeout(window._f);window._f=setTimeout(()=>tray.classList.remove('flip'),780);
+  setTimeout(()=>tray.classList.remove('blink'),480);
+  setTimeout(()=>{if(!active)tray.classList.remove('show')},900);   // 聆听中保持
+}
+
+/* 按住 · 持续聆听：hi 分裂，h 飞向左 */
+function flyH(){const r=hg.getBoundingClientRect();hg.style.transform=`translateX(${16-r.left}px)`}
+function startListen(){
+  active=true;replyBuf='';clearCollapse();
+  tray.classList.add('show');
+  bar.classList.add('convo');bar.classList.remove('paused');
+  flyH();
+  utext.style.opacity=1;utext.textContent='在听…';
+  atext.innerHTML='<span class="dots"><b></b><b></b><b></b></span>';
+}
+function onTranscript(text){
+  if(!active)return;
+  utext.style.opacity=1;utext.textContent=text||'在听…';
+}
+function onReply(chunk){
+  if(!active)return;
+  replyBuf+=chunk||'';
+  bar.classList.add('paused');utext.style.opacity=.7;
+  atext.textContent=replyBuf;
+  scheduleCollapse(REPLY_DWELL);          // 回应流式刷新，最后一段后收起
+}
+function micClosed(){                      // listen_stop：麦克风关，但留住条等回应
+  if(!active)return;
+  bar.classList.add('paused');
+  scheduleCollapse(replyBuf?REPLY_DWELL:STOP_DWELL);
+}
+function collapse(){
+  active=false;clearCollapse();
+  bar.classList.remove('convo','paused');
+  utext.style.opacity=1;
+  hg.style.transform='';                   // h 飞回，复合为 hi
+  setTimeout(()=>{if(!active){tray.classList.remove('show');utext.textContent='在听…';atext.textContent=''}},480);
+}
+
+function handle(ev){
+  switch(ev.kind){
+    case 'glance':       glance(); break;
+    case 'listen_start': startListen(); break;
+    case 'transcript':   onTranscript(ev.text); break;
+    case 'reply':        onReply(ev.text); break;
+    case 'listen_stop':  micClosed(); break;
+  }
+}
+
+/* NDJSON 长连接，断线自动重连 */
+async function connect(){
+  for(;;){
+    try{
+      const res=await fetch('/api/out/attention',{cache:'no-store'});
+      const reader=res.body.getReader();const dec=new TextDecoder();let buf='';
+      for(;;){
+        const {value,done}=await reader.read();
+        if(done)break;
+        buf+=dec.decode(value,{stream:true});
+        let nl;
+        while((nl=buf.indexOf('\n'))>=0){
+          const line=buf.slice(0,nl);buf=buf.slice(nl+1);
+          if(line.trim()){try{handle(JSON.parse(line))}catch(_){}}
+        }
+      }
+    }catch(_){/* server restart / transient */}
+    await new Promise(r=>setTimeout(r,1000));
+  }
+}
+connect();
+
+/* demo 模式：?demo —— 假刘海 + 触发按钮，方便在普通浏览器里预览 */
+if(/(\?|&)demo\b/.test(location.search)||location.hash==='#demo'){
+  document.body.classList.add('demo');
+  document.querySelectorAll('.panel button').forEach(b=>b.onclick=()=>{
+    const ev=b.dataset.ev;
+    if(ev==='transcript')handle({kind:'transcript',text:'把这两张截图拼成长图，发飞书产品群',final:false});
+    else if(ev==='reply')handle({kind:'reply',text:'好，已发到「产品组」。'});
+    else handle({kind:ev});
+  });
+}
+</script>
+</body>
+</html>

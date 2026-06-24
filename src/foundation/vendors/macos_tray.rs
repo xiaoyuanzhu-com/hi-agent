@@ -217,6 +217,11 @@ pub fn run(url: String, shutdown: Arc<Notify>) -> anyhow::Result<()> {
     // Accessory: live in the menu bar only — no Dock icon, no app menu.
     app.setActivationPolicy(NSApplicationActivationPolicy::Accessory);
 
+    // Stand up the ⌘-attention overlay on this same main thread before the AppKit
+    // loop runs. Best-effort: it falls back to no overlay when there's no window
+    // server, just like the status item below. Borrows `url` before it moves.
+    super::macos_overlay::install(mtm, &url);
+
     let target = TrayTarget::new(mtm, url, shutdown);
 
     // SAFETY: all of these are standard AppKit setup calls made on the main thread

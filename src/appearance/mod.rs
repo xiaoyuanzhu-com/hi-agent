@@ -104,6 +104,10 @@ where
         )
         .route("/site.webmanifest", get(|| async { serve_embedded("site.webmanifest") }))
         .route("/vite.svg", get(vite_svg))
+        // The ⌘ attention overlay page — a self-contained, transparent menu-bar
+        // strip loaded by the native overlay's WKWebView. Served inline (not from
+        // the embedded SPA dist) so it works with no SPA build and stays tiny.
+        .route("/attention", get(attention_page))
         .route("/assets/{*path}", get(asset))
 }
 
@@ -152,6 +156,13 @@ async fn index() -> Response {
 /// `GET /assets/*path` — serve a hashed asset from the embedded dist.
 async fn asset(Path(path): Path<String>) -> Response {
     serve_embedded(&format!("assets/{path}"))
+}
+
+/// `GET /attention` — the ⌘ attention overlay page. A single self-contained HTML
+/// document (its CSS/JS inline), compiled into the binary. The native overlay's
+/// transparent `WKWebView` loads this and animates from `GET /api/out/attention`.
+async fn attention_page() -> Response {
+    html_response(include_str!("attention.html").to_string(), StatusCode::OK)
 }
 
 /// Inject the build's `importmap.json` (if embedded) as a `<script type=

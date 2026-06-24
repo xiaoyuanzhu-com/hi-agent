@@ -35,6 +35,9 @@ use std::collections::VecDeque;
 #[cfg(target_os = "macos")]
 use tokio::sync::mpsc;
 
+#[cfg(target_os = "macos")]
+use crate::foundation::server::attention::AttentionEvent;
+
 /// Arm the gestures: from now on a double-tap of Command hands the agent a
 /// screenshot, and a press-and-hold opens continuous attention, both in `scene`.
 /// Spawns the OS event-loop thread and the recognizer task and returns immediately.
@@ -52,6 +55,11 @@ pub fn install(state: Arc<AppState>, scene: Scene) {
     // the runtime, which stamps them against its own clock (so the double-tap window
     // and the hold threshold share one clock with the timer below).
     let (edge_tx, edge_rx) = tokio::sync::mpsc::unbounded_channel::<hotkey::Edge>();
+    // Mirror the scene's transcript + reply onto the attention overlay's event
+    // stream, so the menu-bar overlay can show what the user is saying and the
+    // agent's reply during a hold. Forwards always; the overlay only renders them
+    // between listen-start and listen-stop.
+    handle.spawn(attention_bridge(state.clone(), scene.clone()));
     handle.spawn(recognizer_loop(state, scene, edge_rx));
 
     let spawned = std::thread::Builder::new()
@@ -73,6 +81,45 @@ pub fn install(state: Arc<AppState>, scene: Scene) {
             "Command gestures armed (double-tap → screenshot, press-hold → attention)"
         ),
         Err(e) => tracing::warn!(error = %e, "gesture: could not spawn listener thread; gestures disabled"),
+    }
+}
+
+/// Forward this scene's recognized speech and the agent's worded reply onto the
+/// attention overlay's event stream, for the lifetime of the process. The overlay
+/// shows the user's words on the left and the reply on the right during a hold;
+/// it gates display on listen-start/stop, so forwarding unconditionally here is
+/// harmless when no hold is active. Subscribes to the same non-draining echoes the
+/// channel inspector uses ([`AppState::input_echo`] / [`AppState::output_echo`]).
+#[cfg(target_os = "macos")]
+async fn attention_bridge(state: Arc<AppState>, scene: Scene) {
+    use tokio::sync::broadcast::error::RecvError;
+
+    let mut input_rx = state.input_echo.subscribe();
+    let mut output_rx = state.output_echo.subscribe();
+    loop {
+        tokio::select! {
+            r = input_rx.recv() => match r {
+                Ok(echo) => {
+                    if echo.scene == scene {
+                        state.emit_attention(AttentionEvent::Transcript {
+                            text: echo.text,
+                            is_final: echo.is_final,
+                        });
+                    }
+                }
+                Err(RecvError::Lagged(_)) => {}
+                Err(RecvError::Closed) => break,
+            },
+            r = output_rx.recv() => match r {
+                Ok(echo) => {
+                    if echo.scene == scene {
+                        state.emit_attention(AttentionEvent::Reply { text: echo.text });
+                    }
+                }
+                Err(RecvError::Lagged(_)) => {}
+                Err(RecvError::Closed) => break,
+            },
+        }
     }
 }
 
@@ -131,7 +178,7 @@ async fn recognizer_loop(
                         // pre-roll (released before the hold threshold). `on_command_up`
                         // clears the recognizer's pending press either way.
                         let _ = hold.on_command_up(t);
-                        stop_attention(&mut session);
+                        stop_attention(&state, &mut session);
                     }
                     Edge::Other => {
                         dt.on_other_input();
@@ -151,7 +198,7 @@ async fn recognizer_loop(
                     // half-formed double-tap so a later tap doesn't pair with this press.
                     Some(GestureEvent::HoldStart) => {
                         dt.on_other_input();
-                        commit_capture(&mut session);
+                        commit_capture(&state, &mut session);
                     }
                     _ => {}
                 }
@@ -160,7 +207,7 @@ async fn recognizer_loop(
     }
 
     // Tap thread ended — make sure we aren't left attending.
-    stop_attention(&mut session);
+    stop_attention(&state, &mut session);
 }
 
 /// Capture the screen and hand it to the agent (the double-tap gesture). Flashes the
@@ -169,6 +216,7 @@ async fn recognizer_loop(
 #[cfg(target_os = "macos")]
 fn glance(state: &Arc<AppState>, scene: &Scene) {
     crate::body::capabilities::tray::flash();
+    state.emit_attention(AttentionEvent::Glance);
     let state = state.clone();
     let scene = scene.clone();
     tokio::spawn(async move {
@@ -250,7 +298,7 @@ fn arm_capture(state: &Arc<AppState>, scene: &Scene, session: &mut Option<MicSes
 /// the pre-roll and start feeding the audio ingest. Called when the press crosses the
 /// hold threshold. No-op if not capturing or already committed.
 #[cfg(target_os = "macos")]
-fn commit_capture(session: &mut Option<MicSession>) {
+fn commit_capture(state: &Arc<AppState>, session: &mut Option<MicSession>) {
     if let Some(s) = session.as_mut()
         && !s.committed
     {
@@ -259,6 +307,7 @@ fn commit_capture(session: &mut Option<MicSession>) {
         if s.ctrl.try_send(Ctrl::Commit).is_ok() {
             s.committed = true;
             crate::body::capabilities::tray::flash();
+            state.emit_attention(AttentionEvent::ListenStart);
             tracing::info!("press-hold attention: listening (processing)");
         }
     }
@@ -280,9 +329,10 @@ fn discard_capture(session: &mut Option<MicSession>) {
 /// buffering, the pre-roll is discarded and no transcript is produced. No-op when not
 /// attending.
 #[cfg(target_os = "macos")]
-fn stop_attention(session: &mut Option<MicSession>) {
+fn stop_attention(state: &Arc<AppState>, session: &mut Option<MicSession>) {
     if let Some(s) = session.take() {
         if s.committed {
+            state.emit_attention(AttentionEvent::ListenStop);
             tracing::info!("press-hold attention: released (mic closed)");
         } else {
             tracing::info!("press-hold attention: discarded (released before hold)");

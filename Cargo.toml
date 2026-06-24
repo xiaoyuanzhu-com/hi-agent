@@ -95,7 +95,13 @@ core-foundation = "0.10"
 # generates that target safely. Per-class APIs in objc2-app-kit / objc2-foundation
 # are behind feature flags, so each AppKit/Foundation type we touch is enabled here.
 objc2 = "0.6"
-objc2-foundation = { version = "0.3", features = ["NSString", "NSThread"] }
+objc2-foundation = { version = "0.3", features = [
+    "NSString",
+    "NSThread",
+    "NSURL",
+    "NSURLRequest",
+    "NSValue",
+] }
 objc2-app-kit = { version = "0.3", features = [
     "NSApplication",
     "NSResponder",
@@ -107,7 +113,17 @@ objc2-app-kit = { version = "0.3", features = [
     "NSMenu",
     "NSMenuItem",
     "NSImage",
+    # ⌘-attention overlay (`crate::vendors::macos_overlay`): a transparent,
+    # click-through NSPanel hosting a WKWebView near the notch.
+    "NSWindow",
+    "NSPanel",
+    "NSScreen",
+    "NSColor",
+    "NSView",
 ] }
+# WebKit for the attention overlay — a transparent WKWebView renders the menu-bar
+# feedback (reusing the web design) inside the native panel above.
+objc2-web-kit = { version = "0.3", features = ["WKWebView", "WKWebViewConfiguration"] }
 
 # Native microphone capture for the press-and-hold-⌘ attention gesture
 # (`crate::vendors::macos_audio_capture`): opens the default input device and yields
