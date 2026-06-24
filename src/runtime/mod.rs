@@ -25,8 +25,9 @@
 //!
 //! Detection is all-or-nothing: a partial system set (e.g. `node` but no
 //! `claude`) falls back to the managed install so we never mix a system tool with
-//! a managed one. Prototype scope for the install path: macOS + Linux on
-//! x86_64/aarch64, extraction via the system `tar`, and no SHA-256 verification of
+//! a managed one. Prototype scope for the install path: macOS, Linux, and Windows
+//! on x86_64/aarch64, extraction via the system `tar` (bsdtar on Windows 10+,
+//! which auto-detects the `.zip` Node ships there), and no SHA-256 verification of
 //! the Node download yet.
 
 use std::path::{Path, PathBuf};
@@ -161,11 +162,7 @@ pub async fn ensure_view_esbuild(runtime: &ResolvedRuntime) -> anyhow::Result<Pa
 /// version bump installs fresh instead of reusing a stale binary.
 async fn ensure_standalone_esbuild(node_bin: &Path) -> anyhow::Result<PathBuf> {
     let (os, arch) = node_target()?;
-    let bin_rel = PathBuf::from("node_modules")
-        .join("@esbuild")
-        .join(format!("{os}-{arch}"))
-        .join("bin")
-        .join("esbuild");
+    let bin_rel = PathBuf::from("node_modules").join(esbuild_rel_in_node_modules(os, arch));
 
     let target = esbuild_dir(os, arch)?;
     let bin = target.join(&bin_rel);
@@ -245,12 +242,12 @@ async fn ensure_standalone_esbuild(node_bin: &Path) -> anyhow::Result<PathBuf> {
 /// sentinel if the layout is unfamiliar or the host platform is unsupported, so
 /// the caller's `.exists()` check falls through to a standalone install.
 fn esbuild_binary(adapter_entry: &Path) -> PathBuf {
-    let platform = match node_target() {
-        Ok((os, arch)) => format!("{os}-{arch}"),
+    let (os, arch) = match node_target() {
+        Ok(t) => t,
         Err(_) => return PathBuf::from("esbuild-unsupported-platform"),
     };
     match node_modules_ancestor(adapter_entry) {
-        Some(nm) => nm.join("@esbuild").join(platform).join("bin").join("esbuild"),
+        Some(nm) => nm.join(esbuild_rel_in_node_modules(os, arch)),
         None => PathBuf::from("esbuild-unresolved"),
     }
 }
@@ -430,12 +427,14 @@ fn resolve(target: &Path) -> anyhow::Result<ResolvedRuntime> {
     // The `claude` CLI ships as a native binary inside a platform-specific
     // package `@anthropic-ai/claude-agent-sdk-<os>-<arch>` (an optional dep of
     // the SDK; npm installs only the one matching this host). Its <os>-<arch>
-    // suffix is exactly the Node target mapping.
+    // suffix is exactly the Node target mapping; on Windows the binary is
+    // `claude.exe`.
     let (os, arch) = node_target()?;
+    let exe = if cfg!(target_os = "windows") { ".exe" } else { "" };
     let claude_rel =
-        format!("adapter/node_modules/@anthropic-ai/claude-agent-sdk-{os}-{arch}/claude");
+        format!("adapter/node_modules/@anthropic-ai/claude-agent-sdk-{os}-{arch}/claude{exe}");
     Ok(ResolvedRuntime {
-        node_bin: target.join("node").join("bin").join("node"),
+        node_bin: node_bin_in(&target.join("node")),
         adapter_entry: target.join(ADAPTER_REL),
         claude_bin: target.join(claude_rel),
         origin: "managed",
@@ -468,12 +467,14 @@ async fn fetch_url_bytes(client: &reqwest::Client, url: &str) -> anyhow::Result<
 }
 
 /// Download the pinned Node release and extract it into `<dir>/node`, returning
-/// the path to its `node` binary. Uses the system `tar` (handles strip,
-/// symlinks, hardlinks, and permissions correctly).
+/// the path to its `node` binary. Uses the system `tar` (handles strip, symlinks,
+/// hardlinks, and permissions correctly; on Windows 10+ the bundled bsdtar
+/// auto-detects the `.zip` Node ships there).
 async fn fetch_node(dir: &Path) -> anyhow::Result<PathBuf> {
     let (os, arch) = node_target()?;
-    let stem = format!("node-v{NODE_VERSION}-{os}-{arch}");
-    let url = format!("https://nodejs.org/dist/v{NODE_VERSION}/{stem}.tar.gz");
+    let ext = if cfg!(target_os = "windows") { "zip" } else { "tar.gz" };
+    let stem = format!("node-v{NODE_VERSION}-{}-{arch}", node_dist_os(os));
+    let url = format!("https://nodejs.org/dist/v{NODE_VERSION}/{stem}.{ext}");
 
     let node_dir = dir.join("node");
     tokio::fs::create_dir_all(&node_dir)
@@ -485,15 +486,17 @@ async fn fetch_node(dir: &Path) -> anyhow::Result<PathBuf> {
     let client = crate::net::http_client();
     let bytes = crate::net::with_retries("node", || fetch_url_bytes(&client, url.as_str())).await?;
 
-    let tarball = dir.join("node.tar.gz");
-    tokio::fs::write(&tarball, &bytes)
+    let archive = dir.join(format!("node.{ext}"));
+    tokio::fs::write(&archive, &bytes)
         .await
-        .with_context(|| format!("writing {}", tarball.display()))?;
+        .with_context(|| format!("writing {}", archive.display()))?;
 
     // Strip the leading `node-v.../` component so paths land directly in node/.
+    // `-xf` (no `z`) lets tar auto-detect the format — gzip on unix, zip under
+    // Windows' bsdtar — so one command serves both archives.
     let status = Command::new("tar")
-        .arg("-xzf")
-        .arg(&tarball)
+        .arg("-xf")
+        .arg(&archive)
         .arg("-C")
         .arg(&node_dir)
         .arg("--strip-components=1")
@@ -501,11 +504,11 @@ async fn fetch_node(dir: &Path) -> anyhow::Result<PathBuf> {
         .await
         .context("running `tar` to extract Node (is `tar` installed?)")?;
     if !status.success() {
-        bail!("`tar` failed to extract {}", tarball.display());
+        bail!("`tar` failed to extract {}", archive.display());
     }
-    let _ = tokio::fs::remove_file(&tarball).await;
+    let _ = tokio::fs::remove_file(&archive).await;
 
-    let node_bin = node_dir.join("bin").join("node");
+    let node_bin = node_bin_in(&node_dir);
     if !is_executable(&node_bin) {
         bail!("Node extracted but `{}` is missing or not executable", node_bin.display());
     }
@@ -549,10 +552,15 @@ async fn npm_ci(node_bin: &Path, dir: &Path) -> anyhow::Result<()> {
     Ok(())
 }
 
-/// Locate `npm-cli.js` bundled alongside a `node` binary at `<prefix>/bin/node`.
+/// Locate `npm-cli.js` bundled with a `node` binary. The npm tree sits beside the
+/// binary: `<prefix>/lib/node_modules/npm` on unix (binary at `<prefix>/bin/node`),
+/// and `<dir>/node_modules/npm` on Windows (binary at `<dir>/node.exe`).
 fn npm_cli_for(node_bin: &Path) -> Option<PathBuf> {
-    let prefix = node_bin.parent()?.parent()?; // <prefix>/bin/node -> <prefix>
-    let cli = prefix.join("lib/node_modules/npm/bin/npm-cli.js");
+    let cli = if cfg!(target_os = "windows") {
+        node_bin.parent()?.join("node_modules/npm/bin/npm-cli.js")
+    } else {
+        node_bin.parent()?.parent()?.join("lib/node_modules/npm/bin/npm-cli.js")
+    };
     cli.exists().then_some(cli)
 }
 
@@ -574,15 +582,21 @@ async fn run_with_heartbeat(
     }
 }
 
-/// Map the host to Node's release naming. `Err` on platforms we don't auto-install.
-/// Also names the esbuild platform package (`@esbuild/<os>-<arch>`), which uses
-/// the same `<os>-<arch>` convention — see `crate::mind::views`.
+/// Map the host to the **npm platform-package** naming used by the deps we
+/// resolve: the esbuild platform package (`@esbuild/<os>-<arch>`) and the claude
+/// binary package (`@anthropic-ai/claude-agent-sdk-<os>-<arch>`) — see
+/// `crate::mind::views`. `Err` on platforms we don't auto-install.
+///
+/// nodejs.org's *download* naming agrees with this except on Windows, where the
+/// npm token is `win32` but the Node release archive uses `win`; [`node_dist_os`]
+/// bridges that for [`fetch_node`].
 pub(crate) fn node_target() -> anyhow::Result<(&'static str, &'static str)> {
     let os = match std::env::consts::OS {
         "macos" => "darwin",
         "linux" => "linux",
+        "windows" => "win32",
         other => bail!(
-            "runtime auto-install supports macOS and Linux only (OS `{other}`). \
+            "runtime auto-install supports macOS, Linux, and Windows only (OS `{other}`). \
              Install node, claude-agent-acp, and claude on your PATH to use the \
              system runtime instead."
         ),
@@ -599,13 +613,52 @@ pub(crate) fn node_target() -> anyhow::Result<(&'static str, &'static str)> {
     Ok((os, arch))
 }
 
-/// True if `p` is a regular file with any execute bit set.
+/// nodejs.org dist OS token for an npm OS token. Identical except Windows, where
+/// the Node release archive uses `win` while the npm packages use `win32`.
+fn node_dist_os(npm_os: &str) -> &str {
+    match npm_os {
+        "win32" => "win",
+        other => other,
+    }
+}
+
+/// The `node` binary's path within an extracted Node tree: `node.exe` at the root
+/// on Windows, `bin/node` on unix.
+fn node_bin_in(node_dir: &Path) -> PathBuf {
+    if cfg!(target_os = "windows") {
+        node_dir.join("node.exe")
+    } else {
+        node_dir.join("bin").join("node")
+    }
+}
+
+/// Path of the esbuild native binary *inside a `node_modules`* for this host. On
+/// Windows the `@esbuild/<plat>` package ships `esbuild.exe` at its root; on unix
+/// the binary lives under `bin/esbuild`.
+fn esbuild_rel_in_node_modules(os: &str, arch: &str) -> PathBuf {
+    let pkg = PathBuf::from("@esbuild").join(format!("{os}-{arch}"));
+    if cfg!(target_os = "windows") {
+        pkg.join("esbuild.exe")
+    } else {
+        pkg.join("bin").join("esbuild")
+    }
+}
+
+/// True if `p` is a regular file that can be spawned. On unix that means a file
+/// with any execute bit set; Windows has no execute bit, so existence as a regular
+/// file is the test.
+#[cfg(unix)]
 fn is_executable(p: &Path) -> bool {
     use std::os::unix::fs::PermissionsExt;
     match std::fs::metadata(p) {
         Ok(m) => m.is_file() && (m.permissions().mode() & 0o111 != 0),
         Err(_) => false,
     }
+}
+
+#[cfg(not(unix))]
+fn is_executable(p: &Path) -> bool {
+    std::fs::metadata(p).map(|m| m.is_file()).unwrap_or(false)
 }
 
 /// Use the system's tools when it offers the full set: `node`, the ACP adapter
@@ -637,12 +690,30 @@ fn resolve_system() -> Option<ResolvedRuntime> {
     })
 }
 
-/// Find an executable named `name` on `PATH`, returning the first match.
+/// Find an executable named `name` on `PATH`, returning the first match. On
+/// Windows, where executables carry an extension, each `PATHEXT` suffix is also
+/// tried, so a bare `node` finds `node.exe` and `claude-agent-acp` finds its
+/// `.cmd` shim.
 fn find_on_path(name: &str) -> Option<PathBuf> {
     let path = std::env::var_os("PATH")?;
-    std::env::split_paths(&path)
-        .map(|dir| dir.join(name))
-        .find(|candidate| is_executable(candidate))
+    for dir in std::env::split_paths(&path) {
+        let bare = dir.join(name);
+        if is_executable(&bare) {
+            return Some(bare);
+        }
+        #[cfg(target_os = "windows")]
+        {
+            let exts =
+                std::env::var("PATHEXT").unwrap_or_else(|_| ".EXE;.CMD;.BAT;.COM".to_string());
+            for ext in exts.split(';').map(str::trim).filter(|e| !e.is_empty()) {
+                let cand = dir.join(format!("{name}{ext}"));
+                if is_executable(&cand) {
+                    return Some(cand);
+                }
+            }
+        }
+    }
+    None
 }
 
 /// Locate a *usable* `claude` CLI, resisting launcher shims.
@@ -725,16 +796,35 @@ mod tests {
     fn node_target_maps_known_hosts() {
         // Whatever host runs the test must be a supported target.
         let (os, arch) = node_target().expect("test host should be a supported target");
-        assert!(matches!(os, "darwin" | "linux"));
+        assert!(matches!(os, "darwin" | "linux" | "win32"));
         assert!(matches!(arch, "x64" | "arm64"));
+    }
+
+    #[test]
+    fn node_dist_os_bridges_windows_naming() {
+        // npm packages say `win32`; the nodejs.org download says `win`.
+        assert_eq!(node_dist_os("win32"), "win");
+        assert_eq!(node_dist_os("darwin"), "darwin");
+        assert_eq!(node_dist_os("linux"), "linux");
+    }
+
+    #[test]
+    fn esbuild_rel_uses_host_binary_layout() {
+        // The package dir is named by the (os, arch) args; the binary's location
+        // within it is the *host's* layout (esbuild.exe at root on Windows,
+        // bin/esbuild on unix), since the standalone esbuild is for this host.
+        let rel = esbuild_rel_in_node_modules("darwin", "arm64");
+        assert!(rel.starts_with("@esbuild"));
+        #[cfg(not(target_os = "windows"))]
+        assert!(rel.ends_with("bin/esbuild"));
+        #[cfg(target_os = "windows")]
+        assert!(rel.ends_with("esbuild.exe"));
     }
 
     #[test]
     fn resolve_builds_expected_paths() {
         let r = resolve(Path::new("/cache/runtimeX")).unwrap();
-        assert_eq!(r.node_bin, Path::new("/cache/runtimeX/node/bin/node"));
         assert!(r.adapter_entry.ends_with("claude-agent-acp/dist/index.js"));
-        assert!(r.claude_bin.ends_with("claude"));
         assert!(
             r.claude_bin
                 .to_string_lossy()
@@ -742,8 +832,20 @@ mod tests {
             "claude path should point at a platform package: {}",
             r.claude_bin.display()
         );
-        assert_eq!(r.node_bin_dir(), Path::new("/cache/runtimeX/node/bin"));
         assert_eq!(r.origin, "managed");
+
+        #[cfg(not(target_os = "windows"))]
+        {
+            assert_eq!(r.node_bin, Path::new("/cache/runtimeX/node/bin/node"));
+            assert!(r.claude_bin.ends_with("claude"));
+            assert_eq!(r.node_bin_dir(), Path::new("/cache/runtimeX/node/bin"));
+        }
+        #[cfg(target_os = "windows")]
+        {
+            assert!(r.node_bin.ends_with("node/node.exe"));
+            assert!(r.claude_bin.ends_with("claude.exe"));
+            assert!(r.node_bin_dir().ends_with("runtimeX/node"));
+        }
     }
 
     #[test]
