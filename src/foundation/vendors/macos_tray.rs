@@ -411,10 +411,6 @@ pub fn run(url: String, shutdown: Arc<Notify>) -> anyhow::Result<()> {
     let mtm = MainThreadMarker::new()
         .ok_or_else(|| anyhow!("the menu bar must be set up on the main thread"))?;
 
-    // The chat popover's web view loads this; derived before `url` is moved into the
-    // menu's "Open" target. One desktop, one fixed scene (mirrors `gesture::install`).
-    let chat_url = format!("{url}chat?scene=desktop");
-
     let app = NSApplication::sharedApplication(mtm);
     // Accessory: live in the menu bar only — no Dock icon, no app menu.
     app.setActivationPolicy(NSApplicationActivationPolicy::Accessory);
@@ -518,7 +514,7 @@ pub fn run(url: String, shutdown: Arc<Notify>) -> anyhow::Result<()> {
         // owning the menu permanently (a permanent menu would route *every* click to
         // the menu and the button action would never fire).
         if let Some(button) = &button {
-            crate::foundation::vendors::macos_popover::install(mtm, button.clone(), &chat_url);
+            crate::foundation::vendors::macos_popover::install(mtm, button.clone());
 
             let click = TrayClick::new(mtm, status_item.clone(), button.clone(), menu.clone());
             button.setTarget(Some(&click));
