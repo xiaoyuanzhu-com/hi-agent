@@ -11,6 +11,34 @@
 //! Unlike the cocoa-rs FFI the other macOS vendors use, the tray needs an
 //! Objective-C action target for the menu clicks; this uses the `objc2` family,
 //! whose `define_class!` generates that target safely. Only compiled on macOS.
+//!
+//! ## What you can and can't do with the macOS menu bar (so we don't relitigate it)
+//!
+//! The bar is two regions with very different rules:
+//!
+//! - **Left — the active app's menus** (Apple menu, app name, File/Edit/…). Owned
+//!   by the frontmost app + the system. There is **no public API to inject your own
+//!   clickable entries** into another app's menus. That is the *only* genuinely
+//!   off-limits thing, and only as *menu content*.
+//! - **Right — the status region.** Yours, via `NSStatusItem`. A status item is far
+//!   more than a 22pt icon: its length can be **variable** (auto-sizes to content)
+//!   and its `button` can carry **text and/or a custom `NSView`**, not just an image.
+//!   The "now playing / lyrics" tickers some apps show in the bar are exactly this —
+//!   a wide status item rendering text. So we *can* show the attention transcript
+//!   right here (icon + title), which is what `set_text` below does.
+//!
+//! **Pixels *over* the bar are not restricted either.** You can float a borderless
+//! window over *any* part of the menu bar (left included) — that's how menu-bar
+//! managers (Bartender, Ice) and notch apps draw custom bars. The catch is the
+//! **window level**: it must sit *above* the menu bar. `NSStatusWindowLevel` (25) is
+//! NOT enough — it renders *under* the modern menu bar (an earlier overlay of ours
+//! showed down in the content area for exactly this reason). Those managers also use
+//! the **Accessibility API** to read/move *other apps'* status items — that's the
+//! part that needs the scary permission; rendering only our own item/window does not.
+//!
+//! Net: two clean ways to put our own UI up top — a rich status item (what this file
+//! does) or a high-level borderless overlay window. The one true wall is injecting
+//! into another app's *menus*.
 
 use std::cell::Cell;
 use std::sync::{Arc, OnceLock};
@@ -20,8 +48,8 @@ use objc2::rc::Retained;
 use objc2::runtime::{AnyObject, NSObject, NSObjectProtocol};
 use objc2::{define_class, msg_send, sel, AnyThread, ClassType, DefinedClass, MainThreadOnly};
 use objc2_app_kit::{
-    NSApplication, NSApplicationActivationPolicy, NSImage, NSMenu, NSMenuItem, NSStatusBar,
-    NSStatusBarButton, NSVariableStatusItemLength,
+    NSApplication, NSApplicationActivationPolicy, NSCellImagePosition, NSImage, NSMenu, NSMenuItem,
+    NSStatusBar, NSStatusBarButton, NSVariableStatusItemLength,
 };
 use objc2_foundation::{MainThreadMarker, NSData, NSSize, NSString};
 use tokio::sync::Notify;
@@ -157,6 +185,24 @@ define_class!(
             self.ivars().holding.set(false);
             self.ivars().button.setImage(Some(&self.ivars().idle));
         }
+
+        /// Set the status item's text (the title beside the icon) — the live
+        /// attention transcript, then the reply. A non-empty string widens the
+        /// item to show `icon + text`; an empty string collapses back to icon-only.
+        #[unsafe(method(setText:))]
+        fn set_text(&self, text: Option<&NSString>) {
+            let button = &self.ivars().button;
+            match text {
+                Some(t) if t.length() > 0 => {
+                    button.setTitle(t);
+                    button.setImagePosition(NSCellImagePosition::ImageLeft);
+                }
+                _ => {
+                    button.setTitle(&NSString::from_str(""));
+                    button.setImagePosition(NSCellImagePosition::ImageOnly);
+                }
+            }
+        }
     }
 );
 
@@ -269,6 +315,26 @@ pub fn set_listening(on: bool) {
     }
 }
 
+/// Set the status item's text (the title beside the icon) — empty string collapses
+/// to icon-only. Safe to call from any thread; a no-op until the status item is up.
+pub fn set_text(text: &str) {
+    let Some(blinker) = BLINKER.get() else { return };
+    // The NSString is created here (off the main thread, which is fine for an
+    // immutable string) and retained by `performSelectorOnMainThread:` until the
+    // `setText:` hop runs on the main thread.
+    let ns = NSString::from_str(text);
+    // SAFETY: same contract as `flash` / `set_listening`.
+    unsafe {
+        let obj: &Blinker = &*blinker.0;
+        let _: () = msg_send![
+            obj,
+            performSelectorOnMainThread: sel!(setText:),
+            withObject: &*ns,
+            waitUntilDone: false
+        ];
+    }
+}
+
 /// Build the status item + menu and run the AppKit loop on the current (main)
 /// thread. **Blocks for the process lifetime.** Errors only if we are not on the
 /// main thread; a missing window-server session surfaces as the item simply not
@@ -306,6 +372,9 @@ pub fn run(url: String, shutdown: Arc<Notify>) -> anyhow::Result<()> {
                         height: 18.0,
                     });
                     button.setImage(Some(&idle));
+                    // Resting state is icon-only; `set_text` flips this to
+                    // image-left when there's attention text to show beside it.
+                    button.setImagePosition(NSCellImagePosition::ImageOnly);
                     // The "lit" frame of the gesture ack: the hi mark briefly
                     // blooms to its full colour (red "h" + blue "i") and blinks
                     // back to the resting template — the menu-bar echo of the

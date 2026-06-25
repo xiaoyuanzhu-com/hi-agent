@@ -62,3 +62,13 @@ pub fn set_listening(on: bool) {
     #[cfg(not(target_os = "macos"))]
     let _ = on;
 }
+
+/// Set the menu-bar item's text beside the icon — the live attention transcript,
+/// then the reply. Empty string collapses back to icon-only. Best-effort: a no-op
+/// off macOS or before the status item is up.
+pub fn set_text(text: &str) {
+    #[cfg(target_os = "macos")]
+    crate::foundation::vendors::macos_tray::set_text(text);
+    #[cfg(not(target_os = "macos"))]
+    let _ = text;
+}

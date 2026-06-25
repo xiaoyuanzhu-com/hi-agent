@@ -54,7 +54,11 @@ pub fn install(state: Arc<AppState>, scene: Scene) {
     // the runtime, which stamps them against its own clock (so the double-tap window
     // and the hold threshold share one clock with the timer below).
     let (edge_tx, edge_rx) = tokio::sync::mpsc::unbounded_channel::<hotkey::Edge>();
-    handle.spawn(recognizer_loop(state, scene, edge_rx));
+    // The follower mirrors the held conversation onto the menu-bar item's single
+    // text field — the transcript while you hold, then the reply, in sequence.
+    let (attn_tx, attn_rx) = tokio::sync::mpsc::unbounded_channel::<AttnEvent>();
+    handle.spawn(tray_text_follower(state.clone(), scene.clone(), attn_rx));
+    handle.spawn(recognizer_loop(state, scene, edge_rx, attn_tx));
 
     let spawned = std::thread::Builder::new()
         .name("hotkey-gesture".to_string())
@@ -78,6 +82,112 @@ pub fn install(state: Arc<AppState>, scene: Scene) {
     }
 }
 
+/// What the recognizer tells the tray-text follower: a committed hold began, or
+/// it ended (release). Glance doesn't go through here — it's a self-contained
+/// pulse on the tray icon.
+#[cfg(target_os = "macos")]
+enum AttnEvent {
+    ListenStart,
+    ListenStop,
+}
+
+/// Mirror a held-attention session onto the menu-bar item's single text field: the
+/// live transcript while the user speaks, then the agent's reply — in sequence (we
+/// only have the one field). Spawned once and fed `AttnEvent`s by the recognizer;
+/// it reads transcript/reply off the same non-draining echoes the channel inspector
+/// uses ([`AppState::input_echo`] / [`AppState::output_echo`]). The reply usually
+/// lands *after* release, so `ListenStop` lets the strip linger for a short dwell
+/// that each reply chunk extends, then collapses the item back to icon-only.
+#[cfg(target_os = "macos")]
+async fn tray_text_follower(
+    state: Arc<AppState>,
+    scene: Scene,
+    mut events: tokio::sync::mpsc::UnboundedReceiver<AttnEvent>,
+) {
+    use crate::body::capabilities::tray;
+    use crate::types::Channel;
+    use tokio::sync::broadcast::error::RecvError;
+
+    // How long the strip lingers after release so the reply can show; each reply
+    // chunk pushes it out again.
+    const DWELL: Duration = Duration::from_millis(3500);
+    // Keep the menu-bar item from ballooning past the notch — show only the tail.
+    const MAX_CHARS: usize = 48;
+    fn tail(s: &str) -> String {
+        let chars: Vec<char> = s.chars().collect();
+        if chars.len() <= MAX_CHARS {
+            s.to_string()
+        } else {
+            let cut: String = chars[chars.len() - MAX_CHARS..].iter().collect();
+            format!("…{cut}")
+        }
+    }
+
+    let mut input_rx = state.input_echo.subscribe();
+    let mut output_rx = state.output_echo.subscribe();
+    let mut active = false;
+    let mut reply = String::new();
+    let mut deadline: Option<Instant> = None;
+
+    loop {
+        let dwell = async {
+            match deadline {
+                Some(d) => tokio::time::sleep_until(tokio::time::Instant::from_std(d)).await,
+                None => std::future::pending::<()>().await,
+            }
+        };
+        tokio::select! {
+            ev = events.recv() => match ev {
+                None => break, // recognizer gone
+                Some(AttnEvent::ListenStart) => {
+                    active = true;
+                    reply.clear();
+                    deadline = None;
+                    // Re-subscribe so we start from the live edge (no stale lines).
+                    input_rx = state.input_echo.subscribe();
+                    output_rx = state.output_echo.subscribe();
+                    tray::set_listening(true);
+                    tray::set_text("聆听…");
+                }
+                Some(AttnEvent::ListenStop) => {
+                    if active {
+                        deadline = Some(Instant::now() + DWELL);
+                    }
+                }
+            },
+            r = input_rx.recv(), if active => match r {
+                Ok(echo) => {
+                    if echo.scene == scene && echo.channel == Channel::Text {
+                        tray::set_text(&tail(&echo.text)); // listen phase
+                    }
+                }
+                Err(RecvError::Lagged(_)) => {}
+                Err(RecvError::Closed) => {}
+            },
+            r = output_rx.recv(), if active => match r {
+                Ok(echo) => {
+                    if echo.scene == scene && echo.channel == Channel::Text {
+                        reply.push_str(&echo.text); // speak phase
+                        tray::set_text(&tail(&reply));
+                        if deadline.is_some() {
+                            deadline = Some(Instant::now() + DWELL);
+                        }
+                    }
+                }
+                Err(RecvError::Lagged(_)) => {}
+                Err(RecvError::Closed) => {}
+            },
+            _ = dwell, if deadline.is_some() => {
+                active = false;
+                reply.clear();
+                deadline = None;
+                tray::set_text("");
+                tray::set_listening(false);
+            }
+        }
+    }
+}
+
 /// Drive the recognizers off the edge stream. Double-tap and hold run side by side
 /// over the one key: a quick second press fires a glance; a single press still down
 /// opens attention in two stages — past a short capture threshold the mic opens and
@@ -90,6 +200,7 @@ async fn recognizer_loop(
     state: Arc<AppState>,
     scene: Scene,
     mut edges: tokio::sync::mpsc::UnboundedReceiver<crate::body::capabilities::hotkey::Edge>,
+    attn_tx: tokio::sync::mpsc::UnboundedSender<AttnEvent>,
 ) {
     use crate::body::capabilities::hotkey::{self, Edge, GestureEvent};
 
@@ -133,7 +244,7 @@ async fn recognizer_loop(
                         // pre-roll (released before the hold threshold). `on_command_up`
                         // clears the recognizer's pending press either way.
                         let _ = hold.on_command_up(t);
-                        stop_attention(&mut session);
+                        stop_attention(&attn_tx, &mut session);
                     }
                     Edge::Other => {
                         dt.on_other_input();
@@ -153,7 +264,7 @@ async fn recognizer_loop(
                     // half-formed double-tap so a later tap doesn't pair with this press.
                     Some(GestureEvent::HoldStart) => {
                         dt.on_other_input();
-                        commit_capture(&mut session);
+                        commit_capture(&attn_tx, &mut session);
                     }
                     _ => {}
                 }
@@ -162,7 +273,7 @@ async fn recognizer_loop(
     }
 
     // Tap thread ended — make sure we aren't left attending.
-    stop_attention(&mut session);
+    stop_attention(&attn_tx, &mut session);
 }
 
 /// Capture the screen and hand it to the agent (the double-tap gesture). Flashes the
@@ -252,7 +363,10 @@ fn arm_capture(state: &Arc<AppState>, scene: &Scene, session: &mut Option<MicSes
 /// the pre-roll and start feeding the audio ingest. Called when the press crosses the
 /// hold threshold. No-op if not capturing or already committed.
 #[cfg(target_os = "macos")]
-fn commit_capture(session: &mut Option<MicSession>) {
+fn commit_capture(
+    attn_tx: &tokio::sync::mpsc::UnboundedSender<AttnEvent>,
+    session: &mut Option<MicSession>,
+) {
     if let Some(s) = session.as_mut()
         && !s.committed
     {
@@ -260,8 +374,8 @@ fn commit_capture(session: &mut Option<MicSession>) {
         // the pump is already gone (mic stopped), in which case there's nothing to commit.
         if s.ctrl.try_send(Ctrl::Commit).is_ok() {
             s.committed = true;
-            // The menu-bar icon holds at full colour for the whole hold.
-            crate::body::capabilities::tray::set_listening(true);
+            // The follower lights the icon colour and shows the transcript/reply text.
+            let _ = attn_tx.send(AttnEvent::ListenStart);
             tracing::info!("press-hold attention: listening (processing)");
         }
     }
@@ -283,11 +397,14 @@ fn discard_capture(session: &mut Option<MicSession>) {
 /// buffering, the pre-roll is discarded and no transcript is produced. No-op when not
 /// attending.
 #[cfg(target_os = "macos")]
-fn stop_attention(session: &mut Option<MicSession>) {
+fn stop_attention(
+    attn_tx: &tokio::sync::mpsc::UnboundedSender<AttnEvent>,
+    session: &mut Option<MicSession>,
+) {
     if let Some(s) = session.take() {
         if s.committed {
-            // Leave the listening state — the icon settles back to its resting mark.
-            crate::body::capabilities::tray::set_listening(false);
+            // The follower keeps the strip up through the reply, then settles back.
+            let _ = attn_tx.send(AttnEvent::ListenStop);
             tracing::info!("press-hold attention: released (mic closed)");
         } else {
             tracing::info!("press-hold attention: discarded (released before hold)");

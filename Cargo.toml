@@ -104,6 +104,7 @@ objc2-app-kit = { version = "0.3", features = [
     "NSStatusBarButton",
     "NSButton",
     "NSControl",
+    "NSCell",
     "NSMenu",
     "NSMenuItem",
     "NSImage",
