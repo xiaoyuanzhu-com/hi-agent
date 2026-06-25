@@ -52,7 +52,7 @@ What "done" looks like, and how the user knows it worked.
 - [07 · 用浏览器替我办事](07-browser-errand.md) — 浏览器 effector 实操(非纸上谈兵);敏感动作停下请示;怎么开页沉淀成技能。
 - [08 · 操作电脑/手机上的应用](08-operate-apps.md) — Mac/Win/Linux/Android/iOS 的可行性光谱;有句柄才做,没有就诚实说清。
 - [09 · 用微信(诚实面对脆弱面)](09-wechat.md) — 个人号无开放 API + 反自动化;给受限路径,不假装与飞书同等。
-- [10 · 用 SAM/YOLO 做视觉活](10-vision-sam-yolo.md) — 真跑出检测/掩膜;首选不灵主动换方案(连 14)。
+- [10 · 用 SAM/YOLO 做视觉活](10-vision-sam-yolo.md) — **测的是"能建项目 + 接上 appearance"**(视觉任务只是载体,非通用视觉感官):真跑出检测/掩膜并落 `views/` 呈现;首选不灵主动换方案(连 14)。
 - [11 · 在中国报个税](11-china-tax.md) — 半稳定领域:用前现查当年政策/数字;截止日可作主动提醒。
 - [12 · 陪孩子:讲故事/教认数字/做图](12-play-with-child.md) — register 适配 + 适龄 + 安全边界;够精致的图走 views/。
 - [13 · 配一个外部能力(API + 凭证)](13-equip-a-capability.md) — 能力分流:认识进记忆/技能,凭证逐字进 drive 笔记本,密钥不进脑子。
@@ -71,3 +71,8 @@ What "done" looks like, and how the user knows it worked.
 - [23 · 剪完先自己看一遍(批判反射:好看,不只是能用)](23-critique-before-shipping.md) — 交付前**冷眼自评**,对着研究反射现查来的好范例打分:"能用"≠"好",不到位再来一版、**过线即止**(非无限磨)。把 core.md 的对不对自检(succeeded≠right)推到**好不好**,直接堵 works-but-dumb;在 worker 现有"work to completion"偏向前加一道好不好闸。实测:worker 渲染成图、看实际成品再迭代;审美过线闸未单独隔离。
 - [24 · 第二次剪快得多,而且没用陈货(技能沉淀:难活变顺手流程,且重新核当下)](24-skill-improves-and-refreshes.md) — 一次又查又试又翻车的贵经历沉成 `skills/` 一条笔记,第二次**从 bar 起步**、明显快;但**技能=起点非真理**:durable 半(我怎么干)稳用、transient 半(当下什么好/哪个工具)每次被研究反射([22](22-research-before-stale-answer.md))**重核**——正面解 [11](11-china-tax.md) 的"技能别把旧数字焊死"。门槛=难+会再来+干成了;reflection 策展(照它策展 facets/drive)。实测:worker 自己写了一条技能笔记(contribute 路径通过);reuse/策展/transient 标记待复测。
 - [25 · 干到一半被打断,重启后自己接着干完(一次性交付的断点恢复)](25-resume-interrupted-work.md) — [03](03-feishu-flash-cards.md)/[02](02-feishu-sprint-backlog.md)/[05](05-news-and-watch.md) 常驻职责自愈的**孪生**:恢复的不是"让监听活着",而是**做到一半的一次性交付**(欠老板的那几张卡)。半成品交付 = 一条**临时承诺**,接活当下记进 commitments.md、交付即划掉;重启后读记忆-醒来-注意这个**既有回路**注意到没划掉的 loop → 先看已落什么(不重做副作用)→ 面向用户出声浮现 / 内部悄悄补完。reflection 兜 jot-before-crash 窗口(未交付承诺进 gist→hot.md)。SHIPPED 2026-06-25(57a757c),built+green,**未实测**。
+
+> **通用视觉感官(26–27)**:把"看懂"作为一路感官接进来——不是建 CV 项目([10](10-vision-sam-yolo.md))、不是认人([16](16-recognize-people.md))、也不是收文件([18](18-send-files-to-agent.md)/[19](19-upload-passport.md)),而是 agent 自己看懂一帧 / 一段并化进记忆。两个端点:**frame**(image+prompt→文字)管"一刻",**video**(video+prompt→文字)管"一段"。今天只有 [08](08-operate-apps.md) 用到通用视觉(see-to-act),这两条补上 see-to-answer / see-to-remember / see-an-event。
+
+- [26 · 看懂一帧:举起来当场问 / 存下来回头找](26-look-and-recall.md) — 通用视觉**最典型一路**(frame endpoint):举起实物 / 发来照片,既当场答到点(剂量、成分、跨设备读报错),这份"看懂"又留存让图按**内容**找回;升级现有固定字幕路径(`server/vision.rs`)。与 [16](16-recognize-people.md)(脸=内置模型软证据)、[19](19-upload-passport.md)(文件=物件不走感官)区分。
+- [27 · 看我做,给我反馈(看一段过程,不是一帧)](27-watch-and-guide.md) — 通用视觉 **video endpoint**:看懂一段过程的先后 / 节奏 / 对错(发球、做菜),给针对性反馈、跨段对比进步;语气陪练式(连 [12](12-play-with-child.md))。区别于 [10](10-vision-sam-yolo.md)(建项目跑 CV 模型)。
