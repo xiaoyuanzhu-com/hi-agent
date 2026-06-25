@@ -1,8 +1,12 @@
-//! The right-Command gestures — two ways the user pulls the agent's attention with
-//! one key, both **best-effort and macOS-only**. Bound to the **right** Command alone
+//! The right-Command gestures — ways the user pulls the agent's attention with
+//! one key, all **best-effort and macOS-only**. Bound to the **right** Command alone
 //! (left Command is the everyday shortcut modifier; see
 //! [`crate::foundation::vendors::macos_hotkey`]):
 //!
+//! - **Single-tap the right ⌘ → open the chat popup:** a lone quick tap opens the
+//!   menu-bar conversation popover ([`crate::body::capabilities::tray::open_chat`]).
+//!   It is confirmed only after the double-tap window passes unpaired, so it never
+//!   fires as the first half of a double-tap.
 //! - **Double-tap the right ⌘ → "come and see this":** hands the agent a screenshot of
 //!   the current screen. It is *not a new sense* — the screenshot lands exactly like a
 //!   drag-dropped image (a handed file on the `file` channel) and wakes the mind
@@ -76,7 +80,7 @@ pub fn install(state: Arc<AppState>, scene: Scene) {
     match spawned {
         Ok(_) => tracing::info!(
             scene = %scene_label,
-            "right-Command gestures armed (double-tap → screenshot, press-hold → attention)"
+            "right-Command gestures armed (single-tap → chat, double-tap → screenshot, press-hold → attention)"
         ),
         Err(e) => tracing::warn!(error = %e, "gesture: could not spawn listener thread; gestures disabled"),
     }
@@ -207,13 +211,27 @@ async fn recognizer_loop(
     let start = Instant::now();
     let mut dt = hotkey::DoubleTap::new(hotkey::DEFAULT_WINDOW);
     let mut hold = hotkey::Hold::new(hotkey::DEFAULT_CAPTURE, hotkey::DEFAULT_HOLD);
+    let mut tap = hotkey::SingleTap::new(hotkey::DEFAULT_WINDOW);
     let mut session: Option<MicSession> = None;
 
+    // Per-press bookkeeping for the single-tap recognizer: the current press's
+    // down-time, and whether — since it went down — the mic opened (a hold, not a
+    // tap), a chord broke it, or it completed a double-tap. A release is a *clean
+    // quick tap* (the single-tap candidate) only when none of these is true.
+    let mut down_at: u64 = 0;
+    let mut captured_since_down = false;
+    let mut chorded_since_down = false;
+    let mut glanced_since_down = false;
+
     loop {
-        // Sleep until an armed press would cross its next threshold (capture, then
-        // hold); if none is pending, wait forever (only an edge can wake us). Rebuilt
-        // each iteration so it tracks the current pending press.
-        let deadline = hold.next_deadline();
+        // Sleep until the earliest pending threshold elapses — a hold's capture/hold
+        // threshold, or a single-tap's confirmation window; if none is pending, wait
+        // forever (only an edge can wake us). Rebuilt each iteration so it tracks the
+        // current pending press.
+        let deadline = match (hold.next_deadline(), tap.next_deadline()) {
+            (Some(a), Some(b)) => Some(a.min(b)),
+            (a, b) => a.or(b),
+        };
         let tick = async {
             match deadline {
                 Some(d) => {
@@ -230,12 +248,20 @@ async fn recognizer_loop(
                 let t = start.elapsed().as_millis() as u64;
                 match edge {
                     Edge::CmdDown => {
+                        down_at = t;
+                        captured_since_down = false;
+                        chorded_since_down = false;
+                        glanced_since_down = false;
+                        // A new press is either a fresh tap or the second half of a
+                        // double-tap — either way an earlier tap is no longer "lone".
+                        tap.cancel();
                         hold.on_command_down(t);
                         if dt.on_command_down(t) {
                             // A completed double-tap: glance, and make sure this same
                             // press can't also become a hold.
                             dt.on_other_input();
                             hold.cancel();
+                            glanced_since_down = true;
                             glance(&state, &scene);
                         }
                     }
@@ -245,6 +271,13 @@ async fn recognizer_loop(
                         // clears the recognizer's pending press either way.
                         let _ = hold.on_command_up(t);
                         stop_attention(&attn_tx, &mut session);
+                        // A clean quick tap — released before the mic ever opened, no
+                        // chord, and not a double-tap's second press — is a single-tap
+                        // candidate: confirm it after the double-tap window (so it can't
+                        // be the first half of a double-tap) before it opens the chat.
+                        if !captured_since_down && !chorded_since_down && !glanced_since_down {
+                            tap.arm(down_at);
+                        }
                     }
                     Edge::Other => {
                         dt.on_other_input();
@@ -252,6 +285,8 @@ async fn recognizer_loop(
                         // A chord (e.g. ⌘C) breaks a half-formed hold: drop a buffering
                         // pre-roll, but leave an already-committed attention running.
                         discard_capture(&mut session);
+                        chorded_since_down = true;
+                        tap.cancel();
                     }
                 }
             }
@@ -259,7 +294,10 @@ async fn recognizer_loop(
                 let t = start.elapsed().as_millis() as u64;
                 match hold.poll(t) {
                     // Stage 1: open the mic and start buffering, no processing yet.
-                    Some(GestureEvent::CaptureStart) => arm_capture(&state, &scene, &mut session),
+                    Some(GestureEvent::CaptureStart) => {
+                        captured_since_down = true;
+                        arm_capture(&state, &scene, &mut session);
+                    }
                     // Stage 2: commit the pre-roll to live processing. Cancels a
                     // half-formed double-tap so a later tap doesn't pair with this press.
                     Some(GestureEvent::HoldStart) => {
@@ -267,6 +305,11 @@ async fn recognizer_loop(
                         commit_capture(&attn_tx, &mut session);
                     }
                     _ => {}
+                }
+                // A single tap whose confirmation window elapsed unpaired opens the
+                // menu-bar chat popup (best-effort; a no-op when no tray is up).
+                if tap.poll(t) {
+                    crate::body::capabilities::tray::open_chat();
                 }
             }
         }

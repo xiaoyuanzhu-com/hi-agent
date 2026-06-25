@@ -95,7 +95,13 @@ core-foundation = "0.10"
 # generates that target safely. Per-class APIs in objc2-app-kit / objc2-foundation
 # are behind feature flags, so each AppKit/Foundation type we touch is enabled here.
 objc2 = "0.6"
-objc2-foundation = { version = "0.3", features = ["NSString", "NSThread"] }
+objc2-foundation = { version = "0.3", features = [
+    "NSString",
+    "NSThread",
+    # Chat popover (`crate::vendors::macos_popover`): build the WKWebView's request.
+    "NSURL",
+    "NSURLRequest",
+] }
 objc2-app-kit = { version = "0.3", features = [
     "NSApplication",
     "NSResponder",
@@ -108,7 +114,17 @@ objc2-app-kit = { version = "0.3", features = [
     "NSMenu",
     "NSMenuItem",
     "NSImage",
+    # Chat popover (`crate::vendors::macos_popover`) + tray click routing: an
+    # NSPopover hosting a WKWebView in a bare NSViewController, anchored to the
+    # status button (NSView), toggled vs. menu by inspecting the click NSEvent.
+    "NSView",
+    "NSViewController",
+    "NSPopover",
+    "NSEvent",
 ] }
+# WebKit for the chat popover — a WKWebView renders the `/chat` surface inside the
+# native NSPopover above (`crate::vendors::macos_popover`).
+objc2-web-kit = { version = "0.3", features = ["WKWebView", "WKWebViewConfiguration"] }
 
 # Native microphone capture for the press-and-hold-⌘ attention gesture
 # (`crate::vendors::macos_audio_capture`): opens the default input device and yields

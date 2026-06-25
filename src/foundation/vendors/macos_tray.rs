@@ -48,8 +48,9 @@ use objc2::rc::Retained;
 use objc2::runtime::{AnyObject, NSObject, NSObjectProtocol};
 use objc2::{define_class, msg_send, sel, AnyThread, ClassType, DefinedClass, MainThreadOnly};
 use objc2_app_kit::{
-    NSApplication, NSApplicationActivationPolicy, NSCellImagePosition, NSImage, NSMenu, NSMenuItem,
-    NSStatusBar, NSStatusBarButton, NSVariableStatusItemLength,
+    NSApplication, NSApplicationActivationPolicy, NSCellImagePosition, NSEventModifierFlags,
+    NSEventType, NSImage, NSMenu, NSMenuItem, NSStatusBar, NSStatusBarButton, NSStatusItem,
+    NSVariableStatusItemLength,
 };
 use objc2_foundation::{MainThreadMarker, NSData, NSSize, NSString};
 use tokio::sync::Notify;
@@ -335,6 +336,73 @@ pub fn set_text(text: &str) {
     }
 }
 
+/// What [`TrayClick`] needs to route a click: the status item (to attach the menu
+/// just for a right-click), its button, and the Open/Quit menu.
+struct ClickIvars {
+    status_item: Retained<NSStatusItem>,
+    button: Retained<NSStatusBarButton>,
+    menu: Retained<NSMenu>,
+}
+
+define_class!(
+    // The status-item button's click target. Left-click toggles the chat popover;
+    // right-/control-click shows the Open/Quit menu. Lives on the main thread.
+    #[unsafe(super(NSObject))]
+    #[thread_kind = MainThreadOnly]
+    #[name = "HiAgentTrayClick"]
+    #[ivars = ClickIvars]
+    struct TrayClick;
+
+    unsafe impl NSObjectProtocol for TrayClick {}
+
+    impl TrayClick {
+        /// The button's action (fired on left *and* right mouse-up — see
+        /// `sendActionOn:` in [`run`]). A primary click toggles the chat popover; a
+        /// secondary click (right button, or control-click) shows the Open/Quit menu.
+        ///
+        /// We never keep a permanent `statusItem.menu` — that would hijack *every*
+        /// click into the menu and the button action would never fire — so the menu
+        /// is attached for this one secondary click (`performClick` shows it because a
+        /// menu is set) and detached again immediately after.
+        #[unsafe(method(click:))]
+        fn click(&self, _sender: Option<&AnyObject>) {
+            let mtm = MainThreadMarker::new().expect("tray click runs on the main thread");
+            let app = NSApplication::sharedApplication(mtm);
+            let secondary = app.currentEvent().is_some_and(|ev| {
+                let kind = ev.r#type();
+                kind == NSEventType::RightMouseUp
+                    || (kind == NSEventType::LeftMouseUp
+                        && ev.modifierFlags().contains(NSEventModifierFlags::Control))
+            });
+            let iv = self.ivars();
+            if secondary {
+                iv.status_item.setMenu(Some(&iv.menu));
+                // SAFETY: main-thread NSControl call; with a menu set, this pops the
+                // menu rather than re-firing the action, so there's no recursion.
+                unsafe {
+                    let _: () =
+                        msg_send![&*iv.button, performClick: core::ptr::null_mut::<AnyObject>()];
+                }
+                iv.status_item.setMenu(None);
+            } else {
+                crate::foundation::vendors::macos_popover::toggle();
+            }
+        }
+    }
+);
+
+impl TrayClick {
+    fn new(
+        mtm: MainThreadMarker,
+        status_item: Retained<NSStatusItem>,
+        button: Retained<NSStatusBarButton>,
+        menu: Retained<NSMenu>,
+    ) -> Retained<Self> {
+        let this = Self::alloc(mtm).set_ivars(ClickIvars { status_item, button, menu });
+        unsafe { msg_send![super(this), init] }
+    }
+}
+
 /// Build the status item + menu and run the AppKit loop on the current (main)
 /// thread. **Blocks for the process lifetime.** Errors only if we are not on the
 /// main thread; a missing window-server session surfaces as the item simply not
@@ -342,6 +410,10 @@ pub fn set_text(text: &str) {
 pub fn run(url: String, shutdown: Arc<Notify>) -> anyhow::Result<()> {
     let mtm = MainThreadMarker::new()
         .ok_or_else(|| anyhow!("the menu bar must be set up on the main thread"))?;
+
+    // The chat popover's web view loads this; derived before `url` is moved into the
+    // menu's "Open" target. One desktop, one fixed scene (mirrors `gesture::install`).
+    let chat_url = format!("{url}chat?scene=desktop");
 
     let app = NSApplication::sharedApplication(mtm);
     // Accessory: live in the menu bar only — no Dock icon, no app menu.
@@ -358,8 +430,11 @@ pub fn run(url: String, shutdown: Arc<Notify>) -> anyhow::Result<()> {
 
         // The button carries the icon. The resting icon is the hi mark as a
         // *template* image (the menu bar auto-tints it for light/dark); fall back
-        // to a short title if the embedded PNG ever fails to decode.
-        if let Some(button) = status_item.button(mtm) {
+        // to a short title if the embedded PNG ever fails to decode. Held in an
+        // `Option` (not consumed inline) so the click wiring + popover anchor below
+        // can share it with the blinker.
+        let button = status_item.button(mtm);
+        if let Some(button) = &button {
             let idle = {
                 let data = NSData::with_bytes(include_bytes!("assets/tray-hi.png"));
                 NSImage::initWithData(NSImage::alloc(), &data)
@@ -404,9 +479,10 @@ pub fn run(url: String, shutdown: Arc<Notify>) -> anyhow::Result<()> {
                         width: 18.0,
                         height: 18.0,
                     });
-                    // Build the blinker, leak it (lives as long as the menu bar), and
-                    // publish a pointer so the gesture can drive it from its thread.
-                    let blinker = Blinker::new(mtm, button, idle, active, blank);
+                    // Build the blinker on a clone of the button (the click wiring +
+                    // popover anchor below keep the original), leak it, and publish a
+                    // pointer so the gesture can drive it from its thread.
+                    let blinker = Blinker::new(mtm, button.clone(), idle, active, blank);
                     let ptr: *const Blinker = &*blinker;
                     std::mem::forget(blinker);
                     let _ = BLINKER.set(BlinkerPtr(ptr));
@@ -437,7 +513,24 @@ pub fn run(url: String, shutdown: Arc<Notify>) -> anyhow::Result<()> {
         quit_item.setTarget(Some(&target));
         menu.addItem(&quit_item);
 
-        status_item.setMenu(Some(&menu));
+        // A left-click on the icon toggles the chat popover; a right-/control-click
+        // shows the menu above. So the button drives a `TrayClick` action rather than
+        // owning the menu permanently (a permanent menu would route *every* click to
+        // the menu and the button action would never fire).
+        if let Some(button) = &button {
+            crate::foundation::vendors::macos_popover::install(mtm, button.clone(), &chat_url);
+
+            let click = TrayClick::new(mtm, status_item.clone(), button.clone(), menu.clone());
+            button.setTarget(Some(&click));
+            button.setAction(Some(sel!(click:)));
+            // Fire the action on left *and* right mouse-up so a secondary click also
+            // reaches `click:` (NSEventMaskLeftMouseUp | NSEventMaskRightMouseUp).
+            let mask: u64 = (1 << 2) | (1 << 4);
+            let _: isize = msg_send![&**button, sendActionOn: mask];
+            // The button's target is weak — leak our strong ref so the action target
+            // outlives this function (mirrors `target` below).
+            std::mem::forget(click);
+        }
 
         // Keep the status item and menu alive for the process lifetime. `run` below
         // never returns in the normal path (the process exits on Quit), so leaking

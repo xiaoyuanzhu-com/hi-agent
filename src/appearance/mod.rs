@@ -82,6 +82,10 @@ where
         // e.g. `/inspect/sessions` boots the app, which then renders the right view.
         .route("/inspect", get(index))
         .route("/inspect/{*path}", get(index))
+        // The menu-bar chat popup is another client-routed SPA surface. Serve the
+        // same shell so the popover's WKWebView (and any refresh / deep link) boots
+        // the app, which then renders `<Chat>` for `/chat`.
+        .route("/chat", get(index))
         .route("/favicon.ico", get(favicon))
         // Brand icon set + PWA manifest. The router only serves paths it names,
         // so each root-level asset Vite copies from `public/` needs an explicit

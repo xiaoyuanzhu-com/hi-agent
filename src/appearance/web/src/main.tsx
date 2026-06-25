@@ -1,6 +1,7 @@
 import React from "react";
 import { createRoot } from "react-dom/client";
 import { App } from "./App";
+import { Chat } from "./chat/Chat";
 import { Inspect } from "./inspect/Inspect";
 import { usePath } from "./inspect/router";
 import { installAuthGate } from "./lib/authGate";
@@ -15,12 +16,14 @@ if (!rootEl) {
   throw new Error("missing #root mount point");
 }
 
-// One SPA, two surfaces: the agent "face" at `/`, and the operator console
-// under `/inspect/*`. A tiny path check picks between them; the inspect section
-// owns its own nested routing.
+// One SPA, a few surfaces: the agent "face" at `/`, the operator console under
+// `/inspect/*`, and the menu-bar chat popup at `/chat`. A tiny path check picks
+// between them; the inspect section owns its own nested routing.
 function Root() {
   const { path } = usePath();
-  return path.startsWith("/inspect") ? <Inspect /> : <App />;
+  if (path.startsWith("/inspect")) return <Inspect />;
+  if (path.startsWith("/chat")) return <Chat />;
+  return <App />;
 }
 
 createRoot(rootEl).render(

@@ -1,0 +1,196 @@
+/* The menu-bar chat popup. Self-contained, compact, iMessage-flavoured. All rules
+   are scoped under .chat-* and the surface fills the viewport via position:fixed,
+   so nothing here bleeds into the agent "face" page (which shares the bundle). */
+
+.chat-root {
+  position: fixed;
+  inset: 0;
+  display: flex;
+  flex-direction: column;
+  background: #ffffff;
+  color: #111418;
+  font-family:
+    -apple-system, BlinkMacSystemFont, "Segoe UI", "PingFang SC", "Hiragino Sans GB",
+    "Microsoft YaHei", system-ui, sans-serif;
+  font-size: 15px;
+  -webkit-font-smoothing: antialiased;
+}
+
+.chat-header {
+  flex: 0 0 auto;
+  height: 38px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  border-bottom: 1px solid rgba(0, 0, 0, 0.08);
+  background: rgba(255, 255, 255, 0.92);
+  backdrop-filter: saturate(1.4) blur(8px);
+}
+
+.chat-mark {
+  font-weight: 800;
+  font-size: 18px;
+  letter-spacing: -0.5px;
+}
+.chat-mark-h {
+  color: #fd605e;
+}
+.chat-mark-i {
+  color: #13a7f5;
+}
+
+.chat-list {
+  flex: 1 1 auto;
+  overflow-y: auto;
+  overflow-x: hidden;
+  padding: 12px 12px 6px;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+.chat-empty {
+  margin: auto;
+  color: #9aa0a6;
+  font-size: 14px;
+}
+
+.chat-row {
+  display: flex;
+  width: 100%;
+}
+.chat-row--in {
+  justify-content: flex-end;
+}
+.chat-row--out {
+  justify-content: flex-start;
+}
+
+.chat-bubble {
+  max-width: 78%;
+  padding: 8px 12px;
+  border-radius: 18px;
+  line-height: 1.35;
+  word-break: break-word;
+  overflow-wrap: anywhere;
+}
+.chat-bubble--in {
+  background: #13a7f5;
+  color: #ffffff;
+  border-bottom-right-radius: 5px;
+}
+.chat-bubble--out {
+  background: #eceef1;
+  color: #15181c;
+  border-bottom-left-radius: 5px;
+}
+.chat-bubble--pending {
+  opacity: 0.72;
+}
+
+.chat-text {
+  white-space: pre-wrap;
+}
+
+/* Media bubbles tuck the rendered media flush, with a little gap above any text. */
+.chat-bubble > .chat-media-img,
+.chat-bubble > .chat-media-video,
+.chat-bubble > .chat-media-audio {
+  display: block;
+  margin: -2px 0 0;
+}
+.chat-bubble > .chat-media-img + .chat-text,
+.chat-bubble > .chat-media-video + .chat-text,
+.chat-bubble > .chat-media-audio + .chat-text,
+.chat-bubble > .chat-file + .chat-text {
+  margin-top: 6px;
+}
+
+.chat-media-img {
+  max-width: 100%;
+  max-height: 320px;
+  border-radius: 12px;
+  object-fit: cover;
+}
+.chat-media-video {
+  max-width: 100%;
+  max-height: 320px;
+  border-radius: 12px;
+}
+.chat-media-audio {
+  width: 240px;
+  max-width: 100%;
+}
+
+.chat-file {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  text-decoration: none;
+  color: inherit;
+  font-weight: 600;
+}
+.chat-file-name {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  max-width: 200px;
+}
+
+.chat-composer {
+  flex: 0 0 auto;
+  display: flex;
+  align-items: flex-end;
+  gap: 8px;
+  padding: 8px 10px calc(8px + env(safe-area-inset-bottom, 0px));
+  border-top: 1px solid rgba(0, 0, 0, 0.08);
+  background: rgba(255, 255, 255, 0.96);
+}
+.chat-composer--drag {
+  background: rgba(19, 167, 245, 0.1);
+}
+
+.chat-input {
+  flex: 1 1 auto;
+  resize: none;
+  border: 1px solid rgba(0, 0, 0, 0.14);
+  border-radius: 18px;
+  padding: 8px 12px;
+  font: inherit;
+  line-height: 1.35;
+  max-height: 120px;
+  background: #fff;
+  color: inherit;
+  outline: none;
+}
+.chat-input:focus {
+  border-color: #13a7f5;
+}
+
+.chat-attach,
+.chat-send {
+  flex: 0 0 auto;
+  width: 34px;
+  height: 34px;
+  border: none;
+  border-radius: 50%;
+  cursor: pointer;
+  font-size: 18px;
+  line-height: 1;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+}
+.chat-attach {
+  background: #eceef1;
+  color: #41464c;
+}
+.chat-send {
+  background: #13a7f5;
+  color: #fff;
+  font-weight: 700;
+}
+.chat-send:disabled {
+  background: #cdd2d8;
+  cursor: default;
+}

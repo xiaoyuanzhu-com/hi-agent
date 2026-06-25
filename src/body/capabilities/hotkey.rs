@@ -202,6 +202,63 @@ impl Hold {
     }
 }
 
+/// Recognizes a **single tap** of the key: one clean quick press-and-release that
+/// does *not* turn out to be the first half of a double-tap. Whether a quick tap is
+/// "single" can't be known at release time — a second press may still arrive — so a
+/// confirmed quick tap is *armed* and only fires once the double-tap window elapses
+/// unpaired. The window is [`DEFAULT_WINDOW`], the very same gap that would have made
+/// it a double-tap, so the two are mutually exclusive by construction.
+///
+/// Pure and time-injected like [`DoubleTap`] / [`Hold`]: the host decides a release
+/// was a *clean quick tap* (released before the mic's capture threshold, no chord,
+/// not a double-tap's second press) and [`arm`](SingleTap::arm)s it with that press's
+/// down-time; a fresh press or other key [`cancel`](SingleTap::cancel)s it; and the
+/// host [`poll`](SingleTap::poll)s (via [`next_deadline`](SingleTap::next_deadline))
+/// to let the window elapse.
+#[derive(Debug)]
+pub struct SingleTap {
+    window_ms: u64,
+    /// Absolute time a pending quick tap fires at (its down-time + window), if one is
+    /// awaiting confirmation.
+    fire_at: Option<u64>,
+}
+
+impl SingleTap {
+    pub fn new(window: Duration) -> Self {
+        Self { window_ms: window.as_millis() as u64, fire_at: None }
+    }
+
+    /// A clean quick tap completed; the press went down at `down_at_ms`. Arm it to
+    /// fire once the window elapses, unless a new press cancels it first.
+    pub fn arm(&mut self, down_at_ms: u64) {
+        self.fire_at = Some(down_at_ms + self.window_ms);
+    }
+
+    /// Cancel a pending single tap — a new press (a possible double-tap) or any other
+    /// key means it was not a lone tap after all.
+    pub fn cancel(&mut self) {
+        self.fire_at = None;
+    }
+
+    /// Fire if a pending tap's confirmation window has elapsed. One-shot: it clears the
+    /// pending tap, so a later poll won't fire the same tap twice.
+    pub fn poll(&mut self, now_ms: u64) -> bool {
+        match self.fire_at {
+            Some(at) if now_ms >= at => {
+                self.fire_at = None;
+                true
+            }
+            _ => false,
+        }
+    }
+
+    /// When the host should next [`poll`](SingleTap::poll): the absolute time a pending
+    /// tap fires, or `None` when nothing is armed.
+    pub fn next_deadline(&self) -> Option<u64> {
+        self.fire_at
+    }
+}
+
 /// Whether this build can observe global key events (and thus arm the gesture).
 /// Compile-time, not a permission check — a macOS build still needs the
 /// Accessibility / Input Monitoring grant for the tap to actually receive events.
@@ -358,5 +415,37 @@ mod tests {
         assert_eq!(h.next_deadline(), Some(1_450), "then the hold threshold");
         h.poll(1_450);
         assert_eq!(h.next_deadline(), None, "a started hold has no pending deadline");
+    }
+
+    fn single() -> SingleTap {
+        SingleTap::new(Duration::from_millis(400))
+    }
+
+    #[test]
+    fn armed_tap_fires_after_the_window() {
+        let mut s = single();
+        s.arm(1_000); // a clean quick tap whose press went down at 1_000
+        assert!(!s.poll(1_300), "before the window: not yet a single tap");
+        assert!(s.poll(1_400), "at the window with no second press: fires");
+        assert!(!s.poll(1_500), "one-shot: doesn't fire again");
+    }
+
+    #[test]
+    fn a_second_press_cancels_the_pending_tap() {
+        let mut s = single();
+        s.arm(1_000);
+        s.cancel(); // a second press arrived inside the window (becomes a double-tap)
+        assert!(!s.poll(1_400), "cancelled: never fires");
+        assert!(!s.poll(2_000));
+    }
+
+    #[test]
+    fn next_deadline_tracks_the_pending_tap() {
+        let mut s = single();
+        assert_eq!(s.next_deadline(), None, "nothing armed");
+        s.arm(1_000);
+        assert_eq!(s.next_deadline(), Some(1_400), "fires a window after the down");
+        assert!(s.poll(1_400));
+        assert_eq!(s.next_deadline(), None, "cleared once it fires");
     }
 }

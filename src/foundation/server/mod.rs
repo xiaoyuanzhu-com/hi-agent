@@ -27,7 +27,9 @@ pub mod channels;
 pub mod files;
 pub mod generated;
 pub mod headers;
+pub mod history;
 pub mod mcp;
+pub mod media;
 pub mod observe;
 pub mod reflex;
 pub mod sessions;
@@ -468,6 +470,11 @@ pub fn build(
         // images, and build-agent artifacts. Served here, not in the appearance
         // router, because that router is embed-only and stateless.
         .route("/views/{*path}", get(generated::views_file))
+        // The menu-bar chat popup's read side: `history` seeds the message list for a
+        // scene from the raw journal; `media` serves a referenced blob (audio clip,
+        // vision still) so the bubbles can render it.
+        .route("/api/history", get(history::get_history))
+        .route("/api/media", get(media::get_media))
         .with_state(state.clone())
         .merge(crate::appearance::router())
         .fallback(not_found);
