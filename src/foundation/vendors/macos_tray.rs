@@ -73,30 +73,48 @@ impl TrayTarget {
     }
 }
 
-/// The gesture-ack pulse: on a received gesture the menu-bar icon blinks between
-/// its resting `sparkles` and an `eye` ("the agent looks") a few times over ~half a
-/// second — long enough to read as a deliberate acknowledgement, short enough not to
-/// linger. `STEPS` is the number of toggles after the initial lit frame.
-const PULSE_STEPS: u32 = 4;
-const PULSE_INTERVAL: f64 = 0.1;
+/// The glance ack: on a double-tap the menu-bar icon plays a short scripted
+/// sequence — **resting "hi" → blink → full-colour "hi" (brief stay) → blink →
+/// resting "hi"** — where each "blink" is a quick transparent frame (the icon
+/// winks off and back, keeping its width so neighbours don't shift). Long enough
+/// to read as a deliberate "I looked", short enough not to linger.
+#[derive(Clone, Copy)]
+enum Frame {
+    /// The resting template mark (menu-bar-tinted).
+    Idle,
+    /// The full-colour mark (red "h" + blue "i").
+    Colour,
+    /// A transparent frame — the icon winks off (the "blink").
+    Blank,
+}
 
-/// What [`Blinker`] needs to animate the icon, plus the little pulse state. Touched
-/// only on the main thread (the pulse self-schedules onto the main run loop), so
-/// plain `Cell`s suffice.
+/// The glance script: `(frame to show, seconds to hold it before the next)`. The
+/// last frame ends the sequence (its hold time is unused). It starts from the
+/// resting icon, so the leading Blank reads as a blink *off* the resting mark.
+const GLANCE: &[(Frame, f64)] = &[
+    (Frame::Blank, 0.10),  // wink off the resting "hi"
+    (Frame::Colour, 0.60), // bloom to colour, brief stay
+    (Frame::Blank, 0.10),  // wink off the colour
+    (Frame::Idle, 0.0),    // back to resting
+];
+
+/// What [`Blinker`] needs to drive the icon. Touched only on the main thread (it
+/// self-schedules onto the main run loop), so plain `Cell`s suffice.
 struct BlinkIvars {
     button: Retained<NSStatusBarButton>,
     idle: Retained<NSImage>,
     active: Retained<NSImage>,
-    lit: Cell<bool>,
-    remaining: Cell<u32>,
-    /// While true (⌘ held for press-hold attention), the icon stays at its full
-    /// colour and the glance pulse settles to colour instead of the resting mark.
+    blank: Retained<NSImage>,
+    /// While true (⌘ held for press-hold attention) the icon stays at full colour;
+    /// a glance can't fire mid-hold (you can't double-tap while holding ⌘).
     holding: Cell<bool>,
+    /// Cursor into [`GLANCE`] while a glance sequence is playing.
+    step: Cell<usize>,
 }
 
 define_class!(
-    // Owns the status-item button and drives the brief icon pulse that acknowledges
-    // a received gesture. Lives on the main thread for the process life; reached from
+    // Owns the status-item button and drives the glance sequence + the sustained
+    // listening colour. Lives on the main thread for the process life; reached from
     // other threads only via `performSelectorOnMainThread:`.
     #[unsafe(super(NSObject))]
     #[thread_kind = MainThreadOnly]
@@ -107,82 +125,37 @@ define_class!(
     unsafe impl NSObjectProtocol for Blinker {}
 
     impl Blinker {
-        /// Start (or restart) the pulse. Invoked on the main thread via
+        /// Start (or restart) the glance sequence. Invoked on the main thread via
         /// `performSelectorOnMainThread:`; rapid re-taps coalesce by cancelling any
         /// in-flight steps before re-arming.
         #[unsafe(method(flash:))]
         fn flash(&self, _arg: Option<&AnyObject>) {
-            let iv = self.ivars();
-            unsafe {
-                let _: () = msg_send![
-                    Self::class(),
-                    cancelPreviousPerformRequestsWithTarget: self,
-                    selector: sel!(step:),
-                    object: core::ptr::null_mut::<AnyObject>()
-                ];
-            }
-            iv.lit.set(true);
-            iv.remaining.set(PULSE_STEPS);
-            iv.button.setImage(Some(&iv.active));
-            self.schedule_step();
+            self.cancel_pending();
+            self.ivars().step.set(0);
+            self.play();
         }
 
-        /// One toggle of the pulse, re-scheduling itself until the budget runs out,
-        /// then settling back to the resting icon.
+        /// Advance the glance sequence by one frame.
         #[unsafe(method(step:))]
         fn step(&self, _arg: Option<&AnyObject>) {
-            let iv = self.ivars();
-            let r = iv.remaining.get();
-            if r == 0 {
-                // Settle: hold at full colour while listening, else the resting mark.
-                let holding = iv.holding.get();
-                iv.button.setImage(Some(if holding { &iv.active } else { &iv.idle }));
-                iv.lit.set(holding);
-                return;
-            }
-            let now_lit = !iv.lit.get();
-            iv.lit.set(now_lit);
-            iv.button.setImage(Some(if now_lit { &iv.active } else { &iv.idle }));
-            iv.remaining.set(r - 1);
-            self.schedule_step();
+            self.play();
         }
 
-        /// Enter the sustained "listening" state: the icon holds at its full
-        /// colour for as long as ⌘ is held (the press-hold attention gesture).
-        /// Cancels any in-flight glance pulse.
+        /// Enter the sustained "listening" state: the icon holds at full colour for
+        /// as long as ⌘ is held (press-hold attention). Cancels any glance in flight.
         #[unsafe(method(listenOn:))]
         fn listen_on(&self, _arg: Option<&AnyObject>) {
-            let iv = self.ivars();
-            unsafe {
-                let _: () = msg_send![
-                    Self::class(),
-                    cancelPreviousPerformRequestsWithTarget: self,
-                    selector: sel!(step:),
-                    object: core::ptr::null_mut::<AnyObject>()
-                ];
-            }
-            iv.holding.set(true);
-            iv.lit.set(true);
-            iv.remaining.set(0);
-            iv.button.setImage(Some(&iv.active));
+            self.cancel_pending();
+            self.ivars().holding.set(true);
+            self.ivars().button.setImage(Some(&self.ivars().active));
         }
 
-        /// Leave the listening state: settle back to the resting icon.
+        /// Leave the listening state: settle back to the resting mark.
         #[unsafe(method(listenOff:))]
         fn listen_off(&self, _arg: Option<&AnyObject>) {
-            let iv = self.ivars();
-            unsafe {
-                let _: () = msg_send![
-                    Self::class(),
-                    cancelPreviousPerformRequestsWithTarget: self,
-                    selector: sel!(step:),
-                    object: core::ptr::null_mut::<AnyObject>()
-                ];
-            }
-            iv.holding.set(false);
-            iv.lit.set(false);
-            iv.remaining.set(0);
-            iv.button.setImage(Some(&iv.idle));
+            self.cancel_pending();
+            self.ivars().holding.set(false);
+            self.ivars().button.setImage(Some(&self.ivars().idle));
         }
     }
 );
@@ -193,28 +166,54 @@ impl Blinker {
         button: Retained<NSStatusBarButton>,
         idle: Retained<NSImage>,
         active: Retained<NSImage>,
+        blank: Retained<NSImage>,
     ) -> Retained<Self> {
         let this = Self::alloc(mtm).set_ivars(BlinkIvars {
             button,
             idle,
             active,
-            lit: Cell::new(false),
-            remaining: Cell::new(0),
+            blank,
             holding: Cell::new(false),
+            step: Cell::new(0),
         });
         unsafe { msg_send![super(this), init] }
     }
 
-    /// Re-arm `step:` after [`PULSE_INTERVAL`]. Schedules onto the current run loop,
-    /// so it must run on the main thread (it always does — see [`flash`]).
-    fn schedule_step(&self) {
+    /// Cancel any scheduled `step:` so a re-tap or a listening change can't collide
+    /// with an in-flight glance sequence.
+    fn cancel_pending(&self) {
         unsafe {
             let _: () = msg_send![
-                self,
-                performSelector: sel!(step:),
-                withObject: core::ptr::null_mut::<AnyObject>(),
-                afterDelay: PULSE_INTERVAL
+                Self::class(),
+                cancelPreviousPerformRequestsWithTarget: self,
+                selector: sel!(step:),
+                object: core::ptr::null_mut::<AnyObject>()
             ];
+        }
+    }
+
+    /// Show the current glance frame and, if more remain, schedule the next after
+    /// its hold time. Runs on the main thread (see [`flash`] / [`step`]).
+    fn play(&self) {
+        let iv = self.ivars();
+        let i = iv.step.get();
+        let Some(&(frame, delay)) = GLANCE.get(i) else { return };
+        let img = match frame {
+            Frame::Idle => &iv.idle,
+            Frame::Colour => &iv.active,
+            Frame::Blank => &iv.blank,
+        };
+        iv.button.setImage(Some(img));
+        if i + 1 < GLANCE.len() {
+            iv.step.set(i + 1);
+            unsafe {
+                let _: () = msg_send![
+                    self,
+                    performSelector: sel!(step:),
+                    withObject: core::ptr::null_mut::<AnyObject>(),
+                    afterDelay: delay
+                ];
+            }
         }
     }
 }
@@ -324,9 +323,21 @@ pub fn run(url: String, shutdown: Arc<Notify>) -> anyhow::Result<()> {
                         width: 18.0,
                         height: 18.0,
                     });
+                    // The "blink" frame: a transparent mark of the same size, so the
+                    // icon winks fully off mid-glance without the status item
+                    // collapsing its width (which would jostle the neighbours).
+                    let blank = {
+                        let data = NSData::with_bytes(include_bytes!("assets/tray-hi-blank.png"));
+                        NSImage::initWithData(NSImage::alloc(), &data)
+                    }
+                    .unwrap_or_else(|| idle.clone());
+                    blank.setSize(NSSize {
+                        width: 18.0,
+                        height: 18.0,
+                    });
                     // Build the blinker, leak it (lives as long as the menu bar), and
-                    // publish a pointer so the gesture can pulse it from its thread.
-                    let blinker = Blinker::new(mtm, button, idle, active);
+                    // publish a pointer so the gesture can drive it from its thread.
+                    let blinker = Blinker::new(mtm, button, idle, active, blank);
                     let ptr: *const Blinker = &*blinker;
                     std::mem::forget(blinker);
                     let _ = BLINKER.set(BlinkerPtr(ptr));
