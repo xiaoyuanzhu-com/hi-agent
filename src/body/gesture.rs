@@ -1,12 +1,14 @@
-//! The Command-key gestures — two ways the user pulls the agent's attention with
-//! one key, both **best-effort and macOS-only**:
+//! The right-Command gestures — two ways the user pulls the agent's attention with
+//! one key, both **best-effort and macOS-only**. Bound to the **right** Command alone
+//! (left Command is the everyday shortcut modifier; see
+//! [`crate::foundation::vendors::macos_hotkey`]):
 //!
-//! - **Double-tap ⌘ → "come and see this":** hands the agent a screenshot of the
-//!   current screen. It is *not a new sense* — the screenshot lands exactly like a
+//! - **Double-tap the right ⌘ → "come and see this":** hands the agent a screenshot of
+//!   the current screen. It is *not a new sense* — the screenshot lands exactly like a
 //!   drag-dropped image (a handed file on the `file` channel) and wakes the mind
 //!   ([`crate::foundation::server::files::receive_screenshot`]).
-//! - **Press-and-hold ⌘ → continuous attention:** for as long as Command is held,
-//!   the agent listens (native mic capture → the same audio ingest the browser mic
+//! - **Press-and-hold the right ⌘ → continuous attention:** for as long as the key is
+//!   held, the agent listens (native mic capture → the same audio ingest the browser mic
 //!   uses) and may look at the screen (its existing `look` tool); on release it
 //!   stops. The mic opens early (after a short capture threshold) and buffers a
 //!   pre-roll, but that audio is only *processed* once the press also crosses the
@@ -35,7 +37,7 @@ use std::collections::VecDeque;
 #[cfg(target_os = "macos")]
 use tokio::sync::mpsc;
 
-/// Arm the gestures: from now on a double-tap of Command hands the agent a
+/// Arm the gestures: from now on a double-tap of the right Command hands the agent a
 /// screenshot, and a press-and-hold opens continuous attention, both in `scene`.
 /// Spawns the OS event-loop thread and the recognizer task and returns immediately.
 /// Call once, after the reactor is running, from within the tokio runtime — it
@@ -70,7 +72,7 @@ pub fn install(state: Arc<AppState>, scene: Scene) {
     match spawned {
         Ok(_) => tracing::info!(
             scene = %scene_label,
-            "Command gestures armed (double-tap → screenshot, press-hold → attention)"
+            "right-Command gestures armed (double-tap → screenshot, press-hold → attention)"
         ),
         Err(e) => tracing::warn!(error = %e, "gesture: could not spawn listener thread; gestures disabled"),
     }
@@ -190,7 +192,7 @@ fn glance(state: &Arc<AppState>, scene: &Scene) {
 /// the mind knows this speech is live, headless, and screen-aware — and may look.
 #[cfg(target_os = "macos")]
 const ATTENTION_TAG: &str =
-    "live attention: the user is holding ⌘ — showing you their screen and talking to \
+    "live attention: the user is holding the right ⌘ — showing you their screen and talking to \
      you right now; look at their screen if you need to, and respond as the conversation \
      warrants";
 
