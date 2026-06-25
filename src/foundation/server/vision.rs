@@ -2,11 +2,12 @@
 //!
 //! "Vision is video." The camera streams continuously — the client does not
 //! pre-sample frames — so the *backend* is the control point for how much it
-//! actually looks. Each persisted minute-file is captioned, and when the face
-//! capability is configured one keyframe is decoded out of it (via `ffmpeg`) and
-//! run through face recognition, so the camera recognizes people the same way a
-//! posted still does. The live `video_in` broadcast itself is not yet
-//! frame-sampled in real time — perception works off the minute grid.
+//! actually looks. Each minute is persisted as a standalone file; understanding it
+//! is the agent's call (the `see`/`watch` tools), not an eager caption here. When
+//! the face capability is configured one keyframe is decoded out of the minute (via
+//! `ffmpeg`) and run through face recognition — a receive-time reflex that lets the
+//! camera surface "someone's here" the same way a posted still does. The live
+//! `video_in` broadcast itself is not yet frame-sampled in real time.
 //!
 //! Stream (`WS /api/in/vision/stream`): the client runs a `MediaRecorder` and
 //! ships encoded chunks as binary frames for the whole time the camera is open;
@@ -28,6 +29,7 @@
 
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
+use std::time::{Duration, Instant};
 
 use axum::body::{Body, Bytes};
 use axum::extract::ws::{Message as WsMessage, WebSocketUpgrade};
@@ -43,20 +45,16 @@ use chrono::{DateTime, Utc};
 use uuid::Uuid;
 
 use crate::body::capabilities::face;
-use crate::body::capabilities::vision::{self as vision_cap, VisualMedia};
 use crate::foundation::vendors::ffmpeg_frame;
-use crate::mind::memory::layout::MediaSlot;
+use crate::mind::memory::layout::{MediaSlot, day_key};
 use crate::mind::memory::media;
 use crate::mind::memory::people_vectors::{self, Modality};
 use crate::foundation::server::headers::{AuthBearer, RequiredScene, SceneHeader};
-use crate::foundation::server::{AppState, VideoInEvent, VideoSource};
+use crate::foundation::server::{AppState, PartialMinute, VideoInEvent, VideoSource};
 use crate::types::{Channel, JournalEntry, Media, Origin, Scene};
 
 const DEFAULT_IMAGE_MIME: &str = "image/jpeg";
 const DEFAULT_VIDEO_MIME: &str = "video/webm";
-
-/// The instruction the placeholder perception passes to the vision capability.
-const VISION_PROMPT: &str = "Describe what you see, briefly.";
 
 /// Cosine floor for naming a recognized face in the evidence note; below it the
 /// face is shown as "unfamiliar". Deliberately low — the note is soft evidence
@@ -82,10 +80,10 @@ pub async fn post_vision(
 
     tracing::debug!(scene = %scene, mime = %mime, bytes = body.len(), "POST /api/in/vision");
 
-    // A one-off still: persist the bytes, then perceive it — a caption (the
-    // vision capability, or a placeholder when none is configured) becomes the
-    // signal's text surface. Perception runs in the background so the POST
-    // returns promptly; the journaled signal lands a moment later.
+    // A one-off still: persist the bytes, then raise a minimal signal pointing at
+    // them (a `see`-able ref) — understanding is the agent's call, not an eager
+    // caption. Perception runs in the background so the POST returns promptly; the
+    // journaled signal lands a moment later.
     let ts = Utc::now();
     let rel = match media::store_blob(&state.data_dir, &scene, Channel::Vision, ts, MediaSlot::InputOneOff, ext, &body).await {
         Ok(rel) => rel,
@@ -94,11 +92,9 @@ pub async fn post_vision(
             return (StatusCode::INTERNAL_SERVER_ERROR, "vision store failed\n").into_response();
         }
     };
-    // The raw image bytes ride to perception twice: once wrapped for captioning,
-    // once kept raw for face recognition (a still — video frame-sampling is later).
-    let recognise = FaceSource::Image(body.clone());
-    let visual = VisualMedia::image_bytes(body, mime.clone());
-    spawn_perceive(state.clone(), scene.clone(), visual, rel, mime, ts, None, Some(recognise));
+    // Keep the raw bytes for the receive-time face reflex; nothing is captioned.
+    let recognise = FaceSource::Image(body);
+    spawn_perceive(state.clone(), scene.clone(), Perceived::Still, rel, mime, ts, None, Some(recognise));
     StatusCode::ACCEPTED.into_response()
 }
 
@@ -128,14 +124,25 @@ impl FaceSource {
     }
 }
 
-/// Spawn the perception of one piece of visual media: caption it (via the vision
-/// capability, or a placeholder when unconfigured) and journal a `Vision` signal
-/// whose `body` is that caption and whose `media` points at the stored blob.
-/// Runs detached so capture never blocks on the (possibly remote) understanding.
+/// What kind of vision media was perceived — shapes the signal we raise.
+enum Perceived {
+    /// A one-off still the person handed in (POST /api/in/vision): always worth a
+    /// signal, carrying a `see`-able ref.
+    Still,
+    /// A wall-clock minute of the live camera. Ambient: a signal is raised only when
+    /// someone is on camera (the face reflex); a quiet minute is kept silently.
+    CameraMinute,
+}
+
+/// Persist-and-perceive's journaling half: raise a minimal `Vision` signal pointing
+/// at the stored blob — NOT an eager caption. Understanding is the agent's call (the
+/// `see`/`watch` tools), guided by prose; here we only earn its attention. Face
+/// recognition stays a receive-time reflex (soft evidence) folded into the signal.
+/// Runs detached so capture never blocks on the (possibly slow) keyframe decode.
 fn spawn_perceive(
     state: Arc<AppState>,
     scene: Scene,
-    media: VisualMedia,
+    kind: Perceived,
     blob_rel: String,
     mime: String,
     ts: DateTime<Utc>,
@@ -143,18 +150,33 @@ fn spawn_perceive(
     recognise: Option<FaceSource>,
 ) {
     tokio::spawn(async move {
-        let mut body = caption(media, &mime).await;
-        // Fold any recognized faces into the caption as receive-time evidence —
-        // the body is already a derived surface, so this matches it. Works for a
-        // still image and for a camera-stream minute (one keyframe decoded out);
-        // best-effort (never blocks or fails the signal).
-        if face::available()
+        // Receive-time face reflex (soft evidence): best-effort, never blocks/fails.
+        // Works for a still and for a camera minute (one keyframe decoded out).
+        let face = if face::available()
             && let Some(src) = recognise
             && let Some(img) = src.into_image().await
-            && let Some(note) = face_note(img, &state.data_dir).await
         {
-            body.push_str(&note);
-        }
+            face_note(img, &state.data_dir).await
+        } else {
+            None
+        };
+
+        let body = match kind {
+            Perceived::Still => {
+                let mut b = format!("📷 photo arrived ⟨ref: {}/{}⟩", day_key(ts), blob_rel);
+                if let Some(note) = &face {
+                    b.push_str(note);
+                }
+                b
+            }
+            // Ambient camera: only surface a minute when someone's on it. A quiet
+            // minute stays on disk but raises no signal (no per-minute spam).
+            Perceived::CameraMinute => match &face {
+                Some(note) => format!("👁 someone's on camera{note}"),
+                None => return,
+            },
+        };
+
         let entry = JournalEntry::SignalIn {
             id: Uuid::now_v7().to_string(),
             ts,
@@ -204,26 +226,11 @@ async fn face_note(bytes: Bytes, data_dir: &std::path::Path) -> Option<String> {
     Some(format!(" ⟨faces: {}⟩", parts.join("; ")))
 }
 
-/// Caption a piece of visual media. Uses the configured vision capability when
-/// available; otherwise returns a placeholder so the signal still carries a text
-/// surface (the bytes are persisted regardless).
-async fn caption(media: VisualMedia, mime: &str) -> String {
-    if vision_cap::available() {
-        match vision_cap::understand(media, VISION_PROMPT).await {
-            Ok(text) if !text.trim().is_empty() => text,
-            Ok(_) => format!("[vision: empty understanding ({mime})]"),
-            Err(err) => format!("[vision: understanding failed: {err}]"),
-        }
-    } else {
-        format!("[vision capture ({mime}); understanding not configured]")
-    }
-}
-
 /// Persist one wall-clock minute of camera media as
 /// `vision/<date>/<HH>/<MM>.<ext>` (ext follows the stream's container —
 /// `mp4`/`webm`), prefixed with the init segment so the file decodes standalone,
-/// then perceive it (video → caption). Best-effort: a store failure is logged
-/// and perception is skipped.
+/// then perceive it (a face-gated ambient signal; no caption). Best-effort: a store
+/// failure is logged and perception is skipped.
 async fn flush_video_minute(
     state: &Arc<AppState>,
     scene: &Scene,
@@ -247,11 +254,11 @@ async fn flush_video_minute(
     };
     let video = Bytes::from(bytes);
     // Recognize faces from one keyframe of the minute when the face capability is
-    // on — the camera's twin of the still-image path. Decoding happens inside the
+    // on — the camera's twin of the still-image path, and the gate that decides
+    // whether this ambient minute is worth a signal. Decoding happens inside the
     // detached perceive task, so the flush itself stays cheap.
-    let recognise = face::available().then(|| FaceSource::Video(video.clone()));
-    let visual = VisualMedia::video_bytes(video, mime);
-    spawn_perceive(state.clone(), scene.clone(), visual, rel, mime.to_string(), ts, None, recognise);
+    let recognise = face::available().then(move || FaceSource::Video(video));
+    spawn_perceive(state.clone(), scene.clone(), Perceived::CameraMinute, rel, mime.to_string(), ts, None, recognise);
 }
 
 #[derive(Debug, Deserialize)]
@@ -317,6 +324,9 @@ async fn stream_video_in(
     let mut cap_minute: Option<String> = None;
     let mut cap_ts = Utc::now();
     let mut cap_buf: Vec<u8> = Vec::new();
+    // Throttle for refreshing the shared partial-minute snapshot (`watch`'s freshness
+    // window): cloning the growing minute buffer every chunk would be wasteful.
+    let mut last_partial = Instant::now();
 
     while let Some(msg) = socket.recv().await {
         match msg {
@@ -369,6 +379,23 @@ async fn stream_video_in(
                         cap_ts = now;
                     }
                     cap_buf.extend_from_slice(&b);
+                    // Refresh the freshness snapshot the `watch` tool reads — init +
+                    // buf is an independently-decodable clip. Throttled so we don't
+                    // clone the growing minute buffer on every chunk.
+                    if let Some(init) = cap_init.as_ref()
+                        && last_partial.elapsed() >= Duration::from_secs(1)
+                    {
+                        last_partial = Instant::now();
+                        state.video_in_partial.lock().unwrap().insert(
+                            scene.clone(),
+                            PartialMinute {
+                                turn,
+                                mime: mime.clone(),
+                                init: init.clone(),
+                                buf: Bytes::copy_from_slice(&cap_buf),
+                            },
+                        );
+                    }
                 }
                 let _ = state.video_in.send(VideoInEvent::Frame {
                     scene: Some(scene.clone()),
@@ -394,6 +421,12 @@ async fn stream_video_in(
             live.remove(&scene);
         }
         drop(live);
+        // Drop the freshness snapshot too, if we're still its owner.
+        let mut partial = state.video_in_partial.lock().unwrap();
+        if partial.get(&scene).map(|p| p.turn) == Some(turn) {
+            partial.remove(&scene);
+        }
+        drop(partial);
         let _ = state.video_in.send(VideoInEvent::End { scene: Some(scene.clone()), turn });
     }
     tracing::info!(scene = %scene, "WS /api/in/vision/stream closed");

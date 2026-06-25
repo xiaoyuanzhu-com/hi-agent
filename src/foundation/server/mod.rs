@@ -180,6 +180,20 @@ pub struct VideoSource {
     pub init: Bytes,
 }
 
+/// A snapshot of the in-progress (not-yet-flushed) camera minute for a scene, so a
+/// tool can grab "what just happened" without waiting for the minute to roll over and
+/// flush to disk. Holds the cached init segment plus the media bytes accumulated so
+/// far this minute; `init` followed by `buf` is an independently-decodable clip — the
+/// same shape every persisted minute file has. Refreshed as chunks arrive and cleared
+/// when the camera closes (see [`vision`]).
+#[derive(Debug, Clone)]
+pub struct PartialMinute {
+    pub turn: u64,
+    pub mime: String,
+    pub init: Bytes,
+    pub buf: Bytes,
+}
+
 /// One recognized input, echoed to scene observers on `GET /api/in/<channel>`.
 ///
 /// Inputs (typed text, recognized speech) cross the world→agent boundary on a
@@ -277,6 +291,12 @@ pub struct AppState {
     /// segment so an observer can join the live stream mid-flight (see
     /// [`VideoSource`]). Inserted on a camera's first chunk, removed on close.
     pub video_in_live: Mutex<HashMap<Scene, VideoSource>>,
+
+    /// The in-progress (not-yet-flushed) camera minute per scene — a freshness window
+    /// for the agent's `watch` tool, which otherwise sees only persisted minute files
+    /// up to ~60s stale. Refreshed as chunks accumulate, cleared on camera close. See
+    /// [`PartialMinute`].
+    pub video_in_partial: Mutex<HashMap<Scene, PartialMinute>>,
 
     /// Inbound echo broadcast. GET /api/in/<channel> observers receive recognized
     /// inputs (typed text, recognized speech) from this — live, no replay.
@@ -408,6 +428,7 @@ pub fn build(
         video_in: video_in_tx.clone(),
         video_in_turn: AtomicU64::new(0),
         video_in_live: Mutex::new(HashMap::new()),
+        video_in_partial: Mutex::new(HashMap::new()),
         input_echo: input_echo_tx.clone(),
         output_echo: output_echo_tx.clone(),
         memory,

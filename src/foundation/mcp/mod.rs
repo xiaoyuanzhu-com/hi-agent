@@ -17,8 +17,17 @@
 use serde_json::{Value, json};
 
 use base64::Engine as _;
+
+use std::collections::HashMap;
+use std::path::Path;
+use std::sync::Mutex;
+
+use bytes::Bytes;
+use chrono::{DateTime, Utc};
+
 use crate::mind::memory::people_vectors;
 use crate::body::reactor::{SceneControl, ToolRegistry};
+use crate::foundation::server::PartialMinute;
 use crate::types::{Geometry, Region, Scene};
 
 /// MCP protocol version we advertise when the client doesn't pin one. We echo the
@@ -77,6 +86,7 @@ fn tools_for_role(role: Option<&str>) -> Vec<Value> {
                     "required": ["action"],
                 }),
             ),
+            watch_tool(),
         ],
         // The reflection ("sleep") surface: a voice-less session that consolidates
         // the raw log into derived memory. It segments the scene's unconsolidated
@@ -203,6 +213,7 @@ fn tools_for_role(role: Option<&str>) -> Vec<Value> {
                     "required": ["channel", "date"],
                 }),
             ),
+            see_tool(),
         ],
         // Default to the reactor surface (the soul describes these).
         _ => vec![
@@ -299,6 +310,8 @@ fn tools_for_role(role: Option<&str>) -> Vec<Value> {
                     "required": ["name", "value", "label_contains"],
                 }),
             ),
+            see_tool(),
+            watch_tool(),
         ],
     }
 }
@@ -307,12 +320,56 @@ fn tool(name: &str, description: &str, input_schema: Value) -> Value {
     json!({ "name": name, "description": description, "inputSchema": input_schema })
 }
 
+/// The `see` tool — understand a still the person handed in (or one surfaced in a
+/// signal). Shared by the reactor (answer in conversation) and reflection (index a
+/// day's photos). The bundle decides how: a native-vision model gets the raw image
+/// to reason over; a text-only one gets the vision capability's description.
+fn see_tool() -> Value {
+    tool(
+        "see",
+        "Look at a still image and answer about it — a photo the person sent or held up to the \
+         camera, surfaced to you as a signal like `📷 photo arrived ⟨ref: …⟩`. Pass that `ref`, and \
+         optionally what you want to know. Reach for it the moment seeing the picture beats guessing: \
+         read a label/menu/handwriting, identify a thing, check what's on a screen they photographed.",
+        json!({
+            "type": "object",
+            "properties": {
+                "ref": { "type": "string", "description": "The ⟨ref: …⟩ from the photo's signal, e.g. 2026-06-25/14/23-07.jpg." },
+                "prompt": { "type": "string", "description": "Optional: what you want to know about the image (a question or focus). Omit to just look." },
+            },
+            "required": ["ref"],
+        }),
+    )
+}
+
+/// The `watch` tool — understand a short span of the *live* camera. Shared by the
+/// reactor (in conversation) and workers (mid-task). Always polyfilled: the clip is
+/// understood by the vision capability and the text handed back.
+fn watch_tool() -> Value {
+    tool(
+        "watch",
+        "Watch a few seconds of the live camera and tell what happened — for when motion or a \
+         sequence matters, not a single frame (someone's action, a gesture, \"did you see that?\"). \
+         It reads the camera streaming right now; say how far back with `span` (e.g. \"last 20s\"), or \
+         omit it for the most recent stretch. Carry seconds, not minutes. Optionally say what to look \
+         for with `prompt`.",
+        json!({
+            "type": "object",
+            "properties": {
+                "span": { "type": "string", "description": "How far back to look, e.g. \"last 20s\". Omit for the most recent stretch." },
+                "prompt": { "type": "string", "description": "Optional: what to look for or assess (e.g. \"what's wrong with my serve?\")." },
+            },
+        }),
+    )
+}
+
 
 /// Handle one parsed JSON-RPC message. `scene`/`role`/`worker_id` come from the
 /// request headers; `registry` routes tool calls to the owning scene loop.
 pub async fn handle(
     registry: &ToolRegistry,
     data_dir: &std::path::Path,
+    video_partial: &Mutex<HashMap<Scene, PartialMinute>>,
     scene: Option<Scene>,
     role: Option<&str>,
     worker_id: Option<u64>,
@@ -349,7 +406,7 @@ pub async fn handle(
             let args = params.get("arguments").cloned().unwrap_or_else(|| json!({}));
             McpReply::Json(result(
                 id,
-                dispatch_tool(registry, data_dir, scene.as_ref(), worker_id, name, &args).await,
+                dispatch_tool(registry, data_dir, video_partial, scene.as_ref(), worker_id, name, &args).await,
             ))
         }
         // ping is a no-op request the client may send.
@@ -365,6 +422,7 @@ pub async fn handle(
 async fn dispatch_tool(
     registry: &ToolRegistry,
     data_dir: &std::path::Path,
+    video_partial: &Mutex<HashMap<Scene, PartialMinute>>,
     scene: Option<&Scene>,
     worker_id: Option<u64>,
     name: &str,
@@ -386,6 +444,8 @@ async fn dispatch_tool(
         "record_reflex" => return reflex_record(data_dir, args).await,
         "look" => return do_look().await,
         "act" => return do_act(args).await,
+        "see" => return do_see(data_dir, scene, args).await,
+        "watch" => return do_watch(scene, video_partial, args).await,
         _ => {}
     }
 
@@ -793,6 +853,181 @@ async fn reflection_keep_and_fade(data_dir: &std::path::Path, scene: &Scene, arg
     }
 }
 
+/// `see`: understand a stored still. Resolves the `ref` (the `⟨ref: …⟩` from a
+/// `📷 photo arrived` signal, or one surfaced to reflection) to its bytes, then hands
+/// it to [`perceive_still`] — which the bundle routes either to the model's own eyes
+/// (native vision) or through the vision capability (text-only model).
+async fn do_see(data_dir: &Path, scene: &Scene, args: &Value) -> Value {
+    let prompt = args.get("prompt").and_then(Value::as_str).unwrap_or_default();
+    let Some(reff) = args.get("ref").and_then(Value::as_str).filter(|s| !s.trim().is_empty()) else {
+        return tool_error(
+            "see needs `ref` — the ⟨ref: …⟩ from the photo's signal, e.g. 2026-06-25/14/23-07.jpg",
+        );
+    };
+    let Some((ts, rel, mime)) = parse_still_ref(reff) else {
+        return tool_error(&format!(
+            "see: malformed ref {reff:?} (expected <YYYY-MM-DD>/<HH>/<MM>-<SS>.<ext>)"
+        ));
+    };
+    let Some(path) =
+        crate::mind::memory::media::resolve(data_dir, scene, crate::types::Channel::Vision, ts, &rel).await
+    else {
+        return tool_error(&format!("see: no media at {reff} (it may have faded)"));
+    };
+    let bytes = match tokio::fs::read(&path).await {
+        Ok(b) => Bytes::from(b),
+        Err(e) => return tool_error(&format!("see: reading {reff} failed: {e}")),
+    };
+    perceive_still(bytes, &mime, prompt).await
+}
+
+/// `watch`: understand a short span of the live camera. Reads the in-progress
+/// (not-yet-flushed) minute from [`PartialMinute`] — the freshest source — optionally
+/// trims it to the requested tail with ffmpeg, and hands the clip to
+/// [`perceive_clip`]. Errors plainly when no camera is streaming, so the model can
+/// ask the person to turn it on.
+async fn do_watch(
+    scene: &Scene,
+    video_partial: &Mutex<HashMap<Scene, PartialMinute>>,
+    args: &Value,
+) -> Value {
+    let prompt = args.get("prompt").and_then(Value::as_str).unwrap_or_default();
+    let span = args.get("span").and_then(Value::as_str).unwrap_or_default();
+
+    let Some((bytes, mime)) = partial_clip(video_partial, scene) else {
+        return tool_error(
+            "no live camera to watch — `watch` reads the camera streaming right now; ask the person \
+             to turn it on, then try again.",
+        );
+    };
+
+    // Trim to the requested tail when asked and ffmpeg can; on any trouble fall back
+    // to the whole stretch (≤ ~1 min) rather than failing the look.
+    let clip = match parse_last_secs(span) {
+        Some(secs) => trim_tail(&bytes, &mime, secs).await.unwrap_or(bytes),
+        None => bytes,
+    };
+    perceive_clip(clip, &mime, prompt).await
+}
+
+/// Understand a still per the current [`bundle`](crate::body::capabilities::bundle):
+/// a native-vision model gets the raw image as a tool-result block to reason over; a
+/// text-only model gets the vision capability's description as text.
+async fn perceive_still(bytes: Bytes, mime: &str, prompt: &str) -> Value {
+    use crate::body::capabilities::bundle::{self, Handling, Modality};
+    match bundle::current().handling(Modality::Image) {
+        Handling::Native => {
+            let b64 = base64::engine::general_purpose::STANDARD.encode(&bytes);
+            let hint = if prompt.trim().is_empty() {
+                "the still you asked to see".to_string()
+            } else {
+                format!("the still you asked to see — you wanted to know: {prompt}")
+            };
+            json!({
+                "content": [
+                    { "type": "text", "text": hint },
+                    { "type": "image", "data": b64, "mimeType": mime },
+                ],
+                "isError": false,
+            })
+        }
+        Handling::Polyfill => {
+            use crate::body::capabilities::vision::{self as vision_cap, VisualMedia};
+            if !vision_cap::available() {
+                return tool_error("can't see stills here — no vision provider configured (set VISION_PROVIDER)");
+            }
+            let q = if prompt.trim().is_empty() { "Describe what you see." } else { prompt };
+            match vision_cap::understand(VisualMedia::image_bytes(bytes, mime.to_string()), q).await {
+                Ok(text) => tool_ok(&text),
+                Err(e) => tool_error(&format!("vision understanding failed: {e}")),
+            }
+        }
+    }
+}
+
+/// Understand a short video clip. Always polyfilled — no model reached through the
+/// adapter takes video — so the clip goes to the vision capability and the answer
+/// comes back as text.
+async fn perceive_clip(bytes: Bytes, mime: &str, prompt: &str) -> Value {
+    use crate::body::capabilities::bundle::{self, Modality};
+    use crate::body::capabilities::vision::{self as vision_cap, VisualMedia};
+    // The bundle always polyfills video today — no adapter path carries video to the
+    // model — so this is the only arm; consulting `handling` keeps the
+    // native-vs-polyfill decision in one place for the day a native-video model lands.
+    let _ = bundle::current().handling(Modality::Video);
+    if !vision_cap::available() {
+        return tool_error("can't watch video here — no vision provider configured (set VISION_PROVIDER)");
+    }
+    let q = if prompt.trim().is_empty() { "Describe what happens in this clip." } else { prompt };
+    match vision_cap::understand(VisualMedia::video_bytes(bytes, mime.to_string()), q).await {
+        Ok(text) => tool_ok(&text),
+        Err(e) => tool_error(&format!("video understanding failed: {e}")),
+    }
+}
+
+/// Concatenate a scene's in-progress minute (`init` + `buf`) into one
+/// independently-decodable clip, with its container mime. `None` when no camera is
+/// streaming for the scene.
+fn partial_clip(map: &Mutex<HashMap<Scene, PartialMinute>>, scene: &Scene) -> Option<(Bytes, String)> {
+    let guard = map.lock().unwrap();
+    let p = guard.get(scene)?;
+    let mut v = Vec::with_capacity(p.init.len() + p.buf.len());
+    v.extend_from_slice(&p.init);
+    v.extend_from_slice(&p.buf);
+    Some((Bytes::from(v), p.mime.clone()))
+}
+
+/// Trim the last `secs` seconds out of an in-memory clip via ffmpeg. Writes the
+/// bytes to a temp input file (ffmpeg needs a seekable input for `-sseof`), clips,
+/// and cleans up. `Err` (no ffmpeg, undecodable) lets the caller send the whole clip.
+async fn trim_tail(bytes: &Bytes, mime: &str, secs: f64) -> anyhow::Result<Bytes> {
+    let ext = if mime.contains("mp4") { "mp4" } else { "webm" };
+    let tmp = std::env::temp_dir().join(format!("hi-watch-{}.{ext}", uuid::Uuid::now_v7()));
+    tokio::fs::write(&tmp, bytes).await?;
+    let res = crate::foundation::vendors::ffmpeg_frame::clip_video(&tmp, -secs, secs).await;
+    let _ = tokio::fs::remove_file(&tmp).await;
+    res
+}
+
+/// Pull a tail length out of a `watch` span like "last 20s" / "20 seconds" → 20.0.
+/// `None` (no number) means "the whole recent stretch".
+fn parse_last_secs(span: &str) -> Option<f64> {
+    let digits: String = span
+        .chars()
+        .skip_while(|c| !c.is_ascii_digit())
+        .take_while(|c| c.is_ascii_digit() || *c == '.')
+        .collect();
+    digits.parse::<f64>().ok().filter(|n| *n > 0.0)
+}
+
+/// Map a still image extension to its MIME, for the native image content block.
+fn ext_to_mime(ext: &str) -> String {
+    match ext.to_ascii_lowercase().as_str() {
+        "jpg" | "jpeg" => "image/jpeg",
+        "png" => "image/png",
+        "webp" => "image/webp",
+        "gif" => "image/gif",
+        _ => "application/octet-stream",
+    }
+    .to_string()
+}
+
+/// Parse a still `ref` — `<YYYY-MM-DD>/<HH>/<MM>-<SS>.<ext>` — into the timestamp and
+/// channel-day-relative path [`crate::mind::memory::media::resolve`] wants, plus the
+/// MIME. `None` if the shape doesn't match.
+fn parse_still_ref(reff: &str) -> Option<(DateTime<Utc>, String, String)> {
+    let (date, rel) = reff.split_once('/')?; // "2026-06-25", "14/23-07.jpg"
+    let (hh, file) = rel.split_once('/')?; // "14", "23-07.jpg"
+    let (stem, ext) = file.rsplit_once('.')?; // "23-07", "jpg"
+    let (mm, ss) = stem.split_once('-')?; // "23", "07"
+    // Reuse the proven RFC3339 parse (see keep_and_fade) rather than NaiveDate
+    // helpers — a malformed part fails the parse and yields `None`.
+    let ts = DateTime::parse_from_rfc3339(&format!("{date}T{hh}:{mm}:{ss}Z"))
+        .ok()?
+        .with_timezone(&Utc);
+    Some((ts, rel.to_string(), ext_to_mime(ext)))
+}
+
 fn result(id: Value, result: Value) -> Value {
     json!({ "jsonrpc": "2.0", "id": id, "result": result })
 }
@@ -1044,5 +1279,40 @@ mod screen_tool_tests {
             vec![Modifier::Command, Modifier::Shift, Modifier::Option, Modifier::Control]
         );
         assert_eq!(parse_mods(None), Vec::<Modifier>::new());
+    }
+}
+
+#[cfg(test)]
+mod vision_tool_tests {
+    use super::*;
+
+    #[test]
+    fn parses_a_well_formed_still_ref() {
+        let (ts, rel, mime) = parse_still_ref("2026-06-25/14/23-07.jpg").unwrap();
+        assert_eq!(rel, "14/23-07.jpg");
+        assert_eq!(mime, "image/jpeg");
+        assert_eq!(ts.to_rfc3339(), "2026-06-25T14:23:07+00:00");
+    }
+
+    #[test]
+    fn rejects_malformed_still_refs() {
+        assert!(parse_still_ref("not-a-ref").is_none());
+        assert!(parse_still_ref("2026-06-25/14/23.jpg").is_none(), "minute file, not a one-off still");
+        assert!(parse_still_ref("2026-06-25/14/23-07").is_none(), "no extension");
+    }
+
+    #[test]
+    fn ext_to_mime_covers_common_stills() {
+        assert_eq!(ext_to_mime("JPG"), "image/jpeg");
+        assert_eq!(ext_to_mime("png"), "image/png");
+        assert_eq!(ext_to_mime("bin"), "application/octet-stream");
+    }
+
+    #[test]
+    fn parse_last_secs_pulls_a_tail_length() {
+        assert_eq!(parse_last_secs("last 20s"), Some(20.0));
+        assert_eq!(parse_last_secs("30 seconds"), Some(30.0));
+        assert_eq!(parse_last_secs("what just happened"), None);
+        assert_eq!(parse_last_secs(""), None);
     }
 }

@@ -28,3 +28,10 @@
 - 多段对比靠把上一段的文字理解留在上下文,还是要存下 clip 本身?(连 forgetting:clip 可褪、文字常驻)
 
 _机制:通用视觉 video endpoint(video + prompt → 文字)+ 语气适配(连 12)+ 可选技能沉淀(连 24)。成熟度:capability seam 已在(`vision::understand` 的 `VisualMedia::Video`),endpoint 接入中,未实测。_
+
+## 实测 2026-06-25 · worktree-vision-journeys（build+277 tests green）
+
+- ✅ **看一段过程通**:模拟摄像头(分片 MP4 走 `WS /api/in/vision/stream`)→ 内存里的"进行中分钟"缓冲 → `watch` 切片 → Doubao Responses API(`/api/plan/v3`, `input_video`)→ 准确描述**动态变化**("数字 8 左竖段熄灭,字形改变"),证明看的是"一段"不是单帧。
+- ✅ **Doubao 视频线确认**:`input_video`/`video_url`/`fps` 形状被 Ark 接受(直连 smoke + 产品路径双验)。
+- ✅ **无摄像头优雅报错**:`watch` 在没有直播流时返回可读错误(让 agent 去请用户开摄像头),不 panic。
+- ⚠️ **未实测**:真实浏览器 MediaRecorder(WebM)流(本次用 ffmpeg 分片 MP4 模拟,init-segment 路径相同);`watch` 的 `last Ns` ffmpeg 裁剪(本次走整段)。

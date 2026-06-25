@@ -10,7 +10,10 @@
 //!
 //! The forgetting pass ([`crate::mind::memory::decay`]) reuses the same binary to cut a
 //! keepsake out of cold media before it drops the full bytes: [`still_at`] for a
-//! single vision frame, [`clip_audio`] for a few seconds of sound.
+//! single vision frame, [`clip_audio`] for a few seconds of sound. [`clip_video`]
+//! cuts a few seconds of video out of one minute file (or the in-progress minute,
+//! written to a temp file) — the refinement the agent's `watch` tool uses to carry
+//! only the relevant span to the video-understanding endpoint.
 //!
 //! Best-effort by contract: a missing binary, an undecodable clip, or an empty
 //! result is an `Err` the caller logs and skips. A frame comes back as JPEG bytes,
@@ -139,4 +142,74 @@ pub async fn clip_audio(inputs: &[PathBuf], ss: f64, dur: f64, out: &Path) -> an
         bail!("ffmpeg clip failed: {}", String::from_utf8_lossy(&status.stderr).trim());
     }
     Ok(())
+}
+
+/// Pick the input-seek flag + value for [`clip_video`]: a non-negative `start`
+/// seeks that many seconds from the START (`-ss`); a negative `start` seeks from the
+/// END (`-sseof`), so `-20.0` means "the last 20 seconds". Split out so the choice
+/// is unit-testable without ffmpeg.
+fn seek_args(start: f64) -> (&'static str, String) {
+    if start < 0.0 {
+        ("-sseof", format!("{start:.3}"))
+    } else {
+        ("-ss", format!("{start:.3}"))
+    }
+}
+
+/// Cut a short clip out of one self-contained vision file — a persisted minute file,
+/// or a temp file holding the in-progress minute (each is init-segment prefixed, so
+/// it decodes standalone). `start` selects the window (see [`seek_args`]); `dur` caps
+/// the length. Stream-copied (`-c copy`, no re-encode, so no codec dependency) into a
+/// temp file of the same container as `input`, then read back as bytes ready for
+/// [`crate::body::capabilities::vision`]'s video understanding. Single-file by design:
+/// the input is independently decodable, and a span wide enough to cross a minute
+/// boundary is better served by handing over a whole minute than by stitching
+/// fragmented-MP4/WebM (where the `concat:` protocol is unreliable).
+///
+/// Best-effort by contract, like its siblings: a missing binary or an undecodable
+/// input is an `Err` the caller logs and routes around (`watch` then falls back to
+/// the untrimmed minute).
+pub async fn clip_video(input: &Path, start: f64, dur: f64) -> anyhow::Result<Bytes> {
+    let ext = input.extension().and_then(|e| e.to_str()).unwrap_or("mp4");
+    let out = std::env::temp_dir().join(format!("hi-clip-{}.{ext}", uuid::Uuid::now_v7()));
+    let (seek_flag, seek_val) = seek_args(start);
+
+    let res = Command::new(ffmpeg_bin())
+        .args(["-hide_banner", "-loglevel", "error", seek_flag, &seek_val, "-i"])
+        .arg(input)
+        .args(["-t", &format!("{dur:.3}"), "-c", "copy"])
+        .arg(&out)
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .output()
+        .await
+        .with_context(|| format!("spawning {} failed (is it installed?)", ffmpeg_bin()))?;
+
+    // Read then unlink regardless of status, so a failed run leaves no temp file.
+    let bytes = tokio::fs::read(&out).await.ok();
+    let _ = tokio::fs::remove_file(&out).await;
+
+    if !res.status.success() {
+        bail!("ffmpeg clip_video failed: {}", String::from_utf8_lossy(&res.stderr).trim());
+    }
+    match bytes {
+        Some(b) if !b.is_empty() => Ok(Bytes::from(b)),
+        _ => bail!("ffmpeg produced no clip"),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn seek_args_from_start() {
+        assert_eq!(seek_args(5.0), ("-ss", "5.000".to_string()));
+        assert_eq!(seek_args(0.0), ("-ss", "0.000".to_string()));
+    }
+
+    #[test]
+    fn seek_args_from_end_for_tail() {
+        assert_eq!(seek_args(-20.0), ("-sseof", "-20.000".to_string()));
+    }
 }

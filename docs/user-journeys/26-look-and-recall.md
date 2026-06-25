@@ -34,3 +34,9 @@
 - 升级 caption 是对**所有**入库图都跑,还是有门控(贵)?
 
 _机制:通用视觉 frame endpoint(image + prompt → 文字)+ 现有 caption 路径升级(`server/vision.rs` 那句固定 `"Describe what you see, briefly."`)。"看懂"落进记忆,与 everything-is-memory 同流。成熟度:capability seam 已在(`vision::understand`),endpoint 接入中,未实测。_
+
+## 实测 2026-06-25 · worktree-vision-journeys(build+277 tests green）
+
+- ✅ **当场问端到端通**:POST 一张图 → 落 `📷 photo arrived ⟨ref: <date>/HH/MM-SS.png⟩` 信号(不再 eager caption);老板问"图里是什么" → agent **自己调 `see`**(transcript 里 `mcp__hi-agent__see` ×3)、拿到原图、准确描述(色条测试图 + 数字 8)。Claude bundle 走原图直送模型(ACP image block,非 Doubao)。
+- ✅ **ref 自洽**:信号里的 ref 直接喂回 `see` 即解析(`parse_still_ref` → `media::resolve` → 原图字节)。
+- ⚠️ **未实测**:文本-only bundle 的 Doubao 图片 polyfill(`HI_AGENT_VISION_NATIVE=false`)、reflection 用 `see` 索引照片(需跑一轮 consolidation)——两半都已分别验证,风险低。

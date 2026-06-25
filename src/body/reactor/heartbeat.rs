@@ -318,7 +318,12 @@ fn build_reflection_prompt(
             Some(ids) => {
                 let _ = write!(line, " ⟨faces: {}⟩", ids.join(", "));
             }
-            None if is_image(e) => line.push_str(" ⟨image⟩"),
+            None if is_image(e) => match still_ref(e) {
+                Some(reff) => {
+                    let _ = write!(line, " ⟨image — `see` ref: {reff}⟩");
+                }
+                None => line.push_str(" ⟨image⟩"),
+            },
             None => {}
         }
         if let Some(ids) = voice_ids.get(&i).filter(|v| !v.is_empty()) {
@@ -372,6 +377,20 @@ fn render_signal(e: &JournalEntry) -> String {
 /// `⟨image⟩` even when face clustering found nothing or is unconfigured.
 fn is_image(e: &JournalEntry) -> bool {
     matches!(e, JournalEntry::SignalIn { media: Some(m), .. } if m.mime.starts_with("image/"))
+}
+
+/// The `see`-able ref for a still-image signal — `<date>/<HH>/<MM>-<SS>.<ext>`, the
+/// same shape the `see` tool resolves — so reflection can look at the photo itself
+/// and fold what it shows into episodes/facets, rather than indexing it blind.
+/// `None` for non-image or media-less signals.
+fn still_ref(e: &JournalEntry) -> Option<String> {
+    let JournalEntry::SignalIn { ts, media: Some(m), .. } = e else {
+        return None;
+    };
+    if !m.mime.starts_with("image/") {
+        return None;
+    }
+    Some(format!("{}/{}", crate::mind::memory::layout::day_key(*ts), m.file))
 }
 
 /// How far a voice turn's window is padded, in seconds, when matching co-present

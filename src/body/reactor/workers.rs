@@ -115,8 +115,11 @@ camera:\n\
     `GET $HI_AGENT_BASE_URL/api/in/vision` with header `X-HI-Scene: {scene}`\n\
   (a live video stream — one camera session per response, `video/webm`; \
 re-request for the next). Decode and sample frames however the task needs — \
-detection, CV, etc. is your job. You do not write to any output channel; \
-presenting is the agent's job.\n\
+detection, CV, etc. is your job. But if you only need to KNOW what the camera saw \
+over a few seconds — what happened, what someone did — call `watch` instead: it \
+reads the live camera and hands back a description, no streaming or decoding. Reach \
+for the raw stream only when you need the actual pixels. You do not write to any \
+output channel; presenting is the agent's job.\n\
 \n\
 To do something on the user's own computer — open an app, click a control, type \
 into it — you can see and operate their screen. Call `look` to get a screenshot, \
