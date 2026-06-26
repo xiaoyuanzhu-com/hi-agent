@@ -292,12 +292,6 @@ async fn run_with_shutdown(config: Config, shutdown: Arc<Notify>) -> anyhow::Res
     );
     tracing::info!("reactor started");
 
-    // Wire the menu-bar chat popup to the agent (macOS only, best-effort): the native
-    // popover is a plain HTTP client of this server — it POSTs typed lines to
-    // /api/in/text and follows /api/out/text + /api/in/text + /api/history, same as a
-    // browser would. Same fixed desktop scene as the gesture below.
-    body::capabilities::chat::init(format!("http://127.0.0.1:{}/", config.port));
-
     // Arm the "come and see this" gesture: a double-tap of Command hands the agent
     // a screenshot of the current screen as a file (macOS only, best-effort — needs
     // the Accessibility + Screen Recording grants, else it stays inert). One

@@ -415,6 +415,10 @@ pub fn run(url: String, shutdown: Arc<Notify>) -> anyhow::Result<()> {
     // Accessory: live in the menu bar only — no Dock icon, no app menu.
     app.setActivationPolicy(NSApplicationActivationPolicy::Accessory);
 
+    // The popover's web view loads the face at this base URL; cloned before `url` is
+    // moved into the menu's "Open" target below.
+    let popover_url = url.clone();
+
     let target = TrayTarget::new(mtm, url, shutdown);
 
     // SAFETY: all of these are standard AppKit setup calls made on the main thread
@@ -514,7 +518,7 @@ pub fn run(url: String, shutdown: Arc<Notify>) -> anyhow::Result<()> {
         // owning the menu permanently (a permanent menu would route *every* click to
         // the menu and the button action would never fire).
         if let Some(button) = &button {
-            crate::foundation::vendors::macos_popover::install(mtm, button.clone());
+            crate::foundation::vendors::macos_popover::install(mtm, button.clone(), &popover_url);
 
             let click = TrayClick::new(mtm, status_item.clone(), button.clone(), menu.clone());
             button.setTarget(Some(&click));

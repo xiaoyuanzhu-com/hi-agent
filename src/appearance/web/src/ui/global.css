@@ -665,3 +665,37 @@ button {
     transition-duration: 0.001ms !important;
   }
 }
+
+/* --- Narrow viewport (the menu-bar popover ~380px, and phones) ---------
+   The face is proportioned for a big window; in a popover it clusters. Pull the
+   captions up, shrink the type, reclaim the reserved bottom band, and tighten the
+   control buttons so the whole face fits ~380x540. Wide windows are unaffected. */
+@media (max-width: 420px) {
+  .hi-stage {
+    top: 46%;
+    width: 92vw;
+  }
+  .hi-sentence {
+    font-size: clamp(15px, 5vw, 24px);
+  }
+  .hi-sentence--user {
+    font-size: clamp(14px, 4.4vw, 21px);
+  }
+  .hi-stage--captions .hi-sentence {
+    font-size: clamp(14px, 4.4vw, 22px);
+  }
+  .hi-view-frame {
+    padding: calc(env(safe-area-inset-top, 0px) + 14px) 14px
+      calc(env(safe-area-inset-bottom, 0px) + 64px) 14px;
+  }
+  .hi-channels {
+    right: max(12px, env(safe-area-inset-right));
+    bottom: max(12px, env(safe-area-inset-bottom));
+    gap: 6px;
+  }
+  .hi-channel {
+    width: 32px;
+    height: 32px;
+  }
+}
+

@@ -29,7 +29,6 @@ use crate::foundation::models;
 pub mod accessibility;
 pub mod audio_capture;
 pub mod bundle;
-pub mod chat;
 pub mod desktop_context;
 pub mod face;
 pub mod hotkey;
