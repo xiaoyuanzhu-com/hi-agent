@@ -108,6 +108,31 @@ fn main() -> anyhow::Result<()> {
     // `/data`), or `./data` for a bare/dev binary.
     let data_dir = cli.data_dir.unwrap_or_else(default_data_dir);
 
+    // A packaged `.app` launched from Finder has cwd `/`, so the cwd `.env` load
+    // at the top of `main` found nothing. Without it `AI_API_KEY` is unset and the
+    // agent bails before the tray or server starts — the app "does nothing" when
+    // clicked. Fall back to `<data_dir>/.env` (the OS data dir for a bundle, stable
+    // across launches and user-writable); on first launch seed it from the bundled
+    // `.env.example` so the user has a clear template to drop a key into.
+    if hi_agent::bundle::resources_dir().is_some() {
+        let env_path = data_dir.join(".env");
+        if !env_path.is_file() {
+            if let Err(e) = std::fs::create_dir_all(&data_dir) {
+                tracing::warn!(error = %e, dir = %data_dir.display(), "could not create data dir to seed .env");
+            } else if let Err(e) = std::fs::write(&env_path, include_str!("../.env.example")) {
+                tracing::warn!(error = %e, path = %env_path.display(), "could not seed .env from template");
+            } else {
+                tracing::info!(
+                    path = %env_path.display(),
+                    "seeded .env from template — edit it (set AI_API_KEY=…) and relaunch"
+                );
+            }
+        }
+        if let Err(e) = dotenvy::from_path(&env_path) {
+            tracing::debug!(error = %e, path = %env_path.display(), "no .env at data dir (or unreadable)");
+        }
+    }
+
     if cli.purge_voice_galleries {
         let data_dir = data_dir.clone();
         let rt = tokio::runtime::Runtime::new()?;
