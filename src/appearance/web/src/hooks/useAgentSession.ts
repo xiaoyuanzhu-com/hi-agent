@@ -6,6 +6,7 @@ import { AudioBus } from "../lib/audioBus";
 import { ActivityMeter } from "../lib/activityMeter";
 import { AudioStreamer } from "../lib/audioStreamer";
 import { VideoStreamer } from "../lib/videoStreamer";
+import { PresenceStiller } from "../lib/presenceStiller";
 import { VoicePlayer } from "../lib/voicePlayer";
 import { SentenceBuffer } from "../lib/sentences";
 import { getScene } from "../lib/scene";
@@ -210,6 +211,7 @@ export function useAgentSession(): AgentSession {
   const micGenRef = useRef(0);
   const voiceRef = useRef<VoicePlayer | null>(null);
   const visionRef = useRef<VideoStreamer | null>(null);
+  const presenceRef = useRef<PresenceStiller | null>(null);
   const visionStreamRef = useRef<MediaStream | null>(null);
   const sentenceIdRef = useRef(0);
   // Agent reply sentences awaiting reveal, and the timer pacing them onto screen
@@ -544,6 +546,9 @@ export function useAgentSession(): AgentSession {
       console.debug("[vision] captured", got?.width, "x", got?.height, got);
       visionStreamRef.current = videoStream;
       visionRef.current = await VideoStreamer.create(videoStream, { scene });
+      // Start the presence lane on the same stream — a cheap low-res still feed for
+      // real-time local face recognition, beside the full-fidelity video upload.
+      presenceRef.current = new PresenceStiller(videoStream, { scene });
       setVisionStream(videoStream);
       setVideoError(null);
       setVideoInput(true);
@@ -565,6 +570,8 @@ export function useAgentSession(): AgentSession {
   const disableVision = useCallback(() => {
     visionRef.current?.stop();
     visionRef.current = null;
+    presenceRef.current?.stop();
+    presenceRef.current = null;
     visionStreamRef.current?.getTracks().forEach((t) => t.stop());
     visionStreamRef.current = null;
     setVisionStream(null);
@@ -697,6 +704,7 @@ export function useAgentSession(): AgentSession {
       micStartingRef.current = false;
       micRef.current?.stop();
       visionRef.current?.stop();
+      presenceRef.current?.stop();
       voiceRef.current?.stop();
       micStreamRef.current?.getTracks().forEach((t) => t.stop());
       visionStreamRef.current?.getTracks().forEach((t) => t.stop());

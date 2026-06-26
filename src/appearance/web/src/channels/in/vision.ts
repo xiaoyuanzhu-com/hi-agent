@@ -59,3 +59,26 @@ export async function postVision(opts: {
     );
   }
 }
+
+// The presence lane: a low-res camera still for the backend's always-on local
+// face reflex (see `lib/presenceStiller`). Separate from `postVision` (one-off
+// stills) and the full-fidelity video stream — these frames are never archived,
+// they only feed real-time "who's here" recognition.
+export async function postPresenceStill(opts: {
+  scene: string;
+  blob: Blob;
+  signal?: AbortSignal;
+}): Promise<void> {
+  const res = await fetch("/api/in/vision/presence", {
+    method: "POST",
+    headers: {
+      "Content-Type": "image/jpeg",
+      "X-HI-Scene": opts.scene,
+    },
+    body: opts.blob,
+    signal: opts.signal,
+  });
+  if (!res.ok) {
+    throw new Error(`/api/in/vision/presence POST failed: ${res.status} ${res.statusText}`);
+  }
+}

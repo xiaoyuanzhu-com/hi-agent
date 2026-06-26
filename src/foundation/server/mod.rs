@@ -1,6 +1,6 @@
 //! HTTP front — axum router and shared application state.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use std::sync::atomic::AtomicU64;
@@ -231,6 +231,20 @@ pub struct OutputEcho {
     pub ts: DateTime<Utc>,
 }
 
+/// Per-scene face-presence state for the presence lane (`POST /api/in/vision/presence`).
+///
+/// The presence still-loop posts a low-res camera frame every couple of seconds;
+/// the handler recognizes faces locally and edge-triggers a perception signal only
+/// when *who is present* changes. `last_seen` times each identity label's most
+/// recent sighting (so a momentarily-missed detection doesn't flap a leave), and
+/// `announced` is the set we currently treat as on-camera (so each appear/leave
+/// fires exactly once per transition). See [`vision::post_presence`].
+#[derive(Default)]
+pub struct FacePresence {
+    pub last_seen: HashMap<String, DateTime<Utc>>,
+    pub announced: HashSet<String>,
+}
+
 /// Shared state passed to every handler via `axum::extract::State`.
 pub struct AppState {
     /// Inbound signals from every channel POST. The reactor consumes these.
@@ -343,6 +357,11 @@ pub struct AppState {
     /// `X-HI-Scene` header lands in the right scene. Short TTL, pruned on access,
     /// in-memory (a restart drops outstanding links). See [`files`].
     pub handoffs: Mutex<HashMap<String, files::Handoff>>,
+
+    /// Per-scene face-presence state for the presence lane. The presence handler
+    /// reads and updates this to decide when an appear/leave event is worth a
+    /// signal. See [`FacePresence`] and [`vision::post_presence`].
+    pub face_presence: Mutex<HashMap<Scene, FacePresence>>,
 }
 
 impl AppState {
@@ -439,6 +458,7 @@ pub fn build(
         interrupts,
         presence,
         handoffs: Mutex::new(HashMap::new()),
+        face_presence: Mutex::new(HashMap::new()),
     });
 
     // Channels are namespaced by boundary: `/api/in/*` is the world→agent side
@@ -458,6 +478,12 @@ pub fn build(
         // WebM over the WS, GET plays the live video; POST persists a still frame.
         .route("/api/in/vision", post(vision::post_vision).get(vision::get_vision))
         .route("/api/in/vision/stream", get(vision::get_vision_stream))
+        // The presence lane: a cheap local face reflex. The client posts a low-res
+        // camera still every couple of seconds; the handler recognizes faces on the
+        // local models and emits a perception signal only when who is present
+        // changes — real-time "who's here", no remote call. A no-op without the
+        // face capability.
+        .route("/api/in/vision/presence", post(vision::post_presence))
         // The file channel — handing the agent a file (handed artifact, not a
         // sense). Drag-drop posts to /api/in/file; the phone handoff mints a
         // token (/api/handoff), serves an uploader at /up/<token>, receives at

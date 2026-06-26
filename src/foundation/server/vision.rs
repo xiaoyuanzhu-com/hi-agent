@@ -29,6 +29,7 @@
 
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
+use std::collections::HashSet;
 use std::time::{Duration, Instant};
 
 use axum::body::{Body, Bytes};
@@ -50,8 +51,8 @@ use crate::mind::memory::layout::{MediaSlot, day_key};
 use crate::mind::memory::media;
 use crate::mind::memory::people_vectors::{self, Modality};
 use crate::foundation::server::headers::{AuthBearer, RequiredScene, SceneHeader};
-use crate::foundation::server::{AppState, PartialMinute, VideoInEvent, VideoSource};
-use crate::types::{Channel, JournalEntry, Media, Origin, Scene};
+use crate::foundation::server::{AppState, FacePresence, PartialMinute, VideoInEvent, VideoSource};
+use crate::types::{Channel, JournalEntry, Media, Origin, Scene, Signal};
 
 const DEFAULT_IMAGE_MIME: &str = "image/jpeg";
 const DEFAULT_VIDEO_MIME: &str = "video/webm";
@@ -96,6 +97,212 @@ pub async fn post_vision(
     let recognise = FaceSource::Image(body);
     spawn_perceive(state.clone(), scene.clone(), Perceived::Still, rel, mime, ts, None, Some(recognise));
     StatusCode::ACCEPTED.into_response()
+}
+
+/// The stream label presence signals carry, so they render as `vision#presence` in
+/// the transcript — set apart from the minute-grid `vision` signals.
+const PRESENCE_STREAM: &str = "presence";
+
+/// Internal label for an unrecognized face. The empty string can never be a real
+/// subject (enrollment requires a non-empty slug), so it is a collision-proof key
+/// for the "someone I don't know" bucket; all strangers collapse onto it.
+const STRANGER: &str = "";
+
+/// How long a known label may go unseen before the presence lane calls it gone.
+/// With a ~2.5s still cadence this absorbs a few dropped detections (a turned head,
+/// a missed frame) so presence doesn't flap appear/leave on flicker.
+const PRESENCE_LEAVE_GRACE_SECS: i64 = 8;
+
+/// `POST /api/in/vision/presence` — one low-res camera still from the always-on
+/// presence lane. Recognize faces on the *local* models and, only when *who is
+/// present* changes, journal a perception signal and wake the reactor — so the live
+/// mind learns in real time that someone is on camera (and who, when known) instead
+/// of waiting on the minute grid. Cheaply a no-op (202) without the face capability,
+/// on an undecodable frame, or when nothing changed. Stills are never persisted —
+/// this lane is a reflex, not a record; the full video stream remains the archive.
+pub async fn post_presence(
+    State(state): State<Arc<AppState>>,
+    SceneHeader(scene): SceneHeader,
+    body: Bytes,
+) -> StatusCode {
+    // No models or no body → accept and drop without spending a decode. The client
+    // keeps posting harmlessly; we just don't look.
+    if body.is_empty() || !face::available() {
+        return StatusCode::ACCEPTED;
+    }
+
+    let faces = match face::detect_and_embed(body).await {
+        Ok(f) => f,
+        Err(err) => {
+            tracing::debug!(scene = %scene, error = %err, "presence: face detect failed");
+            return StatusCode::ACCEPTED;
+        }
+    };
+
+    // Map each salient face to a stable identity label: a recognized cluster's
+    // subject, or the stranger bucket. Strangers all collapse onto one key — "there
+    // is someone here I don't know" is the useful signal; telling two unknowns apart
+    // needs clustering, which reflection does later.
+    let mut seen_now: HashSet<String> = HashSet::new();
+    for f in faces.iter().filter(|f| presence_salient(f)) {
+        let label = people_vectors::nearest(&state.data_dir, Modality::Face, &f.embedding, 1)
+            .await
+            .ok()
+            .and_then(|c| c.into_iter().next())
+            .filter(|c| c.similarity >= RECOGNISE_MIN)
+            .map(|c| c.subject)
+            .unwrap_or_else(|| STRANGER.to_string());
+        seen_now.insert(label);
+    }
+
+    let now = Utc::now();
+    let grace = chrono::Duration::seconds(PRESENCE_LEAVE_GRACE_SECS);
+    // Diff under the lock (sync, no await held across it), then journal/wake outside.
+    let (appeared, left) = {
+        let mut map = state.face_presence.lock().expect("face_presence mutex poisoned");
+        let entry = map.entry(scene.clone()).or_default();
+        presence_delta(entry, &seen_now, now, grace)
+    };
+
+    if appeared.is_empty() && left.is_empty() {
+        return StatusCode::ACCEPTED;
+    }
+
+    let body_text = presence_body(&appeared, &left);
+    crate::foundation::channel_log::inbound(Channel::Vision, &scene, &body_text);
+
+    let entry = JournalEntry::SignalIn {
+        id: Uuid::now_v7().to_string(),
+        ts: now,
+        channel: Channel::Vision,
+        scene: scene.clone(),
+        body: body_text.clone(),
+        stream: Some(PRESENCE_STREAM.to_string()),
+        media: None,
+        origin: Some(Origin::Human),
+    };
+    if let Err(err) = state.memory.journal.append(entry).await {
+        tracing::warn!(scene = %scene, error = %err, "presence: journal append failed");
+    }
+
+    // The wake: journaling alone updates disk; the reactor only re-reads on a nudge.
+    let signal = Signal {
+        channel: Channel::Vision,
+        scene: scene.clone(),
+        body: body_text,
+        stream: Some(PRESENCE_STREAM.to_string()),
+        ts: now,
+    };
+    if let Err(err) = state.inbound.send(signal).await {
+        tracing::error!(scene = %scene, error = %err, "presence: inbound channel closed");
+    }
+
+    StatusCode::ACCEPTED
+}
+
+/// A salient presence face: confident enough, and big enough in the (downscaled)
+/// still to embed reliably. The box floor is looser than the reflection clusterer's
+/// because the presence still is ~640px wide, so a face is fewer pixels.
+fn presence_salient(f: &face::DetectedFace) -> bool {
+    let w = (f.bbox[2] - f.bbox[0]).max(0.0);
+    let h = (f.bbox[3] - f.bbox[1]).max(0.0);
+    f.score >= 0.6 && w >= 36.0 && h >= 36.0
+}
+
+/// Fold this frame's observed labels into a scene's presence state and return the
+/// `(appeared, left)` labels that changed. Hysteresis: a label counts as present
+/// from when first seen until `grace` elapses with no sighting, so a dropped
+/// detection doesn't flap a leave. `announced` is the set currently treated as
+/// on-camera, so each transition fires exactly once. Pure (no IO); the caller holds
+/// the lock and journals the result.
+fn presence_delta(
+    state: &mut FacePresence,
+    seen_now: &HashSet<String>,
+    now: DateTime<Utc>,
+    grace: chrono::Duration,
+) -> (Vec<String>, Vec<String>) {
+    for l in seen_now {
+        state.last_seen.insert(l.clone(), now);
+    }
+    let mut appeared: Vec<String> = seen_now
+        .iter()
+        .filter(|l| !state.announced.contains(*l))
+        .cloned()
+        .collect();
+    for l in &appeared {
+        state.announced.insert(l.clone());
+    }
+    // Snapshot the announced set first (owned), so the staleness filter borrows
+    // only `last_seen` — no overlapping borrow of two fields of `state`.
+    let announced: Vec<String> = state.announced.iter().cloned().collect();
+    let mut left: Vec<String> = announced
+        .into_iter()
+        .filter(|l| {
+            state
+                .last_seen
+                .get(l)
+                .is_none_or(|&t| now.signed_duration_since(t) > grace)
+        })
+        .collect();
+    for l in &left {
+        state.announced.remove(l);
+        state.last_seen.remove(l);
+    }
+    appeared.sort();
+    left.sort();
+    (appeared, left)
+}
+
+/// One natural-language line for a presence change, e.g. "赵力 appeared on camera."
+/// or "someone you don't recognize appeared on camera; 老王 left the camera." Soft
+/// evidence for the mind, not a verdict.
+fn presence_body(appeared: &[String], left: &[String]) -> String {
+    let render = |ls: &[String]| -> String {
+        human_join(&ls.iter().map(|l| presence_display(l)).collect::<Vec<_>>())
+    };
+    let mut parts: Vec<String> = Vec::new();
+    if !appeared.is_empty() {
+        parts.push(format!("{} appeared on camera", render(appeared)));
+    }
+    if !left.is_empty() {
+        parts.push(format!("{} left the camera", render(left)));
+    }
+    format!("{}.", parts.join("; "))
+}
+
+/// Render an identity label for the presence body. A real name shows as-is; a raw
+/// cluster id (8 base-36 chars minted by [`people_vectors::mint_id`], a face seen
+/// before but not yet named) reads as a generic "a familiar face" so an opaque id
+/// never leaks into the agent's perception; the stranger bucket reads as "someone
+/// you don't recognize".
+fn presence_display(label: &str) -> String {
+    if label == STRANGER {
+        "someone you don't recognize".to_string()
+    } else if looks_like_cluster_id(label) {
+        "a familiar face".to_string()
+    } else {
+        label.to_string()
+    }
+}
+
+/// Whether `s` looks like a freshly-minted, still-unnamed cluster id from
+/// [`people_vectors::mint_id`] — 8 base-36 lowercase chars with at least one digit.
+/// Random ids almost always carry a digit; an all-letters name like "samantha"
+/// doesn't, so it isn't mistaken for an id.
+fn looks_like_cluster_id(s: &str) -> bool {
+    s.len() == 8
+        && s.bytes().all(|b| b.is_ascii_digit() || b.is_ascii_lowercase())
+        && s.bytes().any(|b| b.is_ascii_digit())
+}
+
+/// Join labels into a clause: "a", "a and b", "a, b, and c".
+fn human_join(items: &[String]) -> String {
+    match items {
+        [] => String::new(),
+        [a] => a.clone(),
+        [a, b] => format!("{a} and {b}"),
+        [rest @ .., last] => format!("{}, and {last}", rest.join(", ")),
+    }
 }
 
 /// The media a perceived signal can recognize faces from: a still image is ready
@@ -603,6 +810,70 @@ fn video_mime_to_ext(mime: &str) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn seen(labels: &[&str]) -> HashSet<String> {
+        labels.iter().map(|s| s.to_string()).collect()
+    }
+
+    #[test]
+    fn presence_first_sighting_appears_once_then_quiet() {
+        let mut st = FacePresence::default();
+        let now = Utc::now();
+        let g = chrono::Duration::seconds(8);
+        let (app, left) = presence_delta(&mut st, &seen(&["赵力"]), now, g);
+        assert_eq!(app, vec!["赵力".to_string()]);
+        assert!(left.is_empty());
+        // Same face two seconds later → no repeat event.
+        let (app2, left2) = presence_delta(&mut st, &seen(&["赵力"]), now + chrono::Duration::seconds(2), g);
+        assert!(app2.is_empty() && left2.is_empty());
+    }
+
+    #[test]
+    fn presence_flicker_within_grace_does_not_leave() {
+        let mut st = FacePresence::default();
+        let now = Utc::now();
+        let g = chrono::Duration::seconds(8);
+        presence_delta(&mut st, &seen(&["a"]), now, g);
+        // A single missed frame 3s later, still within grace → no leave.
+        let (app, left) = presence_delta(&mut st, &HashSet::new(), now + chrono::Duration::seconds(3), g);
+        assert!(app.is_empty() && left.is_empty());
+    }
+
+    #[test]
+    fn presence_leaves_after_grace_then_reappears_fresh() {
+        let mut st = FacePresence::default();
+        let now = Utc::now();
+        let g = chrono::Duration::seconds(8);
+        presence_delta(&mut st, &seen(&["a"]), now, g);
+        let (app, left) = presence_delta(&mut st, &HashSet::new(), now + chrono::Duration::seconds(20), g);
+        assert!(app.is_empty());
+        assert_eq!(left, vec!["a".to_string()]);
+        // Forgotten after leaving — a later sighting is a fresh appear.
+        let (app2, _) = presence_delta(&mut st, &seen(&["a"]), now + chrono::Duration::seconds(25), g);
+        assert_eq!(app2, vec!["a".to_string()]);
+    }
+
+    #[test]
+    fn presence_body_reads_naturally() {
+        assert_eq!(presence_body(&["赵力".to_string()], &[]), "赵力 appeared on camera.");
+        assert_eq!(
+            presence_body(&[STRANGER.to_string()], &[]),
+            "someone you don't recognize appeared on camera."
+        );
+        assert_eq!(
+            presence_body(&["ff32ce3w".to_string()], &["赵力".to_string()]),
+            "a familiar face appeared on camera; 赵力 left the camera."
+        );
+    }
+
+    #[test]
+    fn cluster_id_vs_name_detection() {
+        assert!(looks_like_cluster_id("ff32ce3w")); // minted id (has digits)
+        assert!(!looks_like_cluster_id("samantha")); // 8 letters, no digit → a name
+        assert!(!looks_like_cluster_id("赵力"));
+        assert!(!looks_like_cluster_id("alice"));
+        assert!(!looks_like_cluster_id(STRANGER));
+    }
 
     /// Build a minimal MP4 box: 4-byte big-endian size + 4-byte type + body.
     fn box_bytes(typ: &[u8; 4], body: &[u8]) -> Vec<u8> {
