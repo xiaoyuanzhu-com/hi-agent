@@ -1,4 +1,5 @@
-//! Full-stack smoke: real ACP adapter ↔ local proxy ↔ stub upstream.
+//! Full-stack smoke: real ACP adapter ↔ stub upstream (the child talks to the
+//! upstream LLM directly via `ANTHROPIC_BASE_URL`).
 //! Opt-in: `RUN_E2E=1 cargo test --test e2e_cognition -- --nocapture`.
 
 #[tokio::test]

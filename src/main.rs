@@ -64,7 +64,10 @@ fn default_data_dir() -> PathBuf {
 /// path can defer it onto the server thread: a missing/invalid key then surfaces in
 /// the menu bar instead of aborting `main` before the tray ever appears.
 fn build_config(port: u16, data_dir: PathBuf) -> anyhow::Result<hi_agent::Config> {
-    let agent = hi_agent::foundation::config::AgentConfig::load()?;
+    // Resolve the upstream LLM credential BYOK-first: the user's key from the
+    // credential store (`<data_dir>/credentials.json`) wins, else `.env`. Never
+    // fails — with no key the agent boots unconfigured and Settings can set one.
+    let agent = hi_agent::foundation::config::AgentConfig::resolve(&data_dir);
     // Auth gate config (HI_AGENT_AUTH + OIDC/owner vars). Off by default; when
     // enabled, a missing OIDC var is a hard startup error (fail closed).
     let auth = hi_agent::foundation::auth::AuthConfig::from_env()?;

@@ -1,0 +1,183 @@
+/* Settings — a top-level product page (light app theme, mirrors global.css
+   tokens). Distinct from the dark operator console under /inspect. */
+
+.settings-page {
+  position: absolute;
+  inset: 0;
+  overflow: auto;
+  background: var(--bg-0);
+  color: var(--fg);
+  font-family: var(--font-display);
+}
+
+.settings-shell {
+  max-width: 560px;
+  margin: 0 auto;
+  padding: 56px 24px 80px;
+}
+
+.settings-head {
+  display: flex;
+  align-items: center;
+  gap: 14px;
+  margin-bottom: 28px;
+}
+
+.settings-head h1 {
+  margin: 0;
+  font-size: 26px;
+  font-weight: 600;
+  letter-spacing: -0.01em;
+}
+
+.settings-back {
+  display: grid;
+  place-items: center;
+  width: 34px;
+  height: 34px;
+  border-radius: 50%;
+  border: 1px solid var(--line);
+  color: var(--fg-dim);
+  text-decoration: none;
+  font-size: 17px;
+  background: rgba(255, 255, 255, 0.6);
+  transition: color 160ms var(--ease), border-color 160ms var(--ease);
+}
+.settings-back:hover {
+  color: var(--fg);
+  border-color: var(--line-strong);
+}
+
+.settings-card {
+  background: rgba(255, 255, 255, 0.7);
+  border: 1px solid var(--line);
+  border-radius: 18px;
+  padding: 24px 24px 22px;
+  box-shadow: 0 12px 44px rgba(40, 52, 74, 0.08);
+  backdrop-filter: blur(12px) saturate(1.3);
+  -webkit-backdrop-filter: blur(12px) saturate(1.3);
+}
+
+.settings-card-head {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  margin-bottom: 8px;
+}
+
+.settings-card-head h2 {
+  margin: 0;
+  font-size: 15px;
+  font-weight: 600;
+}
+
+.settings-card .tag {
+  font-family: var(--font-mono);
+  font-size: 11px;
+  letter-spacing: 0.02em;
+  padding: 3px 10px;
+  border-radius: 999px;
+  border: 1px solid var(--line-strong);
+}
+.settings-card .tag.ok {
+  color: #2f8f5b;
+  border-color: rgba(47, 143, 91, 0.32);
+  background: rgba(47, 143, 91, 0.08);
+}
+.settings-card .tag.warn {
+  color: #b9772a;
+  border-color: rgba(185, 119, 42, 0.32);
+  background: rgba(185, 119, 42, 0.08);
+}
+.settings-card .tag.mute {
+  color: var(--fg-mute);
+}
+
+.settings-sub {
+  margin: 0 0 18px;
+  font-size: 13px;
+  line-height: 1.5;
+  color: var(--fg-dim);
+}
+.settings-sub code {
+  font-family: var(--font-mono);
+  font-size: 12px;
+  padding: 1px 5px;
+  border-radius: 5px;
+  background: var(--bg-1);
+}
+
+.settings-card .field {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  margin-bottom: 14px;
+}
+.settings-card .field > span {
+  font-size: 12px;
+  color: var(--fg-dim);
+}
+.settings-card .field em {
+  font-style: normal;
+  color: var(--fg-mute);
+  font-size: 11px;
+}
+
+.settings-card input {
+  width: 100%;
+  padding: 10px 12px;
+  border-radius: 10px;
+  border: 1px solid var(--line-strong);
+  background: rgba(255, 255, 255, 0.8);
+  color: var(--fg);
+  font-family: var(--font-mono);
+  font-size: 13px;
+  outline: none;
+  transition: border-color 180ms var(--ease), box-shadow 180ms var(--ease);
+}
+.settings-card input:focus {
+  border-color: rgba(91, 135, 200, 0.55);
+  box-shadow: 0 0 0 3px rgba(91, 135, 200, 0.16);
+}
+.settings-card input::placeholder {
+  color: var(--fg-mute);
+}
+
+.settings-actions {
+  display: flex;
+  align-items: center;
+  gap: 14px;
+  margin-top: 18px;
+  flex-wrap: wrap;
+}
+
+.settings-actions button.primary {
+  border: none;
+  border-radius: 10px;
+  padding: 10px 22px;
+  font-size: 13px;
+  font-weight: 600;
+  color: #fff;
+  background: var(--accent);
+  box-shadow: 0 6px 18px rgba(91, 135, 200, 0.28);
+  transition: filter 160ms var(--ease), opacity 160ms var(--ease);
+}
+.settings-actions button.primary:hover {
+  filter: brightness(1.05);
+}
+.settings-actions button.primary:disabled {
+  opacity: 0.6;
+  cursor: default;
+  box-shadow: none;
+}
+
+.settings-actions .note {
+  font-size: 12px;
+  line-height: 1.4;
+}
+.settings-actions .note.ok {
+  color: #2f8f5b;
+}
+.settings-actions .note.err {
+  color: #c0473d;
+}

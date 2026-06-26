@@ -78,10 +78,6 @@ pub struct AgentConfig {
     pub effort: Option<String>,
     pub permission_mode: Option<String>,
     pub upstream_key: String,
-    /// Throwaway `sk-…` key the child uses to reach the local proxy. Generated
-    /// once per process; the proxy discards it and injects [`Self::upstream_key`].
-    /// Pre-approved in the managed `.claude.json` so the child will send it.
-    pub placeholder_key: String,
 }
 
 // Hand-written so the upstream credential never lands in logs (`Config` derives
@@ -94,7 +90,6 @@ impl std::fmt::Debug for AgentConfig {
             .field("effort", &self.effort)
             .field("permission_mode", &self.permission_mode)
             .field("upstream_key", &"<redacted>")
-            .field("placeholder_key", &self.placeholder_key)
             .finish()
     }
 }
@@ -108,49 +103,62 @@ fn env_opt(name: &str) -> Option<String> {
 }
 
 impl AgentConfig {
-    /// Load everything from the environment: the upstream credential / base URL
-    /// (`AI_API_KEY` / `AI_API_BASE`) and the cognition parameters
-    /// (`HI_AGENT_MODEL` / `HI_AGENT_EFFORT` / `HI_AGENT_PERMISSION_MODE`).
-    pub fn load() -> anyhow::Result<Self> {
-        let base_url = std::env::var(ENV_AI_API_BASE).unwrap_or_default();
-        let key = std::env::var(ENV_AI_API_KEY).unwrap_or_default();
+    /// Resolve the upstream LLM credential for startup, BYOK-first: the user's
+    /// own key from the credential store (`<data_dir>/credentials.json`) wins; when
+    /// it's unset we fall back to `.env` (`AI_API_KEY` / `AI_API_BASE` / `HI_AGENT_MODEL`)
+    /// so dev / journey-test flows keep working. Never errors — when neither source
+    /// has a key the agent boots **unconfigured** (see [`is_configured`](Self::is_configured)),
+    /// the server + Settings UI come up, and prompts fail clearly until a key is set.
+    /// `effort` / `permission_mode` stay env-driven (they aren't credentials).
+    pub fn resolve(data_dir: &Path) -> Self {
+        let store = crate::foundation::credentials::Credentials::load(data_dir);
+        let llm = store.llm;
+        let (base_url, key, model) = if !llm.api_key.trim().is_empty() {
+            (llm.base_url, llm.api_key, llm.model.or_else(|| env_opt(ENV_MODEL)))
+        } else {
+            (
+                std::env::var(ENV_AI_API_BASE).unwrap_or_default(),
+                std::env::var(ENV_AI_API_KEY).unwrap_or_default(),
+                env_opt(ENV_MODEL),
+            )
+        };
         Self::new(
-            env_opt(ENV_MODEL),
+            model,
             env_opt(ENV_EFFORT),
             env_opt(ENV_PERMISSION_MODE),
             base_url,
             key,
         )
-        .context("building agent config from environment")
     }
 
-    /// Assemble from explicit parts. Errors if the key is empty; the base URL
-    /// falls back to [`DEFAULT_AI_API_BASE`] when unset.
+    /// Whether an upstream key is configured. When false the agent is inert: it
+    /// boots so the user can set a key in Settings, but prompts will fail until then.
+    pub fn is_configured(&self) -> bool {
+        !self.upstream_key.trim().is_empty()
+    }
+
+    /// Assemble from explicit parts. The base URL falls back to
+    /// [`DEFAULT_AI_API_BASE`] when unset; an empty key is allowed (the
+    /// **unconfigured** state — BYOK before the user has pasted a key).
     pub fn new(
         model: Option<String>,
         effort: Option<String>,
         permission_mode: Option<String>,
         upstream_base_url: String,
         upstream_key: String,
-    ) -> anyhow::Result<Self> {
-        if upstream_key.trim().is_empty() {
-            anyhow::bail!(
-                "{ENV_AI_API_KEY} is empty — set it in the environment or .env"
-            );
-        }
+    ) -> Self {
         let upstream_base_url = if upstream_base_url.trim().is_empty() {
             DEFAULT_AI_API_BASE.to_string()
         } else {
             upstream_base_url
         };
-        Ok(Self {
+        Self {
             upstream_base_url,
             model,
             effort,
             permission_mode,
             upstream_key,
-            placeholder_key: format!("sk-{}", uuid::Uuid::now_v7().simple()),
-        })
+        }
     }
 
     /// Write a managed `settings.json` into `config_dir` (the adapter's
@@ -175,20 +183,19 @@ impl AgentConfig {
         Ok(())
     }
 
-    /// Pre-approve the generated placeholder key in the managed config dir's
-    /// `.claude.json`.
+    /// Pre-approve the upstream key in the managed config dir's `.claude.json`.
     ///
     /// Claude Code treats any key supplied via `ANTHROPIC_API_KEY` as a "custom"
     /// key and refuses to use it unless its last-20-char fingerprint appears in
     /// `customApiKeyResponses.approved`. Without this, `session/prompt` fails with
     /// "Please run /login", which the ACP adapter surfaces as
-    /// `-32000 Authentication required`. We seed the approval so the proxy's
-    /// placeholder is accepted; the real upstream key never reaches the child.
+    /// `-32000 Authentication required`. We seed the approval so the child's
+    /// `ANTHROPIC_API_KEY` is accepted without an interactive `/login`.
     ///
-    /// The key rotates every startup, so we pin `approved` to exactly the current
-    /// fingerprint — this dir is hi-agent-owned and the only custom key is ours,
-    /// so there is nothing else to preserve and the list stays bounded.
-    pub fn approve_placeholder_key(&self, config_dir: &Path) -> anyhow::Result<()> {
+    /// We pin `approved` to exactly the current key's fingerprint — this dir is
+    /// hi-agent-owned and the only custom key is ours, so there is nothing else to
+    /// preserve and the list stays bounded. Re-run whenever the key changes.
+    pub fn approve_api_key(&self, config_dir: &Path) -> anyhow::Result<()> {
         std::fs::create_dir_all(config_dir)
             .with_context(|| format!("creating config dir {}", config_dir.display()))?;
         let path = config_dir.join(".claude.json");
@@ -203,7 +210,7 @@ impl AgentConfig {
         };
 
         // Claude matches approvals by the key's last 20 chars (`key.slice(-20)`).
-        let key = self.placeholder_key.as_str();
+        let key = self.upstream_key.as_str();
         let fingerprint = &key[key.len().saturating_sub(20)..];
 
         root.insert(
@@ -218,16 +225,14 @@ impl AgentConfig {
 
     /// Build the env var pairs for the ACP child process.
     ///
-    /// Build the env var pairs for the ACP child process.
-    ///
-    /// `proxy_port` is the local proxy's bound port; `server_port` is hi-agent's
-    /// own HTTP port (handed to the child as `HI_AGENT_BASE_URL` so a session can
-    /// reach the channels); `config_dir` is the managed `CLAUDE_CONFIG_DIR`;
-    /// `node_bin_dir` is the directory containing the resolved `node`; `claude_bin`
-    /// is the resolved claude executable.
+    /// `server_port` is hi-agent's own HTTP port (handed to the child as
+    /// `HI_AGENT_BASE_URL` so a session can reach the channels); `config_dir` is the
+    /// managed `CLAUDE_CONFIG_DIR`; `node_bin_dir` is the directory containing the
+    /// resolved `node`; `claude_bin` is the resolved claude executable. The child
+    /// talks to the upstream LLM directly via `ANTHROPIC_BASE_URL` / the real
+    /// `ANTHROPIC_API_KEY` (pre-approved by [`approve_api_key`]).
     pub fn child_env(
         &self,
-        proxy_port: u16,
         server_port: u16,
         config_dir: &Path,
         node_bin_dir: &Path,
@@ -236,9 +241,9 @@ impl AgentConfig {
         let mut env = vec![
             (
                 "ANTHROPIC_BASE_URL".to_string(),
-                format!("http://127.0.0.1:{proxy_port}"),
+                self.upstream_base_url.clone(),
             ),
-            ("ANTHROPIC_API_KEY".to_string(), self.placeholder_key.clone()),
+            ("ANTHROPIC_API_KEY".to_string(), self.upstream_key.clone()),
             (
                 ENV_SERVER_BASE_URL.to_string(),
                 format!("http://127.0.0.1:{server_port}"),
@@ -278,8 +283,7 @@ mod tests {
             Some("acceptEdits".to_string()),
             "https://upstream.example/v1".to_string(),
             "secret-key".to_string(),
-        )
-        .unwrap();
+        );
         assert_eq!(cfg.upstream_base_url, "https://upstream.example/v1");
         assert_eq!(cfg.model.as_deref(), Some("claude-opus-4-8"));
         assert_eq!(cfg.effort.as_deref(), Some("high"));
@@ -290,7 +294,7 @@ mod tests {
     #[test]
     fn empty_base_url_falls_back_to_default() {
         let cfg =
-            AgentConfig::new(None, None, None, "".to_string(), "k".to_string()).unwrap();
+            AgentConfig::new(None, None, None, "".to_string(), "k".to_string());
         assert_eq!(cfg.upstream_base_url, DEFAULT_AI_API_BASE);
     }
 
@@ -302,24 +306,23 @@ mod tests {
             None,
             "https://x/v1".to_string(),
             "super-secret-key".to_string(),
-        )
-        .unwrap();
+        );
         let rendered = format!("{cfg:?}");
         assert!(!rendered.contains("super-secret-key"), "key leaked: {rendered}");
         assert!(rendered.contains("<redacted>"));
     }
 
     #[test]
-    fn empty_key_is_an_error() {
-        let err = AgentConfig::new(None, None, None, "https://x/v1".to_string(), "".to_string())
-            .unwrap_err();
-        assert!(err.to_string().contains("AI_API_KEY"));
+    fn empty_key_means_unconfigured() {
+        let cfg = AgentConfig::new(None, None, None, "https://x/v1".to_string(), "".to_string());
+        assert!(!cfg.is_configured());
+        let cfg = AgentConfig::new(None, None, None, "https://x/v1".to_string(), "k".to_string());
+        assert!(cfg.is_configured());
     }
 
     #[test]
     fn unset_optionals_default_to_none() {
-        let cfg = AgentConfig::new(None, None, None, "https://x/v1".to_string(), "k".to_string())
-            .unwrap();
+        let cfg = AgentConfig::new(None, None, None, "https://x/v1".to_string(), "k".to_string());
         assert!(cfg.model.is_none());
         assert!(cfg.effort.is_none());
         assert!(cfg.permission_mode.is_none());
@@ -334,8 +337,7 @@ mod tests {
             Some("acceptEdits".to_string()),
             "https://x/v1".to_string(),
             "k".to_string(),
-        )
-        .unwrap();
+        );
         cfg.render_settings_json(dir.path()).unwrap();
         let written = std::fs::read_to_string(dir.path().join("settings.json")).unwrap();
         let v: serde_json::Value = serde_json::from_str(&written).unwrap();
@@ -347,7 +349,7 @@ mod tests {
     fn omits_unset_fields() {
         let dir = tempfile::tempdir().unwrap();
         let cfg =
-            AgentConfig::new(None, None, None, "https://x/v1".to_string(), "k".to_string()).unwrap();
+            AgentConfig::new(None, None, None, "https://x/v1".to_string(), "k".to_string());
         cfg.render_settings_json(dir.path()).unwrap();
         let v: serde_json::Value =
             serde_json::from_str(&std::fs::read_to_string(dir.path().join("settings.json")).unwrap())
@@ -357,27 +359,24 @@ mod tests {
     }
 
     #[test]
-    fn child_env_sets_proxy_and_managed_vars() {
+    fn child_env_sets_upstream_and_managed_vars() {
         let cfg = AgentConfig::new(
             Some("claude-opus-4-8".to_string()),
             None,
             None,
             "https://x/v1".to_string(),
             "k".to_string(),
-        )
-        .unwrap();
+        );
         let env = cfg.child_env(
-            7777,
             8080,
             std::path::Path::new("/cache/config"),
             std::path::Path::new("/cache/runtime/node/bin"),
             std::path::Path::new("/cache/runtime/claude"),
         );
         let map: std::collections::HashMap<_, _> = env.into_iter().collect();
-        assert_eq!(map["ANTHROPIC_BASE_URL"], "http://127.0.0.1:7777");
-        // Generated per process; the env carries exactly the config's placeholder.
-        assert!(map["ANTHROPIC_API_KEY"].starts_with("sk-"));
-        assert_eq!(map["ANTHROPIC_API_KEY"], cfg.placeholder_key);
+        // The child talks to the upstream directly — no local proxy in between.
+        assert_eq!(map["ANTHROPIC_BASE_URL"], "https://x/v1");
+        assert_eq!(map["ANTHROPIC_API_KEY"], "k");
         assert_eq!(map["HI_AGENT_BASE_URL"], "http://127.0.0.1:8080");
         assert_eq!(map["ANTHROPIC_MODEL"], "claude-opus-4-8");
         assert!(!map.contains_key("MAX_THINKING_TOKENS"));
@@ -387,20 +386,25 @@ mod tests {
     }
 
     #[test]
-    fn approve_placeholder_key_seeds_fingerprint_and_preserves_other_fields() {
-        let cfg = AgentConfig::new(None, None, None, "https://x/v1".to_string(), "k".to_string())
-            .unwrap();
+    fn approve_api_key_seeds_fingerprint_and_preserves_other_fields() {
+        let cfg = AgentConfig::new(
+            None,
+            None,
+            None,
+            "https://x/v1".to_string(),
+            "sk-ant-super-secret-key-1234567890".to_string(),
+        );
         let dir = std::env::temp_dir().join(format!("hi-agent-test-{}", uuid::Uuid::now_v7()));
         std::fs::create_dir_all(&dir).unwrap();
         // Pre-existing managed state that must survive the read-modify-write.
         std::fs::write(dir.join(".claude.json"), br#"{"userID":"abc"}"#).unwrap();
 
-        cfg.approve_placeholder_key(&dir).unwrap();
+        cfg.approve_api_key(&dir).unwrap();
 
         let v: serde_json::Value =
             serde_json::from_slice(&std::fs::read(dir.join(".claude.json")).unwrap()).unwrap();
         assert_eq!(v["userID"], "abc");
-        let key = &cfg.placeholder_key;
+        let key = &cfg.upstream_key;
         let fp = &key[key.len().saturating_sub(20)..];
         assert_eq!(v["customApiKeyResponses"]["approved"][0], fp);
 

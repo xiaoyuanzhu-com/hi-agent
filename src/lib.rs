@@ -177,13 +177,6 @@ async fn run_with_shutdown(config: Config, shutdown: Arc<Notify>) -> anyhow::Res
     let runtime = runtime::ensure().await?;
     tracing::info!(origin = runtime.origin, "runtime resolved");
 
-    // Start the local LLM proxy; the adapter talks to it instead of the upstream.
-    let proxy = foundation::llm_proxy::LlmProxy::start(
-        config.agent.upstream_base_url.clone(),
-        config.agent.upstream_key.clone(),
-    )
-    .await?;
-
     // Render the managed settings.json into a hi-agent-owned config dir.
     // Absolutize it: it's handed to the child as `CLAUDE_CONFIG_DIR`, and the
     // child may run with a different cwd than us — a relative path would make
@@ -198,16 +191,22 @@ async fn run_with_shutdown(config: Config, shutdown: Arc<Notify>) -> anyhow::Res
                 .join(dir)
         }
     };
+    if !config.agent.is_configured() {
+        tracing::warn!(
+            "no LLM credentials configured — set them in Settings (or AI_API_KEY in .env); \
+             the agent will boot but prompts fail until a key is set"
+        );
+    }
     config.agent.render_settings_json(&claude_config_dir)?;
-    // Pre-approve the placeholder key, else Claude Code rejects the env-supplied
+    // Pre-approve the upstream key, else Claude Code rejects the env-supplied
     // `ANTHROPIC_API_KEY` ("Please run /login") and prompts fail with -32000.
-    config.agent.approve_placeholder_key(&claude_config_dir)?;
+    config.agent.approve_api_key(&claude_config_dir)?;
 
     // Spawn config for the agent session layer. The subprocess itself is spawned
     // lazily, one per scene, on that scene's first session (Chrome-style isolation);
-    // the pinned runtime, managed env, and local LLM proxy are shared by all.
+    // the pinned runtime and managed env are shared by all. The child reaches the
+    // upstream LLM directly (no local proxy).
     let mut child_env = config.agent.child_env(
-        proxy.port(),
         config.port,
         &claude_config_dir,
         runtime.node_bin_dir(),
@@ -219,7 +218,7 @@ async fn run_with_shutdown(config: Config, shutdown: Arc<Notify>) -> anyhow::Res
     child_env.push(("HI_AGENT_PROMPTS_DIR".to_string(), prompts_dir.display().to_string()));
     // Diagnostic: surface exactly what differs between launchers (terminal vs.
     // cmux etc.) — cwd, the resolved runtime binaries, the config dir claude
-    // will read, and the placeholder key's fingerprint vs. what we seeded.
+    // will read, and the upstream key's fingerprint vs. what we seeded.
     {
         let get = |k: &str| {
             child_env
@@ -240,7 +239,7 @@ async fn run_with_shutdown(config: Config, shutdown: Arc<Notify>) -> anyhow::Res
             anthropic_base_url = get("ANTHROPIC_BASE_URL"),
             claude_config_dir_env = get("CLAUDE_CONFIG_DIR"),
             claude_code_executable = get("CLAUDE_CODE_EXECUTABLE"),
-            placeholder_fp = fp,
+            api_key_fp = fp,
             path_head = child_env.iter().find(|(n,_)| n == "PATH").map(|(_,v)| v.split(':').next().unwrap_or("")).unwrap_or(""),
             "child auth/runtime env resolved"
         );
@@ -339,9 +338,6 @@ async fn run_with_shutdown(config: Config, shutdown: Arc<Notify>) -> anyhow::Res
     if tokio::time::timeout(SHUTDOWN_GRACE, agent_for_shutdown.shutdown()).await.is_err() {
         tracing::warn!("ACP subprocess reaping timed out");
     }
-
-    // Stop the local LLM proxy (its `Drop` aborts the server task).
-    drop(proxy);
 
     tracing::info!("hi-agent shut down");
     Ok(())

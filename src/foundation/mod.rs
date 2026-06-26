@@ -3,10 +3,10 @@
 //! faculty, faculties are built on it.
 //!
 //! - LLM/agent gateway: `acp` (JSON-RPC wire + sessions), `agent` (one subprocess
-//!   per session), `llm_proxy` (local upstream proxy), `mcp` (tool transport).
+//!   per session), `mcp` (tool transport).
 //! - Transport + serving: `server` (HTTP front, channels, carriers).
 //! - Vendor adapters: `vendors` (macOS, doubao, volcengine, ffmpeg, onnx fronts).
-//! - Plumbing: `config`, `models`, `observatory`, `channel_log`, `pcm`, `segment`.
+//! - Plumbing: `config`, `credentials`, `models`, `observatory`, `channel_log`, `pcm`, `segment`.
 //!
 //! Three engine-ish modules deliberately stay at the crate root rather than move
 //! here, because relocating them would break hardcoded build paths the rest of the
@@ -23,7 +23,7 @@ pub mod agent;
 pub mod auth;
 pub mod channel_log;
 pub mod config;
-pub mod llm_proxy;
+pub mod credentials;
 pub mod mcp;
 pub mod models;
 pub mod observatory;

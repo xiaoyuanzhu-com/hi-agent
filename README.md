@@ -138,8 +138,8 @@ Env vars consulted at startup:
 
 | Variable | Default | Purpose |
 |---|---|---|
-| `AI_API_KEY` | — | Upstream LLM credential, injected by the local proxy. Required; read from env only, never written to disk. |
-| `AI_API_BASE` | `https://api.anthropic.com` | Upstream LLM base URL the proxy forwards to. |
+| `AI_API_KEY` | — | Upstream LLM credential, handed to the bundled Claude adapter (`ANTHROPIC_API_KEY`). Optional — set here or via Settings (BYOK); without either the agent boots unconfigured. |
+| `AI_API_BASE` | `https://api.anthropic.com` | Upstream LLM base URL the adapter talks to (`ANTHROPIC_BASE_URL`). |
 | `HI_AGENT_MODEL` | adapter default | Model handed to the bundled Claude adapter (`ANTHROPIC_MODEL`) |
 | `HI_AGENT_EFFORT` | unset | Adapter `effortLevel` (e.g. `low` / `medium` / `high`) |
 | `HI_AGENT_PERMISSION_MODE` | unset | Adapter `permissions.defaultMode` (e.g. `acceptEdits`) |

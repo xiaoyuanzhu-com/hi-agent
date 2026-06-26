@@ -31,6 +31,7 @@ pub mod mcp;
 pub mod observe;
 pub mod reflex;
 pub mod sessions;
+pub mod settings;
 pub mod stubs;
 pub mod text;
 pub mod text_bus;
@@ -508,6 +509,13 @@ pub fn build(
         // accessibility tree and type the stored value, no model in the loop. The
         // v1 trigger (a later hotkey/gesture would call the same path).
         .route("/api/reflex/invoke", post(reflex::post_invoke))
+        // BYOK credential store — the Settings UI reads the configured state
+        // (key never returned, only a hint) and writes the user's vendor keys.
+        // Browser-facing, so it sits behind the OIDC gate when auth is enabled.
+        .route(
+            "/api/settings/credentials",
+            get(settings::get_credentials).post(settings::post_credentials),
+        )
         // A scene's channels, observed live as one merged presence stream — the
         // channel inspector's window onto every in/out channel of one scene.
         .route("/api/scenes/{scene}/channels", get(channels::get_scene_channels))

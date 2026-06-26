@@ -138,7 +138,7 @@ The current tree is organized by *technical layer* (`acp`, `server`, `reactor`,
 
 | Faculty | Today's modules | Notes |
 |---|---|---|
-| **foundation** | `acp`, `agent`, `llm_proxy`, `runtime`, `mcp`, `vendors`, `config`, `models`, `appearance`, `observatory`, `channel_log`, `pcm`, `segment`, `types` | the engine. `vendors` is already the clean impl-layer under `capabilities`. |
+| **foundation** | `acp`, `agent`, `runtime`, `mcp`, `vendors`, `config`, `models`, `appearance`, `observatory`, `channel_log`, `pcm`, `segment`, `types` | the engine. `vendors` is already the clean impl-layer under `capabilities`. |
 | **body** | `capabilities` (senses + actions), `reactor` (loops, loader, sequencer, workers), `presence`, `gesture` | `capabilities`↔`vendors` already maps cleanly to body↔foundation. |
 | **identity** | **scattered, no home today**: `load_soul` + `install_prompts` + `compose_prompt` + the `core/speaking/meaning.md` bases (in `reactor/mod.rs`); `self`/`commitments`/`hot` paths (`memory/layout.rs`); `refresh_hot` (`memory/core.rs`) | consolidating these is the model's biggest readability win. |
 | **mind** | `memory` (journal, snapshot, episodes, facets, decay, media, people_vectors, layout, core), `views` | the agent-grown store; `views` are learned procedural/presentational memory. |
@@ -157,7 +157,7 @@ The grouping shipped to `main` in four build-green, tested commits:
    namespace; the provenance-tagged, seed-shadowing write *port* is still future work).
 3. **`body`** ✅ — `capabilities`, `reactor`, `reflex`, `presence`, `gesture` under
    `src/body/` (the always-on apparatus + loops).
-4. **`foundation`** ✅ — the 12 pure-Rust engine modules (`acp`, `agent`, `llm_proxy`,
+4. **`foundation`** ✅ — the pure-Rust engine modules (`acp`, `agent`,
    `mcp`, `vendors`, `config`, `models`, `observatory`, `channel_log`, `pcm`, `segment`,
    `server`) under `src/foundation/`.
 

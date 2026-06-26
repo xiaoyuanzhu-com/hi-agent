@@ -45,8 +45,8 @@ impl SessionRole {
 }
 
 /// How to spawn one ACP subprocess. Cloned per session: the same pinned runtime
-/// and managed env back every session's process (they share one local LLM proxy
-/// and one rendered config dir, resolved once at startup).
+/// and managed env back every session's process (they share one rendered config
+/// dir, resolved once at startup).
 #[derive(Debug, Clone)]
 pub struct SpawnConfig {
     pub program: PathBuf,
