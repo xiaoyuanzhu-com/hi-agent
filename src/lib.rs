@@ -353,14 +353,24 @@ async fn run_with_shutdown(config: Config, shutdown: Arc<Notify>) -> anyhow::Res
 /// distribution model accepted as the cost of a tray: elsewhere tokio owns the
 /// main thread, here AppKit does.
 ///
+/// The config is built on the server thread (via `build_config`) rather than before
+/// this call, so a missing/invalid key keeps the app alive and visible instead of
+/// aborting before the menu-bar item appears. On any startup failure the server
+/// thread marks the icon, reveals `<data_dir>/.env` for editing, and waits for Quit
+/// — the app stays up so the user can read the problem and fix it.
+///
 /// The tray's "Quit" notifies `shutdown`; the server thread observes it, runs the
 /// normal graceful drain + ACP reap, then exits the process — which also tears
 /// down the main-thread AppKit loop. If the status item can't be created (e.g. no
 /// window-server session), the agent falls back to running headless rather than
 /// failing.
 #[cfg(target_os = "macos")]
-pub fn run_with_tray(config: Config) -> anyhow::Result<()> {
-    let url = format!("http://127.0.0.1:{}/", config.port);
+pub fn run_with_tray(
+    port: u16,
+    data_dir: PathBuf,
+    build_config: impl FnOnce() -> anyhow::Result<Config> + Send + 'static,
+) -> anyhow::Result<()> {
+    let url = format!("http://127.0.0.1:{port}/");
     let shutdown = Arc::new(Notify::new());
 
     let server_shutdown = shutdown.clone();
@@ -374,13 +384,35 @@ pub fn run_with_tray(config: Config) -> anyhow::Result<()> {
                     std::process::exit(1);
                 }
             };
-            match rt.block_on(run_with_shutdown(config, server_shutdown)) {
+            // Build the config here, on the server thread, so a bad/missing config
+            // (e.g. a fresh `.app` whose seeded `.env` has no AI_API_KEY) doesn't
+            // abort before the menu-bar item is up. On failure keep the app alive:
+            // mark the icon, put the `.env` to edit in front of the user, and wait
+            // for Quit — rather than vanishing with no trace.
+            let config = match build_config() {
+                Ok(config) => config,
+                Err(e) => {
+                    tracing::error!(error = ?e, "configuration error — fix it and relaunch; the menu-bar app stays up");
+                    body::capabilities::tray::set_text("⚠ needs setup");
+                    // Reveal the file to edit (best-effort; needs a window-server
+                    // session, so a no-op when headless).
+                    let _ = std::process::Command::new("open")
+                        .arg("-R")
+                        .arg(data_dir.join(".env"))
+                        .spawn();
+                    rt.block_on(server_shutdown.notified());
+                    std::process::exit(0);
+                }
+            };
+            match rt.block_on(run_with_shutdown(config, server_shutdown.clone())) {
                 // Graceful shutdown completed (drained + ACP subprocesses reaped).
                 // Exit the process, which also stops the main-thread AppKit loop.
                 Ok(()) => std::process::exit(0),
                 Err(e) => {
-                    tracing::error!(error = %e, "hi-agent server exited with error");
-                    std::process::exit(1);
+                    tracing::error!(error = %e, "hi-agent server exited with error; the menu-bar app stays up");
+                    body::capabilities::tray::set_text("⚠ startup failed");
+                    rt.block_on(server_shutdown.notified());
+                    std::process::exit(0);
                 }
             }
         })

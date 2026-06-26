@@ -41,7 +41,7 @@
 //! into another app's *menus*.
 
 use std::cell::Cell;
-use std::sync::{Arc, OnceLock};
+use std::sync::{Arc, Mutex, OnceLock};
 
 use anyhow::anyhow;
 use objc2::rc::Retained;
@@ -275,6 +275,12 @@ unsafe impl Sync for BlinkerPtr {}
 
 static BLINKER: OnceLock<BlinkerPtr> = OnceLock::new();
 
+/// The latest text requested via [`set_text`], kept so a request that lands before
+/// the status item exists (e.g. an early config error surfaced from the server
+/// thread, which can win the race against this thread's AppKit setup) isn't
+/// dropped — [`run`] applies it once the item is up.
+static PENDING_TEXT: Mutex<Option<String>> = Mutex::new(None);
+
 /// Briefly pulse the menu-bar icon to acknowledge a received gesture. Safe to call
 /// from any thread; a no-op until the status item is up — so before the tray loads,
 /// or when running headless, it simply does nothing.
@@ -319,6 +325,9 @@ pub fn set_listening(on: bool) {
 /// Set the status item's text (the title beside the icon) — empty string collapses
 /// to icon-only. Safe to call from any thread; a no-op until the status item is up.
 pub fn set_text(text: &str) {
+    // Record it first so a call that beats the status item's creation isn't lost —
+    // `run` flushes this once the item is up.
+    *PENDING_TEXT.lock().unwrap() = Some(text.to_string());
     let Some(blinker) = BLINKER.get() else { return };
     // The NSString is created here (off the main thread, which is fine for an
     // immutable string) and retained by `performSelectorOnMainThread:` until the
@@ -541,6 +550,14 @@ pub fn run(url: String, shutdown: Arc<Notify>) -> anyhow::Result<()> {
     // The target is held by the menu items only weakly (NSMenuItem.target is weak),
     // so leak our strong reference too, or the actions would fire on a freed object.
     std::mem::forget(target);
+
+    // Apply any text requested before the status item existed — e.g. an early
+    // config error from the server thread that won the race with this setup. Bind to
+    // a local first so the lock guard is dropped before `set_text` re-locks.
+    let pending = PENDING_TEXT.lock().unwrap().clone();
+    if let Some(text) = pending {
+        set_text(&text);
+    }
 
     // Drives the AppKit run loop on this thread; returns only if the app is stopped
     // (not our path — we exit the process instead).

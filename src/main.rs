@@ -59,6 +59,18 @@ fn default_data_dir() -> PathBuf {
     PathBuf::from("./data")
 }
 
+/// Build the runtime [`hi_agent::Config`] from the process environment (already
+/// populated from `.env` by the time this runs). Split out so the macOS desktop
+/// path can defer it onto the server thread: a missing/invalid key then surfaces in
+/// the menu bar instead of aborting `main` before the tray ever appears.
+fn build_config(port: u16, data_dir: PathBuf) -> anyhow::Result<hi_agent::Config> {
+    let agent = hi_agent::foundation::config::AgentConfig::load()?;
+    // Auth gate config (HI_AGENT_AUTH + OIDC/owner vars). Off by default; when
+    // enabled, a missing OIDC var is a hard startup error (fail closed).
+    let auth = hi_agent::foundation::auth::AuthConfig::from_env()?;
+    Ok(hi_agent::Config { port, data_dir, agent, auth })
+}
+
 /// Package-time: lay out the full managed runtime, the three recognition models,
 /// and the static ffmpeg under `into` (a `.app`'s `Contents/Resources`), so the
 /// shipped app runs hermetically. Each provisioner targets its own subdir, matching
@@ -143,36 +155,36 @@ fn main() -> anyhow::Result<()> {
         });
     }
 
-    let agent = hi_agent::foundation::config::AgentConfig::load()?;
-    // Auth gate config (HI_AGENT_AUTH + OIDC/owner vars). Off by default; when
-    // enabled, a missing OIDC var is a hard startup error (fail closed).
-    let auth = hi_agent::foundation::auth::AuthConfig::from_env()?;
     // Read on every platform (so the flag is never dead code); only consulted on
     // macOS, where it selects the headless/server-owns-main-thread path.
     let no_tray = cli.no_tray;
-    let config = hi_agent::Config {
-        port: cli.port,
-        data_dir,
-        agent,
-        auth,
-    };
+    let port = cli.port;
 
     // On macOS the default install shape is a desktop app: AppKit owns the main
     // thread and shows a menu-bar icon, while the HTTP server runs on a background
-    // thread (see `hi_agent::run_with_tray`). Skip it — and keep today's behavior of
-    // the server owning the main thread — when explicitly disabled (`--no-tray`) or
-    // when there is no window server (running over SSH, where AppKit can't draw).
+    // thread (see `hi_agent::run_with_tray`). The config is built *there*, on the
+    // server thread — so a missing/invalid key (e.g. a fresh `.app` whose seeded
+    // `.env` has no AI_API_KEY) surfaces in the menu bar instead of aborting `main`
+    // before the tray appears (which looked like "the app does nothing" when
+    // clicked). Skip the tray — keeping the server on the main thread, where a
+    // misconfig is a fatal startup error as a server should have — when explicitly
+    // disabled (`--no-tray`) or when there is no window server (over SSH, where
+    // AppKit can't draw).
     #[cfg(target_os = "macos")]
     {
         let headless = no_tray || std::env::var_os("SSH_CONNECTION").is_some();
         if !headless {
-            return hi_agent::run_with_tray(config);
+            let data_dir_for_config = data_dir.clone();
+            return hi_agent::run_with_tray(port, data_dir, move || {
+                build_config(port, data_dir_for_config)
+            });
         }
         tracing::info!("tray skipped (headless); serving without a menu-bar icon");
     }
     #[cfg(not(target_os = "macos"))]
     let _ = no_tray;
 
+    let config = build_config(port, data_dir)?;
     let rt = tokio::runtime::Builder::new_multi_thread().enable_all().build()?;
     rt.block_on(hi_agent::run(config))
 }
