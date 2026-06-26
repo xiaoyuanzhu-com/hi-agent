@@ -163,6 +163,11 @@ pub fn install(mtm: MainThreadMarker, button: Retained<NSStatusBarButton>, url: 
         webview.setUIDelegate(Some(ProtocolObject::from_ref(&*media)));
         std::mem::forget(media);
 
+        // Allow Web Inspector on the popover's own local page (right-click → Inspect
+        // Element). It's the app's own content on a menu-bar tool, so leaving it on is
+        // fine and lets the agent's UI be debugged.
+        webview.setInspectable(true);
+
         if let Some(nsurl) = NSURL::URLWithString(&NSString::from_str(url)) {
             let req = NSURLRequest::requestWithURL(&nsurl);
             let _: Option<Retained<objc2_web_kit::WKNavigation>> = webview.loadRequest(&req);
