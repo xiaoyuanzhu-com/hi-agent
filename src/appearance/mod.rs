@@ -82,6 +82,10 @@ where
         // e.g. `/inspect/sessions` boots the app, which then renders the right view.
         .route("/inspect", get(index))
         .route("/inspect/{*path}", get(index))
+        // The Settings page is a client-routed SPA section too — same shell so a
+        // direct load or refresh of `/settings` boots the app rather than 404ing.
+        .route("/settings", get(index))
+        .route("/settings/{*path}", get(index))
         .route("/favicon.ico", get(favicon))
         // Brand icon set + PWA manifest. The router only serves paths it names,
         // so each root-level asset Vite copies from `public/` needs an explicit
