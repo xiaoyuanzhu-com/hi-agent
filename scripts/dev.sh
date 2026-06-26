@@ -68,6 +68,11 @@ cleanup() {
 }
 trap cleanup INT TERM EXIT
 
+# The menu-bar popover normally loads the binary's own embedded web (`:8080`), which
+# in dev is the stale last-built `dist/`. Point it at the Vite dev server instead so the
+# popover hot-reloads the same live web the browser sees. Unset in prod (no Vite).
+export HI_AGENT_POPOVER_URL="http://127.0.0.1:5173/"
+
 cargo watch -w src -w build.rs -w Cargo.toml -w Cargo.lock \
   -i 'src/appearance/web/**' -x 'run -- --port 8080' &
 pids="$pids $!"
