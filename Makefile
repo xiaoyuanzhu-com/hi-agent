@@ -15,11 +15,8 @@ build: ## install web deps, build SPA, build release binary
 	cd src/appearance/web && npm ci && npm run build
 	cargo build --release
 
-dev: ## run rust + vite dev servers (Ctrl-C stops both)
-	trap 'kill 0' INT TERM EXIT; \
-	cargo watch -w src -w build.rs -w Cargo.toml -w Cargo.lock -i 'src/appearance/web/**' -x 'run -- --port 8080' & \
-	(cd src/appearance/web && npm run dev) & \
-	wait
+dev: ## run rust + vite dev servers (Ctrl-C stops both, incl. every child proc)
+	./scripts/dev.sh
 
 run: ## run the release binary
 	./target/release/hi-agent
