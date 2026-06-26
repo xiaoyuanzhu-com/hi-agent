@@ -46,6 +46,18 @@ pub const ENV_REFLECT_MAX: &str = "HI_AGENT_REFLECT_MAX";
 /// URL, so sessions can read input channels and write the overlay over the same
 /// wire the browser uses. See [`AgentConfig::child_env`].
 pub const ENV_SERVER_BASE_URL: &str = "HI_AGENT_BASE_URL";
+/// Env var setting the consecutive terminal-turn-failure count that flips the
+/// reactor into vendor-down ("mailbox") mode (`HI_AGENT_VENDOR_DOWN_AFTER`).
+/// Each terminal failure is already the product of the 3-attempt retry inside
+/// `run_turn`, so 2 (the default) means 6 model calls failed across two
+/// separate turns — a strong signal of a sustained outage, not a blip. `1` is
+/// the aggressive setting. Unset / unparseable / `0` → default.
+pub const ENV_VENDOR_DOWN_AFTER: &str = "HI_AGENT_VENDOR_DOWN_AFTER";
+/// Env var setting the recovery-probe cadence while in vendor-down mode
+/// (`HI_AGENT_VENDOR_PROBE`). Alarm-delay grammar (`30s`, `1m`; bare integer =
+/// seconds). Unset / unparseable / `0` / `off` → 30s default. Probes only fire
+/// when a scene has pending mail, so an idle outage costs no vendor calls.
+pub const ENV_VENDOR_PROBE: &str = "HI_AGENT_VENDOR_PROBE";
 
 /// HTTP headers a session's MCP attach carries on every tool call, so the `/mcp`
 /// server can route a call back to the right scene loop and tool surface. Set

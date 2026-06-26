@@ -48,7 +48,7 @@
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::time::Duration;
 
 mod heartbeat;
@@ -184,6 +184,154 @@ fn reflect_interval() -> Option<Duration> {
 /// `0`/blank `HI_AGENT_REFLECT_MAX` falls back to the default.
 fn reflect_max_interval() -> Duration {
     duration_env(crate::foundation::config::ENV_REFLECT_MAX, DEFAULT_REFLECT_MAX).unwrap_or(DEFAULT_REFLECT_MAX)
+}
+
+/// Default recovery-probe cadence while in vendor-down mode. The probe only
+/// fires when a scene has pending mail, so an idle outage costs nothing.
+const DEFAULT_VENDOR_PROBE: Duration = Duration::from_secs(30);
+/// Default consecutive terminal failures before flipping to vendor-down. Each
+/// terminal failure is already 3 failed model calls, so 2 = 6 failures across
+/// two turns — absorbs blips, catches real outages.
+const DEFAULT_VENDOR_DOWN_AFTER: u32 = 2;
+
+/// The recovery-probe interval. `HI_AGENT_VENDOR_PROBE` in alarm-delay grammar;
+/// `off`/`0`/unset/unparseable → default. Probes only fire when a scene has
+/// pending mail, so an idle outage costs no vendor calls — there's no need to
+/// disable them.
+fn vendor_probe_interval() -> Duration {
+    duration_env(crate::foundation::config::ENV_VENDOR_PROBE, DEFAULT_VENDOR_PROBE)
+        .unwrap_or(DEFAULT_VENDOR_PROBE)
+}
+
+/// The consecutive terminal-failure count that flips the reactor into
+/// vendor-down mode. `HI_AGENT_VENDOR_DOWN_AFTER`; `0`/unparseable → default.
+fn vendor_down_after() -> u32 {
+    match std::env::var(crate::foundation::config::ENV_VENDOR_DOWN_AFTER) {
+        Ok(v) => v
+            .trim()
+            .parse::<u32>()
+            .ok()
+            .filter(|n| *n > 0)
+            .unwrap_or(DEFAULT_VENDOR_DOWN_AFTER),
+        Err(_) => DEFAULT_VENDOR_DOWN_AFTER,
+    }
+}
+
+/// Shared, process-wide view of whether the upstream LLM vendor is reachable.
+/// All scene loops read it; `run_turn`'s terminal-failure path writes it. The
+/// vendor is a shared resource, so one scene detecting an outage flips the flag
+/// for every scene — the others stop burning retries too. Per-scene queues
+/// drain independently on recovery.
+///
+/// `record_failure` returns `true` only on the Up→Down transition (so the caller
+/// emits the canned "holding your mail" line exactly once); `record_success`
+/// returns `true` only on Down→Up.
+struct VendorHealth {
+    down: AtomicBool,
+    consecutive_failures: AtomicU32,
+    down_after: u32,
+}
+
+impl VendorHealth {
+    fn new(down_after: u32) -> Self {
+        Self {
+            down: AtomicBool::new(false),
+            consecutive_failures: AtomicU32::new(0),
+            down_after,
+        }
+    }
+
+    fn is_down(&self) -> bool {
+        self.down.load(Ordering::Relaxed)
+    }
+
+    /// Record a terminal turn failure. Returns `true` if this call flipped the
+    /// state Up→Down (the caller emits the canned "holding your mail" line).
+    /// Returns `false` for failures that don't cross the threshold or that land
+    /// while already Down (probe failures).
+    fn record_failure(&self) -> bool {
+        let n = self.consecutive_failures.fetch_add(1, Ordering::Relaxed) + 1;
+        if n >= self.down_after {
+            !self.down.swap(true, Ordering::Relaxed)
+        } else {
+            false
+        }
+    }
+
+    /// Record a successful turn. Returns `true` if this call flipped the state
+    /// Down→Up. Always resets the failure counter.
+    fn record_success(&self) -> bool {
+        self.consecutive_failures.store(0, Ordering::Relaxed);
+        self.down.swap(false, Ordering::Relaxed)
+    }
+}
+
+#[cfg(test)]
+mod vendor_health_tests {
+    use super::*;
+
+    fn fresh() -> VendorHealth {
+        VendorHealth::new(2)
+    }
+
+    #[test]
+    fn starts_up() {
+        let h = fresh();
+        assert!(!h.is_down());
+    }
+
+    #[test]
+    fn first_failure_does_not_flip_at_threshold_two() {
+        let h = fresh();
+        assert!(!h.record_failure());
+        assert!(!h.is_down());
+    }
+
+    #[test]
+    fn second_consecutive_failure_flips_down() {
+        let h = fresh();
+        h.record_failure();
+        assert!(h.record_failure(), "the failure that crosses the threshold must report the flip");
+        assert!(h.is_down());
+    }
+
+    #[test]
+    fn success_resets_the_counter() {
+        let h = fresh();
+        h.record_failure();
+        h.record_success();
+        // Counter reset: one failure after a success must not flip.
+        assert!(!h.record_failure());
+        assert!(!h.is_down());
+    }
+
+    #[test]
+    fn success_after_down_flips_up() {
+        let h = fresh();
+        h.record_failure();
+        h.record_failure();
+        assert!(h.is_down());
+        assert!(h.record_success(), "the success that ends an outage must report the recovery");
+        assert!(!h.is_down());
+    }
+
+    #[test]
+    fn failure_while_already_down_does_not_re_flip() {
+        let h = fresh();
+        h.record_failure();
+        h.record_failure();
+        assert!(h.is_down());
+        // A probe failure landing while already Down must not re-report a flip.
+        assert!(!h.record_failure());
+        assert!(h.is_down());
+    }
+
+    #[test]
+    fn threshold_one_flips_on_first_failure() {
+        let h = VendorHealth::new(1);
+        assert!(h.record_failure());
+        assert!(h.is_down());
+    }
 }
 
 /// The soonest a reflection may fire for a scene, or `None` when reflection is
@@ -420,6 +568,10 @@ struct ReactorInner {
     /// sequencer stamps each turn's voice span; `run_turn` drains the inferred
     /// "what went unheard" note into the next prompt. See [`interrupts`].
     interrupts: InterruptRegistry,
+    /// Shared, process-wide LLM-vendor reachability flag. Read by every scene
+    /// loop to decide whether to hold mail or drive a turn; written by
+    /// `run_turn`'s terminal-failure / success paths. See [`VendorHealth`].
+    vendor_health: Arc<VendorHealth>,
     /// Scene→live-subscriber counts, shared with the HTTP front. Rendered into
     /// each turn as one human-model presence sentence, so the mind knows which
     /// channels actually reach the person right now.
@@ -468,6 +620,7 @@ pub fn start(
             views_dir,
             turn_seq: AtomicU64::new(0),
             scenes: Mutex::new(HashMap::new()),
+            vendor_health: Arc::new(VendorHealth::new(vendor_down_after())),
         }),
     };
     let dispatch_reactor = reactor.clone();
@@ -735,23 +888,53 @@ async fn per_scene_loop(
     let mut backoff_gap = reflect_base.unwrap_or(DEFAULT_REFLECT_EVERY);
     let mut pulsed_once = false;
 
+    // Pending turn-driving items, hoisted out of the main loop so the batch
+    // survives across iterations while in vendor-down mode — a failed probe
+    // must not drop the mail it was attempting to deliver. Cleared on a
+    // successful turn (the mail went out) and on a normal-path failure (the
+    // apology was emitted; re-attempting would re-apologize). Retained on a
+    // probe failure so the next probe retries the same mail plus any new arrivals.
+    let mut batch: Vec<LoopInput> = Vec::new();
+    // Next recovery-probe deadline while in vendor-down mode. `None` whenever
+    // the vendor is Up (re-armed on the next Down observation) or right after a
+    // probe fires (re-armed on the next iteration).
+    let mut next_probe: Option<Instant> = None;
+    let probe_interval = vendor_probe_interval();
+
     loop {
-        // Wait for a turn-driving reason: a new signal, a fired alarm, a due host
-        // pulse, or a worker question. Tool control commands (delegate/alarm) are
-        // pure side-effects — applied as they arrive without starting a turn; only
-        // a worker `ask` becomes a turn-driving item. The soonest of the mind's
-        // alarms and the host pulse also wakes the loop.
-        let mut batch: Vec<LoopInput> = Vec::new();
+        // Wait for a turn-driving reason: a new signal, a fired alarm, a due
+        // host pulse, a worker question, or — while the vendor is Down — a
+        // recovery probe. Tool control commands (delegate/alarm) are pure
+        // side-effects applied without a turn; only a worker `ask` becomes a
+        // turn-driving item. The soonest of the mind's alarms, the host pulse,
+        // and (while Down) the probe wakes the loop.
         'wait: loop {
-            let pulse_at = pulse_every.map(|d| last_activity + d);
-            let reflect_at = next_reflection_at(
-                loop_started,
-                last_activity,
-                last_reflection,
-                reflect_base,
-                backoff_gap,
-            );
-            let deadline = [alarms.next_deadline(), pulse_at, reflect_at]
+            let down = reactor.inner.vendor_health.is_down();
+            // While Down, suppress pulses and reflection — both call the model
+            // and would just fail. The probe cadence replaces the pulse as the
+            // turn-driving timer.
+            let pulse_at = if down { None } else { pulse_every.map(|d| last_activity + d) };
+            let reflect_at = if down {
+                None
+            } else {
+                next_reflection_at(
+                    loop_started,
+                    last_activity,
+                    last_reflection,
+                    reflect_base,
+                    backoff_gap,
+                )
+            };
+            // While Down, arm the recovery probe. Lazy-init on first Down
+            // observation so the first probe is a full interval after the
+            // outage begins, not at loop start; cleared on Up.
+            let probe_at = if down {
+                Some(*next_probe.get_or_insert(Instant::now() + probe_interval))
+            } else {
+                next_probe = None;
+                None
+            };
+            let deadline = [alarms.next_deadline(), pulse_at, reflect_at, probe_at]
                 .into_iter()
                 .flatten()
                 .min();
@@ -769,7 +952,12 @@ async fn per_scene_loop(
             match woke {
                 Woke::Inbound(Some(s)) => {
                     batch.push(s);
-                    break 'wait;
+                    // While Down: collect mail without driving a turn. The
+                    // probe cadence will attempt catch-up once the vendor
+                    // recovers.
+                    if !down {
+                        break 'wait;
+                    }
                 }
                 Woke::Inbound(None) => {
                     tracing::info!(scene = %scene, "per-scene inbound closed; exiting loop");
@@ -783,13 +971,46 @@ async fn per_scene_loop(
                         apply_control(&reactor, &scene, &mut workers, &mut alarms, ctl).await
                     {
                         batch.push(input);
-                        break 'wait;
+                        if !down {
+                            break 'wait;
+                        }
                     }
                     // A delegate/alarm side-effect was applied; keep waiting for a
                     // turn-driving reason rather than running an empty turn.
                 }
                 Woke::Timer => {
                     let now = Instant::now();
+                    if down {
+                        // Alarms still fire and queue while Down — the mind asked
+                        // to be woken, and the note isn't lost — but they don't
+                        // alone drive a turn; the probe does.
+                        for fired in alarms.take_due(now) {
+                            reactor
+                                .inner
+                                .observatory
+                                .record(&scene, EventKind::AlarmFired { note: fired.note.clone() })
+                                .await;
+                            batch.push(LoopInput::Alarm(fired));
+                        }
+                        // Recovery probe: attempt catch-up only if mail is
+                        // pending. An idle outage wakes here, finds the mailbox
+                        // empty, and goes back to sleep — no vendor call spent.
+                        if let Some(at) = probe_at
+                            && at <= now
+                            && !batch.is_empty()
+                        {
+                            next_probe = None;
+                            tracing::info!(scene = %scene, mail = batch.len(), "vendor-down probe firing");
+                            break 'wait;
+                        }
+                        // Probe fired with no mail, or another (already-consumed)
+                        // timer woke us — re-arm so the next probe is a full
+                        // interval out, not stacked behind the missed one.
+                        if probe_at.is_some_and(|at| at <= now) {
+                            next_probe = None;
+                        }
+                        continue 'wait;
+                    }
                     for fired in alarms.take_due(now) {
                         reactor
                             .inner
@@ -858,33 +1079,45 @@ async fn per_scene_loop(
         }
 
         // A timer can resolve with nothing actually due; don't run an empty turn.
+        // (While Down, the probe only breaks 'wait with non-empty mail, so this
+        // guard is for the Up path's pulse/alarm timers.)
         if batch.is_empty() {
             continue;
         }
 
-        // Commit-after-quiet: wait for things to settle before replying. Keep
-        // absorbing utterances; each one that lands resets the wait. When the
-        // settle elapses with nothing new, commit to a reply.
-        let closed = loop {
-            while let Ok(extra) = inbound.try_recv() {
-                batch.push(extra);
+        let was_down = reactor.inner.vendor_health.is_down();
+
+        // Commit-after-quiet: wait for things to settle before replying. Skipped
+        // while Down — a probe should attempt catch-up ASAP rather than wait for
+        // more mail to settle (the probe cadence already coalesces arrivals).
+        if !was_down {
+            let closed = loop {
+                while let Ok(extra) = inbound.try_recv() {
+                    batch.push(extra);
+                }
+                match timeout(RESPONSE_SETTLE, inbound.recv()).await {
+                    Ok(Some(extra)) => batch.push(extra), // another utterance — keep collecting
+                    Ok(None) => break true,               // inbound closed mid-settle
+                    Err(_) => break false,                // quiet elapsed → commit to a reply
+                }
+            };
+            if closed {
+                tracing::info!(scene = %scene, "per-scene inbound closed; exiting loop");
+                return;
             }
-            match timeout(RESPONSE_SETTLE, inbound.recv()).await {
-                Ok(Some(extra)) => batch.push(extra), // another utterance — keep collecting
-                Ok(None) => break true,               // inbound closed mid-settle
-                Err(_) => break false,                // quiet elapsed → commit to a reply
-            }
-        };
-        if closed {
-            tracing::info!(scene = %scene, "per-scene inbound closed; exiting loop");
-            return;
         }
 
         // Forget any workers that have finished, so the registry doesn't grow.
         workers.reap();
 
-        match run_turn(&reactor, &scene, &batch, &mut reactor_session, &mut seeded, &mut budget, &mut workers, &beats).await {
+        // Probe turns don't apologize — the user already heard the "holding your
+        // mail" line when the reactor went Down. Normal turns do.
+        let apologize = !was_down;
+        match run_turn(&reactor, &scene, &batch, &mut reactor_session, &mut seeded, &mut budget, &mut workers, &beats, apologize).await {
             Ok(()) => {
+                // The turn delivered the mail; clear the backlog. (If this was a
+                // probe, run_turn already flipped the vendor Up via record_success.)
+                batch.clear();
                 // Between turns: if the live session has grown past budget, hot-swap
                 // it now. The human is consuming the reply just delivered, so the
                 // summarize-and-reopen happens in that natural gap — invisible, never
@@ -950,6 +1183,17 @@ async fn per_scene_loop(
                 seeded = false;
                 budget.reset();
                 reactor.inner.observatory.set_budget(&scene, 0).await;
+                if was_down {
+                    // Probe failed: the vendor is still Down. Keep the mail for
+                    // the next probe — the session is already discarded above,
+                    // and the next probe cold-opens a fresh one and re-seeds.
+                    tracing::info!(scene = %scene, mail = batch.len(), "probe failed; holding mail");
+                } else {
+                    // Normal failure: the apology (or the Down-flip "holding your
+                    // mail" line) was emitted inside run_turn. Drop the batch so
+                    // it isn't re-attempted on the next turn.
+                    batch.clear();
+                }
             }
         }
 
@@ -1064,6 +1308,11 @@ async fn run_turn(
     budget: &mut heartbeat::ContextBudget,
     workers: &mut workers::WorkerRegistry,
     beats: &mpsc::Sender<sequencer::Beat>,
+    // Whether to emit the canned apology on terminal failure. `true` for normal
+    // turns (driven by a human/worker/alarm/pulse); `false` for probe turns
+    // while in vendor-down mode — those failures are silent, the user already
+    // heard the "holding your mail" line when the reactor went Down.
+    apologize: bool,
 ) -> anyhow::Result<()> {
     let turn_id = reactor.inner.turn_seq.fetch_add(1, Ordering::Relaxed);
     reactor
@@ -1195,16 +1444,33 @@ async fn run_turn(
         }
     };
 
-    // On terminal failure (all attempts exhausted), tell the human something went
-    // wrong before closing the turn — otherwise the reply is an unexplained silence.
-    // Routed through the normal say() seam so it reaches the /text channel (and the
-    // long-poll waiting on it) and closes cleanly on TurnEnd.
+    // On terminal failure (all attempts exhausted), update the shared vendor
+    // health. If this failure trips the threshold, the reactor flips to
+    // vendor-down ("mailbox") mode: subsequent signals queue without driving a
+    // turn, and a probe cadence attempts catch-up. The canned "holding your
+    // mail" line replaces the per-message apology — say it once on the flip.
+    // Otherwise (threshold not yet met, or already Down and probing), fall back
+    // to the apology when this is a normal turn. Probe turns stay silent.
     if let Err(err) = &drive {
-        let _ = beats
-            .send(sequencer::Beat::Say(format!(
-                "抱歉，我这边出了点问题，没能完成这次回应。({err})"
-            )))
-            .await;
+        let flipped = reactor.inner.vendor_health.record_failure();
+        if flipped {
+            let _ = beats
+                .send(sequencer::Beat::Say(
+                    "我暂时连不上模型，先攒着你的消息，等恢复了一起处理。".to_string(),
+                ))
+                .await;
+        } else if apologize {
+            let _ = beats
+                .send(sequencer::Beat::Say(format!(
+                    "抱歉，我这边出了点问题，没能完成这次回应。({err})"
+                )))
+                .await;
+        }
+    } else {
+        let recovered = reactor.inner.vendor_health.record_success();
+        if recovered {
+            tracing::info!(scene = %scene, "vendor recovered; resuming normal turns");
+        }
     }
 
     // Always close the turn on the sequencer, even on error, so any open audio
