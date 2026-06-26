@@ -424,12 +424,9 @@ pub fn run(url: String, shutdown: Arc<Notify>) -> anyhow::Result<()> {
     // Accessory: live in the menu bar only — no Dock icon, no app menu.
     app.setActivationPolicy(NSApplicationActivationPolicy::Accessory);
 
-    // The popover's web view loads the face at this base URL. In dev, `make dev` sets
-    // `HI_AGENT_POPOVER_URL=http://127.0.0.1:5173/` so the popover talks to the Vite dev
-    // server (live web, hot-reload) instead of the binary's embedded `dist/`; in prod the
-    // var is unset and it falls back to the binary's own port (there is no Vite). Derived
-    // before `url` is moved into the menu's "Open" target below.
-    let popover_url = std::env::var("HI_AGENT_POPOVER_URL").unwrap_or_else(|_| url.clone());
+    // The popover's web view loads the face at this base URL; cloned before `url` is
+    // moved into the menu's "Open" target below.
+    let popover_url = url.clone();
 
     let target = TrayTarget::new(mtm, url, shutdown);
 

@@ -68,16 +68,19 @@ cleanup() {
 }
 trap cleanup INT TERM EXIT
 
-# The menu-bar popover normally loads the binary's own embedded web (`:8080`), which
-# in dev is the stale last-built `dist/`. Point it at the Vite dev server instead so the
-# popover hot-reloads the same live web the browser sees. Unset in prod (no Vite).
-export HI_AGENT_POPOVER_URL="http://127.0.0.1:5173/"
-
 cargo watch -w src -w build.rs -w Cargo.toml -w Cargo.lock \
   -i 'src/appearance/web/**' -x 'run -- --port 8080' &
 pids="$pids $!"
 
 ( cd src/appearance/web && exec npm run dev ) &
+pids="$pids $!"
+
+# Keep the binary's embedded web fresh in dev. The menu-bar popover's WKWebView loads
+# the binary's own port (:8080), which serves `dist/` from disk — NOT the Vite dev
+# server (:5173 is HTTPS with a self-signed cert the WKWebView won't trust). So rebuild
+# `dist/` on web changes; the debug binary reads it per request, so the popover shows the
+# latest on reopen. The browser still gets HMR from the :5173 dev server.
+( cd src/appearance/web && exec npm run build -- --watch ) &
 pids="$pids $!"
 
 wait
