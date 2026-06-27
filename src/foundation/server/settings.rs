@@ -133,6 +133,7 @@ fn apply_vendor(vk: &mut credentials::VendorKey, upd: Option<VendorUpdate>) {
 /// applies the new credentials on restart.
 pub async fn post_credentials(
     State(state): State<Arc<AppState>>,
+    headers: axum::http::HeaderMap,
     Json(body): Json<CredentialsUpdate>,
 ) -> Json<Value> {
     let mut creds = Credentials::load(&state.data_dir);
@@ -157,9 +158,16 @@ pub async fn post_credentials(
         return Json(json!({ "ok": false, "error": e.to_string() }));
     }
     // If the user just selected login/free, fetch the bundle now so the account
-    // shows immediately and is cached for the next restart.
+    // shows immediately and is cached for the next restart. Login forwards the
+    // signed-in user's Authentik token from the session (this is a logged-in
+    // browser request); free authenticates by device id.
     if matches!(mode_selected, Some(credentials::Mode::Login | credentials::Mode::Free)) {
-        crate::foundation::broker::refresh(&state.data_dir).await;
+        let bearer = if creds.mode == credentials::Mode::Login {
+            state.auth.as_ref().and_then(|a| a.session_bearer(&headers))
+        } else {
+            None
+        };
+        crate::foundation::broker::refresh(&state.data_dir, bearer.as_deref()).await;
     }
     Json(json!({ "ok": true, "restart_required": true }))
 }

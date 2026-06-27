@@ -121,13 +121,23 @@ async fn fetch(mode: Mode, device_id: &str, bearer: Option<&str>) -> anyhow::Res
 /// the store. Best-effort: a failure logs and leaves any cached bundle in place.
 /// Mints a stable `device_id` on first need. A no-op in BYOK mode.
 ///
-/// v1 refetches on each startup; an expiry-driven mid-session refresh is future
-/// work. Login currently has no bearer source wired, so a login fetch will 401 at
-/// the broker until the Authentik access token is forwarded (see the TODO).
-pub async fn refresh(data_dir: &Path) {
+/// `bearer` is the signed-in user's Authentik access token, required for login
+/// mode (the settings handler reads it from the auth session). Free ignores it
+/// (it authenticates by `device_id`). In login mode with no bearer — e.g. the
+/// startup refresh, which has no request context — the fetch is skipped and any
+/// cached bundle is kept, rather than 401ing the broker every boot.
+///
+/// v1 refetches on each startup / mode-select; an expiry-driven mid-session
+/// refresh is future work.
+pub async fn refresh(data_dir: &Path, bearer: Option<&str>) {
     let mut store = Credentials::load(data_dir);
-    if store.mode == Mode::Byok {
-        return;
+    match store.mode {
+        Mode::Byok => return,
+        Mode::Login if bearer.is_none() => {
+            tracing::debug!("login mode: no Authentik token to present; keeping any cached bundle");
+            return;
+        }
+        _ => {}
     }
 
     let mut dirty = false;
@@ -135,11 +145,6 @@ pub async fn refresh(data_dir: &Path) {
         store.device_id = uuid::Uuid::now_v7().to_string();
         dirty = true;
     }
-
-    // TODO(login): forward the signed-in user's Authentik access token here. Until
-    // that is plumbed from the auth session, a login-mode fetch reaches the broker
-    // without a bearer and is rejected (401) — logged below, BYOK still works.
-    let bearer: Option<&str> = None;
 
     match fetch(store.mode, &store.device_id, bearer).await {
         Ok(managed) => {

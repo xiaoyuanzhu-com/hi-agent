@@ -48,8 +48,8 @@ use axum_extra::extract::cookie::{Cookie, Key, PrivateCookieJar, SameSite};
 use chrono::Utc;
 use openidconnect::core::{CoreAuthenticationFlow, CoreClient, CoreProviderMetadata};
 use openidconnect::{
-    AuthorizationCode, ClientId, ClientSecret, CsrfToken, IssuerUrl, Nonce, PkceCodeChallenge,
-    PkceCodeVerifier, RedirectUrl, Scope, TokenResponse,
+    AuthorizationCode, ClientId, ClientSecret, CsrfToken, IssuerUrl, Nonce, OAuth2TokenResponse,
+    PkceCodeChallenge, PkceCodeVerifier, RedirectUrl, Scope, TokenResponse,
 };
 use serde::{Deserialize, Serialize};
 
@@ -260,6 +260,21 @@ impl AuthState {
     fn jar(&self, headers: &HeaderMap) -> PrivateCookieJar {
         PrivateCookieJar::from_headers(headers, self.key.clone())
     }
+
+    /// The signed-in user's provider access token from a valid session cookie, for
+    /// forwarding to the broker (login mode). `None` when there is no session, it's
+    /// expired, or it carries no token (an older cookie). The settings handler calls
+    /// this; the request reached it only because the gate already accepted the
+    /// session, but re-checking validity here keeps this self-contained.
+    pub fn session_bearer(&self, headers: &HeaderMap) -> Option<String> {
+        let cookie = self.jar(headers).get(SESSION_COOKIE)?;
+        let s: Session = serde_json::from_str(cookie.value()).ok()?;
+        if !s.valid_now() {
+            return None;
+        }
+        let t = s.access_token.trim();
+        (!t.is_empty()).then(|| t.to_string())
+    }
 }
 
 /// A path-`/` removal cookie, matching how the session/flow cookies are set so
@@ -276,6 +291,11 @@ struct Session {
     sub: String,
     label: String,
     exp: i64,
+    /// The provider's access token, kept so the agent can forward it to the broker
+    /// (login mode) on the user's behalf. `default` so older cookies still load
+    /// (they just carry no token → login can't fetch until the next sign-in).
+    #[serde(default)]
+    access_token: String,
 }
 
 impl Session {
@@ -555,6 +575,10 @@ async fn callback(
         sub,
         label,
         exp: Utc::now().timestamp() + SESSION_TTL_SECS,
+        // Kept for the broker (login mode). Note it expires far sooner than the
+        // session — fine for the right-after-login fetch; a refresh-token flow to
+        // keep it fresh long-term is future work.
+        access_token: token.access_token().secret().clone(),
     };
     let jar = jar
         .remove(removal(FLOW_COOKIE))
@@ -783,8 +807,8 @@ mod tests {
 
     #[test]
     fn session_expiry_check() {
-        let fresh = Session { sub: "s".into(), label: "l".into(), exp: Utc::now().timestamp() + 100 };
-        let stale = Session { sub: "s".into(), label: "l".into(), exp: Utc::now().timestamp() - 1 };
+        let fresh = Session { sub: "s".into(), label: "l".into(), exp: Utc::now().timestamp() + 100, access_token: String::new() };
+        let stale = Session { sub: "s".into(), label: "l".into(), exp: Utc::now().timestamp() - 1, access_token: String::new() };
         assert!(fresh.valid_now());
         assert!(!stale.valid_now());
     }

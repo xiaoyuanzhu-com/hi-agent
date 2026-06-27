@@ -335,6 +335,11 @@ pub struct AppState {
     /// incoming bytes here before journaling the reference.
     pub data_dir: PathBuf,
 
+    /// The auth gate (`Some` only when `HI_AGENT_AUTH=on`). The settings handler
+    /// reads the signed-in user's session token from it to forward to the broker in
+    /// login mode. `None` ⇒ no auth, so login mode has no token source.
+    pub auth: Option<Arc<crate::foundation::auth::AuthState>>,
+
     /// Scene→tool-sink table. The `/mcp` handler looks a scene up here to route a
     /// tool call to its reactor loop; the reactor registers each scene's sink as
     /// it stands the loop up. See [`crate::body::reactor::ToolRegistry`].
@@ -453,6 +458,7 @@ pub fn build(
         observatory,
         acp_tap,
         data_dir,
+        auth: auth.clone(),
         tool_registry,
         interrupts,
         presence,

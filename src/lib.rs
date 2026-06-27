@@ -76,8 +76,10 @@ async fn run_with_shutdown(config: Config, shutdown: Arc<Notify>) -> anyhow::Res
     // re-resolve the LLM credential from the (possibly updated) store —
     // `build_config` resolved it before this point, and BYOK mode is a no-op so
     // this changes nothing there. Best-effort: a broker failure leaves the cached
-    // bundle (or boots unconfigured).
-    foundation::broker::refresh(&config.data_dir).await;
+    // bundle (or boots unconfigured). No request context here, so no Authentik
+    // token — login mode keeps its cached bundle (a fresh one is fetched when the
+    // user selects login in Settings, where the session token is available).
+    foundation::broker::refresh(&config.data_dir, None).await;
     config.agent = foundation::config::AgentConfig::resolve(&config.data_dir);
 
     let memory = mind::memory::Memory::open(&config.data_dir).await?;
