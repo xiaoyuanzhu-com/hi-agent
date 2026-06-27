@@ -154,6 +154,17 @@ impl InterruptRegistry {
         tracing::info!(scene = %scene, turn, heard_ms = heard.as_millis() as u64, "barge-in inferred (speech while voice sounding)");
     }
 
+    /// Mark `turn` for flush directly, without an audio span. Used when the mind
+    /// is reorganized mid-turn (new human input lands while the prompt is still in
+    /// flight): in the thinking phase no TTS has started, so `note_speech` never
+    /// fired and nothing marked the turn — but we still want the sequencer to drop
+    /// any say/show beats this now-abandoned turn emits before it's cancelled.
+    /// `flush_turn` is monotonic-per-turn, so this never collides with a later
+    /// reorganized pass's id (self-clearing, no reset).
+    pub async fn mark_flush(&self, scene: &Scene, turn: u64) {
+        self.inner.lock().await.entry(scene.clone()).or_default().flush_turn = Some(turn);
+    }
+
     /// Take (and clear) the scene's pending note, for the next prompt.
     pub async fn take_pending(&self, scene: &Scene) -> Option<Interruption> {
         self.inner.lock().await.get_mut(scene)?.pending.take()
@@ -188,6 +199,20 @@ pub(super) fn render_interruption(i: &Interruption) -> String {
              voice cut out there; the rest of what you were saying went unheard."
         ),
     }
+}
+
+/// Render a reorganization note for a re-prompt: new human input arrived while the
+/// mind was still mid-reply. Only used when the mind had already spoken something
+/// (the speaking phase); in the thinking phase nothing was said, so the folded
+/// input alone speaks for itself and no note is rendered. Facts only — whether to
+/// continue, pivot, or drop the tail is the soul's judgment (see `speaking.md`).
+pub(super) fn render_reorg(spoken_so_far: &str) -> String {
+    format!(
+        "## Still mid-reply\nYou'd already begun replying and had said: \"{spoken_so_far}\". \
+         They added more before you finished (see New signals) — so your reply isn't done. Fold \
+         it all into one reply: continue from where you left off, don't restart or repeat what \
+         you already said."
+    )
 }
 
 #[cfg(test)]
@@ -292,5 +317,22 @@ mod tests {
         let t0 = Instant::now();
         reg.audio_began(&scene(), 4, t0).await;
         assert!(!reg.should_skip(&scene(), 4).await);
+    }
+
+    #[tokio::test]
+    async fn mark_flush_marks_turn_for_skip_without_an_audio_span() {
+        let reg = InterruptRegistry::new();
+        // No audio_began / note_speech — the thinking-phase reorg case.
+        reg.mark_flush(&scene(), 9).await;
+        assert!(reg.should_skip(&scene(), 9).await);
+        // A later (reorganized) pass with a fresh id is unaffected.
+        assert!(!reg.should_skip(&scene(), 10).await);
+    }
+
+    #[test]
+    fn render_reorg_carries_the_spoken_text() {
+        let note = render_reorg("最近你加了 amnesia、transient");
+        assert!(note.contains("最近你加了 amnesia、transient"));
+        assert!(note.contains("Still mid-reply"));
     }
 }
