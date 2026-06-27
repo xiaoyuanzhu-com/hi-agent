@@ -18,15 +18,18 @@ pub fn path(data_dir: &Path) -> PathBuf {
 }
 
 /// How the agent obtains its credentials.
-/// - `byok`: the user's own keys (the flat fields below), the default.
-/// - `login` / `free`: a bundle fetched from the broker (hi.xiaoyuanzhu.com),
-///   cached in [`Credentials::managed`].
+/// - `free`: anonymous daily credits from the broker (hi.xiaoyuanzhu.com) — the
+///   default, so a fresh install works with no setup.
+/// - `login`: subscription credits, tied to an account.xiaoyuanzhu.com user.
+/// - `byok`: the user's own keys (the flat fields below).
+///
+/// `free`/`login` cache the broker bundle in [`Credentials::managed`].
 #[derive(Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize, Debug)]
 #[serde(rename_all = "lowercase")]
 pub enum Mode {
-    #[default]
     Byok,
     Login,
+    #[default]
     Free,
 }
 
@@ -36,7 +39,7 @@ pub enum Mode {
 #[derive(Clone, Default, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Credentials {
-    /// Which credential source is live. Default `byok`.
+    /// Which credential source is live. Default `free`.
     pub mode: Mode,
     pub llm: LlmCredentials,
     /// Speech-to-text (Volcengine).
@@ -314,7 +317,10 @@ mod tests {
     #[test]
     fn effective_picks_byok_or_managed() {
         let mut c = Credentials::default();
-        assert_eq!(c.mode, Mode::Byok);
+        assert_eq!(c.mode, Mode::Free); // free is the default
+
+        // BYOK mode → the flat fields.
+        c.mode = Mode::Byok;
         c.llm.api_key = "byok-key".into();
         assert_eq!(c.effective().unwrap().llm.api_key, "byok-key");
 

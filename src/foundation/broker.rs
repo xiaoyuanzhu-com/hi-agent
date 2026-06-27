@@ -83,7 +83,13 @@ async fn fetch(mode: Mode, device_id: &str, bearer: Option<&str>) -> anyhow::Res
         Mode::Byok => anyhow::bail!("broker fetch is only for login/free mode"),
     };
     let url = format!("{}/api/agent/credentials", base_url());
-    let mut req = reqwest::Client::new()
+    // Bounded so a slow/unreachable broker can't hang startup (the fetch runs on
+    // the boot path in the default free mode).
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(8))
+        .build()
+        .context("building broker http client")?;
+    let mut req = client
         .post(&url)
         .json(&serde_json::json!({ "mode": mode_str, "device_id": device_id }));
     if let Some(b) = bearer {

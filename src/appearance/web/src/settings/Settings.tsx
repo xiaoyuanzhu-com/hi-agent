@@ -20,9 +20,9 @@ const VENDORS = [
 ] as const;
 
 const MODES: { id: Mode; label: string }[] = [
-  { id: "byok", label: "Your keys" },
-  { id: "login", label: "Login" },
   { id: "free", label: "Free" },
+  { id: "login", label: "Xiaoyuanzhu" },
+  { id: "byok", label: "BYOK" },
 ];
 
 /**
@@ -59,7 +59,7 @@ export function Settings() {
     return () => ctrl.abort();
   }, [reloadKey]);
 
-  const mode: Mode = view?.mode ?? "byok";
+  const mode: Mode = view?.mode ?? "free";
 
   const onSelectMode = async (m: Mode) => {
     if (m === mode) return;
@@ -229,7 +229,7 @@ function AccountCard({ mode, account }: { mode: Mode; account: Account | null })
   return (
     <section className="settings-card">
       <div className="settings-card-head">
-        <h2>{mode === "free" ? "Free" : "Login"}</h2>
+        <h2>{mode === "free" ? "Free" : "Xiaoyuanzhu"}</h2>
         {account ? (
           <span className="tag ok">{account.plan}</span>
         ) : (
