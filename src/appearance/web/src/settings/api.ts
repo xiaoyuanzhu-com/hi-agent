@@ -2,6 +2,13 @@
 // route. The raw key is never sent to the browser; the view shows `configured`
 // plus a `key_hint`.
 
+/** The redacted view of a key-only vendor (STT/TTS/vision/image/video). */
+export interface VendorView {
+  configured: boolean;
+  key_hint: string;
+  env_fallback: boolean;
+}
+
 export interface CredentialsView {
   llm: {
     base_url: string;
@@ -10,21 +17,34 @@ export interface CredentialsView {
     key_hint: string;
     env_fallback: boolean;
   };
+  stt: VendorView;
+  tts: VendorView;
+  vision: VendorView;
+  image: VendorView;
+  video: VendorView;
+}
+
+/** Tri-state `api_key`: omit to keep the stored key, "" clears it, a value sets it. */
+export interface VendorUpdate {
+  api_key?: string;
 }
 
 export interface CredentialsUpdate {
-  llm: {
+  llm?: {
     base_url: string;
     model: string | null;
-    // Omit to keep the stored key; "" clears it; a value replaces it.
     api_key?: string;
   };
+  stt?: VendorUpdate;
+  tts?: VendorUpdate;
+  vision?: VendorUpdate;
+  image?: VendorUpdate;
+  video?: VendorUpdate;
 }
 
 export interface SaveResult {
   ok: boolean;
   restart_required?: boolean;
-  configured?: boolean;
   error?: string;
 }
 

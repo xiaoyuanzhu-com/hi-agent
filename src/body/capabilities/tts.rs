@@ -7,7 +7,7 @@
 //! per-sentence clips — the brain consolidates, the client just plays.
 //!
 //! The capability is a module of free functions over a process-global,
-//! once-initialized config: [`init_from_env`] reads `TTS_PROVIDER`, [`available`]
+//! once-initialized config: [`init`] reads `TTS_PROVIDER`, [`available`]
 //! reports whether a provider is configured, and [`start`] dispatches to it. The
 //! config never appears in a signature.
 
@@ -48,11 +48,16 @@ const ENV_PROVIDER: &str = "TTS_PROVIDER";
 /// Resolve the provider from `TTS_PROVIDER` into the process-global config.
 /// Unset or `none` disables the capability; an unknown name is an error.
 /// Idempotent — the first init wins.
-pub fn init_from_env() -> anyhow::Result<()> {
-    let backend = match std::env::var(ENV_PROVIDER).unwrap_or_default().as_str() {
-        "" | "none" => Backend::Disabled,
-        "volcengine" => Backend::Volcengine(volcengine_tts::Config::from_env()?),
-        other => anyhow::bail!("unknown {ENV_PROVIDER}: {other}"),
+pub fn init(store_key: Option<&str>) -> anyhow::Result<()> {
+    let backend = if store_key.map(|k| !k.trim().is_empty()).unwrap_or(false) {
+        // A BYOK key implies the provider (Volcengine is the only TTS impl).
+        Backend::Volcengine(volcengine_tts::Config::from_env_with_key(store_key)?)
+    } else {
+        match std::env::var(ENV_PROVIDER).unwrap_or_default().as_str() {
+            "" | "none" => Backend::Disabled,
+            "volcengine" => Backend::Volcengine(volcengine_tts::Config::from_env()?),
+            other => anyhow::bail!("unknown {ENV_PROVIDER}: {other}"),
+        }
     };
     let _ = BACKEND.set(backend);
     Ok(())

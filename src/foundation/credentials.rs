@@ -1,8 +1,8 @@
 //! BYOK credential store: the user's own vendor keys, persisted under the data
 //! dir as `credentials.json` and resolved at startup. When a key is unset, the
-//! agent falls back to `.env` (`AI_API_KEY` etc.) so dev / journey-test flows keep
-//! working. Only `llm` is wired today; the other vendors are reserved so the
-//! schema stays stable as they move off `.env`.
+//! agent falls back to `.env` (`AI_API_KEY`, `VOLCENGINE_*`, `DOUBAO_*`, …) so
+//! dev / journey-test flows keep working. A vendor key in the store also implies
+//! that vendor is the selected provider for its capability.
 
 use std::path::{Path, PathBuf};
 
@@ -17,11 +17,23 @@ pub fn path(data_dir: &Path) -> PathBuf {
     data_dir.join(FILE)
 }
 
-/// The user's own vendor credentials (BYOK).
+/// The user's own vendor credentials (BYOK). `llm` is the upstream Claude
+/// adapter; the rest are the keyed capability vendors (each defaults to the env
+/// when its key is unset).
 #[derive(Clone, Default, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Credentials {
     pub llm: LlmCredentials,
+    /// Speech-to-text (Volcengine).
+    pub stt: VendorKey,
+    /// Text-to-speech (Volcengine).
+    pub tts: VendorKey,
+    /// Image + video understanding (Doubao).
+    pub vision: VendorKey,
+    /// Image generation (Doubao).
+    pub image: VendorKey,
+    /// Video generation (Doubao).
+    pub video: VendorKey,
 }
 
 /// Upstream LLM credentials (the bundled Claude adapter's `ANTHROPIC_*`).
@@ -37,6 +49,28 @@ pub struct LlmCredentials {
     pub model: Option<String>,
 }
 
+/// A single-vendor secret — just the API key (the BYOK essential). Non-secret
+/// params (endpoints, resource ids, models, voices) stay on their env defaults.
+#[derive(Clone, Default, Serialize, Deserialize)]
+#[serde(default)]
+pub struct VendorKey {
+    /// API key; empty → not configured (falls back to that vendor's env key).
+    pub api_key: String,
+}
+
+impl VendorKey {
+    /// The trimmed key if non-empty, else `None` — the "use my key / fall back to
+    /// env" signal threaded into each capability's init.
+    pub fn key_opt(&self) -> Option<&str> {
+        let k = self.api_key.trim();
+        if k.is_empty() {
+            None
+        } else {
+            Some(k)
+        }
+    }
+}
+
 // Hand-written so a stray trace never prints the key.
 impl std::fmt::Debug for LlmCredentials {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -48,9 +82,22 @@ impl std::fmt::Debug for LlmCredentials {
     }
 }
 
+impl std::fmt::Debug for VendorKey {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("VendorKey").field("api_key", &redact(&self.api_key)).finish()
+    }
+}
+
 impl std::fmt::Debug for Credentials {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("Credentials").field("llm", &self.llm).finish()
+        f.debug_struct("Credentials")
+            .field("llm", &self.llm)
+            .field("stt", &self.stt)
+            .field("tts", &self.tts)
+            .field("vision", &self.vision)
+            .field("image", &self.image)
+            .field("video", &self.video)
+            .finish()
     }
 }
 
@@ -123,12 +170,17 @@ mod tests {
                 api_key: "sk-secret".into(),
                 model: Some("claude-opus-4-8".into()),
             },
+            stt: VendorKey { api_key: "stt-key".into() },
+            ..Default::default()
         };
         c.save(dir.path()).unwrap();
         let back = Credentials::load(dir.path());
         assert_eq!(back.llm.base_url, "https://gw.example/v1");
         assert_eq!(back.llm.api_key, "sk-secret");
         assert_eq!(back.llm.model.as_deref(), Some("claude-opus-4-8"));
+        assert_eq!(back.stt.api_key, "stt-key");
+        assert_eq!(back.stt.key_opt(), Some("stt-key"));
+        assert_eq!(back.tts.key_opt(), None);
     }
 
     #[test]
@@ -147,9 +199,12 @@ mod tests {
                 api_key: "sk-super-secret".into(),
                 model: None,
             },
+            vision: VendorKey { api_key: "vision-super-secret".into() },
+            ..Default::default()
         };
         let rendered = format!("{c:?}");
         assert!(!rendered.contains("sk-super-secret"), "key leaked: {rendered}");
+        assert!(!rendered.contains("vision-super-secret"), "vendor key leaked: {rendered}");
         assert!(rendered.contains("<redacted>"));
     }
 

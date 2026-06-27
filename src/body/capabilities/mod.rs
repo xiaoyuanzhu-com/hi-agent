@@ -11,18 +11,18 @@
 //! cross-capability references. A vendor that happens to back several
 //! capabilities is configured separately for each.
 //!
-//! [`init_from_env`] is the composition root for the env-configured capabilities
-//! — it sequences each one's own `init_from_env`, so a misconfigured provider
-//! (unknown name, missing key) fails fast at startup rather than as an error at
-//! first use. The two recognition capabilities (voiceprint, face) are not
-//! env-configured — they run pinned local ONNX models that [`init_recognition`]
+//! [`init`] is the composition root for the keyed capabilities — it sequences
+//! each one's own `init`, threading that vendor's BYOK key (from the credential
+//! store, else its `.env` key) in. A misconfigured provider (unknown name, a key
+//! that won't build) fails fast at startup rather than as an error at first use.
+//! The two recognition capabilities (voiceprint, face) are not env-configured — they run pinned local ONNX models that [`init_recognition`]
 //! auto-provisions on first run (see [`crate::foundation::models`]), so they have no provider
 //! toggle and nothing for the operator to set.
 //!
 //! [`accessibility`], [`audio_capture`], [`desktop_context`], [`hotkey`],
 //! [`input`], [`screencast`], and [`tray`] are the exceptions to the env-config
 //! pattern: their vendor is the operating system, selected at compile time, so they
-//! have no `init_from_env` and do not appear in the composition root.
+//! have no `init` and do not appear in the composition root.
 
 use crate::foundation::models;
 
@@ -42,15 +42,16 @@ pub mod video_gen;
 pub mod vision;
 pub mod voiceprint;
 
-/// Initialize the env-configured capabilities. Fails fast if any configured
-/// provider is missing a required credential or names an unknown provider. The
+/// Initialize the keyed capabilities (STT, TTS, vision, image/video gen) from the
+/// BYOK credential store, falling back to `.env` per vendor. Fails fast if a
+/// configured provider is missing its key or names an unknown provider. The
 /// recognition capabilities are provisioned separately by [`init_recognition`].
-pub fn init_from_env() -> anyhow::Result<()> {
-    stt::init_from_env()?;
-    tts::init_from_env()?;
-    vision::init_from_env()?;
-    image_gen::init_from_env()?;
-    video_gen::init_from_env()?;
+pub fn init(creds: &crate::foundation::credentials::Credentials) -> anyhow::Result<()> {
+    stt::init(creds.stt.key_opt())?;
+    tts::init(creds.tts.key_opt())?;
+    vision::init(creds.vision.key_opt())?;
+    image_gen::init(creds.image.key_opt())?;
+    video_gen::init(creds.video.key_opt())?;
     Ok(())
 }
 

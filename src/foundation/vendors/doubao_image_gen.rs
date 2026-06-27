@@ -54,9 +54,18 @@ impl Config {
     /// Resolve config from the environment. `DOUBAO_IMAGE_API_KEY` is required;
     /// base URL and model fall back to the plan endpoint and seedream default.
     pub fn from_env() -> anyhow::Result<Self> {
-        let api_key = std::env::var(ENV_IMAGE_API_KEY).map_err(|_| {
-            anyhow::anyhow!("{ENV_IMAGE_API_KEY} is required when IMAGE_GEN_PROVIDER=doubao")
-        })?;
+        Self::from_env_with_key(None)
+    }
+
+    /// Like [`from_env`](Self::from_env) but the API key comes from `key_override`
+    /// when non-empty (the BYOK store), falling back to `DOUBAO_IMAGE_API_KEY`.
+    pub fn from_env_with_key(key_override: Option<&str>) -> anyhow::Result<Self> {
+        let api_key = match key_override {
+            Some(k) if !k.trim().is_empty() => k.trim().to_string(),
+            _ => std::env::var(ENV_IMAGE_API_KEY).map_err(|_| {
+                anyhow::anyhow!("{ENV_IMAGE_API_KEY} is required when IMAGE_GEN_PROVIDER=doubao")
+            })?,
+        };
         let api_base =
             std::env::var(ENV_IMAGE_API_BASE).unwrap_or_else(|_| DEFAULT_API_BASE.to_string());
         let model =

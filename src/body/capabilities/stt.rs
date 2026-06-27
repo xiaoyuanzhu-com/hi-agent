@@ -1,7 +1,7 @@
 //! Speech-to-text capability — audio bytes in, text out.
 //!
 //! The capability is a module of free functions over a process-global,
-//! once-initialized config: [`init_from_env`] reads `STT_PROVIDER` and the
+//! once-initialized config: [`init`] reads `STT_PROVIDER` and the
 //! selected vendor's credentials into the global, [`available`] reports whether
 //! a provider is configured, and [`transcribe`] / [`transcribe_streaming`]
 //! dispatch to it. The config never appears in a signature — it is transparent
@@ -57,15 +57,21 @@ static BACKEND: OnceLock<Backend> = OnceLock::new();
 
 const ENV_PROVIDER: &str = "STT_PROVIDER";
 
-/// Resolve the provider from `STT_PROVIDER` into the process-global config.
-/// Unset or `none` disables the capability; an unknown name is an error so a
-/// typo fails at startup rather than as a 501 at request time. Idempotent —
-/// the first init wins.
-pub fn init_from_env() -> anyhow::Result<()> {
-    let backend = match std::env::var(ENV_PROVIDER).unwrap_or_default().as_str() {
-        "" | "none" => Backend::Disabled,
-        "volcengine" => Backend::Volcengine(volcengine_stt::Config::from_env()?),
-        other => anyhow::bail!("unknown {ENV_PROVIDER}: {other}"),
+/// Resolve the STT backend into the process-global config. BYOK-first: a
+/// non-empty `store_key` (the user's key from `credentials.json`) implies the
+/// provider (Volcengine is the only STT impl) and overrides the env key. With no
+/// store key, fall back to `STT_PROVIDER` — unset/`none` disables, an unknown
+/// name is an error so a typo fails at startup rather than as a 501 at request
+/// time. Idempotent — the first init wins.
+pub fn init(store_key: Option<&str>) -> anyhow::Result<()> {
+    let backend = if store_key.map(|k| !k.trim().is_empty()).unwrap_or(false) {
+        Backend::Volcengine(volcengine_stt::Config::from_env_with_key(store_key)?)
+    } else {
+        match std::env::var(ENV_PROVIDER).unwrap_or_default().as_str() {
+            "" | "none" => Backend::Disabled,
+            "volcengine" => Backend::Volcengine(volcengine_stt::Config::from_env()?),
+            other => anyhow::bail!("unknown {ENV_PROVIDER}: {other}"),
+        }
     };
     let _ = BACKEND.set(backend);
     Ok(())

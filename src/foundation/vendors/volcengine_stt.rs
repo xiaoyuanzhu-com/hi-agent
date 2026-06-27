@@ -111,9 +111,19 @@ pub struct Config {
 
 impl Config {
     pub fn from_env() -> anyhow::Result<Self> {
-        let api_key = std::env::var(ENV_API_KEY).map_err(|_| {
-            anyhow::anyhow!("{ENV_API_KEY} is required when STT_PROVIDER=volcengine")
-        })?;
+        Self::from_env_with_key(None)
+    }
+
+    /// Like [`from_env`](Self::from_env) but the API key comes from `key_override`
+    /// when non-empty (the BYOK store), falling back to `VOLCENGINE_STT_API_KEY`.
+    /// All other params stay env-driven.
+    pub fn from_env_with_key(key_override: Option<&str>) -> anyhow::Result<Self> {
+        let api_key = match key_override {
+            Some(k) if !k.trim().is_empty() => k.trim().to_string(),
+            _ => std::env::var(ENV_API_KEY).map_err(|_| {
+                anyhow::anyhow!("{ENV_API_KEY} is required when STT_PROVIDER=volcengine")
+            })?,
+        };
         let model = std::env::var(ENV_MODEL).unwrap_or_else(|_| DEFAULT_MODEL.to_string());
         let resource_id =
             std::env::var(ENV_RESOURCE_ID).unwrap_or_else(|_| DEFAULT_RESOURCE_ID.to_string());

@@ -128,9 +128,12 @@ async fn run_with_shutdown(config: Config, shutdown: Arc<Notify>) -> anyhow::Res
     // streams it to the raw session inspector.
     let acp_tap = foundation::acp::AcpTap::new();
 
-    // Resolve all capabilities from the environment. Unconfigured capabilities
-    // are fine; gates affect /audio (STT) and the speak path (TTS) only.
-    body::capabilities::init_from_env()?;
+    // Resolve all keyed capabilities BYOK-first: each vendor's key from the
+    // credential store (`<data_dir>/credentials.json`) wins, else its `.env` key.
+    // Unconfigured capabilities are fine; gates affect /audio (STT) and the speak
+    // path (TTS) only.
+    let creds = foundation::credentials::Credentials::load(&config.data_dir);
+    body::capabilities::init(&creds)?;
     // Voice/face recognition need no env config — provision their pinned local
     // ONNX models on first run (cached thereafter) and load them. Best-effort:
     // a failed provision leaves the capability disabled, never blocks startup.

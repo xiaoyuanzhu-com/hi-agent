@@ -178,7 +178,7 @@ async fn post_vision_journals_and_persists() {
 async fn all_sensory_stubs_return_501() {
     // touch/smell/taste are still 501 in v0. /audio returns 501 only when
     // STT is unconfigured, which the test forces by never calling
-    // capabilities::init_from_env — the STT global stays uninitialized, so
+    // capabilities::init — the STT global stays uninitialized, so
     // stt::available() is false.
     let (base, _dir, _seams) = spawn_server().await;
     let client = reqwest::Client::new();
