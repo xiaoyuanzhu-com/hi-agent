@@ -43,15 +43,17 @@ pub mod vision;
 pub mod voiceprint;
 
 /// Initialize the keyed capabilities (STT, TTS, vision, image/video gen) from the
-/// BYOK credential store, falling back to `.env` per vendor. Fails fast if a
-/// configured provider is missing its key or names an unknown provider. The
-/// recognition capabilities are provisioned separately by [`init_recognition`].
+/// credentials in effect for the current mode — the user's BYOK keys, or the
+/// broker-minted bundle (login/free) — falling back to `.env` per vendor. Fails
+/// fast if a configured provider is missing its key or names an unknown provider.
+/// The recognition capabilities are provisioned separately by [`init_recognition`].
 pub fn init(creds: &crate::foundation::credentials::Credentials) -> anyhow::Result<()> {
-    stt::init(creds.stt.key_opt())?;
-    tts::init(creds.tts.key_opt())?;
-    vision::init(creds.vision.key_opt())?;
-    image_gen::init(creds.image.key_opt())?;
-    video_gen::init(creds.video.key_opt())?;
+    let eff = creds.effective();
+    stt::init(eff.as_ref().and_then(|e| e.stt.key_opt()))?;
+    tts::init(eff.as_ref().and_then(|e| e.tts.key_opt()))?;
+    vision::init(eff.as_ref().and_then(|e| e.vision.key_opt()))?;
+    image_gen::init(eff.as_ref().and_then(|e| e.image.key_opt()))?;
+    video_gen::init(eff.as_ref().and_then(|e| e.video.key_opt()))?;
     Ok(())
 }
 

@@ -46,7 +46,22 @@ pub async fn get_credentials(State(state): State<Arc<AppState>>) -> Json<Value> 
     let creds = Credentials::load(&state.data_dir);
     let key = creds.llm.api_key.trim();
     let llm_configured = !key.is_empty();
+    // In login/free mode, the broker-minted bundle's account snapshot — for the UI
+    // to show the plan + remaining credits. Absent until a bundle has been fetched.
+    let account = creds.managed.as_ref().map(|m| {
+        json!({
+            "plan": m.plan,
+            "credits_remaining": m.credits_remaining,
+            "credits_limit": m.credits_limit,
+            "credits_resets_at": m.credits_resets_at,
+            "expires_at": m.expires_at,
+        })
+    });
     Json(json!({
+        "mode": creds.mode,
+        "account": account,
+        // The BYOK sections — always reported so the user can see/edit their own
+        // keys (used when mode is byok; ignored while a managed bundle is live).
         "llm": {
             "base_url": creds.llm.base_url,
             "model": creds.llm.model,
@@ -85,9 +100,11 @@ pub struct VendorUpdate {
 }
 
 /// A settings update. Every section is optional — the UI may send only the ones
-/// it changed.
+/// it changed. `mode` switches the credential source (byok / login / free).
 #[derive(Deserialize)]
 pub struct CredentialsUpdate {
+    #[serde(default)]
+    mode: Option<credentials::Mode>,
     #[serde(default)]
     llm: Option<LlmUpdate>,
     #[serde(default)]
@@ -111,12 +128,18 @@ fn apply_vendor(vk: &mut credentials::VendorKey, upd: Option<VendorUpdate>) {
 
 /// Persist the credential store. Always 200; the body's `ok` flag reports success
 /// (mirrors the reflex route's convention). `restart_required` is always true —
-/// the change takes effect on the next start.
+/// the change takes effect on the next start. Selecting login/free triggers a
+/// broker fetch now (so the UI can show the account) but the running agent still
+/// applies the new credentials on restart.
 pub async fn post_credentials(
     State(state): State<Arc<AppState>>,
     Json(body): Json<CredentialsUpdate>,
 ) -> Json<Value> {
     let mut creds = Credentials::load(&state.data_dir);
+    let mode_selected = body.mode;
+    if let Some(m) = mode_selected {
+        creds.mode = m;
+    }
     if let Some(llm) = body.llm {
         creds.llm.base_url = llm.base_url.trim().to_string();
         creds.llm.model = llm.model.map(|m| m.trim().to_string()).filter(|m| !m.is_empty());
@@ -129,11 +152,14 @@ pub async fn post_credentials(
     apply_vendor(&mut creds.vision, body.vision);
     apply_vendor(&mut creds.image, body.image);
     apply_vendor(&mut creds.video, body.video);
-    match creds.save(&state.data_dir) {
-        Ok(()) => Json(json!({ "ok": true, "restart_required": true })),
-        Err(e) => {
-            tracing::warn!(error = %e, "failed to save credentials");
-            Json(json!({ "ok": false, "error": e.to_string() }))
-        }
+    if let Err(e) = creds.save(&state.data_dir) {
+        tracing::warn!(error = %e, "failed to save credentials");
+        return Json(json!({ "ok": false, "error": e.to_string() }));
     }
+    // If the user just selected login/free, fetch the bundle now so the account
+    // shows immediately and is cached for the next restart.
+    if matches!(mode_selected, Some(credentials::Mode::Login | credentials::Mode::Free)) {
+        crate::foundation::broker::refresh(&state.data_dir).await;
+    }
+    Json(json!({ "ok": true, "restart_required": true }))
 }

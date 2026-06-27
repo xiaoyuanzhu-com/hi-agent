@@ -9,7 +9,21 @@ export interface VendorView {
   env_fallback: boolean;
 }
 
+/** How the agent obtains its credentials. */
+export type Mode = "byok" | "login" | "free";
+
+/** The broker account snapshot (login/free), absent until a bundle is fetched. */
+export interface Account {
+  plan: string;
+  credits_remaining: number;
+  credits_limit: number;
+  credits_resets_at: string;
+  expires_at: string;
+}
+
 export interface CredentialsView {
+  mode: Mode;
+  account: Account | null;
   llm: {
     base_url: string;
     model: string | null;
@@ -30,6 +44,7 @@ export interface VendorUpdate {
 }
 
 export interface CredentialsUpdate {
+  mode?: Mode;
   llm?: {
     base_url: string;
     model: string | null;

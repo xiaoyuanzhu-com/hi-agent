@@ -17,12 +17,27 @@ pub fn path(data_dir: &Path) -> PathBuf {
     data_dir.join(FILE)
 }
 
-/// The user's own vendor credentials (BYOK). `llm` is the upstream Claude
-/// adapter; the rest are the keyed capability vendors (each defaults to the env
-/// when its key is unset).
+/// How the agent obtains its credentials.
+/// - `byok`: the user's own keys (the flat fields below), the default.
+/// - `login` / `free`: a bundle fetched from the broker (hi.xiaoyuanzhu.com),
+///   cached in [`Credentials::managed`].
+#[derive(Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize, Debug)]
+#[serde(rename_all = "lowercase")]
+pub enum Mode {
+    #[default]
+    Byok,
+    Login,
+    Free,
+}
+
+/// The user's credentials (BYOK) plus, for login/free, the broker-minted bundle.
+/// The flat `llm`/vendor fields are the BYOK keys; `managed` caches the broker
+/// bundle. [`Credentials::effective`] picks which set is live for the current mode.
 #[derive(Clone, Default, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Credentials {
+    /// Which credential source is live. Default `byok`.
+    pub mode: Mode,
     pub llm: LlmCredentials,
     /// Speech-to-text (Volcengine).
     pub stt: VendorKey,
@@ -34,6 +49,13 @@ pub struct Credentials {
     pub image: VendorKey,
     /// Video generation (Doubao).
     pub video: VendorKey,
+    /// Stable per-install id sent to the broker as the free-mode allowance key.
+    /// Minted on first need (see the broker client); not a secret.
+    #[serde(skip_serializing_if = "String::is_empty")]
+    pub device_id: String,
+    /// The last bundle the broker minted (login/free). Refreshed before `expires_at`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub managed: Option<Managed>,
 }
 
 /// Upstream LLM credentials (the bundled Claude adapter's `ANTHROPIC_*`).
@@ -71,6 +93,49 @@ impl VendorKey {
     }
 }
 
+/// A broker-minted bundle (login/free): the same credential fields as BYOK plus
+/// the account snapshot. Cached in the store; refreshed from the broker.
+#[derive(Clone, Default, Serialize, Deserialize)]
+#[serde(default)]
+pub struct Managed {
+    pub llm: LlmCredentials,
+    pub stt: VendorKey,
+    pub tts: VendorKey,
+    pub vision: VendorKey,
+    pub image: VendorKey,
+    pub video: VendorKey,
+    /// Plan name from the broker (e.g. "free", "pro").
+    pub plan: String,
+    pub credits_remaining: i64,
+    pub credits_limit: i64,
+    pub credits_resets_at: String,
+    /// RFC3339; after this the bundle should be refreshed (refresh timer is future
+    /// work — v1 refetches on each startup).
+    pub expires_at: String,
+}
+
+impl std::fmt::Debug for Managed {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Managed")
+            .field("llm", &self.llm)
+            .field("plan", &self.plan)
+            .field("credits_remaining", &self.credits_remaining)
+            .field("expires_at", &self.expires_at)
+            .finish_non_exhaustive()
+    }
+}
+
+/// The credentials in effect for the current mode — borrows from either the BYOK
+/// fields or the managed bundle.
+pub struct Effective<'a> {
+    pub llm: &'a LlmCredentials,
+    pub stt: &'a VendorKey,
+    pub tts: &'a VendorKey,
+    pub vision: &'a VendorKey,
+    pub image: &'a VendorKey,
+    pub video: &'a VendorKey,
+}
+
 // Hand-written so a stray trace never prints the key.
 impl std::fmt::Debug for LlmCredentials {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -91,12 +156,15 @@ impl std::fmt::Debug for VendorKey {
 impl std::fmt::Debug for Credentials {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("Credentials")
+            .field("mode", &self.mode)
             .field("llm", &self.llm)
             .field("stt", &self.stt)
             .field("tts", &self.tts)
             .field("vision", &self.vision)
             .field("image", &self.image)
             .field("video", &self.video)
+            .field("device_id", &self.device_id)
+            .field("managed", &self.managed)
             .finish()
     }
 }
@@ -110,6 +178,31 @@ fn redact(s: &str) -> &'static str {
 }
 
 impl Credentials {
+    /// The credentials in effect: the BYOK fields in `byok` mode, the managed
+    /// bundle in login/free. `None` in login/free before a bundle has been
+    /// fetched — callers then fall back to `.env` (resolve) or leave the
+    /// capability off.
+    pub fn effective(&self) -> Option<Effective<'_>> {
+        match self.mode {
+            Mode::Byok => Some(Effective {
+                llm: &self.llm,
+                stt: &self.stt,
+                tts: &self.tts,
+                vision: &self.vision,
+                image: &self.image,
+                video: &self.video,
+            }),
+            Mode::Login | Mode::Free => self.managed.as_ref().map(|m| Effective {
+                llm: &m.llm,
+                stt: &m.stt,
+                tts: &m.tts,
+                vision: &m.vision,
+                image: &m.image,
+                video: &m.video,
+            }),
+        }
+    }
+
     /// Load from `<data_dir>/credentials.json`. A missing file yields defaults; a
     /// corrupt one logs a warning and *also* yields defaults, so a bad hand-edit
     /// can't brick boot — the user re-saves from Settings.
@@ -216,5 +309,56 @@ mod tests {
         Credentials::default().save(dir.path()).unwrap();
         let mode = std::fs::metadata(path(dir.path())).unwrap().permissions().mode();
         assert_eq!(mode & 0o777, 0o600);
+    }
+
+    #[test]
+    fn effective_picks_byok_or_managed() {
+        let mut c = Credentials::default();
+        assert_eq!(c.mode, Mode::Byok);
+        c.llm.api_key = "byok-key".into();
+        assert_eq!(c.effective().unwrap().llm.api_key, "byok-key");
+
+        // login/free with no bundle → nothing in effect (callers fall back to env).
+        c.mode = Mode::Free;
+        assert!(c.effective().is_none());
+
+        // a bundle takes over.
+        c.managed = Some(Managed {
+            llm: LlmCredentials {
+                base_url: "https://songguo.xiaoyuanzhu.com".into(),
+                api_key: "managed-key".into(),
+                model: None,
+            },
+            stt: VendorKey { api_key: "managed-stt".into() },
+            plan: "free".into(),
+            ..Default::default()
+        });
+        let e = c.effective().unwrap();
+        assert_eq!(e.llm.api_key, "managed-key");
+        assert_eq!(e.llm.base_url, "https://songguo.xiaoyuanzhu.com");
+        assert_eq!(e.stt.key_opt(), Some("managed-stt"));
+        // BYOK key is ignored while a managed bundle is live.
+        assert_ne!(e.llm.api_key, "byok-key");
+    }
+
+    #[test]
+    fn mode_and_device_id_round_trip() {
+        let dir = tempfile::tempdir().unwrap();
+        let c = Credentials { mode: Mode::Login, device_id: "dev-1".into(), ..Default::default() };
+        c.save(dir.path()).unwrap();
+        let back = Credentials::load(dir.path());
+        assert_eq!(back.mode, Mode::Login);
+        assert_eq!(back.device_id, "dev-1");
+    }
+
+    #[test]
+    fn managed_debug_redacts_keys() {
+        let m = Managed {
+            llm: LlmCredentials { base_url: "x".into(), api_key: "managed-super-secret".into(), model: None },
+            plan: "pro".into(),
+            ..Default::default()
+        };
+        let rendered = format!("{m:?}");
+        assert!(!rendered.contains("managed-super-secret"), "key leaked: {rendered}");
     }
 }

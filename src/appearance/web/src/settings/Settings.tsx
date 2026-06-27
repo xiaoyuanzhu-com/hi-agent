@@ -2,8 +2,10 @@ import { useEffect, useState } from "react";
 import {
   fetchCredentials,
   saveCredentials,
+  type Account,
   type CredentialsUpdate,
   type CredentialsView,
+  type Mode,
   type VendorView,
 } from "./api";
 import "./settings.css";
@@ -17,12 +19,18 @@ const VENDORS = [
   { id: "video", label: "Video generation", vendor: "Doubao" },
 ] as const;
 
+const MODES: { id: Mode; label: string }[] = [
+  { id: "byok", label: "Your keys" },
+  { id: "login", label: "Login" },
+  { id: "free", label: "Free" },
+];
+
 /**
- * Settings — a top-level product page at `/settings` (distinct from the operator
- * console at `/inspect`). Holds BYOK: the upstream LLM credential the agent runs
- * on, plus the keyed capability vendors (speech, vision, media). A raw key is
- * never sent back from the server (only a hint), so key fields start empty and a
- * blank save keeps the stored key. Changes take effect on the next restart.
+ * Settings — a top-level product page at `/settings`. Three ways to get model
+ * credits: Your keys (BYOK — the user's own vendor keys), Login (a subscription
+ * via account.xiaoyuanzhu.com), or Free (anonymous daily credits). Login/Free
+ * draw a credential bundle from the broker; BYOK uses the keys entered here. A raw
+ * key is never returned from the server (only a hint); changes apply on restart.
  */
 export function Settings() {
   const [view, setView] = useState<CredentialsView | null>(null);
@@ -51,6 +59,28 @@ export function Settings() {
     return () => ctrl.abort();
   }, [reloadKey]);
 
+  const mode: Mode = view?.mode ?? "byok";
+
+  const onSelectMode = async (m: Mode) => {
+    if (m === mode) return;
+    setSaving(true);
+    setStatus(null);
+    setError(null);
+    try {
+      const res = await saveCredentials({ mode: m });
+      if (res.ok) {
+        setStatus(m === "byok" ? "Using your own keys." : "Switched — restart hi-agent to apply.");
+        setReloadKey((k) => k + 1);
+      } else {
+        setError(res.error ?? "failed to switch mode");
+      }
+    } catch (e) {
+      setError(String(e));
+    } finally {
+      setSaving(false);
+    }
+  };
+
   const onSave = async () => {
     setSaving(true);
     setStatus(null);
@@ -64,7 +94,6 @@ export function Settings() {
           ...(apiKey.trim() ? { api_key: apiKey.trim() } : {}),
         },
       };
-      // Only send a vendor section when its field was typed into.
       for (const v of VENDORS) {
         const k = (vendorKeys[v.id] ?? "").trim();
         if (k) update[v.id] = { api_key: k };
@@ -98,78 +127,140 @@ export function Settings() {
           <h1>Settings</h1>
         </header>
 
-        <p className="settings-intro">
-          Bring your own keys. Stored locally in <code>credentials.json</code>; keys
-          are never sent back to this page. A key here also turns that capability on.
-        </p>
+        <p className="settings-intro">How the agent draws its model credits.</p>
 
-        <section className="settings-card">
-          <div className="settings-card-head">
-            <h2>LLM · Claude</h2>
-            {llmConfigured ? (
-              <span className="tag ok">configured · {view?.llm.key_hint}</span>
-            ) : llmEnvFallback ? (
-              <span className="tag mute">using AI_API_KEY from .env</span>
-            ) : (
-              <span className="tag warn">not configured</span>
-            )}
-          </div>
+        <div className="mode-tabs" role="tablist">
+          {MODES.map((m) => (
+            <button
+              key={m.id}
+              className={m.id === mode ? "mode-tab sel" : "mode-tab"}
+              disabled={saving}
+              onClick={() => onSelectMode(m.id)}
+            >
+              {m.label}
+            </button>
+          ))}
+        </div>
 
-          <label className="field">
-            <span>API key</span>
-            <input
-              type="password"
-              value={apiKey}
-              placeholder={llmConfigured ? "•••• (unchanged)" : "sk-ant-…"}
-              onChange={(e) => setApiKey(e.target.value)}
-              autoComplete="off"
-            />
-          </label>
+        {mode === "byok" ? (
+          <>
+            <section className="settings-card">
+              <div className="settings-card-head">
+                <h2>LLM · Claude</h2>
+                {llmConfigured ? (
+                  <span className="tag ok">configured · {view?.llm.key_hint}</span>
+                ) : llmEnvFallback ? (
+                  <span className="tag mute">using AI_API_KEY from .env</span>
+                ) : (
+                  <span className="tag warn">not configured</span>
+                )}
+              </div>
 
-          <label className="field">
-            <span>Base URL</span>
-            <input
-              type="text"
-              value={baseUrl}
-              placeholder="https://api.anthropic.com"
-              onChange={(e) => setBaseUrl(e.target.value)}
-            />
-          </label>
+              <label className="field">
+                <span>API key</span>
+                <input
+                  type="password"
+                  value={apiKey}
+                  placeholder={llmConfigured ? "•••• (unchanged)" : "sk-ant-…"}
+                  onChange={(e) => setApiKey(e.target.value)}
+                  autoComplete="off"
+                />
+              </label>
 
-          <label className="field">
-            <span>
-              Model <em>optional</em>
-            </span>
-            <input
-              type="text"
-              value={model}
-              placeholder="adapter default"
-              onChange={(e) => setModel(e.target.value)}
-            />
-          </label>
-        </section>
+              <label className="field">
+                <span>Base URL</span>
+                <input
+                  type="text"
+                  value={baseUrl}
+                  placeholder="https://api.anthropic.com"
+                  onChange={(e) => setBaseUrl(e.target.value)}
+                />
+              </label>
 
-        {VENDORS.map((v) => (
-          <VendorCard
-            key={v.id}
-            label={v.label}
-            vendor={v.vendor}
-            view={view?.[v.id]}
-            value={vendorKeys[v.id] ?? ""}
-            onChange={(val) => setVendorKeys((m) => ({ ...m, [v.id]: val }))}
-          />
-        ))}
+              <label className="field">
+                <span>
+                  Model <em>optional</em>
+                </span>
+                <input
+                  type="text"
+                  value={model}
+                  placeholder="adapter default"
+                  onChange={(e) => setModel(e.target.value)}
+                />
+              </label>
+            </section>
+
+            {VENDORS.map((v) => (
+              <VendorCard
+                key={v.id}
+                label={v.label}
+                vendor={v.vendor}
+                view={view?.[v.id]}
+                value={vendorKeys[v.id] ?? ""}
+                onChange={(val) => setVendorKeys((m) => ({ ...m, [v.id]: val }))}
+              />
+            ))}
+          </>
+        ) : (
+          <AccountCard mode={mode} account={view?.account ?? null} />
+        )}
 
         <div className="settings-actions">
-          <button className="primary" onClick={onSave} disabled={saving}>
-            {saving ? "Saving…" : "Save"}
-          </button>
+          {mode === "byok" && (
+            <button className="primary" onClick={onSave} disabled={saving}>
+              {saving ? "Saving…" : "Save"}
+            </button>
+          )}
           {status && <span className="note ok">{status}</span>}
           {error && <span className="note err">{error}</span>}
         </div>
       </div>
     </div>
   );
+}
+
+/** Login/Free: show the broker account — plan + remaining credits, or a connecting/hint state. */
+function AccountCard({ mode, account }: { mode: Mode; account: Account | null }) {
+  const pct =
+    account && account.credits_limit > 0
+      ? Math.max(0, Math.min(100, Math.round((account.credits_remaining / account.credits_limit) * 100)))
+      : 0;
+  const resets = account?.credits_resets_at ? fmtDate(account.credits_resets_at) : "";
+  return (
+    <section className="settings-card">
+      <div className="settings-card-head">
+        <h2>{mode === "free" ? "Free" : "Login"}</h2>
+        {account ? (
+          <span className="tag ok">{account.plan}</span>
+        ) : (
+          <span className="tag off">not connected</span>
+        )}
+      </div>
+      {account ? (
+        <div className="account-credits">
+          <div className="account-bar">
+            <i style={{ width: `${pct}%` }} />
+          </div>
+          <p className="settings-sub">
+            {account.credits_remaining.toLocaleString()} / {account.credits_limit.toLocaleString()} credits
+            {resets && <> · resets {resets}</>}
+          </p>
+        </div>
+      ) : mode === "login" ? (
+        <p className="settings-sub">
+          Sign in at <code>account.xiaoyuanzhu.com</code> to draw subscription credits.{" "}
+          <em>(login token wiring in progress)</em>
+        </p>
+      ) : (
+        <p className="settings-sub">Connecting to the gateway for daily free credits…</p>
+      )}
+    </section>
+  );
+}
+
+function fmtDate(iso: string): string {
+  const d = new Date(iso);
+  return Number.isNaN(d.getTime()) ? iso : d.toLocaleDateString();
 }
 
 /** A key-only vendor card (speech, vision, media). Unset is "off", not an error. */

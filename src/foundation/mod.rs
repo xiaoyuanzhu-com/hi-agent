@@ -21,6 +21,7 @@
 pub mod acp;
 pub mod agent;
 pub mod auth;
+pub mod broker;
 pub mod channel_log;
 pub mod config;
 pub mod credentials;

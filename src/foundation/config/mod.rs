@@ -103,24 +103,26 @@ fn env_opt(name: &str) -> Option<String> {
 }
 
 impl AgentConfig {
-    /// Resolve the upstream LLM credential for startup, BYOK-first: the user's
-    /// own key from the credential store (`<data_dir>/credentials.json`) wins; when
-    /// it's unset we fall back to `.env` (`AI_API_KEY` / `AI_API_BASE` / `HI_AGENT_MODEL`)
-    /// so dev / journey-test flows keep working. Never errors — when neither source
-    /// has a key the agent boots **unconfigured** (see [`is_configured`](Self::is_configured)),
-    /// the server + Settings UI come up, and prompts fail clearly until a key is set.
-    /// `effort` / `permission_mode` stay env-driven (they aren't credentials).
+    /// Resolve the upstream LLM credential for startup. Uses the credentials in
+    /// effect for the current mode — the user's BYOK key, or (login/free) the
+    /// broker-minted bundle — and falls back to `.env` (`AI_API_KEY` / `AI_API_BASE`
+    /// / `HI_AGENT_MODEL`) when neither has a key, so dev / journey-test flows keep
+    /// working. Never errors — with no key the agent boots **unconfigured** (see
+    /// [`is_configured`](Self::is_configured)), the server + Settings UI come up,
+    /// and prompts fail clearly until a key is set. `effort` / `permission_mode`
+    /// stay env-driven (they aren't credentials).
     pub fn resolve(data_dir: &Path) -> Self {
         let store = crate::foundation::credentials::Credentials::load(data_dir);
-        let llm = store.llm;
-        let (base_url, key, model) = if !llm.api_key.trim().is_empty() {
-            (llm.base_url, llm.api_key, llm.model.or_else(|| env_opt(ENV_MODEL)))
-        } else {
-            (
+        let llm = store.effective().map(|e| e.llm.clone());
+        let (base_url, key, model) = match llm {
+            Some(l) if !l.api_key.trim().is_empty() => {
+                (l.base_url, l.api_key, l.model.or_else(|| env_opt(ENV_MODEL)))
+            }
+            _ => (
                 std::env::var(ENV_AI_API_BASE).unwrap_or_default(),
                 std::env::var(ENV_AI_API_KEY).unwrap_or_default(),
                 env_opt(ENV_MODEL),
-            )
+            ),
         };
         Self::new(
             model,
