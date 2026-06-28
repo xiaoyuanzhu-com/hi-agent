@@ -586,6 +586,15 @@ struct ReactorInner {
     /// end. (The client no longer needs it — turns are internal to the mind.)
     turn_seq: AtomicU64,
     scenes: Mutex<HashMap<Scene, SceneHandle>>,
+    /// Wall-monotonic time of the most recent inbound human signal across **all**
+    /// scenes — the global "fresh input" signal the single consolidated reflection
+    /// clock reads to decide base-vs-backoff cadence (see [`consolidated_reflection_loop`]).
+    /// Written in [`Reactor::deliver_to_scene`]; read each reflection tick.
+    last_signal_at: std::sync::Mutex<Instant>,
+    /// Wakes the consolidated reflection loop when fresh input lands, so a scene
+    /// that goes active after a long quiet doesn't wait out the backed-off gap
+    /// before its first pass — the loop re-derives its deadline on every notify.
+    reflect_wake: tokio::sync::Notify,
 }
 
 struct SceneHandle {
@@ -621,6 +630,8 @@ pub fn start(
             turn_seq: AtomicU64::new(0),
             scenes: Mutex::new(HashMap::new()),
             vendor_health: Arc::new(VendorHealth::new(vendor_down_after())),
+            last_signal_at: std::sync::Mutex::new(Instant::now()),
+            reflect_wake: tokio::sync::Notify::new(),
         }),
     };
     let dispatch_reactor = reactor.clone();
@@ -658,7 +669,77 @@ pub fn start(
         }
     });
 
+    // Consolidated reflection ("sleep"): one pass over every recently-active scene
+    // on a single global clock, replacing the old per-scene timers. A single mind
+    // settles the whole day across contexts at once — so it can link across scenes
+    // and one writer (not N racing) touches the shared facet/people stores.
+    let reflect_reactor = reactor.clone();
+    tokio::spawn(async move {
+        consolidated_reflection_loop(reflect_reactor).await;
+    });
+
     reactor
+}
+
+/// The single consolidated reflection loop: one "sleep" pass over all
+/// recently-active scenes, on one adaptive clock, never overlapping itself.
+///
+/// Anchored on the **last completed pass** (or loop start before the first), it
+/// fires `base` after the anchor while any scene saw fresh input since (the active
+/// cadence), else on a `backoff_gap` doubling toward `reflect_max` while the whole
+/// system is quiet — the same rule the old per-scene loops used, now global (see
+/// [`next_reflection_at`]). A fresh signal arriving mid-gap pokes [`reflect_wake`]
+/// so the loop re-derives its deadline immediately rather than waiting out a long
+/// backoff. Each tick consolidates only scenes with enough on their frontier; a
+/// tick with nothing ready is a cheap no-op. Returns (the task ends) only when
+/// reflection is disabled outright (`HI_AGENT_REFLECT=off` or `REFLECT_EVERY=0`).
+async fn consolidated_reflection_loop(reactor: Reactor) {
+    let reflect_base = reflect_interval();
+    let reflect_max = reflect_max_interval();
+    if reflect_base.is_none() {
+        tracing::info!("consolidated reflection disabled");
+        return;
+    }
+    let loop_started = Instant::now();
+    let mut last_reflection: Option<Instant> = None;
+    let mut backoff_gap = reflect_base.unwrap_or(DEFAULT_REFLECT_EVERY);
+
+    loop {
+        let last_activity = *reactor.inner.last_signal_at.lock().unwrap();
+        let Some(at) =
+            next_reflection_at(loop_started, last_activity, last_reflection, reflect_base, backoff_gap)
+        else {
+            return;
+        };
+        let now = Instant::now();
+        if at > now {
+            // Sleep until due, but wake early if fresh input lands — then re-loop to
+            // recompute the deadline (which only actually fires once it's past).
+            tokio::select! {
+                _ = tokio::time::sleep(at.saturating_duration_since(now)) => {}
+                _ = reactor.inner.reflect_wake.notified() => continue,
+            }
+        }
+
+        // Due. Adapt the backoff against the *old* anchor before re-anchoring: fresh
+        // input since the last pass snaps the gap back to base; a quiet pass doubles
+        // it toward the cap. Re-anchor on `now` whether or not anything consolidates,
+        // so a no-op tick can't hot-spin the clock.
+        let now = Instant::now();
+        let last_activity = *reactor.inner.last_signal_at.lock().unwrap();
+        let anchor = last_reflection.unwrap_or(loop_started);
+        backoff_gap = if last_activity > anchor {
+            reflect_base.unwrap_or(DEFAULT_REFLECT_EVERY)
+        } else {
+            backoff_gap.checked_mul(2).unwrap_or(reflect_max).min(reflect_max)
+        };
+        last_reflection = Some(now);
+
+        // The scenes to consider — the same source that decides which loops exist, so
+        // we consolidate exactly the scenes that were reflecting under the old design.
+        let scenes = recent_scenes(reactor.inner.memory.data_dir(), REWARM_WINDOW);
+        heartbeat::consolidate(&reactor, &scenes).await;
+    }
 }
 
 /// Scenes whose raw memory saw activity within `window`: the directories under
@@ -697,6 +778,12 @@ fn recent_scenes(data_dir: &std::path::Path, window: Duration) -> Vec<Scene> {
 
 impl Reactor {
     async fn deliver_to_scene(&self, scene: Scene, signal: Signal) {
+        // Mark global activity and poke the consolidated reflection clock, so a scene
+        // going active after a long quiet gets its first pass without waiting out the
+        // backed-off gap.
+        *self.inner.last_signal_at.lock().unwrap() = Instant::now();
+        self.inner.reflect_wake.notify_one();
+
         let sender = self.get_or_create_scene(scene.clone()).await;
 
         // A new signal never cancels the in-flight prompt: the serial per-scene
@@ -868,11 +955,6 @@ async fn per_scene_loop(
     // Self-alarms the mind has scheduled. They give the loop a second reason to
     // wake — time passing — on top of an incoming signal; see the `select!` below.
     let mut alarms = Alarms::new();
-    // The scene's in-flight reflection ("sleep") pass, if one is running. Kicked
-    // off detached on a reflection trigger (periodic or idle; see below); kept only
-    // to skip starting a second while the previous is still going — the cursor lets
-    // the next round consolidate whatever this one didn't reach.
-    let mut reflection: Option<tokio::task::JoinHandle<()>> = None;
 
     // Warm-up: this loop was just stood up (a scene-presence GET, or the first
     // utterance). Pull the cold-start forward now — spawn the subprocess, open the
@@ -888,17 +970,8 @@ async fn per_scene_loop(
     // after the loop stands up also carries how long ago the host process started,
     // which is all "wake on boot" amounts to.
     let pulse_every = pulse_interval();
-    // Reflection runs on one adaptive clock, decoupled from the compact heartbeat:
-    // a scene with fresh input consolidates every `reflect_base`; once it goes quiet
-    // the gap backs off (doubling) up to `reflect_max`. `backoff_gap` is that
-    // running idle gap — reset to the base when a pass runs with fresh input,
-    // doubled toward the cap when one runs while quiet. See `next_reflection_at`.
-    let reflect_base = reflect_interval();
-    let reflect_max = reflect_max_interval();
     let loop_started = Instant::now();
     let mut last_activity = Instant::now();
-    let mut last_reflection: Option<Instant> = None;
-    let mut backoff_gap = reflect_base.unwrap_or(DEFAULT_REFLECT_EVERY);
     let mut pulsed_once = false;
 
     // Pending turn-driving items, hoisted out of the main loop so the batch
@@ -935,21 +1008,9 @@ async fn per_scene_loop(
                 break 'wait;
             }
             let down = reactor.inner.vendor_health.is_down();
-            // While Down, suppress pulses and reflection — both call the model
-            // and would just fail. The probe cadence replaces the pulse as the
-            // turn-driving timer.
+            // While Down, suppress pulses — they call the model and would just fail.
+            // The probe cadence replaces the pulse as the turn-driving timer.
             let pulse_at = if down { None } else { pulse_every.map(|d| last_activity + d) };
-            let reflect_at = if down {
-                None
-            } else {
-                next_reflection_at(
-                    loop_started,
-                    last_activity,
-                    last_reflection,
-                    reflect_base,
-                    backoff_gap,
-                )
-            };
             // While Down, arm the recovery probe. Lazy-init on first Down
             // observation so the first probe is a full interval after the
             // outage begins, not at loop start; cleared on Up.
@@ -959,7 +1020,7 @@ async fn per_scene_loop(
                 next_probe = None;
                 None
             };
-            let deadline = [alarms.next_deadline(), pulse_at, reflect_at, probe_at]
+            let deadline = [alarms.next_deadline(), pulse_at, probe_at]
                 .into_iter()
                 .flatten()
                 .min();
@@ -1061,40 +1122,6 @@ async fn per_scene_loop(
                         last_activity = now;
                         tracing::info!(scene = %scene, "pulse fired");
                         batch.push(LoopInput::Pulse { note });
-                    }
-                    // Reflection ("sleep"): one adaptive clock — fires `base` after
-                    // the last pass while there's fresh input, and on a backed-off
-                    // gap once the scene is caught up and quiet (see
-                    // `next_reflection_at`). Spawned detached so it never blocks the
-                    // floor; the cursor makes it idempotent and a pass with too
-                    // little on the frontier is a fast no-op. It drives no turn, so
-                    // it never joins `batch` — the loop just re-waits on the next
-                    // deadline.
-                    if let Some(at) = reflect_at
-                        && at <= now
-                    {
-                        // Adapt the idle backoff against the *old* anchor before
-                        // re-anchoring: a pass with fresh input since the last
-                        // reflection snaps the gap back to the base; one that runs
-                        // while quiet doubles it toward the cap, so a long-idle scene
-                        // stops re-checking in vain. Then consume the tick (re-anchor
-                        // on `now`) whether or not we spawn, so a busy guard can't
-                        // hot-spin the wait loop on an already-past deadline.
-                        let anchor = last_reflection.unwrap_or(loop_started);
-                        backoff_gap = if last_activity > anchor {
-                            reflect_base.unwrap_or(DEFAULT_REFLECT_EVERY)
-                        } else {
-                            backoff_gap.checked_mul(2).unwrap_or(reflect_max).min(reflect_max)
-                        };
-                        last_reflection = Some(now);
-                        if reflection.as_ref().is_none_or(|h| h.is_finished()) {
-                            let r = reactor.clone();
-                            let s = scene.clone();
-                            reflection = Some(tokio::spawn(async move {
-                                heartbeat::reflect(&r, &s).await;
-                            }));
-                            tracing::info!(scene = %scene, "reflection fired");
-                        }
                     }
                     if !batch.is_empty() {
                         break 'wait;

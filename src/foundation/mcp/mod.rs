@@ -89,17 +89,20 @@ fn tools_for_role(role: Option<&str>) -> Vec<Value> {
             watch_tool(),
         ],
         // The reflection ("sleep") surface: a voice-less session that consolidates
-        // the raw log into derived memory. It segments the scene's unconsolidated
-        // signals into episodes and regenerates the facets they touch.
+        // the raw log into derived memory. One pass spans every recently-active
+        // scene at once — the signals come grouped by scene, each group numbered
+        // from 1 — so every scene-specific tool (`record_episode`, `keep_and_fade`,
+        // `see`) names the scene it acts on.
         Some("reflection") => vec![
             tool(
                 "record_episode",
-                "File one coherent event as an episode. You are shown the scene's still-unconsolidated \
-                 signals as a numbered list, oldest first; `count` is how many signals from the TOP of \
-                 that list this one episode covers. Call it in order, front to back — each call consumes \
-                 that many signals from the front, so the next call's `count` starts after them. STOP \
-                 early (just don't cover the last few) when the most recent signals are an event still in \
-                 progress; they'll come back next time. `gist` is the consolidated event in your own \
+                "File one coherent event as an episode. You are shown each scene's still-unconsolidated \
+                 signals as its own numbered list, oldest first, under a `# Scene: <id>` header; `scene` is \
+                 that id and `count` is how many signals from the TOP of THAT scene's list this one episode \
+                 covers. Work one scene at a time, in order, front to back — each call consumes that many \
+                 signals from the front of its scene, so the next `count` for the same scene starts after \
+                 them. STOP early (just don't cover the last few) when the most recent signals are an event \
+                 still in progress; they'll come back next time. `gist` is the consolidated event in your own \
                  prose. `title` is a short handle for this event (a few words) — it becomes the episode's \
                  directory name, so make it specific and human-readable (e.g. \"Lunch plan with Alice\", \
                  \"Kyoto flights booked\"). `subjects` are the `dimension/subject` refs this episode is about \
@@ -108,12 +111,13 @@ fn tools_for_role(role: Option<&str>) -> Vec<Value> {
                 json!({
                     "type": "object",
                     "properties": {
-                        "count": { "type": "integer", "minimum": 1, "description": "How many signals from the top of the unconsolidated list this episode covers." },
+                        "scene": { "type": "string", "description": "The scene this episode belongs to — the id from its `# Scene: <id>` group header." },
+                        "count": { "type": "integer", "minimum": 1, "description": "How many signals from the top of THAT scene's unconsolidated list this episode covers." },
                         "title": { "type": "string", "description": "A short, specific handle for this event (a few words); becomes the episode's directory name, e.g. \"Lunch plan with Alice\"." },
                         "gist": { "type": "string", "description": "The consolidated event, in prose — what happened, what mattered." },
                         "subjects": { "type": "array", "items": { "type": "string" }, "description": "The dimension/subject refs this episode touches, e.g. [\"people/alice\", \"projects/kyoto-trip\"]." },
                     },
-                    "required": ["count", "title", "gist"],
+                    "required": ["scene", "count", "title", "gist"],
                 }),
             ),
             tool(
@@ -185,16 +189,18 @@ fn tools_for_role(role: Option<&str>) -> Vec<Value> {
                 "Let a cold day's media fade to the text, keeping only the moments worth keeping \
                  vivid. Use it on a day from the old-store list you're shown — one genuinely old and \
                  settled, heaviest first — when the raw bytes are vividness the words have outlived. \
-                 `channel` is `audio` or `vision`, `date` the `YYYY-MM-DD` day. `keep` is the spans to \
-                 preserve, each `{start, end}` in RFC3339 — a vision keepsake is a still at `start`, an \
-                 audio keepsake the clip `[start, end)`. Keep almost nothing: a frame or a few seconds, \
-                 often none — pass `keep: []` to fade straight to text (which always remains). Keep only \
-                 what the transcript can't carry (a face, a place, the sound of a voice), never someone \
+                 `scene` is the scene that day belongs to (the `# Scene: <id>` group the old-store list \
+                 appeared under). `channel` is `audio` or `vision`, `date` the `YYYY-MM-DD` day. `keep` is \
+                 the spans to preserve, each `{start, end}` in RFC3339 — a vision keepsake is a still at \
+                 `start`, an audio keepsake the clip `[start, end)`. Keep almost nothing: a frame or a few \
+                 seconds, often none — pass `keep: []` to fade straight to text (which always remains). Keep \
+                 only what the transcript can't carry (a face, a place, the sound of a voice), never someone \
                  merely talking. You can only fade a day already behind your consolidation; the tool \
                  refuses the rest.",
                 json!({
                     "type": "object",
                     "properties": {
+                        "scene": { "type": "string", "description": "The scene this day belongs to — the id from the `# Scene: <id>` group its old-store list appeared under." },
                         "channel": { "type": "string", "enum": ["audio", "vision"], "description": "Which sense's media to fade for this day." },
                         "date": { "type": "string", "description": "The day to fade, YYYY-MM-DD (UTC), from the old-store list." },
                         "keep": {
@@ -210,7 +216,7 @@ fn tools_for_role(role: Option<&str>) -> Vec<Value> {
                             },
                         },
                     },
-                    "required": ["channel", "date"],
+                    "required": ["scene", "channel", "date"],
                 }),
             ),
             see_tool(),
@@ -336,6 +342,7 @@ fn see_tool() -> Value {
             "properties": {
                 "ref": { "type": "string", "description": "The ⟨ref: …⟩ from the photo's signal, e.g. 2026-06-25/14/23-07.jpg." },
                 "prompt": { "type": "string", "description": "Optional: what you want to know about the image (a question or focus). Omit to just look." },
+                "scene": { "type": "string", "description": "Reflection only: the scene shown next to a `see` ref (its `# Scene: <id>` group). Pass it so the still resolves. Omit in conversation." },
             },
             "required": ["ref"],
         }),
@@ -432,15 +439,18 @@ async fn dispatch_tool(
         return tool_error("missing X-HI-Scene header");
     };
 
-    // Reflection tools are pure derived-memory IO over `data_dir` + `scene`; they
-    // don't touch the scene loop (no sink), so handle them before the sink lookup.
+    // Reflection tools are pure derived-memory IO over `data_dir`; they don't touch
+    // the scene loop (no sink), so handle them before the sink lookup. The
+    // consolidated reflection session spans every scene, so the scene-specific ones
+    // (`record_episode`/`keep_and_fade`/`see`) take their scene from the args, not the
+    // (sentinel) header — `see` falls back to the header for the live reactor surface.
     match name {
-        "record_episode" => return reflection_record_episode(data_dir, scene, args).await,
+        "record_episode" => return reflection_record_episode(data_dir, args).await,
         "read_facet" => return reflection_read_facet(data_dir, args).await,
         "update_facet" => return reflection_update_facet(data_dir, args).await,
         "name_person" => return reflection_name_person(data_dir, args).await,
         "merge_people" => return reflection_merge_people(data_dir, args).await,
-        "keep_and_fade" => return reflection_keep_and_fade(data_dir, scene, args).await,
+        "keep_and_fade" => return reflection_keep_and_fade(data_dir, args).await,
         "record_reflex" => return reflex_record(data_dir, args).await,
         "look" => return do_look().await,
         "act" => return do_act(args).await,
@@ -671,14 +681,27 @@ fn parse_mods(v: Option<&Value>) -> Vec<crate::body::capabilities::input::Modifi
         .unwrap_or_default()
 }
 
-/// `record_episode`: file the first `count` of the scene's unconsolidated signals
-/// as one episode (see [`crate::mind::memory::episodes::record_episode`]). Returns the
-/// episode ref for the session to cite when it updates a facet.
-async fn reflection_record_episode(
-    data_dir: &std::path::Path,
-    scene: &Scene,
-    args: &Value,
-) -> Value {
+/// The scene a reflection tool names explicitly in its args. The consolidated
+/// reflection session spans every scene, so the scene-writing tools carry the scene
+/// they act on as an argument rather than reading the session's (sentinel) header.
+/// `None` (and the caller's error) when missing or blank.
+fn arg_scene(args: &Value) -> Option<Scene> {
+    args.get("scene")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(|s| Scene(s.to_string()))
+}
+
+/// `record_episode`: file the first `count` of the named scene's unconsolidated
+/// signals as one episode (see [`crate::mind::memory::episodes::record_episode`]).
+/// Returns the episode ref for the session to cite when it updates a facet.
+async fn reflection_record_episode(data_dir: &std::path::Path, args: &Value) -> Value {
+    let Some(scene) = arg_scene(args) else {
+        return tool_error(
+            "record_episode requires `scene` — the id from the episode's `# Scene: <id>` group header",
+        );
+    };
     let Some(count) = args.get("count").and_then(Value::as_u64) else {
         return tool_error("record_episode requires an integer `count` >= 1");
     };
@@ -695,7 +718,7 @@ async fn reflection_record_episode(
         .and_then(Value::as_array)
         .map(|a| a.iter().filter_map(|v| v.as_str().map(str::to_owned)).collect())
         .unwrap_or_default();
-    match crate::mind::memory::episodes::record_episode(data_dir, scene, count as usize, title, gist, &subjects)
+    match crate::mind::memory::episodes::record_episode(data_dir, &scene, count as usize, title, gist, &subjects)
         .await
     {
         Ok(name) => tool_ok(&format!("recorded episode {name}")),
@@ -814,7 +837,12 @@ async fn reflection_merge_people(data_dir: &std::path::Path, args: &Value) -> Va
 /// spans the mind chose (see [`crate::mind::memory::decay::keep_and_fade`]). The safety
 /// gate lives in the tool, so an attempt on an un-consolidated day comes back as a
 /// tool error the session can read, not a panic.
-async fn reflection_keep_and_fade(data_dir: &std::path::Path, scene: &Scene, args: &Value) -> Value {
+async fn reflection_keep_and_fade(data_dir: &std::path::Path, args: &Value) -> Value {
+    let Some(scene) = arg_scene(args) else {
+        return tool_error(
+            "keep_and_fade requires `scene` — the id from the day's `# Scene: <id>` group header",
+        );
+    };
     let Some(channel) = args.get("channel").and_then(Value::as_str) else {
         return tool_error("keep_and_fade requires `channel` (audio|vision)");
     };
@@ -842,7 +870,7 @@ async fn reflection_keep_and_fade(data_dir: &std::path::Path, scene: &Scene, arg
             spans.push(crate::mind::memory::decay::KeepSpan { start, end });
         }
     }
-    match crate::mind::memory::decay::keep_and_fade(data_dir, scene, channel, date, &spans).await {
+    match crate::mind::memory::decay::keep_and_fade(data_dir, &scene, channel, date, &spans).await {
         Ok(r) => tool_ok(&format!(
             "faded {} {date}: kept {} keepsake(s), freed {} bytes",
             channel.as_str(),
@@ -869,6 +897,11 @@ async fn do_see(data_dir: &Path, scene: &Scene, args: &Value) -> Value {
             "see: malformed ref {reff:?} (expected <YYYY-MM-DD>/<HH>/<MM>-<SS>.<ext>)"
         ));
     };
+    // The live reactor `see` resolves against its own scene (the header). The
+    // consolidated reflection session has no single scene, so it names the scene the
+    // ref belongs to in `scene` — honored here, header otherwise.
+    let owned = arg_scene(args);
+    let scene = owned.as_ref().unwrap_or(scene);
     let Some(path) =
         crate::mind::memory::media::resolve(data_dir, scene, crate::types::Channel::Vision, ts, &rel).await
     else {
