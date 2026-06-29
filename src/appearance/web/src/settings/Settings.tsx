@@ -219,19 +219,19 @@ export function Settings() {
   );
 }
 
-/** Login/Free: show the broker account — plan + remaining credits, or a connecting/hint state. */
+/** Login/Free: show the broker account — tier + remaining energy, or a connecting/hint state. */
 function AccountCard({ mode, account }: { mode: Mode; account: Account | null }) {
   const pct =
-    account && account.credits_limit > 0
-      ? Math.max(0, Math.min(100, Math.round((account.credits_remaining / account.credits_limit) * 100)))
+    account && account.energy_total > 0
+      ? Math.max(0, Math.min(100, Math.round((account.energy_remaining / account.energy_total) * 100)))
       : 0;
-  const resets = account?.credits_resets_at ? fmtDate(account.credits_resets_at) : "";
+  const resets = account?.resets_at ? fmtDate(account.resets_at) : "";
   return (
     <section className="settings-card">
       <div className="settings-card-head">
         <h2>{mode === "free" ? "Free" : "Xiaoyuanzhu"}</h2>
         {account ? (
-          <span className="tag ok">{account.plan}</span>
+          <span className="tag ok">{account.tier}</span>
         ) : (
           <span className="tag off">not connected</span>
         )}
@@ -242,17 +242,17 @@ function AccountCard({ mode, account }: { mode: Mode; account: Account | null })
             <i style={{ width: `${pct}%` }} />
           </div>
           <p className="settings-sub">
-            {account.credits_remaining.toLocaleString()} / {account.credits_limit.toLocaleString()} credits
+            {account.energy_remaining.toLocaleString()} / {account.energy_total.toLocaleString()} energy
             {resets && <> · resets {resets}</>}
           </p>
         </div>
       ) : mode === "login" ? (
         <p className="settings-sub">
-          Sign in at <code>account.xiaoyuanzhu.com</code> to draw subscription credits.{" "}
+          Sign in at <code>account.xiaoyuanzhu.com</code> to draw subscription energy.{" "}
           <em>(login token wiring in progress)</em>
         </p>
       ) : (
-        <p className="settings-sub">Connecting to the gateway for daily free credits…</p>
+        <p className="settings-sub">Connecting to the gateway for daily free energy…</p>
       )}
     </section>
   );

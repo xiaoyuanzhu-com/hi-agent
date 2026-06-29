@@ -264,6 +264,26 @@ impl VendorHealth {
         self.consecutive_failures.store(0, Ordering::Relaxed);
         self.down.swap(false, Ordering::Relaxed)
     }
+
+    /// Force the Down state immediately — for a *definite* outage like
+    /// out-of-energy (a 402), which shouldn't wait out `down_after` flaky retries.
+    /// Returns `true` on the Up→Down flip (so the caller emits the notice once).
+    fn force_down(&self) -> bool {
+        self.consecutive_failures.store(self.down_after, Ordering::Relaxed);
+        !self.down.swap(true, Ordering::Relaxed)
+    }
+}
+
+/// Whether a terminal turn error is the gateway reporting "out of energy"
+/// (songguo 402) rather than a generic outage. The ACP adapter collapses the
+/// upstream HTTP status into an opaque string, so we match the markers it carries.
+/// A miss just degrades to the generic vendor-down message — input is still
+/// stashed and caught up either way.
+fn is_out_of_energy(err: &anyhow::Error) -> bool {
+    let s = format!("{err:#}").to_ascii_lowercase();
+    s.contains("songguo_budget_exceeded")
+        || s.contains("budget exceeded")
+        || s.contains("payment required")
 }
 
 #[cfg(test)]
@@ -272,6 +292,24 @@ mod vendor_health_tests {
 
     fn fresh() -> VendorHealth {
         VendorHealth::new(2)
+    }
+
+    #[test]
+    fn force_down_flips_immediately_and_once() {
+        let h = fresh();
+        assert!(h.force_down(), "Up -> Down flips on first force");
+        assert!(h.is_down());
+        assert!(!h.force_down(), "already Down -> no second flip");
+        assert!(h.record_success(), "Down -> Up on success");
+        assert!(!h.is_down());
+    }
+
+    #[test]
+    fn detects_out_of_energy() {
+        assert!(super::is_out_of_energy(&anyhow::anyhow!(
+            "session/prompt failed: 402 Payment Required songguo_budget_exceeded"
+        )));
+        assert!(!super::is_out_of_energy(&anyhow::anyhow!("connection reset by peer")));
     }
 
     #[test]
@@ -1637,14 +1675,24 @@ async fn run_turn(
                 }
             }
             Err(err) => {
-                let flipped = reactor.inner.vendor_health.record_failure();
+                // Out-of-energy (gateway 402) is a *definite* outage: flip to the
+                // mailbox immediately rather than waiting out `down_after`, and
+                // nudge toward sub/byok. Either way the existing down/probe path
+                // stashes input and catches up when it recovers (energy resets).
+                let out_of_energy = is_out_of_energy(err);
+                let flipped = if out_of_energy {
+                    reactor.inner.vendor_health.force_down()
+                } else {
+                    reactor.inner.vendor_health.record_failure()
+                };
                 if flipped {
-                    let _ = beats
-                        .send(sequencer::Beat::Say(
-                            "我暂时连不上模型，先攒着你的消息，等恢复了一起处理。".to_string(),
-                        ))
-                        .await;
-                } else if apologize {
+                    let line = if out_of_energy {
+                        "能量用完了。我先把你说的记下来，等能量恢复就接着处理。想现在就继续的话，可以在设置里订阅，或填入自己的 API key。".to_string()
+                    } else {
+                        "我暂时连不上模型，先攒着你的消息，等恢复了一起处理。".to_string()
+                    };
+                    let _ = beats.send(sequencer::Beat::Say(line)).await;
+                } else if apologize && !out_of_energy {
                     let _ = beats
                         .send(sequencer::Beat::Say(format!(
                             "抱歉，我这边出了点问题，没能完成这次回应。({err})"

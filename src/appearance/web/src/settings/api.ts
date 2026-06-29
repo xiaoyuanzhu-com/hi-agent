@@ -12,13 +12,12 @@ export interface VendorView {
 /** How the agent obtains its credentials. */
 export type Mode = "byok" | "login" | "free";
 
-/** The broker account snapshot (login/free), absent until a bundle is fetched. */
+/** The broker account snapshot (login/free), absent until energy is fetched. */
 export interface Account {
-  plan: string;
-  credits_remaining: number;
-  credits_limit: number;
-  credits_resets_at: string;
-  expires_at: string;
+  tier: string;
+  energy_remaining: number;
+  energy_total: number;
+  resets_at: string;
 }
 
 export interface CredentialsView {
