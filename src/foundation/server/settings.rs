@@ -46,15 +46,14 @@ pub async fn get_credentials(State(state): State<Arc<AppState>>) -> Json<Value> 
     let creds = Credentials::load(&state.data_dir);
     let key = creds.llm.api_key.trim();
     let llm_configured = !key.is_empty();
-    // In login/free mode, the broker-minted bundle's account snapshot — for the UI
-    // to show the plan + remaining credits. Absent until a bundle has been fetched.
-    let account = creds.managed.as_ref().map(|m| {
+    // In free/login mode, the broker's energy snapshot — for the UI to show the
+    // tier + remaining/total energy. Absent until energy has been fetched.
+    let account = creds.energy.as_ref().map(|e| {
         json!({
-            "plan": m.plan,
-            "credits_remaining": m.credits_remaining,
-            "credits_limit": m.credits_limit,
-            "credits_resets_at": m.credits_resets_at,
-            "expires_at": m.expires_at,
+            "tier": e.tier,
+            "energy_remaining": e.remaining,
+            "energy_total": e.total,
+            "resets_at": e.resets_at,
         })
     });
     Json(json!({

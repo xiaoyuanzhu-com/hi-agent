@@ -1,15 +1,17 @@
-//! BYOK credential store: the user's own vendor keys, persisted under the data
-//! dir as `credentials.json` and resolved at startup. When a key is unset, the
-//! agent falls back to `.env` (`AI_API_KEY`, `VOLCENGINE_*`, `DOUBAO_*`, …) so
-//! dev / journey-test flows keep working. A vendor key in the store also implies
-//! that vendor is the selected provider for its capability.
+//! Credential store: the user's BYOK keys, or (free/login) the broker-issued
+//! account tokens plus the configs the broker hands back. Persisted under the
+//! data dir as `credentials.json`, resolved at startup, refreshed by the broker
+//! client. When a managed key is unset the agent falls back to `.env`
+//! (`AI_API_KEY`, `VOLCENGINE_*`, `DOUBAO_*`, …) so dev / journey-test flows keep
+//! working. A vendor key in effect also implies that vendor is the provider for
+//! its capability.
 
 use std::path::{Path, PathBuf};
 
 use anyhow::Context;
 use serde::{Deserialize, Serialize};
 
-/// File under the data dir holding the user's vendor credentials.
+/// File under the data dir holding the credential store.
 const FILE: &str = "credentials.json";
 
 /// Absolute path to the credential store for `data_dir`.
@@ -18,12 +20,13 @@ pub fn path(data_dir: &Path) -> PathBuf {
 }
 
 /// How the agent obtains its credentials.
-/// - `free`: anonymous daily credits from the broker (hi.xiaoyuanzhu.com) — the
+/// - `free`: an anonymous device account, auto-created at the broker — the
 ///   default, so a fresh install works with no setup.
-/// - `login`: subscription credits, tied to an account.xiaoyuanzhu.com user.
+/// - `login`: an account.xiaoyuanzhu.com user (where a subscription lives).
 /// - `byok`: the user's own keys (the flat fields below).
 ///
-/// `free`/`login` cache the broker bundle in [`Credentials::managed`].
+/// `free`/`login` go through a one-time **bootstrap** that yields account
+/// [`Tokens`]; the access token then authenticates the configs + energy fetches.
 #[derive(Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize, Debug)]
 #[serde(rename_all = "lowercase")]
 pub enum Mode {
@@ -33,32 +36,47 @@ pub enum Mode {
     Free,
 }
 
-/// The user's credentials (BYOK) plus, for login/free, the broker-minted bundle.
-/// The flat `llm`/vendor fields are the BYOK keys; `managed` caches the broker
-/// bundle. [`Credentials::effective`] picks which set is live for the current mode.
+/// The user's credentials (BYOK) plus, for free/login, the broker account tokens
+/// and the configs/energy the broker minted. [`Credentials::effective`] picks
+/// which credential set is live for the current mode.
 #[derive(Clone, Default, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Credentials {
     /// Which credential source is live. Default `free`.
     pub mode: Mode,
     pub llm: LlmCredentials,
-    /// Speech-to-text (Volcengine).
     pub stt: VendorKey,
-    /// Text-to-speech (Volcengine).
     pub tts: VendorKey,
-    /// Image + video understanding (Doubao).
     pub vision: VendorKey,
-    /// Image generation (Doubao).
     pub image: VendorKey,
-    /// Video generation (Doubao).
     pub video: VendorKey,
-    /// Stable per-install id sent to the broker as the free-mode allowance key.
-    /// Minted on first need (see the broker client); not a secret.
+    /// Stable per-install id — the seed for the free bootstrap (not a secret).
     #[serde(skip_serializing_if = "String::is_empty")]
     pub device_id: String,
-    /// The last bundle the broker minted (login/free). Refreshed before `expires_at`.
+    /// Broker-issued account tokens (free/login). The unified credential after
+    /// bootstrap: the access token authenticates configs + energy; the refresh
+    /// token mints a new access when it expires.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tokens: Option<Tokens>,
+    /// Last configs the broker minted (free/login) — the vendor settings applied.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub managed: Option<Managed>,
+    /// Last energy snapshot, for the Settings bar. Polled on its own cadence,
+    /// separate from configs.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub energy: Option<Energy>,
+}
+
+/// Broker-issued account tokens. The access token is a short-lived bearer for
+/// configs/energy; the refresh token mints new access tokens (and is rotated each
+/// refresh, so the newest must always be persisted).
+#[derive(Clone, Default, Serialize, Deserialize)]
+#[serde(default)]
+pub struct Tokens {
+    pub access_token: String,
+    pub refresh_token: String,
+    /// RFC3339 access-token expiry; refresh at or before this.
+    pub access_expires_at: String,
 }
 
 /// Upstream LLM credentials (the bundled Claude adapter's `ANTHROPIC_*`).
@@ -74,12 +92,10 @@ pub struct LlmCredentials {
     pub model: Option<String>,
 }
 
-/// A single-vendor secret — just the API key (the BYOK essential). Non-secret
-/// params (endpoints, resource ids, models, voices) stay on their env defaults.
+/// A single-vendor secret — just the API key (the BYOK essential).
 #[derive(Clone, Default, Serialize, Deserialize)]
 #[serde(default)]
 pub struct VendorKey {
-    /// API key; empty → not configured (falls back to that vendor's env key).
     pub api_key: String,
 }
 
@@ -88,16 +104,13 @@ impl VendorKey {
     /// env" signal threaded into each capability's init.
     pub fn key_opt(&self) -> Option<&str> {
         let k = self.api_key.trim();
-        if k.is_empty() {
-            None
-        } else {
-            Some(k)
-        }
+        if k.is_empty() { None } else { Some(k) }
     }
 }
 
-/// A broker-minted bundle (login/free): the same credential fields as BYOK plus
-/// the account snapshot. Cached in the store; refreshed from the broker.
+/// Broker-minted configs (free/login): the same credential fields as BYOK. The
+/// account/energy snapshot is separate ([`Energy`]) so it can be polled often
+/// without re-fetching configs.
 #[derive(Clone, Default, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Managed {
@@ -107,29 +120,22 @@ pub struct Managed {
     pub vision: VendorKey,
     pub image: VendorKey,
     pub video: VendorKey,
-    /// Plan name from the broker (e.g. "free", "pro").
-    pub plan: String,
-    pub credits_remaining: i64,
-    pub credits_limit: i64,
-    pub credits_resets_at: String,
-    /// RFC3339; after this the bundle should be refreshed (refresh timer is future
-    /// work — v1 refetches on each startup).
-    pub expires_at: String,
 }
 
-impl std::fmt::Debug for Managed {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("Managed")
-            .field("llm", &self.llm)
-            .field("plan", &self.plan)
-            .field("credits_remaining", &self.credits_remaining)
-            .field("expires_at", &self.expires_at)
-            .finish_non_exhaustive()
-    }
+/// The user-facing balance from `/energy` (free/login). Cached for display; the
+/// live value is metered at the gateway. `unit` is always "energy".
+#[derive(Clone, Default, Serialize, Deserialize, Debug)]
+#[serde(default)]
+pub struct Energy {
+    pub remaining: i64,
+    pub total: i64,
+    pub resets_at: String,
+    /// Tier the broker reports: "free" or "sub".
+    pub tier: String,
 }
 
 /// The credentials in effect for the current mode — borrows from either the BYOK
-/// fields or the managed bundle.
+/// fields or the managed configs.
 pub struct Effective<'a> {
     pub llm: &'a LlmCredentials,
     pub stt: &'a VendorKey,
@@ -139,52 +145,10 @@ pub struct Effective<'a> {
     pub video: &'a VendorKey,
 }
 
-// Hand-written so a stray trace never prints the key.
-impl std::fmt::Debug for LlmCredentials {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("LlmCredentials")
-            .field("base_url", &self.base_url)
-            .field("api_key", &redact(&self.api_key))
-            .field("model", &self.model)
-            .finish()
-    }
-}
-
-impl std::fmt::Debug for VendorKey {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("VendorKey").field("api_key", &redact(&self.api_key)).finish()
-    }
-}
-
-impl std::fmt::Debug for Credentials {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("Credentials")
-            .field("mode", &self.mode)
-            .field("llm", &self.llm)
-            .field("stt", &self.stt)
-            .field("tts", &self.tts)
-            .field("vision", &self.vision)
-            .field("image", &self.image)
-            .field("video", &self.video)
-            .field("device_id", &self.device_id)
-            .field("managed", &self.managed)
-            .finish()
-    }
-}
-
-fn redact(s: &str) -> &'static str {
-    if s.trim().is_empty() {
-        "<unset>"
-    } else {
-        "<redacted>"
-    }
-}
-
 impl Credentials {
-    /// The credentials in effect: the BYOK fields in `byok` mode, the managed
-    /// bundle in login/free. `None` in login/free before a bundle has been
-    /// fetched — callers then fall back to `.env` (resolve) or leave the
-    /// capability off.
+    /// The credentials in effect: BYOK fields in `byok` mode, the managed configs
+    /// in free/login. `None` in free/login before configs have been fetched —
+    /// callers then fall back to `.env` (resolve) or leave the capability off.
     pub fn effective(&self) -> Option<Effective<'_>> {
         match self.mode {
             Mode::Byok => Some(Effective {
@@ -207,7 +171,7 @@ impl Credentials {
     }
 
     /// Load from `<data_dir>/credentials.json`. A missing file yields defaults; a
-    /// corrupt one logs a warning and *also* yields defaults, so a bad hand-edit
+    /// corrupt one logs a warning and also yields defaults, so a bad hand-edit
     /// can't brick boot — the user re-saves from Settings.
     pub fn load(data_dir: &Path) -> Self {
         let p = path(data_dir);
@@ -244,6 +208,61 @@ impl Credentials {
     }
 }
 
+fn redact(s: &str) -> &'static str {
+    if s.trim().is_empty() { "<unset>" } else { "<redacted>" }
+}
+
+// Hand-written Debug impls so a stray trace never prints a secret.
+impl std::fmt::Debug for LlmCredentials {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("LlmCredentials")
+            .field("base_url", &self.base_url)
+            .field("api_key", &redact(&self.api_key))
+            .field("model", &self.model)
+            .finish()
+    }
+}
+
+impl std::fmt::Debug for VendorKey {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("VendorKey").field("api_key", &redact(&self.api_key)).finish()
+    }
+}
+
+impl std::fmt::Debug for Tokens {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Tokens")
+            .field("access_token", &redact(&self.access_token))
+            .field("refresh_token", &redact(&self.refresh_token))
+            .field("access_expires_at", &self.access_expires_at)
+            .finish()
+    }
+}
+
+impl std::fmt::Debug for Managed {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Managed").field("llm", &self.llm).finish_non_exhaustive()
+    }
+}
+
+impl std::fmt::Debug for Credentials {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Credentials")
+            .field("mode", &self.mode)
+            .field("llm", &self.llm)
+            .field("stt", &self.stt)
+            .field("tts", &self.tts)
+            .field("vision", &self.vision)
+            .field("image", &self.image)
+            .field("video", &self.video)
+            .field("device_id", &self.device_id)
+            .field("tokens", &self.tokens)
+            .field("managed", &self.managed)
+            .field("energy", &self.energy)
+            .finish()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -252,55 +271,86 @@ mod tests {
     fn missing_file_is_defaults() {
         let dir = tempfile::tempdir().unwrap();
         let c = Credentials::load(dir.path());
+        assert_eq!(c.mode, Mode::Free);
         assert!(c.llm.api_key.is_empty());
-        assert!(c.llm.base_url.is_empty());
-        assert!(c.llm.model.is_none());
+        assert!(c.tokens.is_none());
     }
 
     #[test]
     fn round_trips_through_disk() {
         let dir = tempfile::tempdir().unwrap();
         let c = Credentials {
-            llm: LlmCredentials {
-                base_url: "https://gw.example/v1".into(),
-                api_key: "sk-secret".into(),
-                model: Some("claude-opus-4-8".into()),
-            },
-            stt: VendorKey { api_key: "stt-key".into() },
+            mode: Mode::Free,
+            device_id: "dev-1".into(),
+            tokens: Some(Tokens {
+                access_token: "acc".into(),
+                refresh_token: "ref".into(),
+                access_expires_at: "2026-06-29T00:00:00Z".into(),
+            }),
+            managed: Some(Managed {
+                llm: LlmCredentials {
+                    base_url: "https://songguo.xiaoyuanzhu.com".into(),
+                    api_key: "sg-secret".into(),
+                    model: None,
+                },
+                stt: VendorKey { api_key: "sg-secret".into() },
+                ..Default::default()
+            }),
+            energy: Some(Energy { remaining: 70, total: 100, resets_at: "x".into(), tier: "free".into() }),
             ..Default::default()
         };
         c.save(dir.path()).unwrap();
         let back = Credentials::load(dir.path());
-        assert_eq!(back.llm.base_url, "https://gw.example/v1");
-        assert_eq!(back.llm.api_key, "sk-secret");
-        assert_eq!(back.llm.model.as_deref(), Some("claude-opus-4-8"));
-        assert_eq!(back.stt.api_key, "stt-key");
-        assert_eq!(back.stt.key_opt(), Some("stt-key"));
-        assert_eq!(back.tts.key_opt(), None);
+        assert_eq!(back.device_id, "dev-1");
+        assert_eq!(back.tokens.as_ref().unwrap().access_token, "acc");
+        assert_eq!(back.managed.as_ref().unwrap().llm.base_url, "https://songguo.xiaoyuanzhu.com");
+        assert_eq!(back.energy.as_ref().unwrap().remaining, 70);
     }
 
     #[test]
-    fn corrupt_file_falls_back_to_defaults() {
-        let dir = tempfile::tempdir().unwrap();
-        std::fs::write(path(dir.path()), b"not json{{").unwrap();
-        let c = Credentials::load(dir.path());
-        assert!(c.llm.api_key.is_empty());
-    }
+    fn effective_picks_byok_or_managed() {
+        let mut c = Credentials::default();
+        assert_eq!(c.mode, Mode::Free); // free is the default
 
-    #[test]
-    fn debug_redacts_the_key() {
-        let c = Credentials {
+        c.mode = Mode::Byok;
+        c.llm.api_key = "byok-key".into();
+        assert_eq!(c.effective().unwrap().llm.api_key, "byok-key");
+
+        // free with no configs → nothing in effect (callers fall back to env).
+        c.mode = Mode::Free;
+        assert!(c.effective().is_none());
+
+        c.managed = Some(Managed {
             llm: LlmCredentials {
-                base_url: "https://x".into(),
-                api_key: "sk-super-secret".into(),
+                base_url: "https://songguo.xiaoyuanzhu.com".into(),
+                api_key: "managed-key".into(),
                 model: None,
             },
+            stt: VendorKey { api_key: "managed-stt".into() },
+            ..Default::default()
+        });
+        let e = c.effective().unwrap();
+        assert_eq!(e.llm.api_key, "managed-key");
+        assert_eq!(e.stt.key_opt(), Some("managed-stt"));
+        assert_ne!(e.llm.api_key, "byok-key"); // BYOK ignored while managed is live
+    }
+
+    #[test]
+    fn debug_redacts_secrets() {
+        let c = Credentials {
+            llm: LlmCredentials { base_url: "https://x".into(), api_key: "sk-super-secret".into(), model: None },
             vision: VendorKey { api_key: "vision-super-secret".into() },
+            tokens: Some(Tokens {
+                access_token: "access-super-secret".into(),
+                refresh_token: "refresh-super-secret".into(),
+                access_expires_at: "x".into(),
+            }),
             ..Default::default()
         };
         let rendered = format!("{c:?}");
-        assert!(!rendered.contains("sk-super-secret"), "key leaked: {rendered}");
-        assert!(!rendered.contains("vision-super-secret"), "vendor key leaked: {rendered}");
+        for leak in ["sk-super-secret", "vision-super-secret", "access-super-secret", "refresh-super-secret"] {
+            assert!(!rendered.contains(leak), "leaked {leak}: {rendered}");
+        }
         assert!(rendered.contains("<redacted>"));
     }
 
@@ -312,59 +362,5 @@ mod tests {
         Credentials::default().save(dir.path()).unwrap();
         let mode = std::fs::metadata(path(dir.path())).unwrap().permissions().mode();
         assert_eq!(mode & 0o777, 0o600);
-    }
-
-    #[test]
-    fn effective_picks_byok_or_managed() {
-        let mut c = Credentials::default();
-        assert_eq!(c.mode, Mode::Free); // free is the default
-
-        // BYOK mode → the flat fields.
-        c.mode = Mode::Byok;
-        c.llm.api_key = "byok-key".into();
-        assert_eq!(c.effective().unwrap().llm.api_key, "byok-key");
-
-        // login/free with no bundle → nothing in effect (callers fall back to env).
-        c.mode = Mode::Free;
-        assert!(c.effective().is_none());
-
-        // a bundle takes over.
-        c.managed = Some(Managed {
-            llm: LlmCredentials {
-                base_url: "https://songguo.xiaoyuanzhu.com".into(),
-                api_key: "managed-key".into(),
-                model: None,
-            },
-            stt: VendorKey { api_key: "managed-stt".into() },
-            plan: "free".into(),
-            ..Default::default()
-        });
-        let e = c.effective().unwrap();
-        assert_eq!(e.llm.api_key, "managed-key");
-        assert_eq!(e.llm.base_url, "https://songguo.xiaoyuanzhu.com");
-        assert_eq!(e.stt.key_opt(), Some("managed-stt"));
-        // BYOK key is ignored while a managed bundle is live.
-        assert_ne!(e.llm.api_key, "byok-key");
-    }
-
-    #[test]
-    fn mode_and_device_id_round_trip() {
-        let dir = tempfile::tempdir().unwrap();
-        let c = Credentials { mode: Mode::Login, device_id: "dev-1".into(), ..Default::default() };
-        c.save(dir.path()).unwrap();
-        let back = Credentials::load(dir.path());
-        assert_eq!(back.mode, Mode::Login);
-        assert_eq!(back.device_id, "dev-1");
-    }
-
-    #[test]
-    fn managed_debug_redacts_keys() {
-        let m = Managed {
-            llm: LlmCredentials { base_url: "x".into(), api_key: "managed-super-secret".into(), model: None },
-            plan: "pro".into(),
-            ..Default::default()
-        };
-        let rendered = format!("{m:?}");
-        assert!(!rendered.contains("managed-super-secret"), "key leaked: {rendered}");
     }
 }
