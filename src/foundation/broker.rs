@@ -245,3 +245,44 @@ pub async fn refresh(data_dir: &Path, bearer: Option<&str>) {
         }
     }
 }
+
+/// Lightweight energy poll: re-fetch the balance with the cached access token and
+/// update the store. Best-effort — a failure leaves the last value in place.
+async fn poll_energy(data_dir: &Path) {
+    let mut store = Credentials::load(data_dir);
+    if store.mode == Mode::Byok {
+        return;
+    }
+    let Some(tokens) = store.tokens.clone() else {
+        return;
+    };
+    match fetch_energy(&tokens.access_token).await {
+        Ok(en) => {
+            store.energy = Some(en);
+            if let Err(e) = store.save(data_dir) {
+                tracing::debug!(error = %e, "failed to persist energy poll");
+            }
+        }
+        Err(e) => tracing::debug!(error = %e, "energy poll failed; keeping last value"),
+    }
+}
+
+/// Spawn a detached loop that keeps managed credentials fresh while running: the
+/// full configs refresh on a slow cadence (which also rotates the access token)
+/// and an energy poll on a fast one. No-op in BYOK (each call returns early).
+/// Best-effort; never panics.
+pub fn spawn_refresh_loop(data_dir: std::path::PathBuf) {
+    tokio::spawn(async move {
+        let mut configs = tokio::time::interval(Duration::from_secs(3600));
+        let mut energy = tokio::time::interval(Duration::from_secs(60));
+        // Startup already refreshed once; drop the immediate first ticks.
+        configs.tick().await;
+        energy.tick().await;
+        loop {
+            tokio::select! {
+                _ = configs.tick() => refresh(&data_dir, None).await,
+                _ = energy.tick() => poll_energy(&data_dir).await,
+            }
+        }
+    });
+}

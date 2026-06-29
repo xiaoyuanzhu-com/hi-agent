@@ -82,6 +82,11 @@ async fn run_with_shutdown(config: Config, shutdown: Arc<Notify>) -> anyhow::Res
     foundation::broker::refresh(&config.data_dir, None).await;
     config.agent = foundation::config::AgentConfig::resolve(&config.data_dir);
 
+    // Keep managed credentials fresh while running: re-fetch configs on a slow
+    // cadence (rotating the access token) and poll energy on a fast one. No-op in
+    // BYOK. New sessions pick up a rotated token; long-running ones on respawn.
+    foundation::broker::spawn_refresh_loop(config.data_dir.clone());
+
     let memory = mind::memory::Memory::open(&config.data_dir).await?;
     tracing::info!(data_dir = %config.data_dir.display(), "memory opened");
 
