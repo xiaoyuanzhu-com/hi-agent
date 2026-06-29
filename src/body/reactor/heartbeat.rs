@@ -257,7 +257,13 @@ async fn run_consolidation(reactor: &Reactor, scenes: &[Scene]) -> anyhow::Resul
     // The facet subject index is global — gathered once, shared across every group so
     // the mind reuses a subject instead of coining a near-duplicate in each scene.
     let subjects = facets::facet_subject_index(data_dir).await.unwrap_or_default();
-    let prompt = build_consolidation_prompt(&groups, &subjects);
+
+    // The current proactivity read, folded into the prompt so the pass can
+    // regenerate it from old-plus-new — the session has no cwd to read the file
+    // itself, so it goes in (and back out through `update_proactivity`) like facets.
+    let current_proactivity = crate::mind::memory::proactivity::read(data_dir).await.ok().flatten();
+
+    let prompt = build_consolidation_prompt(&groups, &subjects, current_proactivity.as_deref());
     let system_prompt = crate::identity::reflection_prompt(data_dir).await;
 
     let sentinel = consolidation_scene();
@@ -298,7 +304,11 @@ async fn run_consolidation(reactor: &Reactor, scenes: &[Scene]) -> anyhow::Resul
 /// one labelled group per scene (see [`render_scene_group`]). Each scene's frontier
 /// is numbered oldest-first from 1 independently, so the `count` the mind hands back
 /// to `record_episode` is into *that scene's* list; the scene is named on the call.
-fn build_consolidation_prompt(groups: &[SceneFrontier], subjects: &[String]) -> String {
+fn build_consolidation_prompt(
+    groups: &[SceneFrontier],
+    subjects: &[String],
+    current_proactivity: Option<&str>,
+) -> String {
     use std::fmt::Write as _;
     let mut s = String::new();
     // The subject index is global — one block, shared across every scene group, so a
@@ -312,6 +322,19 @@ fn build_consolidation_prompt(groups: &[SceneFrontier], subjects: &[String]) -> 
         let _ = writeln!(s, "# Scene: {}\n", g.scene.0);
         render_scene_group(&mut s, g);
         s.push('\n');
+    }
+    // The current proactivity read goes in so the pass regenerates it from
+    // old-plus-new (it can't read the file itself — no cwd). What to do with it
+    // lives in reflection.md; this just carries the data.
+    s.push_str(
+        "## Current proactivity.md (your read on speaking up unprompted — regenerate via `update_proactivity` if any unprompted word of yours landed this stretch)\n",
+    );
+    match current_proactivity {
+        Some(c) if !c.trim().is_empty() => {
+            s.push_str(c.trim());
+            s.push_str("\n\n");
+        }
+        _ => s.push_str("(none yet)\n\n"),
     }
     s.push_str("Consolidate these now — name the scene on every `record_episode`, `keep_and_fade`, and `see`.");
     s
@@ -781,7 +804,7 @@ mod cooccur_tests {
     fn prompt_annotates_a_sole_co_occurring_face() {
         let tail = vec![vision(at(0), None), audio(at(1), None)];
         let g = group("s", tail, faces(&[(0, "ff32ce3w")]));
-        let p = build_consolidation_prompt(std::slice::from_ref(&g), &[]);
+        let p = build_consolidation_prompt(std::slice::from_ref(&g), &[], None);
         assert!(p.contains("⟨one face present: ff32ce3w⟩"), "prompt was:\n{p}");
     }
 
@@ -791,7 +814,7 @@ mod cooccur_tests {
         // its frontier restarts numbering at [1], so a `count` is unambiguous per scene.
         let a = group("alpha", vec![audio(at(0), None), audio(at(1), None)], HashMap::new());
         let b = group("beta", vec![audio(at(10), None)], HashMap::new());
-        let p = build_consolidation_prompt(&[a, b], &[]);
+        let p = build_consolidation_prompt(&[a, b], &[], None);
         assert!(p.contains("# Scene: alpha"), "prompt was:\n{p}");
         assert!(p.contains("# Scene: beta"), "prompt was:\n{p}");
         // Two groups, so the "[1]" first-signal marker appears exactly twice.
@@ -801,7 +824,7 @@ mod cooccur_tests {
     #[test]
     fn global_subjects_appear_once_above_the_groups() {
         let a = group("alpha", vec![audio(at(0), None), audio(at(1), None), audio(at(2), None), audio(at(3), None)], HashMap::new());
-        let p = build_consolidation_prompt(std::slice::from_ref(&a), &["people/alice".into(), "places/office".into()]);
+        let p = build_consolidation_prompt(std::slice::from_ref(&a), &["people/alice".into(), "places/office".into()], None);
         assert_eq!(p.matches("Subjects you already model").count(), 1, "prompt was:\n{p}");
         assert!(p.contains("people/alice, places/office"), "prompt was:\n{p}");
     }

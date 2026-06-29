@@ -219,6 +219,24 @@ fn tools_for_role(role: Option<&str>) -> Vec<Value> {
                     "required": ["scene", "channel", "date"],
                 }),
             ),
+            tool(
+                "update_proactivity",
+                "Rewrite the agent's standing read on speaking up unprompted — the whole \
+                 `proactivity.md`, regenerated, not patched. Reach for it when an unprompted word of the \
+                 agent's landed (or fell flat) in the signals you just read: the agent spoke first, no one \
+                 asked, and how that was met is what you're folding in. Pass the COMPLETE file: a short \
+                 line per subject with where it now stands — `welcomed`, `tolerated`, `unproven`, or \
+                 `muted` — and a few words of why, grounded in what actually happened. Be quick to pull a \
+                 subject back on a brush-off or silence, slow to widen one on a single warm reception. \
+                 Keep it short and scannable — the agent reads this before every proactive word.",
+                json!({
+                    "type": "object",
+                    "properties": {
+                        "content": { "type": "string", "description": "The full regenerated proactivity.md (markdown): a line per subject with its standing (welcomed/tolerated/unproven/muted) and a brief, evidence-based why." },
+                    },
+                    "required": ["content"],
+                }),
+            ),
             see_tool(),
         ],
         // Default to the reactor surface (the soul describes these).
@@ -448,6 +466,7 @@ async fn dispatch_tool(
         "record_episode" => return reflection_record_episode(data_dir, args).await,
         "read_facet" => return reflection_read_facet(data_dir, args).await,
         "update_facet" => return reflection_update_facet(data_dir, args).await,
+        "update_proactivity" => return reflection_update_proactivity(data_dir, args).await,
         "name_person" => return reflection_name_person(data_dir, args).await,
         "merge_people" => return reflection_merge_people(data_dir, args).await,
         "keep_and_fade" => return reflection_keep_and_fade(data_dir, args).await,
@@ -755,6 +774,20 @@ async fn reflection_update_facet(data_dir: &std::path::Path, args: &Value) -> Va
     }
     match crate::mind::memory::facets::update_facet(data_dir, dim, subject, content).await {
         Ok(refname) => tool_ok(&format!("updated facet {refname}")),
+        Err(err) => tool_error(&err.to_string()),
+    }
+}
+
+/// `update_proactivity`: regenerate the whole `proactivity.md` — the learned
+/// read on speaking up unprompted — from how the agent's own unprompted utterances
+/// landed (see [`crate::mind::memory::proactivity::write`]). Whole-file, never a patch.
+async fn reflection_update_proactivity(data_dir: &std::path::Path, args: &Value) -> Value {
+    let content = args.get("content").and_then(Value::as_str).unwrap_or_default();
+    if content.trim().is_empty() {
+        return tool_error("update_proactivity requires non-empty `content`");
+    }
+    match crate::mind::memory::proactivity::write(data_dir, content).await {
+        Ok(()) => tool_ok("updated proactivity.md"),
         Err(err) => tool_error(&err.to_string()),
     }
 }

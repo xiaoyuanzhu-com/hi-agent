@@ -132,6 +132,7 @@ pub fn load_soul(data_dir: &Path) -> String {
     let self_md = self_path(&base);
     let commitments = commitments_path(&base);
     let hot = crate::mind::memory::layout::hot_path(&base);
+    let proactivity = crate::mind::memory::layout::proactivity_path(&base);
     format!(
         "You're warm, honest, and kind-hearted — easy company. You like being \
 useful, and when there's a hand to lend you're glad to lend it.\n\n\
@@ -149,13 +150,18 @@ loads into every fresh session, so it's how you remember a duty across a restart
 yours to write: note a duty there the moment you take one on, strike it when it ends. \
 Always use that exact absolute path, never a relative one, so there is only ever one such file.\n\
 - {} — a rolling digest of what's lately been on your mind, refreshed as you reflect. \
-It may not exist yet; that's fine.",
+It may not exist yet; that's fine.\n\
+- {} — what the person welcomes you raising unprompted, and what they don't: a per-topic \
+read you've built from how your past nudges landed, refreshed as you reflect. Consult it \
+before you ever speak up on your own initiative, and respect it. It may not exist yet; \
+then nothing's proven — lean quiet.",
         core.display(),
         speaking.display(),
         meaning.display(),
         self_md.display(),
         commitments.display(),
         hot.display(),
+        proactivity.display(),
     )
 }
 
@@ -174,6 +180,9 @@ mod soul_tests {
         // The recency digest is referenced by path too, never inlined.
         let hot = crate::mind::memory::layout::hot_path(dir.path());
         assert!(seed.contains(&hot.display().to_string()));
+        // The proactivity license is referenced the same way — read, never inlined.
+        let proactivity = crate::mind::memory::layout::proactivity_path(dir.path());
+        assert!(seed.contains(&proactivity.display().to_string()));
         // It tells the mind to read them up front.
         assert!(seed.contains("read them all now"));
     }
