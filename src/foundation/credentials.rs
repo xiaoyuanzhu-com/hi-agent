@@ -19,6 +19,31 @@ pub fn path(data_dir: &Path) -> PathBuf {
     data_dir.join(FILE)
 }
 
+/// Env flag that overrides the stored credential mode — handy for flipping
+/// free/byok in testing without the Settings UI or editing the file. When set it
+/// wins over the stored mode; unset → the stored mode (default free).
+const ENV_MODE: &str = "HI_AGENT_MODE";
+
+/// Parse a mode string, case-insensitive (`byok` | `login` | `free`). Unknown → None.
+fn parse_mode(s: &str) -> Option<Mode> {
+    match s.trim().to_ascii_lowercase().as_str() {
+        "byok" => Some(Mode::Byok),
+        "login" => Some(Mode::Login),
+        "free" => Some(Mode::Free),
+        _ => None,
+    }
+}
+
+/// The mode forced by `HI_AGENT_MODE`, if set to a recognized value.
+fn mode_override() -> Option<Mode> {
+    let v = std::env::var(ENV_MODE).ok()?;
+    let m = parse_mode(&v);
+    if m.is_none() && !v.trim().is_empty() {
+        tracing::warn!(value = %v, "ignoring unknown HI_AGENT_MODE (expected byok|login|free)");
+    }
+    m
+}
+
 /// How the agent obtains its credentials.
 /// - `free`: an anonymous device account, auto-created at the broker — the
 ///   default, so a fresh install works with no setup.
@@ -175,7 +200,7 @@ impl Credentials {
     /// can't brick boot — the user re-saves from Settings.
     pub fn load(data_dir: &Path) -> Self {
         let p = path(data_dir);
-        match std::fs::read(&p) {
+        let mut c = match std::fs::read(&p) {
             Ok(bytes) => serde_json::from_slice(&bytes).unwrap_or_else(|e| {
                 tracing::warn!(
                     path = %p.display(), error = %e,
@@ -188,7 +213,12 @@ impl Credentials {
                 tracing::warn!(path = %p.display(), error = %e, "could not read credentials.json; ignoring");
                 Self::default()
             }
+        };
+        // An explicit HI_AGENT_MODE wins over the stored mode (testing override).
+        if let Some(m) = mode_override() {
+            c.mode = m;
         }
+        c
     }
 
     /// Persist to `<data_dir>/credentials.json`, owner-only (`0600` on unix).
@@ -266,6 +296,14 @@ impl std::fmt::Debug for Credentials {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn parse_mode_is_case_insensitive() {
+        assert_eq!(parse_mode("byok"), Some(Mode::Byok));
+        assert_eq!(parse_mode("FREE"), Some(Mode::Free));
+        assert_eq!(parse_mode(" login "), Some(Mode::Login));
+        assert_eq!(parse_mode("nope"), None);
+    }
 
     #[test]
     fn missing_file_is_defaults() {
