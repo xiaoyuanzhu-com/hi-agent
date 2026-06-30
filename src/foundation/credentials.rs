@@ -117,11 +117,18 @@ pub struct LlmCredentials {
     pub model: Option<String>,
 }
 
-/// A single-vendor secret — just the API key (the BYOK essential).
+/// A single-vendor config. In BYOK only `api_key` is set (other params stay on
+/// env defaults); in managed mode the broker also fills `base_url` (songguo) and
+/// may fill `model`, and the vendor host-rebases its native endpoint onto songguo.
 #[derive(Clone, Default, Serialize, Deserialize)]
 #[serde(default)]
 pub struct VendorKey {
+    /// Gateway base; empty → the vendor's own default endpoint.
+    pub base_url: String,
     pub api_key: String,
+    /// Model override; None → the vendor's default.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub model: Option<String>,
 }
 
 impl VendorKey {
@@ -130,6 +137,17 @@ impl VendorKey {
     pub fn key_opt(&self) -> Option<&str> {
         let k = self.api_key.trim();
         if k.is_empty() { None } else { Some(k) }
+    }
+
+    /// The managed gateway base if set, else `None` (use the vendor's default).
+    pub fn base_url_opt(&self) -> Option<&str> {
+        let b = self.base_url.trim();
+        if b.is_empty() { None } else { Some(b) }
+    }
+
+    /// The managed model override if set, else `None`.
+    pub fn model_opt(&self) -> Option<&str> {
+        self.model.as_deref().map(str::trim).filter(|m| !m.is_empty())
     }
 }
 
@@ -255,7 +273,11 @@ impl std::fmt::Debug for LlmCredentials {
 
 impl std::fmt::Debug for VendorKey {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("VendorKey").field("api_key", &redact(&self.api_key)).finish()
+        f.debug_struct("VendorKey")
+            .field("base_url", &self.base_url)
+            .field("api_key", &redact(&self.api_key))
+            .field("model", &self.model)
+            .finish()
     }
 }
 
@@ -331,7 +353,7 @@ mod tests {
                     api_key: "sg-secret".into(),
                     model: None,
                 },
-                stt: VendorKey { api_key: "sg-secret".into() },
+                stt: VendorKey { api_key: "sg-secret".into(), ..Default::default() },
                 ..Default::default()
             }),
             energy: Some(Energy { remaining: 70, total: 100, resets_at: "x".into(), tier: "free".into() }),
@@ -364,7 +386,7 @@ mod tests {
                 api_key: "managed-key".into(),
                 model: None,
             },
-            stt: VendorKey { api_key: "managed-stt".into() },
+            stt: VendorKey { api_key: "managed-stt".into(), ..Default::default() },
             ..Default::default()
         });
         let e = c.effective().unwrap();
@@ -377,7 +399,7 @@ mod tests {
     fn debug_redacts_secrets() {
         let c = Credentials {
             llm: LlmCredentials { base_url: "https://x".into(), api_key: "sk-super-secret".into(), model: None },
-            vision: VendorKey { api_key: "vision-super-secret".into() },
+            vision: VendorKey { api_key: "vision-super-secret".into(), ..Default::default() },
             tokens: Some(Tokens {
                 access_token: "access-super-secret".into(),
                 refresh_token: "refresh-super-secret".into(),

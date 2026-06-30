@@ -82,25 +82,41 @@ impl Config {
     /// overriding it verbatim. Required-and-missing / an unknown preset fails fast at
     /// startup rather than as an error at first use.
     pub fn from_env() -> anyhow::Result<Self> {
-        Self::from_env_with_key(None)
+        Self::from_env_with(None, None, None)
     }
 
-    /// Like [`from_env`](Self::from_env) but the API key comes from `key_override`
-    /// when non-empty (the BYOK store), falling back to `DOUBAO_VISION_API_KEY`.
+    /// Back-compat: BYOK key override only.
     pub fn from_env_with_key(key_override: Option<&str>) -> anyhow::Result<Self> {
+        Self::from_env_with(key_override, None, None)
+    }
+
+    /// Resolve config, taking managed overrides when present: `key_override`
+    /// replaces `DOUBAO_VISION_API_KEY`, `base_url_override` host-rebases the api
+    /// base onto the gateway (songguo), `model_override` replaces the model.
+    pub fn from_env_with(
+        key_override: Option<&str>,
+        base_url_override: Option<&str>,
+        model_override: Option<&str>,
+    ) -> anyhow::Result<Self> {
         let api_key = match key_override {
             Some(k) if !k.trim().is_empty() => k.trim().to_string(),
             _ => std::env::var(ENV_API_KEY)
                 .map_err(|_| anyhow::anyhow!("{ENV_API_KEY} is required when VISION_PROVIDER=doubao"))?,
         };
-        let api_base =
+        let mut api_base =
             std::env::var(ENV_API_BASE).unwrap_or_else(|_| DEFAULT_API_BASE.to_string());
-        let model = match std::env::var(ENV_MODEL) {
-            Ok(m) if !m.trim().is_empty() => m,
-            _ => {
-                let preset = std::env::var(ENV_PRESET).unwrap_or_else(|_| DEFAULT_PRESET.to_string());
-                preset_model(&preset)?.to_string()
-            }
+        if let Some(base) = base_url_override {
+            api_base = super::rebase_host(&api_base, base);
+        }
+        let model = match model_override {
+            Some(m) if !m.trim().is_empty() => m.trim().to_string(),
+            _ => match std::env::var(ENV_MODEL) {
+                Ok(m) if !m.trim().is_empty() => m,
+                _ => {
+                    let preset = std::env::var(ENV_PRESET).unwrap_or_else(|_| DEFAULT_PRESET.to_string());
+                    preset_model(&preset)?.to_string()
+                }
+            },
         };
 
         let client = reqwest::Client::builder()

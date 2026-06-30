@@ -63,9 +63,9 @@ const ENV_PROVIDER: &str = "STT_PROVIDER";
 /// store key, fall back to `STT_PROVIDER` — unset/`none` disables, an unknown
 /// name is an error so a typo fails at startup rather than as a 501 at request
 /// time. Idempotent — the first init wins.
-pub fn init(store_key: Option<&str>) -> anyhow::Result<()> {
+pub fn init(store_key: Option<&str>, base_url: Option<&str>, model: Option<&str>) -> anyhow::Result<()> {
     let backend = if store_key.map(|k| !k.trim().is_empty()).unwrap_or(false) {
-        Backend::Volcengine(volcengine_stt::Config::from_env_with_key(store_key)?)
+        Backend::Volcengine(volcengine_stt::Config::from_env_with(store_key, base_url, model)?)
     } else {
         match std::env::var(ENV_PROVIDER).unwrap_or_default().as_str() {
             "" | "none" => Backend::Disabled,

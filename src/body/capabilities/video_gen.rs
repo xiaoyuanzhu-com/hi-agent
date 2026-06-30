@@ -101,10 +101,10 @@ const ENV_PROVIDER: &str = "VIDEO_GEN_PROVIDER";
 /// Resolve the provider from `VIDEO_GEN_PROVIDER` into the process-global
 /// config. Unset or `none` disables the capability; an unknown name is an
 /// error. Idempotent — the first init wins.
-pub fn init(store_key: Option<&str>) -> anyhow::Result<()> {
+pub fn init(store_key: Option<&str>, base_url: Option<&str>, model: Option<&str>) -> anyhow::Result<()> {
     let backend = if store_key.map(|k| !k.trim().is_empty()).unwrap_or(false) {
         // A BYOK key implies the provider (Doubao is the only video-gen impl).
-        Backend::Doubao(doubao_video_gen::Config::from_env_with_key(store_key)?)
+        Backend::Doubao(doubao_video_gen::Config::from_env_with(store_key, base_url, model)?)
     } else {
         match std::env::var(ENV_PROVIDER).unwrap_or_default().as_str() {
             "" | "none" => Backend::Disabled,

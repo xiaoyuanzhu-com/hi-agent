@@ -49,11 +49,30 @@ pub mod voiceprint;
 /// The recognition capabilities are provisioned separately by [`init_recognition`].
 pub fn init(creds: &crate::foundation::credentials::Credentials) -> anyhow::Result<()> {
     let eff = creds.effective();
-    stt::init(eff.as_ref().and_then(|e| e.stt.key_opt()))?;
-    tts::init(eff.as_ref().and_then(|e| e.tts.key_opt()))?;
-    vision::init(eff.as_ref().and_then(|e| e.vision.key_opt()))?;
-    image_gen::init(eff.as_ref().and_then(|e| e.image.key_opt()))?;
-    video_gen::init(eff.as_ref().and_then(|e| e.video.key_opt()))?;
+    stt::init(
+        eff.as_ref().and_then(|e| e.stt.key_opt()),
+        eff.as_ref().and_then(|e| e.stt.base_url_opt()),
+        eff.as_ref().and_then(|e| e.stt.model_opt()),
+    )?;
+    tts::init(
+        eff.as_ref().and_then(|e| e.tts.key_opt()),
+        eff.as_ref().and_then(|e| e.tts.base_url_opt()),
+    )?;
+    vision::init(
+        eff.as_ref().and_then(|e| e.vision.key_opt()),
+        eff.as_ref().and_then(|e| e.vision.base_url_opt()),
+        eff.as_ref().and_then(|e| e.vision.model_opt()),
+    )?;
+    image_gen::init(
+        eff.as_ref().and_then(|e| e.image.key_opt()),
+        eff.as_ref().and_then(|e| e.image.base_url_opt()),
+        eff.as_ref().and_then(|e| e.image.model_opt()),
+    )?;
+    video_gen::init(
+        eff.as_ref().and_then(|e| e.video.key_opt()),
+        eff.as_ref().and_then(|e| e.video.base_url_opt()),
+        eff.as_ref().and_then(|e| e.video.model_opt()),
+    )?;
     Ok(())
 }
 

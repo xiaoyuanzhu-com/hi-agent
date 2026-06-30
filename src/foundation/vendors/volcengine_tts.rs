@@ -119,13 +119,21 @@ pub struct Config {
 
 impl Config {
     pub fn from_env() -> anyhow::Result<Self> {
-        Self::from_env_with_key(None)
+        Self::from_env_with(None, None)
     }
 
-    /// Like [`from_env`](Self::from_env) but the API key comes from `key_override`
-    /// when non-empty (the BYOK store), falling back to `VOLCENGINE_TTS_API_KEY`.
-    /// All other params stay env-driven.
+    /// Back-compat: BYOK key override only; other params stay env-driven.
     pub fn from_env_with_key(key_override: Option<&str>) -> anyhow::Result<Self> {
+        Self::from_env_with(key_override, None)
+    }
+
+    /// Resolve config, taking managed overrides when present: `key_override`
+    /// replaces `VOLCENGINE_TTS_API_KEY` and `base_url_override` host-rebases the
+    /// endpoint onto the gateway (songguo). Empty overrides fall back to env.
+    pub fn from_env_with(
+        key_override: Option<&str>,
+        base_url_override: Option<&str>,
+    ) -> anyhow::Result<Self> {
         let api_key = match key_override {
             Some(k) if !k.trim().is_empty() => k.trim().to_string(),
             _ => std::env::var(ENV_API_KEY).map_err(|_| {
@@ -134,8 +142,11 @@ impl Config {
         };
         let resource_id =
             std::env::var(ENV_RESOURCE_ID).unwrap_or_else(|_| DEFAULT_RESOURCE_ID.to_string());
-        let endpoint =
+        let mut endpoint =
             std::env::var(ENV_ENDPOINT).unwrap_or_else(|_| DEFAULT_ENDPOINT.to_string());
+        if let Some(base) = base_url_override {
+            endpoint = super::rebase_host(&endpoint, base);
+        }
         let voice = std::env::var(ENV_VOICE).unwrap_or_else(|_| DEFAULT_VOICE.to_string());
         let encoding =
             std::env::var(ENV_ENCODING).unwrap_or_else(|_| DEFAULT_ENCODING.to_string());

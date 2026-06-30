@@ -62,22 +62,36 @@ impl Config {
     /// Resolve config from the environment. `DOUBAO_VIDEO_API_KEY` is required;
     /// base URL and model fall back to the plan endpoint and seedance default.
     pub fn from_env() -> anyhow::Result<Self> {
-        Self::from_env_with_key(None)
+        Self::from_env_with(None, None, None)
     }
 
-    /// Like [`from_env`](Self::from_env) but the API key comes from `key_override`
-    /// when non-empty (the BYOK store), falling back to `DOUBAO_VIDEO_API_KEY`.
+    /// Back-compat: BYOK key override only.
     pub fn from_env_with_key(key_override: Option<&str>) -> anyhow::Result<Self> {
+        Self::from_env_with(key_override, None, None)
+    }
+
+    /// Resolve config, taking managed overrides when present: key, api-base host
+    /// (rebased onto the gateway), and model.
+    pub fn from_env_with(
+        key_override: Option<&str>,
+        base_url_override: Option<&str>,
+        model_override: Option<&str>,
+    ) -> anyhow::Result<Self> {
         let api_key = match key_override {
             Some(k) if !k.trim().is_empty() => k.trim().to_string(),
             _ => std::env::var(ENV_VIDEO_API_KEY).map_err(|_| {
                 anyhow::anyhow!("{ENV_VIDEO_API_KEY} is required when VIDEO_GEN_PROVIDER=doubao")
             })?,
         };
-        let api_base =
+        let mut api_base =
             std::env::var(ENV_VIDEO_API_BASE).unwrap_or_else(|_| DEFAULT_API_BASE.to_string());
-        let model =
-            std::env::var(ENV_VIDEO_MODEL).unwrap_or_else(|_| DEFAULT_VIDEO_MODEL.to_string());
+        if let Some(base) = base_url_override {
+            api_base = super::rebase_host(&api_base, base);
+        }
+        let model = match model_override {
+            Some(m) if !m.trim().is_empty() => m.trim().to_string(),
+            _ => std::env::var(ENV_VIDEO_MODEL).unwrap_or_else(|_| DEFAULT_VIDEO_MODEL.to_string()),
+        };
         let client = reqwest::Client::builder()
             .timeout(REQUEST_TIMEOUT)
             .build()
