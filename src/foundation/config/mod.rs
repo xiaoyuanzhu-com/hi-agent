@@ -1,7 +1,9 @@
 //! Cognition config → child env + settings.json. The LLM credential (base URL,
-//! key, model) is resolved from the config store (Settings / broker); the cognition
-//! tunables (effort, permission mode, pulse, reflection cadence, …) are still
-//! dev-managed from the environment (`.env`).
+//! key, model) and the cognition tunables (effort, permission mode, pulse,
+//! reflection cadence, …) all come from the config store (Settings). The tunables
+//! are read via [`tunables`] (a startup snapshot for the reactor's argless helpers)
+//! or [`crate::foundation::credentials::get_setting`] directly where a data dir is
+//! in scope. Only infra vars (e.g. the server base URL) remain env-driven.
 
 use std::path::Path;
 
@@ -9,49 +11,63 @@ use anyhow::Context;
 
 /// Default upstream base URL when the stored LLM base URL is empty.
 pub const DEFAULT_AI_API_BASE: &str = "https://api.anthropic.com";
-/// Env var setting the adapter's `effortLevel` in its managed settings.json.
-pub const ENV_EFFORT: &str = "HI_AGENT_EFFORT";
-/// Env var setting the adapter's `permissions.defaultMode` in settings.json.
-pub const ENV_PERMISSION_MODE: &str = "HI_AGENT_PERMISSION_MODE";
-/// Env var overriding the reactor heartbeat's hot-swap character ceiling
-/// (`HI_AGENT_COMPACT`). Unset / blank / non-positive → the built-in default.
-pub const ENV_COMPACT: &str = "HI_AGENT_COMPACT";
-/// Env var overriding the idle interval between host pulses (`HI_AGENT_PULSE`).
-/// Accepts the alarm-delay grammar (`90s`, `30m`, `1h`; bare integer = seconds);
-/// `0` or `off` disables pulses. Unset / unparseable → the built-in default.
-pub const ENV_PULSE: &str = "HI_AGENT_PULSE";
-/// Env var to disable the reflection ("sleep") pass entirely
-/// (`HI_AGENT_REFLECT=off`). Any other value (or unset) leaves it on; reflection
-/// then runs on one adaptive clock (see [`ENV_REFLECT_EVERY`]), consolidating the
-/// raw frontier into episodes/facets.
-pub const ENV_REFLECT: &str = "HI_AGENT_REFLECT";
-/// Env var setting the **base** reflection cadence (`HI_AGENT_REFLECT_EVERY`):
-/// how often a scene with fresh input consolidates. Accepts the alarm-delay
-/// grammar (`90s`, `30m`, `1h`; bare integer = seconds); `0` or `off` disables
-/// reflection. Unset / unparseable → the built-in default (1m). When a scene goes
-/// quiet the gap backs off from this base (doubling) up to [`ENV_REFLECT_MAX`].
-pub const ENV_REFLECT_EVERY: &str = "HI_AGENT_REFLECT_EVERY";
-/// Env var capping the idle backoff (`HI_AGENT_REFLECT_MAX`): once a scene is
-/// caught up and quiet, the reflection gap doubles from the base each pass but
-/// never exceeds this, so a long-idle scene stops re-checking in vain. Alarm-delay
-/// grammar; unset / unparseable → the built-in default (8h).
-pub const ENV_REFLECT_MAX: &str = "HI_AGENT_REFLECT_MAX";
+
+// Keys under which the cognition tunables live in the config store's `app_settings`
+// table. Shared by the readers (reactor, `resolve`) and the settings handler so the
+// names can't drift. Each is optional; an absent key → the built-in default.
+/// Adapter `effortLevel` in settings.json (e.g. low | medium | high).
+pub const KEY_EFFORT: &str = "effort";
+/// Adapter `permissions.defaultMode` in settings.json (e.g. acceptEdits).
+pub const KEY_PERMISSION_MODE: &str = "permission_mode";
+/// Reactor heartbeat hot-swap character ceiling. Blank / non-positive → default.
+pub const KEY_COMPACT: &str = "compact";
+/// Idle interval between host pulses. Alarm-delay grammar (`90s`/`30m`/`1h`);
+/// `0`/`off` disables pulses; unset / unparseable → the built-in default.
+pub const KEY_PULSE: &str = "pulse";
+/// Master switch for the reflection ("sleep") pass; `off` disables it entirely.
+pub const KEY_REFLECT: &str = "reflect";
+/// Base reflection cadence — how often a scene with fresh input consolidates.
+/// Alarm-delay grammar; `0`/`off` disables; unset → the built-in default (1m).
+pub const KEY_REFLECT_EVERY: &str = "reflect_every";
+/// Ceiling on the idle reflection backoff. Alarm-delay grammar; unset → default (8h).
+pub const KEY_REFLECT_MAX: &str = "reflect_max";
+/// Consecutive terminal-turn failures before flipping to vendor-down ("mailbox")
+/// mode. Each terminal failure is already 3 failed model calls, so 2 (the default)
+/// = 6 failures across two turns. `0`/unparseable → default.
+pub const KEY_VENDOR_DOWN_AFTER: &str = "vendor_down_after";
+/// Recovery-probe cadence while in vendor-down mode. Alarm-delay grammar;
+/// `off`/`0`/unset/unparseable → the 30s default.
+pub const KEY_VENDOR_PROBE: &str = "vendor_probe";
+
 /// Env var (set on the cognition subprocess) carrying hi-agent's own HTTP base
 /// URL, so sessions can read input channels and write the overlay over the same
-/// wire the browser uses. See [`AgentConfig::child_env`].
+/// wire the browser uses. See [`AgentConfig::child_env`]. Infra, not user config.
 pub const ENV_SERVER_BASE_URL: &str = "HI_AGENT_BASE_URL";
-/// Env var setting the consecutive terminal-turn-failure count that flips the
-/// reactor into vendor-down ("mailbox") mode (`HI_AGENT_VENDOR_DOWN_AFTER`).
-/// Each terminal failure is already the product of the 3-attempt retry inside
-/// `run_turn`, so 2 (the default) means 6 model calls failed across two
-/// separate turns — a strong signal of a sustained outage, not a blip. `1` is
-/// the aggressive setting. Unset / unparseable / `0` → default.
-pub const ENV_VENDOR_DOWN_AFTER: &str = "HI_AGENT_VENDOR_DOWN_AFTER";
-/// Env var setting the recovery-probe cadence while in vendor-down mode
-/// (`HI_AGENT_VENDOR_PROBE`). Alarm-delay grammar (`30s`, `1m`; bare integer =
-/// seconds). Unset / unparseable / `0` / `off` → 30s default. Probes only fire
-/// when a scene has pending mail, so an idle outage costs no vendor calls.
-pub const ENV_VENDOR_PROBE: &str = "HI_AGENT_VENDOR_PROBE";
+
+/// The cognition tunables loaded once from the config store at startup into a
+/// process global, so the reactor's argless helpers can read them without threading
+/// a data dir. Changes apply on restart — like every other setting.
+pub mod tunables {
+    use std::collections::HashMap;
+    use std::path::Path;
+    use std::sync::OnceLock;
+
+    static TUNABLES: OnceLock<HashMap<String, String>> = OnceLock::new();
+
+    /// Snapshot the config store's `app_settings` into the global. Idempotent (first
+    /// wins); the composition root calls this once before the reactor spawns.
+    pub fn init(data_dir: &Path) {
+        let _ = TUNABLES.set(crate::foundation::credentials::all_settings(data_dir));
+    }
+
+    /// A stored tunable (trimmed, non-empty), or `None` when unset / before
+    /// [`init`] — callers then apply their built-in default.
+    pub fn get(key: &str) -> Option<String> {
+        let map = TUNABLES.get()?;
+        let v = map.get(key)?.trim();
+        (!v.is_empty()).then(|| v.to_string())
+    }
+}
 
 /// HTTP headers a session's MCP attach carries on every tool call, so the `/mcp`
 /// server can route a call back to the right scene loop and tool surface. Set
@@ -88,31 +104,23 @@ impl std::fmt::Debug for AgentConfig {
     }
 }
 
-/// Read an env var, treating unset *and* blank/whitespace-only as absent.
-fn env_opt(name: &str) -> Option<String> {
-    std::env::var(name)
-        .ok()
-        .map(|v| v.trim().to_string())
-        .filter(|v| !v.is_empty())
-}
-
 impl AgentConfig {
-    /// Resolve the upstream LLM credential for startup from the credential store —
-    /// the user's BYOK key, or (xiaoyuanzhu) the broker-minted bundle. There is no
-    /// `.env` fallback: a fresh install works out of the box because xiaoyuanzhu
-    /// auto-bootstraps a device account and the broker mints the key. Never errors —
-    /// with no key the agent boots **unconfigured** (see
-    /// [`is_configured`](Self::is_configured)), the server + Settings UI come up, and
-    /// prompts fail clearly until a key is set (via Settings or by signing in).
-    /// `effort` / `permission_mode` stay env-driven (they aren't credentials).
+    /// Resolve the upstream LLM credential + adapter tunables for startup from the
+    /// config store — the user's BYOK key, or (xiaoyuanzhu) the broker-minted bundle,
+    /// plus the stored `effort` / `permission_mode`. There is no `.env` fallback: a
+    /// fresh install works out of the box because xiaoyuanzhu auto-bootstraps a device
+    /// account and the broker mints the key. Never errors — with no key the agent
+    /// boots **unconfigured** (see [`is_configured`](Self::is_configured)), the server
+    /// + Settings UI come up, and prompts fail clearly until a key is set.
     pub fn resolve(data_dir: &Path) -> Self {
         let store = crate::foundation::credentials::Credentials::load(data_dir);
         let llm = store.effective().map(|e| e.llm.clone()).unwrap_or_default();
         let model = llm.model.map(|m| m.trim().to_string()).filter(|m| !m.is_empty());
+        use crate::foundation::credentials::get_setting;
         Self::new(
             model,
-            env_opt(ENV_EFFORT),
-            env_opt(ENV_PERMISSION_MODE),
+            get_setting(data_dir, KEY_EFFORT),
+            get_setting(data_dir, KEY_PERMISSION_MODE),
             llm.base_url,
             llm.api_key,
         )

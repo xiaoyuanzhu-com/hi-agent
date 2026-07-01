@@ -56,7 +56,7 @@ The tray **auto-skips when `SSH_CONNECTION` is set** (no window server over SSH)
 
 ## Testing user journeys live (Mac mini)
 
-Journeys in [docs/user-journeys/](docs/user-journeys/) are specs of *intended* behavior — test them against a real running instance, not by code-reading. Standing setup: clone at `~/projects/hi-agent` on the Mac mini (`ssh macmini`), `cargo build --release`, run from the repo root. Model credentials are no longer in `.env`: the default `xiaoyuanzhu` mode auto-bootstraps a broker account and mints the LLM key OOTB, so a fresh box just works; to force BYOK keys headlessly, write them into the config store (`sqlite3 data/config.db` — the `app_settings` mode flag + `credential` rows) or set them in Settings. The `.env` still carries the non-credential knobs (`HI_AGENT_PULSE`, auth, etc.):
+Journeys in [docs/user-journeys/](docs/user-journeys/) are specs of *intended* behavior — test them against a real running instance, not by code-reading. Standing setup: clone at `~/projects/hi-agent` on the Mac mini (`ssh macmini`), `cargo build --release`, run from the repo root. Model credentials are no longer in `.env`: the default `xiaoyuanzhu` mode auto-bootstraps a broker account and mints the LLM key OOTB, so a fresh box just works; to force BYOK keys (or tune agent behaviour) headlessly, write into the config store (`sqlite3 data/config.db` — the `app_settings` KV holds the mode flag + cognition tunables; `credential` rows hold vendor keys) or set them in Settings. The `.env` now carries only infra knobs (auth, dirs, `RUST_LOG`, etc.):
 
     nohup ./target/release/hi-agent --port 12358 > server.log 2>&1 &
 
@@ -70,5 +70,5 @@ Method — the parts that keep the test honest:
 - **Don't lead the witness.** Speak like a terse, normal boss; never script journey-expected behaviors into the prompt. Test recovery by *creating the situation* (kill its processes, restart the host, plant a failure) and watching — not by mentioning it.
 - **Trust but verify every claim.** Ground truth lives outside the conversation: `server.log`, `GET /api/sessions`, the scene transcripts (`data/claude-config/projects/*/<session>.jsonl` — `tool_use` entries show what it actually ran), and its workspace artifacts/ledgers.
 - **Keep the harness out of the experiment.** A watcher whose own command line contains the probe string becomes a decoy (`pgrep -f "[f]oo"` avoids self-match); a long-poll `--max-time` that aborts mid-utterance triggers at-least-once redelivery on the next poll.
-- `HI_AGENT_PULSE=120` in `.env` speeds pulses up for a test session; remove it afterwards (default 30m).
+- To speed pulses up for a test session, set the `pulse` tunable in the config store (`sqlite3 data/config.db "INSERT INTO app_settings(key,value) VALUES('pulse','120') ON CONFLICT(key) DO UPDATE SET value='120'"`) or the Agent section of Settings; reset it afterwards (default 30m).
 - Findings go back into the journey doc (实测缺口 / 复测 sections). When behavior and journey disagree, that's a bug in one or the other — resolve explicitly.

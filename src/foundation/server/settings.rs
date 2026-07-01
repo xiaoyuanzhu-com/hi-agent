@@ -1,12 +1,13 @@
-//! BYOK settings routes — read/write the vendor credential store.
+//! Settings routes — read/write the config store.
 //!
 //! `GET /api/settings/credentials` reports the configured state of every keyed
-//! vendor **without ever returning the key** (only a last-4 hint), plus whether
-//! `.env` provides a fallback. `POST` writes the store via [`Credentials::save`].
-//! Persist-only: the running agent resolved its keys at startup, so the response
-//! flags `restart_required` — a restart re-resolves the store. These routes are
-//! browser-facing, so they sit behind the OIDC login gate when auth is enabled
-//! (only the owner should set keys).
+//! vendor **without ever returning the key** (only a last-4 hint), the non-secret
+//! per-vendor overrides, and the agent tunables (effort, permission mode, pulse).
+//! `POST` writes credentials via [`Credentials::save`] and the tunables via
+//! [`credentials::set_setting`]. Persist-only: the running agent resolved everything
+//! at startup, so the response flags `restart_required` — a restart re-resolves the
+//! store. These routes are browser-facing, so they sit behind the OIDC login gate
+//! when auth is enabled (only the owner should set them).
 
 use std::sync::Arc;
 
@@ -15,6 +16,7 @@ use axum::extract::State;
 use serde::Deserialize;
 use serde_json::{Value, json};
 
+use crate::foundation::config;
 use crate::foundation::credentials::{self, Credentials};
 use crate::foundation::server::AppState;
 
@@ -36,6 +38,11 @@ fn vendor_view(vk: &credentials::VendorKey) -> Value {
         "base_url": vk.base_url,
         "model": vk.model,
     })
+}
+
+/// One agent tunable from the config store, for the Settings view (`null` if unset).
+fn creds_setting(state: &AppState, key: &str) -> Option<String> {
+    credentials::get_setting(&state.data_dir, key)
 }
 
 /// Report the credential state for the Settings UI. Never returns a raw key.
@@ -69,6 +76,13 @@ pub async fn get_credentials(State(state): State<Arc<AppState>>) -> Json<Value> 
         "vision": vendor_view(&creds.vision),
         "image": vendor_view(&creds.image),
         "video": vendor_view(&creds.video),
+        // Agent behaviour tunables (not credentials; apply in every mode). The
+        // curated subset the UI exposes — the rest of Group D is store-only.
+        "agent": {
+            "effort": creds_setting(&state, config::KEY_EFFORT),
+            "permission_mode": creds_setting(&state, config::KEY_PERMISSION_MODE),
+            "pulse": creds_setting(&state, config::KEY_PULSE),
+        },
     }))
 }
 
@@ -98,8 +112,21 @@ pub struct VendorUpdate {
     model: Option<String>,
 }
 
+/// The agent-tunables section of a settings update. Each field is absent-keeps; a
+/// value (including "") sets it, with "" clearing back to the built-in default.
+#[derive(Deserialize)]
+pub struct AgentUpdate {
+    #[serde(default)]
+    effort: Option<String>,
+    #[serde(default)]
+    permission_mode: Option<String>,
+    #[serde(default)]
+    pulse: Option<String>,
+}
+
 /// A settings update. Every section is optional — the UI may send only the ones
-/// it changed. `mode` switches the credential source (byok / xiaoyuanzhu).
+/// it changed. `mode` switches the credential source (byok / xiaoyuanzhu); `agent`
+/// carries the (non-credential) behaviour tunables.
 #[derive(Deserialize)]
 pub struct CredentialsUpdate {
     #[serde(default)]
@@ -116,6 +143,8 @@ pub struct CredentialsUpdate {
     image: Option<VendorUpdate>,
     #[serde(default)]
     video: Option<VendorUpdate>,
+    #[serde(default)]
+    agent: Option<AgentUpdate>,
 }
 
 /// Apply a vendor update in place. Each field is independent and absent-keeps:
@@ -165,6 +194,22 @@ pub async fn post_credentials(
     if let Err(e) = creds.save(&state.data_dir) {
         tracing::warn!(error = %e, "failed to save credentials");
         return Json(json!({ "ok": false, "error": e.to_string() }));
+    }
+    // Agent tunables live in the app_settings KV, separate from the credential rows.
+    if let Some(agent) = body.agent {
+        let writes = [
+            (config::KEY_EFFORT, agent.effort),
+            (config::KEY_PERMISSION_MODE, agent.permission_mode),
+            (config::KEY_PULSE, agent.pulse),
+        ];
+        for (key, val) in writes {
+            if let Some(v) = val {
+                if let Err(e) = credentials::set_setting(&state.data_dir, key, v.trim()) {
+                    tracing::warn!(error = %e, key, "failed to save agent tunable");
+                    return Json(json!({ "ok": false, "error": e.to_string() }));
+                }
+            }
+        }
     }
     // If the user just selected xiaoyuanzhu, fetch the bundle now so the account
     // shows immediately and is cached for the next restart. Forward the signed-in

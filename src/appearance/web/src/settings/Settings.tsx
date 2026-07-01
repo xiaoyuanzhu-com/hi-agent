@@ -40,6 +40,9 @@ export function Settings() {
   const [vendorKeys, setVendorKeys] = useState<Record<string, string>>({});
   const [vendorBaseUrls, setVendorBaseUrls] = useState<Record<string, string>>({});
   const [vendorModels, setVendorModels] = useState<Record<string, string>>({});
+  const [effort, setEffort] = useState("");
+  const [permissionMode, setPermissionMode] = useState("");
+  const [pulse, setPulse] = useState("");
   const [status, setStatus] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [saving, setSaving] = useState(false);
@@ -57,6 +60,9 @@ export function Settings() {
         // Prefill the non-secret vendor overrides so edits start from the stored value.
         setVendorBaseUrls(Object.fromEntries(VENDORS.map((x) => [x.id, v[x.id].base_url])));
         setVendorModels(Object.fromEntries(VENDORS.map((x) => [x.id, v[x.id].model ?? ""])));
+        setEffort(v.agent.effort ?? "");
+        setPermissionMode(v.agent.permission_mode ?? "");
+        setPulse(v.agent.pulse ?? "");
       })
       .catch((e) => {
         if (!ctrl.signal.aborted) setError(String(e));
@@ -114,6 +120,29 @@ export function Settings() {
         setStatus("Saved. Restart hi-agent for the new credentials to take effect.");
         setApiKey("");
         setVendorKeys({});
+        setReloadKey((k) => k + 1);
+      } else {
+        setError(res.error ?? "save failed");
+      }
+    } catch (e) {
+      setError(String(e));
+    } finally {
+      setSaving(false);
+    }
+  };
+
+  // The agent tunables save independently of the credential fields (they apply in
+  // both modes). Each is sent as-is: empty clears back to the built-in default.
+  const onSaveAgent = async () => {
+    setSaving(true);
+    setStatus(null);
+    setError(null);
+    try {
+      const res = await saveCredentials({
+        agent: { effort: effort.trim(), permission_mode: permissionMode.trim(), pulse: pulse.trim() },
+      });
+      if (res.ok) {
+        setStatus("Saved. Restart hi-agent for the new agent settings to take effect.");
         setReloadKey((k) => k + 1);
       } else {
         setError(res.error ?? "save failed");
@@ -225,6 +254,53 @@ export function Settings() {
           )}
           {status && <span className="note ok">{status}</span>}
           {error && <span className="note err">{error}</span>}
+        </div>
+
+        <p className="settings-intro">How the agent behaves. Applies in either mode.</p>
+
+        <section className="settings-card">
+          <div className="settings-card-head">
+            <h2>Agent</h2>
+          </div>
+          <label className="field">
+            <span>
+              Effort <em>optional</em>
+            </span>
+            <input
+              type="text"
+              value={effort}
+              placeholder="adapter default (e.g. low · medium · high)"
+              onChange={(e) => setEffort(e.target.value)}
+            />
+          </label>
+          <label className="field">
+            <span>
+              Permission mode <em>optional</em>
+            </span>
+            <input
+              type="text"
+              value={permissionMode}
+              placeholder="adapter default (e.g. acceptEdits)"
+              onChange={(e) => setPermissionMode(e.target.value)}
+            />
+          </label>
+          <label className="field">
+            <span>
+              Pulse interval <em>optional</em>
+            </span>
+            <input
+              type="text"
+              value={pulse}
+              placeholder="default 30m (e.g. 90s · 30m · 1h · off)"
+              onChange={(e) => setPulse(e.target.value)}
+            />
+          </label>
+        </section>
+
+        <div className="settings-actions">
+          <button className="primary" onClick={onSaveAgent} disabled={saving}>
+            {saving ? "Saving…" : "Save agent settings"}
+          </button>
         </div>
       </div>
     </div>

@@ -34,16 +34,15 @@ use super::Reactor;
 /// don't see the model's token count, and an over-estimate just swaps a little
 /// early, which is harmless (the replacement is seeded). Kept well below a
 /// typical model window so the briefing-plus-tail seed always fits with room to
-/// grow. Overridable via `HI_AGENT_COMPACT` — see [`swap_after_chars`].
+/// grow. Overridable via the stored `compact` tunable — see [`swap_after_chars`].
 pub(crate) const DEFAULT_SWAP_AFTER_CHARS: usize = 48_000;
 
-/// Resolve the hot-swap ceiling: `HI_AGENT_COMPACT` if it parses to a positive
-/// integer, else [`DEFAULT_SWAP_AFTER_CHARS`]. Read fresh so the observatory
-/// denominator and a budget opened mid-run agree on the same value.
+/// Resolve the hot-swap ceiling: the stored `compact` tunable if it parses to a
+/// positive integer, else [`DEFAULT_SWAP_AFTER_CHARS`]. Read from the startup
+/// snapshot so the observatory denominator and a budget opened mid-run agree.
 pub(crate) fn swap_after_chars() -> usize {
-    std::env::var(crate::foundation::config::ENV_COMPACT)
-        .ok()
-        .and_then(|v| v.trim().parse::<usize>().ok())
+    crate::foundation::config::tunables::get(crate::foundation::config::KEY_COMPACT)
+        .and_then(|v| v.parse::<usize>().ok())
         .filter(|&n| n > 0)
         .unwrap_or(DEFAULT_SWAP_AFTER_CHARS)
 }

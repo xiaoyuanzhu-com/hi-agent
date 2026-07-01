@@ -36,6 +36,12 @@ export interface CredentialsView {
   vision: VendorView;
   image: VendorView;
   video: VendorView;
+  /** Agent behaviour tunables (apply in every mode; not credentials). */
+  agent: {
+    effort: string | null;
+    permission_mode: string | null;
+    pulse: string | null;
+  };
 }
 
 /** `api_key` is tri-state: omit to keep the stored key, "" clears it, a value sets
@@ -59,6 +65,12 @@ export interface CredentialsUpdate {
   vision?: VendorUpdate;
   image?: VendorUpdate;
   video?: VendorUpdate;
+  /** Each field absent-keeps; a value ("" clears to the default) sets it. */
+  agent?: {
+    effort?: string;
+    permission_mode?: string;
+    pulse?: string;
+  };
 }
 
 export interface SaveResult {

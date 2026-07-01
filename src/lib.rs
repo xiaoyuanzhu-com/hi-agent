@@ -72,6 +72,11 @@ async fn run_with_shutdown(config: Config, shutdown: Arc<Notify>) -> anyhow::Res
         .context("resolving cwd to absolutize data dir")?;
     tracing::debug!(?config, "starting hi-agent");
 
+    // Snapshot the cognition tunables (pulse, reflection cadence, compact ceiling,
+    // vendor-down thresholds, …) from the config store into the process global the
+    // reactor's argless helpers read. Once, before anything reads them.
+    foundation::config::tunables::init(&config.data_dir);
+
     // Xiaoyuanzhu: refresh the managed credential bundle from the broker, then
     // re-resolve the LLM credential from the (possibly updated) store —
     // `build_config` resolved it before this point, and BYOK mode is a no-op so

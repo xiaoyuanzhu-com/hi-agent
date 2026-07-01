@@ -75,6 +75,7 @@ use tokio::time::{Instant, sleep_until, timeout};
 
 use crate::foundation::acp::{AcpSession, SessionOpts, SessionUpdate};
 use crate::foundation::agent::{AgentLayer, SessionRole};
+use crate::foundation::config;
 use crate::mind::memory::{Memory, build_for_scene};
 use crate::foundation::observatory::{EventKind, Observatory, SessionKind};
 use crate::types::{Channel, Geometry, JournalEntry, Origin, Scene, Signal, ViewEnvelope, ViewOp};
@@ -103,39 +104,23 @@ const SWAP_TIMEOUT: Duration = Duration::from_secs(180);
 /// self-attention. A pulse is not a schedule of work: it injects bare situational
 /// facts ("nothing new for 30m") and core.md tells the mind what such a moment is
 /// for (review commitments, glance at setups it owns); most pulses should
-/// conclude with nothing to do or say. Override via `HI_AGENT_PULSE`; `0`/`off`
+/// conclude with nothing to do or say. Override via `pulse`; `0`/`off`
 /// disables. Boot is not a special case — the first pulse after the host starts
 /// simply carries that fact.
 const DEFAULT_PULSE: Duration = Duration::from_secs(1800);
 
-/// Resolve the pulse interval: `HI_AGENT_PULSE` in alarm-delay grammar if set
-/// (`None` for `0`/`off` — pulses disabled), else [`DEFAULT_PULSE`].
+/// Resolve the pulse interval from the stored `pulse` tunable in alarm-delay grammar
+/// if set (`None` for `0`/`off` — pulses disabled), else [`DEFAULT_PULSE`].
 fn pulse_interval() -> Option<Duration> {
-    match std::env::var(crate::foundation::config::ENV_PULSE) {
-        Ok(v) => {
-            let v = v.trim().to_owned();
-            if v.is_empty() {
-                return Some(DEFAULT_PULSE);
-            }
-            if v.eq_ignore_ascii_case("off") {
-                return None;
-            }
-            match parse_delay(&v) {
-                Some(d) if d.is_zero() => None,
-                Some(d) => Some(d),
-                None => Some(DEFAULT_PULSE),
-            }
-        }
-        Err(_) => Some(DEFAULT_PULSE),
-    }
+    duration_tunable(config::tunables::get(config::KEY_PULSE), DEFAULT_PULSE)
 }
 
-/// Whether the reflection ("sleep") pass runs at all. On unless `HI_AGENT_REFLECT`
-/// is `off` — a master escape hatch to disable consolidation without touching the
-/// cadence (see [`reflect_interval`]).
+/// Whether the reflection ("sleep") pass runs at all. On unless the stored `reflect`
+/// tunable is `off` — a master escape hatch to disable consolidation without
+/// touching the cadence (see [`reflect_interval`]).
 fn reflect_enabled() -> bool {
-    !std::env::var(crate::foundation::config::ENV_REFLECT)
-        .map(|v| v.trim().eq_ignore_ascii_case("off"))
+    !config::tunables::get(config::KEY_REFLECT)
+        .map(|v| v.eq_ignore_ascii_case("off"))
         .unwrap_or(false)
 }
 
@@ -146,44 +131,38 @@ const DEFAULT_REFLECT_EVERY: Duration = Duration::from_secs(60);
 /// scene re-checks at most this often.
 const DEFAULT_REFLECT_MAX: Duration = Duration::from_secs(8 * 3600);
 
-/// Resolve a duration env in alarm-delay grammar (`90s`/`30m`/`1h`; bare integer =
-/// seconds): `None` for `off`/`0` (disabled), the parsed value, or `default` when
-/// unset / blank / unparseable.
-fn duration_env(var: &str, default: Duration) -> Option<Duration> {
-    match std::env::var(var) {
-        Ok(v) => {
-            let v = v.trim();
-            if v.is_empty() {
-                return Some(default);
-            }
-            if v.eq_ignore_ascii_case("off") {
-                return None;
-            }
-            match parse_delay(v) {
-                Some(d) if d.is_zero() => None,
-                Some(d) => Some(d),
-                None => Some(default),
-            }
-        }
-        Err(_) => Some(default),
+/// Resolve a stored duration tunable in alarm-delay grammar (`90s`/`30m`/`1h`; bare
+/// integer = seconds): `None` for `off`/`0` (disabled), the parsed value, or
+/// `default` when unset / unparseable. (The value is already trimmed / non-empty by
+/// [`config::tunables::get`].)
+fn duration_tunable(value: Option<String>, default: Duration) -> Option<Duration> {
+    match value {
+        None => Some(default),
+        Some(v) if v.eq_ignore_ascii_case("off") => None,
+        Some(v) => match parse_delay(&v) {
+            Some(d) if d.is_zero() => None,
+            Some(d) => Some(d),
+            None => Some(default),
+        },
     }
 }
 
 /// The base reflection cadence, or `None` if reflection is off
-/// (`HI_AGENT_REFLECT=off`) or `HI_AGENT_REFLECT_EVERY` is `0`/`off`. A scene with
+/// (`reflect=off`) or `reflect_every` is `0`/`off`. A scene with
 /// fresh input consolidates this often; once it goes quiet the gap backs off from
 /// here up to [`reflect_max_interval`].
 fn reflect_interval() -> Option<Duration> {
     reflect_enabled()
-        .then(|| duration_env(crate::foundation::config::ENV_REFLECT_EVERY, DEFAULT_REFLECT_EVERY))
+        .then(|| duration_tunable(config::tunables::get(config::KEY_REFLECT_EVERY), DEFAULT_REFLECT_EVERY))
         .flatten()
 }
 
 /// The ceiling on the idle backoff: a caught-up, quiet scene doubles its gap from
 /// the base each pass but never past this. Always returns a value (no `off`); a
-/// `0`/blank `HI_AGENT_REFLECT_MAX` falls back to the default.
+/// `0`/blank `reflect_max` falls back to the default.
 fn reflect_max_interval() -> Duration {
-    duration_env(crate::foundation::config::ENV_REFLECT_MAX, DEFAULT_REFLECT_MAX).unwrap_or(DEFAULT_REFLECT_MAX)
+    duration_tunable(config::tunables::get(config::KEY_REFLECT_MAX), DEFAULT_REFLECT_MAX)
+        .unwrap_or(DEFAULT_REFLECT_MAX)
 }
 
 /// Default recovery-probe cadence while in vendor-down mode. The probe only
@@ -194,27 +173,22 @@ const DEFAULT_VENDOR_PROBE: Duration = Duration::from_secs(30);
 /// two turns — absorbs blips, catches real outages.
 const DEFAULT_VENDOR_DOWN_AFTER: u32 = 2;
 
-/// The recovery-probe interval. `HI_AGENT_VENDOR_PROBE` in alarm-delay grammar;
+/// The recovery-probe interval. `vendor_probe` in alarm-delay grammar;
 /// `off`/`0`/unset/unparseable → default. Probes only fire when a scene has
 /// pending mail, so an idle outage costs no vendor calls — there's no need to
 /// disable them.
 fn vendor_probe_interval() -> Duration {
-    duration_env(crate::foundation::config::ENV_VENDOR_PROBE, DEFAULT_VENDOR_PROBE)
+    duration_tunable(config::tunables::get(config::KEY_VENDOR_PROBE), DEFAULT_VENDOR_PROBE)
         .unwrap_or(DEFAULT_VENDOR_PROBE)
 }
 
 /// The consecutive terminal-failure count that flips the reactor into
-/// vendor-down mode. `HI_AGENT_VENDOR_DOWN_AFTER`; `0`/unparseable → default.
+/// vendor-down mode. `vendor_down_after`; `0`/unparseable → default.
 fn vendor_down_after() -> u32 {
-    match std::env::var(crate::foundation::config::ENV_VENDOR_DOWN_AFTER) {
-        Ok(v) => v
-            .trim()
-            .parse::<u32>()
-            .ok()
-            .filter(|n| *n > 0)
-            .unwrap_or(DEFAULT_VENDOR_DOWN_AFTER),
-        Err(_) => DEFAULT_VENDOR_DOWN_AFTER,
-    }
+    config::tunables::get(config::KEY_VENDOR_DOWN_AFTER)
+        .and_then(|v| v.parse::<u32>().ok())
+        .filter(|n| *n > 0)
+        .unwrap_or(DEFAULT_VENDOR_DOWN_AFTER)
 }
 
 /// Shared, process-wide view of whether the upstream LLM vendor is reachable.
@@ -730,7 +704,7 @@ pub fn start(
 /// so the loop re-derives its deadline immediately rather than waiting out a long
 /// backoff. Each tick consolidates only scenes with enough on their frontier; a
 /// tick with nothing ready is a cheap no-op. Returns (the task ends) only when
-/// reflection is disabled outright (`HI_AGENT_REFLECT=off` or `REFLECT_EVERY=0`).
+/// reflection is disabled outright (`reflect=off` or `reflect_every=0`).
 async fn consolidated_reflection_loop(reactor: Reactor) {
     let reflect_base = reflect_interval();
     let reflect_max = reflect_max_interval();

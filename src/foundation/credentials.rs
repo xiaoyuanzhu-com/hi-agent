@@ -26,6 +26,27 @@ pub fn path(data_dir: &Path) -> PathBuf {
     data_dir.join(FILE)
 }
 
+/// A single app-level setting (the `app_settings` KV table) — e.g. a cognition
+/// tunable. `None` when absent, blank, or the store can't be read. This is the same
+/// table the credential `mode`/`device_id` live in; callers key their own namespace.
+pub fn get_setting(data_dir: &Path, key: &str) -> Option<String> {
+    let v = db::get_setting_at(data_dir, key).ok().flatten()?;
+    let v = v.trim();
+    (!v.is_empty()).then(|| v.to_string())
+}
+
+/// Set a single app-level setting (upsert). Used by the settings handler to persist
+/// the cognition tunables the UI edits.
+pub fn set_setting(data_dir: &Path, key: &str, value: &str) -> anyhow::Result<()> {
+    db::set_setting_at(data_dir, key, value)
+}
+
+/// Every app-level setting as a map — the startup snapshot the reactor's tunables
+/// global loads. Empty on a fresh / unreadable store (defaults then apply).
+pub fn all_settings(data_dir: &Path) -> std::collections::HashMap<String, String> {
+    db::all_settings(data_dir).unwrap_or_default()
+}
+
 /// Parse a stored mode string, case-insensitive (`byok` | `xiaoyuanzhu`). The
 /// legacy values `free`/`login` map to `xiaoyuanzhu` (the mode that absorbed
 /// both). Unknown → None. The Settings UI / config store is the sole authority for
@@ -481,6 +502,30 @@ mod db {
         Ok(())
     }
 
+    /// Read one setting by key, opening the store directly (for the pub `get_setting`
+    /// accessor — a caller that has only a `data_dir`, not a live connection).
+    pub fn get_setting_at(data_dir: &Path, key: &str) -> anyhow::Result<Option<String>> {
+        get_setting(&open(data_dir)?, key)
+    }
+
+    /// Upsert one setting by key, opening the store directly (for the pub accessor).
+    pub fn set_setting_at(data_dir: &Path, key: &str, value: &str) -> anyhow::Result<()> {
+        set_setting(&open(data_dir)?, key, value)
+    }
+
+    /// Every `app_settings` row as a map, opening the store directly.
+    pub fn all_settings(data_dir: &Path) -> anyhow::Result<std::collections::HashMap<String, String>> {
+        let conn = open(data_dir)?;
+        let mut stmt = conn.prepare("SELECT key, value FROM app_settings")?;
+        let rows = stmt.query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))?;
+        let mut map = std::collections::HashMap::new();
+        for row in rows {
+            let (k, v) = row?;
+            map.insert(k, v);
+        }
+        Ok(map)
+    }
+
     /// The `(wire, base_url, api_key, model)` tuple for one `(mode, feature)`, or
     /// `None` when no row exists.
     fn read_row(
@@ -744,6 +789,22 @@ mod tests {
         assert_eq!(after.llm.api_key, "byok-llm", "BYOK config must persist across a switch");
         assert_eq!(after.managed.as_ref().unwrap().llm.api_key, "managed-llm");
         assert_eq!(after.effective().unwrap().llm.api_key, "managed-llm");
+    }
+
+    #[test]
+    fn app_settings_get_set_round_trip() {
+        let dir = tempfile::tempdir().unwrap();
+        assert_eq!(get_setting(dir.path(), "pulse"), None); // unset
+        set_setting(dir.path(), "pulse", "120").unwrap();
+        assert_eq!(get_setting(dir.path(), "pulse").as_deref(), Some("120"));
+        // Blank reads back as absent (→ the caller's built-in default).
+        set_setting(dir.path(), "pulse", "  ").unwrap();
+        assert_eq!(get_setting(dir.path(), "pulse"), None);
+        // Coexists with the credential mode row in the same table.
+        Credentials { mode: Mode::Byok, ..Default::default() }.save(dir.path()).unwrap();
+        set_setting(dir.path(), "effort", "high").unwrap();
+        assert_eq!(Credentials::load(dir.path()).mode, Mode::Byok);
+        assert_eq!(get_setting(dir.path(), "effort").as_deref(), Some("high"));
     }
 
     #[test]
