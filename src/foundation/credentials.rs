@@ -25,30 +25,16 @@ pub fn path(data_dir: &Path) -> PathBuf {
     data_dir.join(FILE)
 }
 
-/// Env flag that overrides the stored credential mode — handy for flipping
-/// xiaoyuanzhu/byok in testing without the Settings UI or editing the file. When
-/// set it wins over the stored mode; unset → the stored mode (default xiaoyuanzhu).
-const ENV_MODE: &str = "HI_AGENT_MODE";
-
-/// Parse a mode string, case-insensitive (`byok` | `xiaoyuanzhu`). The legacy
-/// values `free`/`login` map to `xiaoyuanzhu` (the mode that absorbed both).
-/// Unknown → None.
+/// Parse a stored mode string, case-insensitive (`byok` | `xiaoyuanzhu`). The
+/// legacy values `free`/`login` map to `xiaoyuanzhu` (the mode that absorbed
+/// both). Unknown → None. The Settings UI / config store is the sole authority for
+/// the mode; there is no env override.
 fn parse_mode(s: &str) -> Option<Mode> {
     match s.trim().to_ascii_lowercase().as_str() {
         "byok" => Some(Mode::Byok),
         "xiaoyuanzhu" | "free" | "login" => Some(Mode::Xiaoyuanzhu),
         _ => None,
     }
-}
-
-/// The mode forced by `HI_AGENT_MODE`, if set to a recognized value.
-fn mode_override() -> Option<Mode> {
-    let v = std::env::var(ENV_MODE).ok()?;
-    let m = parse_mode(&v);
-    if m.is_none() && !v.trim().is_empty() {
-        tracing::warn!(value = %v, "ignoring unknown HI_AGENT_MODE (expected byok|xiaoyuanzhu)");
-    }
-    m
 }
 
 /// How the agent obtains its credentials.
@@ -254,18 +240,13 @@ impl Credentials {
     /// brick boot — the user re-saves from Settings. On first load a legacy
     /// `credentials.json` is imported into the DB (see [`db::load`]).
     pub fn load(data_dir: &Path) -> Self {
-        let mut c = db::load(data_dir).unwrap_or_else(|e| {
+        db::load(data_dir).unwrap_or_else(|e| {
             tracing::warn!(
                 path = %path(data_dir).display(), error = %e,
                 "config store unreadable; using defaults (re-save from Settings)"
             );
             Self::default()
-        });
-        // An explicit HI_AGENT_MODE wins over the stored mode (testing override).
-        if let Some(m) = mode_override() {
-            c.mode = m;
-        }
-        c
+        })
     }
 
     /// Persist to `<data_dir>/config.db`, owner-only (`0600` on unix). Writes both
