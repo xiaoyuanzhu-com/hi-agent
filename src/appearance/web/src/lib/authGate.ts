@@ -1,13 +1,15 @@
-// Session-expiry guard for the login gate.
+// Login redirect for the owner surface.
 //
-// When the backend runs with `HI_AGENT_AUTH=on`, the SPA's own HTML entry is
-// already behind the gate — so a loaded app means an authenticated session. The
-// only way to become unauthenticated mid-session is the session cookie expiring
-// while the tab is open, after which the channel fetches start returning 401.
+// With `HI_AGENT_AUTH=on` the backend gates only the owner surface (Settings,
+// inspect and their APIs) — the appearance page and its channels are public, so
+// loading the SPA at `/` no longer implies a session. A 401 therefore means the
+// tab reached a protected endpoint without one: the owner opened Settings/inspect
+// unauthenticated, or a live session cookie expired mid-use.
 //
 // This installs a one-time `fetch` wrapper that catches any 401 and does a
 // single full-page navigation to the login flow (which bounces through the IdP
-// and back). It is a no-op when auth is disabled (no 401s are ever produced).
+// and back). Public-face fetches never 401, so the appearance page is never
+// bounced. It is a no-op when auth is disabled (no 401s are ever produced).
 let redirecting = false;
 
 export function installAuthGate(): void {

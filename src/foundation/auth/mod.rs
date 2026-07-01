@@ -2,9 +2,13 @@
 //!
 //! ## What this gives you
 //!
-//! When `HI_AGENT_AUTH=on`, every browser-facing route (the SPA and its human
-//! API channels) requires a logged-in session. The login itself is delegated to
-//! an external OpenID Connect provider — in the intended deployment, the
+//! When `HI_AGENT_AUTH=on`, the *owner surface* of the SPA requires a logged-in
+//! session — the Settings page and the inspect console, plus the APIs that back
+//! them. The agent's public face (the `/` appearance page and all its
+//! human `/api/in/*` · `/api/out/*` channels) stays open so anyone can walk up
+//! and interact; login is only ever provoked by reaching an owner surface. The
+//! login itself is delegated to an external OpenID Connect provider — in the
+//! intended deployment, the
 //! Authentik instance at `xiaoyuanzhu.com`, whose login screen offers "scan a
 //! WeChat QR". hi-agent is a plain OIDC *relying party*: it never touches
 //! WeChat's non-standard OAuth and never mints identity. Authentik owns the
@@ -21,14 +25,19 @@
 //! - unset → **trust on first use**: the first identity to log in is recorded in
 //!   `<data_dir>/auth/owner.json` and is the only one accepted thereafter.
 //!
-//! ## What is NOT gated
+//! ## What IS gated
 //!
-//! Machine/server-to-server callers don't carry browser cookies, so the gate
-//! leaves their paths public: the MCP tool endpoint (`/mcp`), the phone-upload
-//! carrier (`/api/handoff`, `/up/{token}`, `/api/up/{token}`, `/api/qr`, which
-//! are already token-scoped), the unimplemented sense stubs, and `/healthz`. A
-//! shared bearer (`HI_AGENT_SERVICE_TOKEN`) additionally bypasses the gate on
-//! *any* route, so Feishu and the curl journey-tests keep working.
+//! The gate is deny-by-exception: only the owner surface is protected (see
+//! [`is_protected`]) and everything else is public. Protected are the Settings
+//! page (`/settings`) and its credential API (`/api/settings/*`), and the
+//! inspect console (`/inspect`) and the observability feeds it consumes
+//! (`/api/sessions*`, `/api/acp/*`) — those expose stored credentials and raw
+//! session transcripts, owner-only by nature. Everything else — the appearance
+//! page and its channels, the machine/token-scoped carriers (`/mcp`, the
+//! phone-upload `/api/handoff` · `/up/{token}` · `/api/up/{token}` · `/api/qr`),
+//! the sense stubs, `/healthz` — is served without a login. A shared bearer
+//! (`HI_AGENT_SERVICE_TOKEN`) additionally bypasses the gate on the protected
+//! routes, so Feishu and the curl journey-tests keep working.
 //!
 //! Security-sensitive primitives are delegated to vetted crates: `openidconnect`
 //! for discovery / code exchange / ID-token (JWT) verification, and
@@ -363,28 +372,28 @@ fn routes(state: Arc<AuthState>) -> Router {
         .with_state(state)
 }
 
-/// Paths that bypass the login gate entirely: the auth endpoints themselves, the
-/// machine/token-scoped carriers, the unimplemented sense stubs, and health.
-fn is_public(path: &str) -> bool {
+/// Paths that require an owner session (deny-by-exception — everything not listed
+/// here is public). The owner surface is the Settings page and its credential API,
+/// and the inspect console plus the observability feeds it consumes; those carry
+/// stored credentials and raw session transcripts. The public agent face (`/` and
+/// its `/api/in/*` · `/api/out/*` channels), the machine/token carriers, the sense
+/// stubs, and health are all *not* protected. Note `/auth/*` must stay public here
+/// so the login flow itself isn't gated.
+fn is_protected(path: &str) -> bool {
     const PREFIXES: &[&str] = &[
-        "/auth/",
-        "/mcp",
-        "/api/handoff",
-        "/up/",
-        "/api/up/",
-        "/api/qr",
-        "/api/in/touch",
-        "/api/in/smell",
-        "/api/in/taste",
-        "/healthz",
+        "/settings",     // owner Settings page (and any nested path)
+        "/api/settings", // BYOK credential store
+        "/inspect",      // operator console page (and any nested path)
+        "/api/sessions", // session list/events feed the console reads
+        "/api/acp/",     // raw ACP wire frames the console reads
     ];
     PREFIXES.iter().any(|p| path == p.trim_end_matches('/') || path.starts_with(p))
 }
 
-/// The gate. Order: public path → service token → session cookie → reject.
+/// The gate. Order: unprotected path → service token → session cookie → reject.
 async fn require_auth(State(st): State<Arc<AuthState>>, req: Request, next: Next) -> Response {
     let path = req.uri().path();
-    if is_public(path) {
+    if !is_protected(path) {
         return next.run(req).await;
     }
 
@@ -761,8 +770,24 @@ mod tests {
     }
 
     #[test]
-    fn public_paths_classified() {
+    fn protected_paths_classified() {
+        // Owner surface — gated behind login.
         for p in [
+            "/settings",
+            "/settings/",
+            "/settings/deep/link",
+            "/api/settings/credentials",
+            "/inspect",
+            "/inspect/sessions",
+            "/api/sessions",
+            "/api/sessions/events",
+            "/api/acp/frames/events",
+        ] {
+            assert!(is_protected(p), "expected protected: {p}");
+        }
+        // Public agent face, machine carriers, auth flow, health — never gated.
+        for p in [
+            "/",
             "/auth/login",
             "/auth/callback",
             "/mcp",
@@ -770,13 +795,15 @@ mod tests {
             "/up/abc",
             "/api/up/abc",
             "/api/qr",
+            "/api/in/text",
             "/api/in/touch",
+            "/api/out/text",
+            "/api/out/view",
+            "/views/x.mjs",
+            "/assets/a.js",
             "/healthz",
         ] {
-            assert!(is_public(p), "expected public: {p}");
-        }
-        for p in ["/", "/api/in/text", "/api/out/text", "/views/x.mjs", "/assets/a.js"] {
-            assert!(!is_public(p), "expected gated: {p}");
+            assert!(!is_protected(p), "expected public: {p}");
         }
     }
 
