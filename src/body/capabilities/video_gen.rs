@@ -98,13 +98,25 @@ static BACKEND: OnceLock<Backend> = OnceLock::new();
 
 const ENV_PROVIDER: &str = "VIDEO_GEN_PROVIDER";
 
-/// Resolve the provider from `VIDEO_GEN_PROVIDER` into the process-global
-/// config. Unset or `none` disables the capability; an unknown name is an
-/// error. Idempotent — the first init wins.
-pub fn init(store_key: Option<&str>, base_url: Option<&str>, model: Option<&str>) -> anyhow::Result<()> {
+/// The default wire when the store selects none — the only video-gen impl today.
+const DEFAULT_WIRE: &str = "doubao";
+
+/// Resolve the video-gen backend into the process-global config. With a BYOK key
+/// the configured `wire` selects the impl (`None` → [`DEFAULT_WIRE`]); otherwise
+/// `VIDEO_GEN_PROVIDER` decides (unset/`none` disables). An unknown wire or provider
+/// name is an error. Adding a vendor is a new `Backend` variant plus a match arm
+/// here. Idempotent — the first init wins.
+pub fn init(
+    store_key: Option<&str>,
+    base_url: Option<&str>,
+    model: Option<&str>,
+    wire: Option<&str>,
+) -> anyhow::Result<()> {
     let backend = if store_key.map(|k| !k.trim().is_empty()).unwrap_or(false) {
-        // A BYOK key implies the provider (Doubao is the only video-gen impl).
-        Backend::Doubao(doubao_video_gen::Config::from_env_with(store_key, base_url, model)?)
+        match wire.unwrap_or(DEFAULT_WIRE) {
+            "doubao" => Backend::Doubao(doubao_video_gen::Config::from_env_with(store_key, base_url, model)?),
+            other => anyhow::bail!("unknown video-gen wire: {other}"),
+        }
     } else {
         match std::env::var(ENV_PROVIDER).unwrap_or_default().as_str() {
             "" | "none" => Backend::Disabled,

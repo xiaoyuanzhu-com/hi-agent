@@ -118,6 +118,11 @@ pub struct Tokens {
 #[derive(Clone, Default, Serialize, Deserialize)]
 #[serde(default)]
 pub struct LlmCredentials {
+    /// Which wire (vendor/protocol impl) backs the LLM; empty → the feature's
+    /// default (the bundled Claude adapter). Reserved for a future second LLM wire;
+    /// `resolve` uses the single adapter today. See [`VendorKey::wire`].
+    #[serde(skip_serializing_if = "String::is_empty")]
+    pub wire: String,
     /// Upstream base URL; empty → the bundled Anthropic default.
     pub base_url: String,
     /// Upstream API key; empty → not configured (falls back to `.env`).
@@ -127,12 +132,27 @@ pub struct LlmCredentials {
     pub model: Option<String>,
 }
 
+impl LlmCredentials {
+    /// The configured wire id if set, else `None` (use the feature default).
+    pub fn wire_opt(&self) -> Option<&str> {
+        let w = self.wire.trim();
+        if w.is_empty() { None } else { Some(w) }
+    }
+}
+
 /// A single-vendor config. In BYOK only `api_key` is set (other params stay on
 /// env defaults); in managed mode the broker also fills `base_url` (songguo) and
 /// may fill `model`, and the vendor host-rebases its native endpoint onto songguo.
+///
+/// `wire` names which vendor/protocol impl serves the feature — the seam for
+/// supporting more than one vendor per capability. Empty means the feature's
+/// default wire (today the only one); the capability's `init` dispatches on it.
 #[derive(Clone, Default, Serialize, Deserialize)]
 #[serde(default)]
 pub struct VendorKey {
+    /// Which wire (vendor impl) backs this feature; empty → the feature default.
+    #[serde(skip_serializing_if = "String::is_empty")]
+    pub wire: String,
     /// Gateway base; empty → the vendor's own default endpoint.
     pub base_url: String,
     pub api_key: String,
@@ -158,6 +178,12 @@ impl VendorKey {
     /// The managed model override if set, else `None`.
     pub fn model_opt(&self) -> Option<&str> {
         self.model.as_deref().map(str::trim).filter(|m| !m.is_empty())
+    }
+
+    /// The configured wire id if set, else `None` (use the feature default).
+    pub fn wire_opt(&self) -> Option<&str> {
+        let w = self.wire.trim();
+        if w.is_empty() { None } else { Some(w) }
     }
 }
 
@@ -328,6 +354,7 @@ mod db {
         CREATE TABLE IF NOT EXISTS credential (
             mode     TEXT NOT NULL,
             feature  TEXT NOT NULL,
+            wire     TEXT NOT NULL DEFAULT '',
             base_url TEXT NOT NULL DEFAULT '',
             api_key  TEXT NOT NULL DEFAULT '',
             model    TEXT,
@@ -364,12 +391,35 @@ mod db {
         let conn = Connection::open(&p).with_context(|| format!("opening {}", p.display()))?;
         conn.busy_timeout(std::time::Duration::from_secs(5))?;
         conn.execute_batch(SCHEMA).context("initializing config schema")?;
+        migrate(&conn).context("migrating config schema")?;
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
             let _ = std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o600));
         }
         Ok(conn)
+    }
+
+    /// Bring an older DB up to the current schema. Additive, idempotent column
+    /// adds only (the `CREATE TABLE IF NOT EXISTS` above already covers fresh DBs);
+    /// each is guarded on `table_info` so re-running is a no-op.
+    fn migrate(conn: &Connection) -> anyhow::Result<()> {
+        if !column_exists(conn, "credential", "wire")? {
+            conn.execute_batch("ALTER TABLE credential ADD COLUMN wire TEXT NOT NULL DEFAULT ''")?;
+        }
+        Ok(())
+    }
+
+    fn column_exists(conn: &Connection, table: &str, column: &str) -> anyhow::Result<bool> {
+        let mut stmt = conn.prepare(&format!("PRAGMA table_info({table})"))?;
+        let mut rows = stmt.query([])?;
+        while let Some(row) = rows.next()? {
+            let name: String = row.get(1)?; // (cid, name, type, ...)
+            if name == column {
+                return Ok(true);
+            }
+        }
+        Ok(false)
     }
 
     /// Load the credential store, importing a legacy `credentials.json` on first run.
@@ -449,31 +499,31 @@ mod db {
         Ok(())
     }
 
-    /// The `(base_url, api_key, model)` triple for one `(mode, feature)`, or `None`
-    /// when no row exists.
+    /// The `(wire, base_url, api_key, model)` tuple for one `(mode, feature)`, or
+    /// `None` when no row exists.
     fn read_row(
         conn: &Connection,
         mode: Mode,
         feature: &str,
-    ) -> anyhow::Result<Option<(String, String, Option<String>)>> {
+    ) -> anyhow::Result<Option<(String, String, String, Option<String>)>> {
         Ok(conn
             .query_row(
-                "SELECT base_url, api_key, model FROM credential WHERE mode = ?1 AND feature = ?2",
+                "SELECT wire, base_url, api_key, model FROM credential WHERE mode = ?1 AND feature = ?2",
                 params![mode_str(mode), feature],
-                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
             )
             .optional()?)
     }
 
     fn read_vendor(conn: &Connection, mode: Mode, feature: &str) -> anyhow::Result<VendorKey> {
         Ok(read_row(conn, mode, feature)?
-            .map(|(base_url, api_key, model)| VendorKey { base_url, api_key, model })
+            .map(|(wire, base_url, api_key, model)| VendorKey { wire, base_url, api_key, model })
             .unwrap_or_default())
     }
 
     fn read_llm(conn: &Connection, mode: Mode, feature: &str) -> anyhow::Result<LlmCredentials> {
         Ok(read_row(conn, mode, feature)?
-            .map(|(base_url, api_key, model)| LlmCredentials { base_url, api_key, model })
+            .map(|(wire, base_url, api_key, model)| LlmCredentials { wire, base_url, api_key, model })
             .unwrap_or_default())
     }
 
@@ -499,26 +549,28 @@ mod db {
     }
 
     fn write_vendor(conn: &Connection, mode: Mode, feature: &str, vk: &VendorKey) -> anyhow::Result<()> {
-        write_row(conn, mode, feature, &vk.base_url, &vk.api_key, vk.model.as_deref())
+        write_row(conn, mode, feature, &vk.wire, &vk.base_url, &vk.api_key, vk.model.as_deref())
     }
 
     fn write_llm(conn: &Connection, mode: Mode, feature: &str, llm: &LlmCredentials) -> anyhow::Result<()> {
-        write_row(conn, mode, feature, &llm.base_url, &llm.api_key, llm.model.as_deref())
+        write_row(conn, mode, feature, &llm.wire, &llm.base_url, &llm.api_key, llm.model.as_deref())
     }
 
     fn write_row(
         conn: &Connection,
         mode: Mode,
         feature: &str,
+        wire: &str,
         base_url: &str,
         api_key: &str,
         model: Option<&str>,
     ) -> anyhow::Result<()> {
         conn.execute(
-            "INSERT INTO credential (mode, feature, base_url, api_key, model) VALUES (?1, ?2, ?3, ?4, ?5)
+            "INSERT INTO credential (mode, feature, wire, base_url, api_key, model) VALUES (?1, ?2, ?3, ?4, ?5, ?6)
              ON CONFLICT(mode, feature) DO UPDATE SET
-                 base_url = excluded.base_url, api_key = excluded.api_key, model = excluded.model",
-            params![mode_str(mode), feature, base_url, api_key, model],
+                 wire = excluded.wire, base_url = excluded.base_url,
+                 api_key = excluded.api_key, model = excluded.model",
+            params![mode_str(mode), feature, wire, base_url, api_key, model],
         )?;
         Ok(())
     }
@@ -666,6 +718,7 @@ mod tests {
                     base_url: "https://songguo.xiaoyuanzhu.com".into(),
                     api_key: "sg-secret".into(),
                     model: None,
+                    ..Default::default()
                 },
                 stt: VendorKey { api_key: "sg-secret".into(), ..Default::default() },
                 ..Default::default()
@@ -712,6 +765,23 @@ mod tests {
     }
 
     #[test]
+    fn wire_selection_persists_through_disk() {
+        // The per-feature wire id is stored and restored, so a future non-default
+        // vendor choice survives a restart.
+        let dir = tempfile::tempdir().unwrap();
+        let c = Credentials {
+            mode: Mode::Byok,
+            tts: VendorKey { wire: "volcengine".into(), api_key: "k".into(), ..Default::default() },
+            ..Default::default()
+        };
+        c.save(dir.path()).unwrap();
+        let back = Credentials::load(dir.path());
+        assert_eq!(back.tts.wire_opt(), Some("volcengine"));
+        // An unset wire stays empty (→ the feature default at init time).
+        assert_eq!(back.stt.wire_opt(), None);
+    }
+
+    #[test]
     fn imports_legacy_credentials_json_once() {
         let dir = tempfile::tempdir().unwrap();
         // A pre-SQLite store with a legacy mode value and a BYOK key.
@@ -748,6 +818,7 @@ mod tests {
                 base_url: "https://songguo.xiaoyuanzhu.com".into(),
                 api_key: "managed-key".into(),
                 model: None,
+                ..Default::default()
             },
             stt: VendorKey { api_key: "managed-stt".into(), ..Default::default() },
             ..Default::default()
@@ -761,7 +832,7 @@ mod tests {
     #[test]
     fn debug_redacts_secrets() {
         let c = Credentials {
-            llm: LlmCredentials { base_url: "https://x".into(), api_key: "sk-super-secret".into(), model: None },
+            llm: LlmCredentials { base_url: "https://x".into(), api_key: "sk-super-secret".into(), model: None, ..Default::default() },
             vision: VendorKey { api_key: "vision-super-secret".into(), ..Default::default() },
             tokens: Some(Tokens {
                 access_token: "access-super-secret".into(),

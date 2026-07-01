@@ -45,13 +45,20 @@ static BACKEND: OnceLock<Backend> = OnceLock::new();
 
 const ENV_PROVIDER: &str = "TTS_PROVIDER";
 
-/// Resolve the provider from `TTS_PROVIDER` into the process-global config.
-/// Unset or `none` disables the capability; an unknown name is an error.
+/// The default wire when the store selects none — the only TTS impl today.
+const DEFAULT_WIRE: &str = "volcengine";
+
+/// Resolve the TTS backend into the process-global config. With a BYOK key the
+/// configured `wire` selects the impl (`None` → [`DEFAULT_WIRE`]); otherwise
+/// `TTS_PROVIDER` decides (unset/`none` disables). An unknown wire or provider name
+/// is an error. Adding a vendor is a new `Backend` variant plus a match arm here.
 /// Idempotent — the first init wins.
-pub fn init(store_key: Option<&str>, base_url: Option<&str>) -> anyhow::Result<()> {
+pub fn init(store_key: Option<&str>, base_url: Option<&str>, wire: Option<&str>) -> anyhow::Result<()> {
     let backend = if store_key.map(|k| !k.trim().is_empty()).unwrap_or(false) {
-        // A BYOK key implies the provider (Volcengine is the only TTS impl).
-        Backend::Volcengine(volcengine_tts::Config::from_env_with(store_key, base_url)?)
+        match wire.unwrap_or(DEFAULT_WIRE) {
+            "volcengine" => Backend::Volcengine(volcengine_tts::Config::from_env_with(store_key, base_url)?),
+            other => anyhow::bail!("unknown TTS wire: {other}"),
+        }
     } else {
         match std::env::var(ENV_PROVIDER).unwrap_or_default().as_str() {
             "" | "none" => Backend::Disabled,

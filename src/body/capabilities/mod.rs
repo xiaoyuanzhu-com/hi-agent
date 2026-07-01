@@ -53,25 +53,30 @@ pub fn init(creds: &crate::foundation::credentials::Credentials) -> anyhow::Resu
         eff.as_ref().and_then(|e| e.stt.key_opt()),
         eff.as_ref().and_then(|e| e.stt.base_url_opt()),
         eff.as_ref().and_then(|e| e.stt.model_opt()),
+        eff.as_ref().and_then(|e| e.stt.wire_opt()),
     )?;
     tts::init(
         eff.as_ref().and_then(|e| e.tts.key_opt()),
         eff.as_ref().and_then(|e| e.tts.base_url_opt()),
+        eff.as_ref().and_then(|e| e.tts.wire_opt()),
     )?;
     vision::init(
         eff.as_ref().and_then(|e| e.vision.key_opt()),
         eff.as_ref().and_then(|e| e.vision.base_url_opt()),
         eff.as_ref().and_then(|e| e.vision.model_opt()),
+        eff.as_ref().and_then(|e| e.vision.wire_opt()),
     )?;
     image_gen::init(
         eff.as_ref().and_then(|e| e.image.key_opt()),
         eff.as_ref().and_then(|e| e.image.base_url_opt()),
         eff.as_ref().and_then(|e| e.image.model_opt()),
+        eff.as_ref().and_then(|e| e.image.wire_opt()),
     )?;
     video_gen::init(
         eff.as_ref().and_then(|e| e.video.key_opt()),
         eff.as_ref().and_then(|e| e.video.base_url_opt()),
         eff.as_ref().and_then(|e| e.video.model_opt()),
+        eff.as_ref().and_then(|e| e.video.wire_opt()),
     )?;
     Ok(())
 }

@@ -57,15 +57,27 @@ static BACKEND: OnceLock<Backend> = OnceLock::new();
 
 const ENV_PROVIDER: &str = "STT_PROVIDER";
 
+/// The default wire when the store selects none — the only STT impl today.
+const DEFAULT_WIRE: &str = "volcengine";
+
 /// Resolve the STT backend into the process-global config. BYOK-first: a
-/// non-empty `store_key` (the user's key from `credentials.json`) implies the
-/// provider (Volcengine is the only STT impl) and overrides the env key. With no
-/// store key, fall back to `STT_PROVIDER` — unset/`none` disables, an unknown
-/// name is an error so a typo fails at startup rather than as a 501 at request
-/// time. Idempotent — the first init wins.
-pub fn init(store_key: Option<&str>, base_url: Option<&str>, model: Option<&str>) -> anyhow::Result<()> {
+/// non-empty `store_key` (the user's key from the config store) selects the
+/// configured `wire` (which vendor impl backs STT; `None` → [`DEFAULT_WIRE`]) and
+/// overrides the env key. With no store key, fall back to `STT_PROVIDER` —
+/// unset/`none` disables. An unknown wire or provider name is an error so a typo
+/// fails at startup rather than as a 501 at request time. Adding a vendor is a new
+/// `Backend` variant plus a match arm here. Idempotent — the first init wins.
+pub fn init(
+    store_key: Option<&str>,
+    base_url: Option<&str>,
+    model: Option<&str>,
+    wire: Option<&str>,
+) -> anyhow::Result<()> {
     let backend = if store_key.map(|k| !k.trim().is_empty()).unwrap_or(false) {
-        Backend::Volcengine(volcengine_stt::Config::from_env_with(store_key, base_url, model)?)
+        match wire.unwrap_or(DEFAULT_WIRE) {
+            "volcengine" => Backend::Volcengine(volcengine_stt::Config::from_env_with(store_key, base_url, model)?),
+            other => anyhow::bail!("unknown STT wire: {other}"),
+        }
     } else {
         match std::env::var(ENV_PROVIDER).unwrap_or_default().as_str() {
             "" | "none" => Backend::Disabled,
