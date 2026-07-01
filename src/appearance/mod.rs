@@ -114,7 +114,7 @@ where
 /// `GET /` — serve index.html with OG tags injected before `</head>`.
 ///
 /// If the embedded `index.html` is missing (debug builds before the SPA is
-/// built), respond with a small dev placeholder pointing at Vite on :5173.
+/// built), respond with a small dev placeholder pointing at Vite on :12359.
 async fn index() -> Response {
     let tags = og::OgTags::default_for_agent();
 
@@ -244,7 +244,7 @@ fn not_found() -> Response {
 }
 
 fn dev_placeholder() -> String {
-    // Minimal, themed to match the SPA. Mentions :5173 so a new contributor
+    // Minimal, themed to match the SPA. Mentions :12359 so a new contributor
     // knows where to look.
     r#"<!doctype html>
 <html lang="en">
@@ -272,8 +272,8 @@ fn dev_placeholder() -> String {
       <p>The embedded web bundle has not been built yet.</p>
       <p>
         For development, run the Vite dev server on
-        <code>http://127.0.0.1:5173</code> — it proxies the channel routes
-        back to this Rust server on <code>:8080</code>.
+        <code>http://127.0.0.1:12359</code> — it proxies the channel routes
+        back to this Rust server on <code>:12358</code>.
       </p>
       <pre><code>cd src/appearance/web &amp;&amp; pnpm install &amp;&amp; pnpm dev</code></pre>
       <p class="hint">
@@ -297,7 +297,7 @@ mod tests {
         let html = dev_placeholder();
         assert!(html.starts_with("<!doctype html>"));
         assert!(html.contains("hi-agent"));
-        assert!(html.contains(":5173"));
+        assert!(html.contains(":12359"));
     }
 
     #[test]

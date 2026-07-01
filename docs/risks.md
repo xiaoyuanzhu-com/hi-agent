@@ -118,10 +118,10 @@ issue is implementation-side, not docs-side.
       timing roughly equal to single-session timing (concurrency works —
       see "Concurrent ACP sessions" above)
 - [ ] `cd src/appearance/web && pnpm install && pnpm build` succeeds
-- [ ] `./target/release/hi-agent` starts; `curl http://127.0.0.1:8080/`
+- [ ] `./target/release/hi-agent` starts; `curl http://127.0.0.1:12358/`
       returns the embedded SPA HTML (200, `text/html`)
 - [ ] `curl -X POST -H 'X-HI-Scene: alice@phone' --data-binary 'hi'
-      http://127.0.0.1:8080/thought` returns 202 and writes a `SignalIn`
+      http://127.0.0.1:12358/thought` returns 202 and writes a `SignalIn`
       line to `data/journal.jsonl`
 - [ ] A `GET /thought` long-poll opened beforehand receives the router's
       reply on the same scene

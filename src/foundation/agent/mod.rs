@@ -62,7 +62,7 @@ pub struct AgentLayer {
 
 struct Inner {
     spawn: SpawnConfig,
-    /// hi-agent's own HTTP base URL (e.g. `http://127.0.0.1:8080`), used to build
+    /// hi-agent's own HTTP base URL (e.g. `http://127.0.0.1:12358`), used to build
     /// each session's MCP attach URL (`<base>/mcp`). The same value the child gets
     /// as `HI_AGENT_BASE_URL`.
     server_base_url: String,

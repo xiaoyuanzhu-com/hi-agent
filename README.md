@@ -44,7 +44,7 @@ make build && make run
 ### Verify it's alive
 
 ```sh
-curl -X POST http://127.0.0.1:8080/thought \
+curl -X POST http://127.0.0.1:12358/thought \
   -H 'X-HI-Scene: alice@phone' \
   --data-binary 'hello'
 ```
@@ -52,7 +52,7 @@ curl -X POST http://127.0.0.1:8080/thought \
 You should see `202 Accepted` and a fresh line in `data/journal.jsonl`. To watch the agent talk back, open a long-poll in another terminal first:
 
 ```sh
-curl -N -H 'X-HI-Scene: alice@phone' http://127.0.0.1:8080/thought
+curl -N -H 'X-HI-Scene: alice@phone' http://127.0.0.1:12358/thought
 ```
 
 ## Curl recipes
@@ -61,23 +61,23 @@ The most useful four:
 
 ```sh
 # Open a long-poll on /thought for scene alice@phone (Ctrl-C to close)
-curl -N -H 'X-HI-Scene: alice@phone' http://127.0.0.1:8080/thought
+curl -N -H 'X-HI-Scene: alice@phone' http://127.0.0.1:12358/thought
 
 # Send a thought
 curl -X POST -H 'X-HI-Scene: alice@phone' \
   --data-binary 'hey, are you there?' \
-  http://127.0.0.1:8080/thought
+  http://127.0.0.1:12358/thought
 
 # Schedule a reminder (the router decides whether to call set_intent)
 curl -X POST -H 'X-HI-Scene: alice@phone' \
   --data-binary 'remind me at 21:00 to call mom' \
-  http://127.0.0.1:8080/thought
+  http://127.0.0.1:12358/thought
 
 # Approve a pending action (id comes from the /approval long-poll JSON)
 curl -X POST -H 'X-HI-Scene: alice@phone' \
   -H 'Content-Type: application/json' \
   -d '{"id":"<approval-uuid>","allow":true}' \
-  http://127.0.0.1:8080/approval
+  http://127.0.0.1:12358/approval
 ```
 
 ## Architecture
@@ -194,7 +194,7 @@ CLI flags:
 
 | Flag | Default | Purpose |
 |---|---|---|
-| `--port` | `8080` | HTTP port to bind |
+| `--port` | `12358` | HTTP port to bind |
 | `--data-dir` | `./data` | Where `journal.jsonl` / `intents.jsonl` / `mcp.sock` live |
 
 ## Project layout
@@ -229,7 +229,7 @@ hi-agent/
 
 ## Development
 
-Two processes — the Rust binary on `:8080` and the Vite dev server on `:5173`, with Vite proxying channel routes to `:8080`:
+Two processes — the Rust binary on `:12358` and the Vite dev server on `:12359`, with Vite proxying channel routes to `:12358`:
 
 ```sh
 make dev
@@ -237,7 +237,7 @@ make dev
 
 (That backgrounds `cargo watch` and `npm run dev` with a `trap` so Ctrl-C stops both. Output from the two processes is interleaved without prefixes — if that bothers you, run them in separate terminals.)
 
-The browser talks to `:5173`. HMR works for the SPA; Rust reloads on file change via `cargo watch`.
+The browser talks to `:12359`. HMR works for the SPA; Rust reloads on file change via `cargo watch`.
 
 ## Docker
 

@@ -9,7 +9,7 @@ use tracing_subscriber::EnvFilter;
 #[command(version = version_string())]
 struct Cli {
     /// HTTP port to bind on.
-    #[arg(long, default_value_t = 8080)]
+    #[arg(long, default_value_t = 12358)]
     port: u16,
 
     /// Root for memory (`memory/raw/…`), the soul, and runtime state. Unset: a

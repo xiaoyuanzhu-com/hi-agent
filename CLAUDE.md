@@ -25,10 +25,10 @@ The working tree may hold the user's in-progress work that is unrelated to your 
 ## Running locally
 
 Use `make dev` — it runs both halves together (Ctrl-C stops both):
-- **Rust backend** on `:8080` via `cargo watch -x 'run -- --port 8080'` (auto-rebuilds/restarts on Rust changes).
-- **Vite dev server** on `:5173` (`npm run dev` in `src/appearance/web`) — this is the page you open in dev.
+- **Rust backend** on `:12358` via `cargo watch -x 'run -- --port 12358'` (auto-rebuilds/restarts on Rust changes).
+- **Vite dev server** on `:12359` (`npm run dev` in `src/appearance/web`) — this is the page you open in dev.
 
-In dev the browser talks only to Vite (`:5173`), which proxies `/api/*` and `/generated/*` to the backend. Caveat: `cargo watch` restarts the backend on Rust edits, but **Vite config changes (`vite.config.ts`) are NOT hot-reloaded** — restart `make dev` (or just the Vite process) after editing it.
+In dev the browser talks only to Vite (`:12359`), which proxies `/api/*` and `/generated/*` to the backend. Caveat: `cargo watch` restarts the backend on Rust edits, but **Vite config changes (`vite.config.ts`) are NOT hot-reloaded** — restart `make dev` (or just the Vite process) after editing it.
 
 Other targets: `make build` (npm ci + build SPA, then `cargo build --release`), `make run` (release binary), `make test` (cargo + vitest), `make docker`.
 
@@ -58,12 +58,12 @@ The tray **auto-skips when `SSH_CONNECTION` is set** (no window server over SSH)
 
 Journeys in [docs/user-journeys/](docs/user-journeys/) are specs of *intended* behavior — test them against a real running instance, not by code-reading. Standing setup: clone at `~/projects/hi-agent` on the Mac mini (`ssh macmini`), `cargo build --release`, run from the repo root (`.env` with `AI_API_KEY` etc. lives there):
 
-    nohup ./target/release/hi-agent --port 8080 > server.log 2>&1 &
+    nohup ./target/release/hi-agent --port 12358 > server.log 2>&1 &
 
 Talk to it over the text channel — Claude plays the boss; the human is only pulled in for account-side steps (QR/device auth, credentials) and for observing effects in external apps (e.g. what actually landed in the Feishu group):
 
-    curl -X POST -H "X-HI-Scene: boss" --data-binary "..." localhost:8080/api/in/text
-    curl -H "X-HI-Scene: boss" localhost:8080/api/out/text   # long-poll; one utterance per GET
+    curl -X POST -H "X-HI-Scene: boss" --data-binary "..." localhost:12358/api/in/text
+    curl -H "X-HI-Scene: boss" localhost:12358/api/out/text   # long-poll; one utterance per GET
 
 Method — the parts that keep the test honest:
 

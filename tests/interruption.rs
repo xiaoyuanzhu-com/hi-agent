@@ -32,7 +32,7 @@
 //! tail -F data/memory/raw/*/text/*/text.jsonl
 //!
 //! # in another, fire two POSTs in rapid succession to the same scene
-//! BASE=http://127.0.0.1:8080
+//! BASE=http://127.0.0.1:12358
 //! ME=alice@phone
 //! curl -X POST -H "X-HI-Scene: $ME" \
 //!     --data-binary 'first thought, take your time' "$BASE/api/in/text" &

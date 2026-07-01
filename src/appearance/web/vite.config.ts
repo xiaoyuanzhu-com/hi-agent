@@ -76,9 +76,9 @@ function devImportMap(): Plugin {
   };
 }
 
-// During dev, the browser only talks to Vite (:5173). Vite proxies every
+// During dev, the browser only talks to Vite (:12359). Vite proxies every
 // human-interface channel route — all under `/api/*` — to the Rust server on
-// :8080.
+// :12358.
 //
 // TLS is on (basic-ssl, a self-signed localhost cert) for one reason: HTTP/2.
 // Browsers only negotiate h2 over TLS, and h2 multiplexes every request over a
@@ -87,7 +87,7 @@ function devImportMap(): Plugin {
 // and HTTP/1.1's ~6-connections-per-origin cap would otherwise starve any
 // further request (worklet fetch, a second tab, the inspect snapshot). Vite 7.2+
 // keeps h2 even with `server.proxy` set (it moved off the h2-incapable
-// `http-proxy` to `http-proxy3`); the upstream hop to :8080 stays HTTP/1.1,
+// `http-proxy` to `http-proxy3`); the upstream hop to :12358 stays HTTP/1.1,
 // which is fine — the connection ceiling only bites browser-side.
 //
 // The proxy MUST NOT buffer: /api/out/text (and the /api/in/* observe streams)
@@ -105,7 +105,7 @@ const proxy: Record<string, ProxyOptions> = Object.fromEntries(
   ["/api", "/views", "/auth"].map((path) => [
     path,
     {
-      target: "http://127.0.0.1:8080",
+      target: "http://127.0.0.1:12358",
       changeOrigin: false,
       // /api/in/audio/stream is a WebSocket (continuous mic → STT). Without
       // ws:true the proxy leaves the Upgrade handshake hanging and mic audio
@@ -157,7 +157,7 @@ export default defineConfig({
     },
   },
   server: {
-    port: 5173,
+    port: 12359,
     strictPort: true,
     proxy,
   },

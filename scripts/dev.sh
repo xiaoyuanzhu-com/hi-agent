@@ -2,8 +2,8 @@
 #
 # Run the two dev servers together and tear the WHOLE tree down on Ctrl-C.
 #
-#   - Rust backend on :8080 via `cargo watch -x 'run -- --port 8080'`
-#   - Vite dev server on :5173 (src/appearance/web)
+#   - Rust backend on :12358 via `cargo watch -x 'run -- --port 12358'`
+#   - Vite dev server on :12359 (src/appearance/web)
 #
 # Why this isn't just `trap 'kill 0'`: `cargo watch` runs the backend
 # (`cargo run` -> `hi-agent` -> `node` ACP adapter -> `claude`, plus esbuild /
@@ -12,7 +12,7 @@
 # those — they're left to cargo watch's own signal forwarding, which races on
 # exit and "sometimes" orphans the backend. Worse, hi-agent drains in-flight
 # HTTP for up to 10s on SIGTERM (the browser holds SSE + long-poll open), so the
-# backend + its node/claude children keep :8080 bound long after the prompt
+# backend + its node/claude children keep :12358 bound long after the prompt
 # returns.
 #
 # Instead we snapshot the full descendant tree of each server *by PID* (so a
@@ -69,17 +69,17 @@ cleanup() {
 trap cleanup INT TERM EXIT
 
 cargo watch -w src -w build.rs -w Cargo.toml -w Cargo.lock \
-  -i 'src/appearance/web/**' -x 'run -- --port 8080' &
+  -i 'src/appearance/web/**' -x 'run -- --port 12358' &
 pids="$pids $!"
 
 ( cd src/appearance/web && exec npm run dev ) &
 pids="$pids $!"
 
 # Keep the binary's embedded web fresh in dev. The menu-bar popover's WKWebView loads
-# the binary's own port (:8080), which serves `dist/` from disk — NOT the Vite dev
-# server (:5173 is HTTPS with a self-signed cert the WKWebView won't trust). So rebuild
+# the binary's own port (:12358), which serves `dist/` from disk — NOT the Vite dev
+# server (:12359 is HTTPS with a self-signed cert the WKWebView won't trust). So rebuild
 # `dist/` on web changes; the debug binary reads it per request, so the popover shows the
-# latest on reopen. The browser still gets HMR from the :5173 dev server.
+# latest on reopen. The browser still gets HMR from the :12359 dev server.
 ( cd src/appearance/web && exec npm run build -- --watch ) &
 pids="$pids $!"
 
