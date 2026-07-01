@@ -1,18 +1,24 @@
 //! Credential store: the user's BYOK keys, or (xiaoyuanzhu) the broker-issued
 //! account tokens plus the configs the broker hands back. Persisted under the
-//! data dir as `credentials.json`, resolved at startup, refreshed by the broker
-//! client. When a managed key is unset the agent falls back to `.env`
-//! (`AI_API_KEY`, `VOLCENGINE_*`, `DOUBAO_*`, …) so dev / journey-test flows keep
-//! working. A vendor key in effect also implies that vendor is the provider for
-//! its capability.
+//! data dir as `config.db` (SQLite; see the [`db`] submodule), resolved at
+//! startup, refreshed by the broker client. When a managed key is unset the agent
+//! falls back to `.env` (`AI_API_KEY`, `VOLCENGINE_*`, `DOUBAO_*`, …) so dev /
+//! journey-test flows keep working. A vendor key in effect also implies that
+//! vendor is the provider for its capability.
+//!
+//! Both modes' configs are stored side by side (one row per `(mode, feature)`),
+//! so switching mode in Settings surfaces whatever was last entered for it. The
+//! in-memory [`Credentials`] shape is unchanged — only persistence moved from a
+//! JSON file to SQLite; a legacy `credentials.json` is imported once on first
+//! load (see [`db::load`]).
 
 use std::path::{Path, PathBuf};
 
 use anyhow::Context;
 use serde::{Deserialize, Serialize};
 
-/// File under the data dir holding the credential store.
-const FILE: &str = "credentials.json";
+/// File under the data dir holding the credential store (SQLite).
+const FILE: &str = "config.db";
 
 /// Absolute path to the credential store for `data_dir`.
 pub fn path(data_dir: &Path) -> PathBuf {
@@ -217,25 +223,18 @@ impl Credentials {
         }
     }
 
-    /// Load from `<data_dir>/credentials.json`. A missing file yields defaults; a
-    /// corrupt one logs a warning and also yields defaults, so a bad hand-edit
-    /// can't brick boot — the user re-saves from Settings.
+    /// Load from `<data_dir>/config.db`. A missing DB yields defaults; any read
+    /// error logs a warning and also yields defaults, so a corrupt store can't
+    /// brick boot — the user re-saves from Settings. On first load a legacy
+    /// `credentials.json` is imported into the DB (see [`db::load`]).
     pub fn load(data_dir: &Path) -> Self {
-        let p = path(data_dir);
-        let mut c = match std::fs::read(&p) {
-            Ok(bytes) => serde_json::from_slice(&bytes).unwrap_or_else(|e| {
-                tracing::warn!(
-                    path = %p.display(), error = %e,
-                    "credentials.json is unreadable; ignoring (re-save from Settings)"
-                );
-                Self::default()
-            }),
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Self::default(),
-            Err(e) => {
-                tracing::warn!(path = %p.display(), error = %e, "could not read credentials.json; ignoring");
-                Self::default()
-            }
-        };
+        let mut c = db::load(data_dir).unwrap_or_else(|e| {
+            tracing::warn!(
+                path = %path(data_dir).display(), error = %e,
+                "config store unreadable; using defaults (re-save from Settings)"
+            );
+            Self::default()
+        });
         // An explicit HI_AGENT_MODE wins over the stored mode (testing override).
         if let Some(m) = mode_override() {
             c.mode = m;
@@ -243,20 +242,10 @@ impl Credentials {
         c
     }
 
-    /// Persist to `<data_dir>/credentials.json`, owner-only (`0600` on unix).
+    /// Persist to `<data_dir>/config.db`, owner-only (`0600` on unix). Writes both
+    /// modes' rows so a later mode switch surfaces the stored config for it.
     pub fn save(&self, data_dir: &Path) -> anyhow::Result<()> {
-        std::fs::create_dir_all(data_dir)
-            .with_context(|| format!("creating data dir {}", data_dir.display()))?;
-        let p = path(data_dir);
-        let body = serde_json::to_vec_pretty(self).context("serializing credentials")?;
-        std::fs::write(&p, &body).with_context(|| format!("writing {}", p.display()))?;
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o600))
-                .with_context(|| format!("chmod 600 {}", p.display()))?;
-        }
-        Ok(())
+        db::save(data_dir, self)
     }
 }
 
@@ -316,6 +305,315 @@ impl std::fmt::Debug for Credentials {
             .field("managed", &self.managed)
             .field("energy", &self.energy)
             .finish()
+    }
+}
+
+/// SQLite persistence for the credential store. The on-disk shape is normalized:
+/// scalar flags in `app_settings`, one `credential` row per `(mode, feature)` (so
+/// both modes coexist), and a single-row `account` for the broker tokens + energy.
+/// The mapping to/from the in-memory [`Credentials`] lives entirely here; the rest
+/// of the tree only sees [`Credentials::load`] / [`Credentials::save`].
+mod db {
+    use super::*;
+    use rusqlite::{Connection, OptionalExtension, params};
+
+    /// The broker account/energy row is a singleton (`id = 1`).
+    const ACCOUNT_ID: i64 = 1;
+
+    const SCHEMA: &str = "
+        CREATE TABLE IF NOT EXISTS app_settings (
+            key   TEXT PRIMARY KEY,
+            value TEXT NOT NULL
+        );
+        CREATE TABLE IF NOT EXISTS credential (
+            mode     TEXT NOT NULL,
+            feature  TEXT NOT NULL,
+            base_url TEXT NOT NULL DEFAULT '',
+            api_key  TEXT NOT NULL DEFAULT '',
+            model    TEXT,
+            PRIMARY KEY (mode, feature)
+        );
+        CREATE TABLE IF NOT EXISTS account (
+            id                INTEGER PRIMARY KEY CHECK (id = 1),
+            access_token      TEXT,
+            refresh_token     TEXT,
+            access_expires_at TEXT,
+            energy_remaining  INTEGER,
+            energy_total      INTEGER,
+            energy_resets_at  TEXT,
+            energy_tier       TEXT
+        );
+    ";
+
+    /// The stable string a `Mode` is stored under (matches the serde/JSON name, so
+    /// legacy imports and the wire API line up).
+    fn mode_str(m: Mode) -> &'static str {
+        match m {
+            Mode::Byok => "byok",
+            Mode::Xiaoyuanzhu => "xiaoyuanzhu",
+        }
+    }
+
+    /// Open (creating if needed) the config DB, ensure the schema, and lock it down
+    /// to owner-only. A short busy timeout lets the startup load, the settings
+    /// writes, and the periodic broker poll serialize instead of erroring.
+    fn open(data_dir: &Path) -> anyhow::Result<Connection> {
+        std::fs::create_dir_all(data_dir)
+            .with_context(|| format!("creating data dir {}", data_dir.display()))?;
+        let p = path(data_dir);
+        let conn = Connection::open(&p).with_context(|| format!("opening {}", p.display()))?;
+        conn.busy_timeout(std::time::Duration::from_secs(5))?;
+        conn.execute_batch(SCHEMA).context("initializing config schema")?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let _ = std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o600));
+        }
+        Ok(conn)
+    }
+
+    /// Load the credential store, importing a legacy `credentials.json` on first run.
+    pub fn load(data_dir: &Path) -> anyhow::Result<Credentials> {
+        let conn = open(data_dir)?;
+        maybe_import_legacy(&conn, data_dir)?;
+        read(&conn)
+    }
+
+    /// Persist the whole store atomically (both modes' rows + the account).
+    pub fn save(data_dir: &Path, c: &Credentials) -> anyhow::Result<()> {
+        let conn = open(data_dir)?;
+        let tx = conn.unchecked_transaction()?;
+        write_all(&tx, c)?;
+        tx.commit()?;
+        Ok(())
+    }
+
+    /// Reconstruct a [`Credentials`] from the tables. Absent rows read as empty /
+    /// `None`, so a partially-populated store loads cleanly.
+    fn read(conn: &Connection) -> anyhow::Result<Credentials> {
+        let mode = get_setting(conn, "mode")?
+            .and_then(|s| parse_mode(&s))
+            .unwrap_or_default();
+        let device_id = get_setting(conn, "device_id")?.unwrap_or_default();
+        let (tokens, energy) = read_account(conn)?;
+        Ok(Credentials {
+            mode,
+            device_id,
+            llm: read_llm(conn, Mode::Byok, "llm")?,
+            stt: read_vendor(conn, Mode::Byok, "stt")?,
+            tts: read_vendor(conn, Mode::Byok, "tts")?,
+            vision: read_vendor(conn, Mode::Byok, "vision")?,
+            image: read_vendor(conn, Mode::Byok, "image")?,
+            video: read_vendor(conn, Mode::Byok, "video")?,
+            managed: read_managed(conn)?,
+            tokens,
+            energy,
+        })
+    }
+
+    /// Write every field of `c` — the BYOK flat fields, the managed bundle (when
+    /// present), the account, and the scalar flags. Upserts, so re-saving is idempotent.
+    fn write_all(conn: &Connection, c: &Credentials) -> anyhow::Result<()> {
+        set_setting(conn, "mode", mode_str(c.mode))?;
+        set_setting(conn, "device_id", &c.device_id)?;
+        write_llm(conn, Mode::Byok, "llm", &c.llm)?;
+        write_vendor(conn, Mode::Byok, "stt", &c.stt)?;
+        write_vendor(conn, Mode::Byok, "tts", &c.tts)?;
+        write_vendor(conn, Mode::Byok, "vision", &c.vision)?;
+        write_vendor(conn, Mode::Byok, "image", &c.image)?;
+        write_vendor(conn, Mode::Byok, "video", &c.video)?;
+        if let Some(m) = &c.managed {
+            write_llm(conn, Mode::Xiaoyuanzhu, "llm", &m.llm)?;
+            write_vendor(conn, Mode::Xiaoyuanzhu, "stt", &m.stt)?;
+            write_vendor(conn, Mode::Xiaoyuanzhu, "tts", &m.tts)?;
+            write_vendor(conn, Mode::Xiaoyuanzhu, "vision", &m.vision)?;
+            write_vendor(conn, Mode::Xiaoyuanzhu, "image", &m.image)?;
+            write_vendor(conn, Mode::Xiaoyuanzhu, "video", &m.video)?;
+        }
+        write_account(conn, c)?;
+        Ok(())
+    }
+
+    fn get_setting(conn: &Connection, key: &str) -> anyhow::Result<Option<String>> {
+        Ok(conn
+            .query_row("SELECT value FROM app_settings WHERE key = ?1", params![key], |r| r.get(0))
+            .optional()?)
+    }
+
+    fn set_setting(conn: &Connection, key: &str, value: &str) -> anyhow::Result<()> {
+        conn.execute(
+            "INSERT INTO app_settings (key, value) VALUES (?1, ?2)
+             ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+            params![key, value],
+        )?;
+        Ok(())
+    }
+
+    /// The `(base_url, api_key, model)` triple for one `(mode, feature)`, or `None`
+    /// when no row exists.
+    fn read_row(
+        conn: &Connection,
+        mode: Mode,
+        feature: &str,
+    ) -> anyhow::Result<Option<(String, String, Option<String>)>> {
+        Ok(conn
+            .query_row(
+                "SELECT base_url, api_key, model FROM credential WHERE mode = ?1 AND feature = ?2",
+                params![mode_str(mode), feature],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+            )
+            .optional()?)
+    }
+
+    fn read_vendor(conn: &Connection, mode: Mode, feature: &str) -> anyhow::Result<VendorKey> {
+        Ok(read_row(conn, mode, feature)?
+            .map(|(base_url, api_key, model)| VendorKey { base_url, api_key, model })
+            .unwrap_or_default())
+    }
+
+    fn read_llm(conn: &Connection, mode: Mode, feature: &str) -> anyhow::Result<LlmCredentials> {
+        Ok(read_row(conn, mode, feature)?
+            .map(|(base_url, api_key, model)| LlmCredentials { base_url, api_key, model })
+            .unwrap_or_default())
+    }
+
+    /// The managed bundle is `Some` iff at least one xiaoyuanzhu row was stored —
+    /// mirrors the JSON store's `managed: Option<Managed>` (absent until fetched).
+    fn read_managed(conn: &Connection) -> anyhow::Result<Option<Managed>> {
+        let any: bool = conn.query_row(
+            "SELECT EXISTS(SELECT 1 FROM credential WHERE mode = ?1)",
+            params![mode_str(Mode::Xiaoyuanzhu)],
+            |r| r.get(0),
+        )?;
+        if !any {
+            return Ok(None);
+        }
+        Ok(Some(Managed {
+            llm: read_llm(conn, Mode::Xiaoyuanzhu, "llm")?,
+            stt: read_vendor(conn, Mode::Xiaoyuanzhu, "stt")?,
+            tts: read_vendor(conn, Mode::Xiaoyuanzhu, "tts")?,
+            vision: read_vendor(conn, Mode::Xiaoyuanzhu, "vision")?,
+            image: read_vendor(conn, Mode::Xiaoyuanzhu, "image")?,
+            video: read_vendor(conn, Mode::Xiaoyuanzhu, "video")?,
+        }))
+    }
+
+    fn write_vendor(conn: &Connection, mode: Mode, feature: &str, vk: &VendorKey) -> anyhow::Result<()> {
+        write_row(conn, mode, feature, &vk.base_url, &vk.api_key, vk.model.as_deref())
+    }
+
+    fn write_llm(conn: &Connection, mode: Mode, feature: &str, llm: &LlmCredentials) -> anyhow::Result<()> {
+        write_row(conn, mode, feature, &llm.base_url, &llm.api_key, llm.model.as_deref())
+    }
+
+    fn write_row(
+        conn: &Connection,
+        mode: Mode,
+        feature: &str,
+        base_url: &str,
+        api_key: &str,
+        model: Option<&str>,
+    ) -> anyhow::Result<()> {
+        conn.execute(
+            "INSERT INTO credential (mode, feature, base_url, api_key, model) VALUES (?1, ?2, ?3, ?4, ?5)
+             ON CONFLICT(mode, feature) DO UPDATE SET
+                 base_url = excluded.base_url, api_key = excluded.api_key, model = excluded.model",
+            params![mode_str(mode), feature, base_url, api_key, model],
+        )?;
+        Ok(())
+    }
+
+    /// Read the singleton account row. Tokens are `Some` iff an expiry is stored;
+    /// energy is `Some` iff a tier is stored — the two are written independently.
+    fn read_account(conn: &Connection) -> anyhow::Result<(Option<Tokens>, Option<Energy>)> {
+        let row = conn
+            .query_row(
+                "SELECT access_token, refresh_token, access_expires_at,
+                        energy_remaining, energy_total, energy_resets_at, energy_tier
+                 FROM account WHERE id = ?1",
+                params![ACCOUNT_ID],
+                |r| {
+                    Ok((
+                        r.get::<_, Option<String>>(0)?,
+                        r.get::<_, Option<String>>(1)?,
+                        r.get::<_, Option<String>>(2)?,
+                        r.get::<_, Option<i64>>(3)?,
+                        r.get::<_, Option<i64>>(4)?,
+                        r.get::<_, Option<String>>(5)?,
+                        r.get::<_, Option<String>>(6)?,
+                    ))
+                },
+            )
+            .optional()?;
+        let Some((at, rt, exp, remaining, total, resets_at, tier)) = row else {
+            return Ok((None, None));
+        };
+        let tokens = exp.map(|access_expires_at| Tokens {
+            access_token: at.unwrap_or_default(),
+            refresh_token: rt.unwrap_or_default(),
+            access_expires_at,
+        });
+        let energy = tier.map(|tier| Energy {
+            remaining: remaining.unwrap_or_default(),
+            total: total.unwrap_or_default(),
+            resets_at: resets_at.unwrap_or_default(),
+            tier,
+        });
+        Ok((tokens, energy))
+    }
+
+    fn write_account(conn: &Connection, c: &Credentials) -> anyhow::Result<()> {
+        let (at, rt, exp) = match &c.tokens {
+            Some(t) => (Some(&t.access_token), Some(&t.refresh_token), Some(&t.access_expires_at)),
+            None => (None, None, None),
+        };
+        let (remaining, total, resets_at, tier) = match &c.energy {
+            Some(e) => (Some(e.remaining), Some(e.total), Some(&e.resets_at), Some(&e.tier)),
+            None => (None, None, None, None),
+        };
+        conn.execute(
+            "INSERT INTO account (id, access_token, refresh_token, access_expires_at,
+                                  energy_remaining, energy_total, energy_resets_at, energy_tier)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
+             ON CONFLICT(id) DO UPDATE SET
+                 access_token = excluded.access_token, refresh_token = excluded.refresh_token,
+                 access_expires_at = excluded.access_expires_at,
+                 energy_remaining = excluded.energy_remaining, energy_total = excluded.energy_total,
+                 energy_resets_at = excluded.energy_resets_at, energy_tier = excluded.energy_tier",
+            params![ACCOUNT_ID, at, rt, exp, remaining, total, resets_at, tier],
+        )?;
+        Ok(())
+    }
+
+    /// The pre-SQLite JSON store, imported once. Named for its legacy filename.
+    const LEGACY_JSON: &str = "credentials.json";
+
+    /// Import a legacy `credentials.json` into a never-written DB, then rename it to
+    /// `.bak` so the import runs at most once. A malformed legacy file logs and is
+    /// skipped (the user re-saves from Settings) rather than blocking boot.
+    fn maybe_import_legacy(conn: &Connection, data_dir: &Path) -> anyhow::Result<()> {
+        let legacy = data_dir.join(LEGACY_JSON);
+        if !legacy.exists() {
+            return Ok(());
+        }
+        let already_written: bool =
+            conn.query_row("SELECT EXISTS(SELECT 1 FROM app_settings)", [], |r| r.get(0))?;
+        if already_written {
+            return Ok(());
+        }
+        let bytes = std::fs::read(&legacy).with_context(|| format!("reading {}", legacy.display()))?;
+        match serde_json::from_slice::<Credentials>(&bytes) {
+            Ok(c) => {
+                let tx = conn.unchecked_transaction()?;
+                write_all(&tx, &c)?;
+                tx.commit()?;
+                let bak = data_dir.join(format!("{LEGACY_JSON}.bak"));
+                let _ = std::fs::rename(&legacy, &bak);
+                tracing::info!(backup = %bak.display(), "imported legacy credentials.json into config.db");
+            }
+            Err(e) => tracing::warn!(error = %e, "legacy credentials.json unreadable; skipping import"),
+        }
+        Ok(())
     }
 }
 
@@ -381,6 +679,55 @@ mod tests {
         assert_eq!(back.tokens.as_ref().unwrap().access_token, "acc");
         assert_eq!(back.managed.as_ref().unwrap().llm.base_url, "https://songguo.xiaoyuanzhu.com");
         assert_eq!(back.energy.as_ref().unwrap().remaining, 70);
+    }
+
+    #[test]
+    fn both_modes_configs_coexist_across_a_switch() {
+        // The user's BYOK keys and the broker's managed bundle are stored side by
+        // side; flipping the active mode must not lose the other mode's config.
+        let dir = tempfile::tempdir().unwrap();
+        let c = Credentials {
+            mode: Mode::Byok,
+            llm: LlmCredentials { api_key: "byok-llm".into(), ..Default::default() },
+            managed: Some(Managed {
+                llm: LlmCredentials { api_key: "managed-llm".into(), ..Default::default() },
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        c.save(dir.path()).unwrap();
+
+        // Switch to xiaoyuanzhu and re-save (as the settings handler would).
+        let mut back = Credentials::load(dir.path());
+        assert_eq!(back.llm.api_key, "byok-llm"); // BYOK still there while in byok
+        back.mode = Mode::Xiaoyuanzhu;
+        back.save(dir.path()).unwrap();
+
+        // Both configs survive the round-trip; effective() follows the active mode.
+        let after = Credentials::load(dir.path());
+        assert_eq!(after.mode, Mode::Xiaoyuanzhu);
+        assert_eq!(after.llm.api_key, "byok-llm", "BYOK config must persist across a switch");
+        assert_eq!(after.managed.as_ref().unwrap().llm.api_key, "managed-llm");
+        assert_eq!(after.effective().unwrap().llm.api_key, "managed-llm");
+    }
+
+    #[test]
+    fn imports_legacy_credentials_json_once() {
+        let dir = tempfile::tempdir().unwrap();
+        // A pre-SQLite store with a legacy mode value and a BYOK key.
+        let legacy = r#"{"mode":"free","llm":{"base_url":"","api_key":"old-key","model":null}}"#;
+        std::fs::write(dir.path().join("credentials.json"), legacy).unwrap();
+
+        let c = Credentials::load(dir.path());
+        assert_eq!(c.mode, Mode::Xiaoyuanzhu, "legacy free → xiaoyuanzhu");
+        assert_eq!(c.llm.api_key, "old-key", "legacy key imported");
+        // The JSON is renamed so the import can't run twice.
+        assert!(!dir.path().join("credentials.json").exists());
+        assert!(dir.path().join("credentials.json.bak").exists());
+
+        // A second load reads purely from the DB (no re-import) and is unchanged.
+        let again = Credentials::load(dir.path());
+        assert_eq!(again.llm.api_key, "old-key");
     }
 
     #[test]
