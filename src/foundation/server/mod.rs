@@ -336,8 +336,8 @@ pub struct AppState {
     pub data_dir: PathBuf,
 
     /// The auth gate (`Some` only when `HI_AGENT_AUTH=on`). The settings handler
-    /// reads the signed-in user's session token from it to forward to the broker in
-    /// login mode. `None` ⇒ no auth, so login mode has no token source.
+    /// reads the signed-in user's session token from it to forward to the broker for
+    /// a xiaoyuanzhu `sub`-tier account. `None` ⇒ no auth, so no signed-in token source.
     pub auth: Option<Arc<crate::foundation::auth::AuthState>>,
 
     /// Scene→tool-sink table. The `/mcp` handler looks a scene up here to route a

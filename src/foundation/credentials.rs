@@ -1,4 +1,4 @@
-//! Credential store: the user's BYOK keys, or (free/login) the broker-issued
+//! Credential store: the user's BYOK keys, or (xiaoyuanzhu) the broker-issued
 //! account tokens plus the configs the broker hands back. Persisted under the
 //! data dir as `credentials.json`, resolved at startup, refreshed by the broker
 //! client. When a managed key is unset the agent falls back to `.env`
@@ -20,16 +20,17 @@ pub fn path(data_dir: &Path) -> PathBuf {
 }
 
 /// Env flag that overrides the stored credential mode — handy for flipping
-/// free/byok in testing without the Settings UI or editing the file. When set it
-/// wins over the stored mode; unset → the stored mode (default free).
+/// xiaoyuanzhu/byok in testing without the Settings UI or editing the file. When
+/// set it wins over the stored mode; unset → the stored mode (default xiaoyuanzhu).
 const ENV_MODE: &str = "HI_AGENT_MODE";
 
-/// Parse a mode string, case-insensitive (`byok` | `login` | `free`). Unknown → None.
+/// Parse a mode string, case-insensitive (`byok` | `xiaoyuanzhu`). The legacy
+/// values `free`/`login` map to `xiaoyuanzhu` (the mode that absorbed both).
+/// Unknown → None.
 fn parse_mode(s: &str) -> Option<Mode> {
     match s.trim().to_ascii_lowercase().as_str() {
         "byok" => Some(Mode::Byok),
-        "login" => Some(Mode::Login),
-        "free" => Some(Mode::Free),
+        "xiaoyuanzhu" | "free" | "login" => Some(Mode::Xiaoyuanzhu),
         _ => None,
     }
 }
@@ -39,35 +40,38 @@ fn mode_override() -> Option<Mode> {
     let v = std::env::var(ENV_MODE).ok()?;
     let m = parse_mode(&v);
     if m.is_none() && !v.trim().is_empty() {
-        tracing::warn!(value = %v, "ignoring unknown HI_AGENT_MODE (expected byok|login|free)");
+        tracing::warn!(value = %v, "ignoring unknown HI_AGENT_MODE (expected byok|xiaoyuanzhu)");
     }
     m
 }
 
 /// How the agent obtains its credentials.
-/// - `free`: an anonymous device account, auto-created at the broker — the
-///   default, so a fresh install works with no setup.
-/// - `login`: an account.xiaoyuanzhu.com user (where a subscription lives).
+/// - `xiaoyuanzhu`: a broker account (`hi.xiaoyuanzhu.com`) — the default, so a
+///   fresh install works with no setup. Anonymous device bootstrap yields the
+///   `free` tier; a signed-in account.xiaoyuanzhu.com session yields `sub`.
 /// - `byok`: the user's own keys (the flat fields below).
 ///
-/// `free`/`login` go through a one-time **bootstrap** that yields account
+/// `xiaoyuanzhu` goes through a one-time **bootstrap** that yields account
 /// [`Tokens`]; the access token then authenticates the configs + energy fetches.
+///
+/// The legacy `free`/`login` values deserialize to `Xiaoyuanzhu` (they were split
+/// modes that collapsed into it), so an older `credentials.json` loads unchanged.
 #[derive(Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize, Debug)]
 #[serde(rename_all = "lowercase")]
 pub enum Mode {
     Byok,
-    Login,
     #[default]
-    Free,
+    #[serde(alias = "free", alias = "login")]
+    Xiaoyuanzhu,
 }
 
-/// The user's credentials (BYOK) plus, for free/login, the broker account tokens
+/// The user's credentials (BYOK) plus, for xiaoyuanzhu, the broker account tokens
 /// and the configs/energy the broker minted. [`Credentials::effective`] picks
 /// which credential set is live for the current mode.
 #[derive(Clone, Default, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Credentials {
-    /// Which credential source is live. Default `free`.
+    /// Which credential source is live. Default `xiaoyuanzhu`.
     pub mode: Mode,
     pub llm: LlmCredentials,
     pub stt: VendorKey,
@@ -78,12 +82,12 @@ pub struct Credentials {
     /// Stable per-install id — the seed for the free bootstrap (not a secret).
     #[serde(skip_serializing_if = "String::is_empty")]
     pub device_id: String,
-    /// Broker-issued account tokens (free/login). The unified credential after
+    /// Broker-issued account tokens (xiaoyuanzhu). The unified credential after
     /// bootstrap: the access token authenticates configs + energy; the refresh
     /// token mints a new access when it expires.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub tokens: Option<Tokens>,
-    /// Last configs the broker minted (free/login) — the vendor settings applied.
+    /// Last configs the broker minted (xiaoyuanzhu) — the vendor settings applied.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub managed: Option<Managed>,
     /// Last energy snapshot, for the Settings bar. Polled on its own cadence,
@@ -151,7 +155,7 @@ impl VendorKey {
     }
 }
 
-/// Broker-minted configs (free/login): the same credential fields as BYOK. The
+/// Broker-minted configs (xiaoyuanzhu): the same credential fields as BYOK. The
 /// account/energy snapshot is separate ([`Energy`]) so it can be polled often
 /// without re-fetching configs.
 #[derive(Clone, Default, Serialize, Deserialize)]
@@ -165,7 +169,7 @@ pub struct Managed {
     pub video: VendorKey,
 }
 
-/// The user-facing balance from `/energy` (free/login). Cached for display; the
+/// The user-facing balance from `/energy` (xiaoyuanzhu). Cached for display; the
 /// live value is metered at the gateway. `unit` is always "energy".
 #[derive(Clone, Default, Serialize, Deserialize, Debug)]
 #[serde(default)]
@@ -190,7 +194,7 @@ pub struct Effective<'a> {
 
 impl Credentials {
     /// The credentials in effect: BYOK fields in `byok` mode, the managed configs
-    /// in free/login. `None` in free/login before configs have been fetched —
+    /// in xiaoyuanzhu. `None` in xiaoyuanzhu before configs have been fetched —
     /// callers then fall back to `.env` (resolve) or leave the capability off.
     pub fn effective(&self) -> Option<Effective<'_>> {
         match self.mode {
@@ -202,7 +206,7 @@ impl Credentials {
                 image: &self.image,
                 video: &self.video,
             }),
-            Mode::Login | Mode::Free => self.managed.as_ref().map(|m| Effective {
+            Mode::Xiaoyuanzhu => self.managed.as_ref().map(|m| Effective {
                 llm: &m.llm,
                 stt: &m.stt,
                 tts: &m.tts,
@@ -322,16 +326,28 @@ mod tests {
     #[test]
     fn parse_mode_is_case_insensitive() {
         assert_eq!(parse_mode("byok"), Some(Mode::Byok));
-        assert_eq!(parse_mode("FREE"), Some(Mode::Free));
-        assert_eq!(parse_mode(" login "), Some(Mode::Login));
+        assert_eq!(parse_mode("XIAOYUANZHU"), Some(Mode::Xiaoyuanzhu));
+        // Legacy values fold into xiaoyuanzhu.
+        assert_eq!(parse_mode("FREE"), Some(Mode::Xiaoyuanzhu));
+        assert_eq!(parse_mode(" login "), Some(Mode::Xiaoyuanzhu));
         assert_eq!(parse_mode("nope"), None);
+    }
+
+    #[test]
+    fn legacy_mode_values_deserialize_to_xiaoyuanzhu() {
+        // An older credentials.json with `"mode": "free"` (or "login") must still
+        // load — the serde aliases fold it into xiaoyuanzhu, not a parse failure.
+        for legacy in [r#"{"mode":"free"}"#, r#"{"mode":"login"}"#] {
+            let c: Credentials = serde_json::from_str(legacy).unwrap();
+            assert_eq!(c.mode, Mode::Xiaoyuanzhu);
+        }
     }
 
     #[test]
     fn missing_file_is_defaults() {
         let dir = tempfile::tempdir().unwrap();
         let c = Credentials::load(dir.path());
-        assert_eq!(c.mode, Mode::Free);
+        assert_eq!(c.mode, Mode::Xiaoyuanzhu);
         assert!(c.llm.api_key.is_empty());
         assert!(c.tokens.is_none());
     }
@@ -340,7 +356,7 @@ mod tests {
     fn round_trips_through_disk() {
         let dir = tempfile::tempdir().unwrap();
         let c = Credentials {
-            mode: Mode::Free,
+            mode: Mode::Xiaoyuanzhu,
             device_id: "dev-1".into(),
             tokens: Some(Tokens {
                 access_token: "acc".into(),
@@ -370,14 +386,14 @@ mod tests {
     #[test]
     fn effective_picks_byok_or_managed() {
         let mut c = Credentials::default();
-        assert_eq!(c.mode, Mode::Free); // free is the default
+        assert_eq!(c.mode, Mode::Xiaoyuanzhu); // xiaoyuanzhu is the default
 
         c.mode = Mode::Byok;
         c.llm.api_key = "byok-key".into();
         assert_eq!(c.effective().unwrap().llm.api_key, "byok-key");
 
-        // free with no configs → nothing in effect (callers fall back to env).
-        c.mode = Mode::Free;
+        // xiaoyuanzhu with no configs → nothing in effect (callers fall back to env).
+        c.mode = Mode::Xiaoyuanzhu;
         assert!(c.effective().is_none());
 
         c.managed = Some(Managed {

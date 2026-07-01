@@ -20,17 +20,17 @@ const VENDORS = [
 ] as const;
 
 const MODES: { id: Mode; label: string }[] = [
-  { id: "free", label: "Free" },
-  { id: "login", label: "Xiaoyuanzhu" },
+  { id: "xiaoyuanzhu", label: "Xiaoyuanzhu" },
   { id: "byok", label: "BYOK" },
 ];
 
 /**
- * Settings — a top-level product page at `/settings`. Three ways to get model
- * credits: Your keys (BYOK — the user's own vendor keys), Login (a subscription
- * via account.xiaoyuanzhu.com), or Free (anonymous daily credits). Login/Free
- * draw a credential bundle from the broker; BYOK uses the keys entered here. A raw
- * key is never returned from the server (only a hint); changes apply on restart.
+ * Settings — a top-level product page at `/settings`. Two ways to get model
+ * credits: Xiaoyuanzhu (a broker account — anonymous daily free energy, or a
+ * subscription once signed in via account.xiaoyuanzhu.com) or BYOK (the user's own
+ * vendor keys). Xiaoyuanzhu draws a credential bundle from the broker; BYOK uses the
+ * keys entered here. A raw key is never returned from the server (only a hint);
+ * changes apply on restart.
  */
 export function Settings() {
   const [view, setView] = useState<CredentialsView | null>(null);
@@ -59,7 +59,7 @@ export function Settings() {
     return () => ctrl.abort();
   }, [reloadKey]);
 
-  const mode: Mode = view?.mode ?? "free";
+  const mode: Mode = view?.mode ?? "xiaoyuanzhu";
 
   const onSelectMode = async (m: Mode) => {
     if (m === mode) return;
@@ -202,7 +202,7 @@ export function Settings() {
             ))}
           </>
         ) : (
-          <AccountCard mode={mode} account={view?.account ?? null} />
+          <AccountCard account={view?.account ?? null} />
         )}
 
         <div className="settings-actions">
@@ -219,8 +219,8 @@ export function Settings() {
   );
 }
 
-/** Login/Free: show the broker account — tier + remaining energy, or a connecting/hint state. */
-function AccountCard({ mode, account }: { mode: Mode; account: Account | null }) {
+/** Xiaoyuanzhu: show the broker account — tier + remaining energy, or a connecting state. */
+function AccountCard({ account }: { account: Account | null }) {
   const pct =
     account && account.energy_total > 0
       ? Math.max(0, Math.min(100, Math.round((account.energy_remaining / account.energy_total) * 100)))
@@ -229,7 +229,7 @@ function AccountCard({ mode, account }: { mode: Mode; account: Account | null })
   return (
     <section className="settings-card">
       <div className="settings-card-head">
-        <h2>{mode === "free" ? "Free" : "Xiaoyuanzhu"}</h2>
+        <h2>Xiaoyuanzhu</h2>
         {account ? (
           <span className="tag ok">{account.tier}</span>
         ) : (
@@ -246,13 +246,11 @@ function AccountCard({ mode, account }: { mode: Mode; account: Account | null })
             {resets && <> · resets {resets}</>}
           </p>
         </div>
-      ) : mode === "login" ? (
-        <p className="settings-sub">
-          Sign in at <code>account.xiaoyuanzhu.com</code> to draw subscription energy.{" "}
-          <em>(login token wiring in progress)</em>
-        </p>
       ) : (
-        <p className="settings-sub">Connecting to the gateway for daily free energy…</p>
+        <p className="settings-sub">
+          Connecting to the gateway for daily free energy… Sign in at{" "}
+          <code>account.xiaoyuanzhu.com</code> to draw subscription energy instead.
+        </p>
       )}
     </section>
   );

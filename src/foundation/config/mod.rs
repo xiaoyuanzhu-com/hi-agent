@@ -104,7 +104,7 @@ fn env_opt(name: &str) -> Option<String> {
 
 impl AgentConfig {
     /// Resolve the upstream LLM credential for startup. Uses the credentials in
-    /// effect for the current mode — the user's BYOK key, or (login/free) the
+    /// effect for the current mode — the user's BYOK key, or (xiaoyuanzhu) the
     /// broker-minted bundle — and falls back to `.env` (`AI_API_KEY` / `AI_API_BASE`
     /// / `HI_AGENT_MODEL`) when neither has a key, so dev / journey-test flows keep
     /// working. Never errors — with no key the agent boots **unconfigured** (see

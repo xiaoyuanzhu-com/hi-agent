@@ -271,7 +271,7 @@ impl AuthState {
     }
 
     /// The signed-in user's provider access token from a valid session cookie, for
-    /// forwarding to the broker (login mode). `None` when there is no session, it's
+    /// forwarding to the broker (xiaoyuanzhu `sub` tier). `None` when there is no session, it's
     /// expired, or it carries no token (an older cookie). The settings handler calls
     /// this; the request reached it only because the gate already accepted the
     /// session, but re-checking validity here keeps this self-contained.
@@ -301,8 +301,8 @@ struct Session {
     label: String,
     exp: i64,
     /// The provider's access token, kept so the agent can forward it to the broker
-    /// (login mode) on the user's behalf. `default` so older cookies still load
-    /// (they just carry no token → login can't fetch until the next sign-in).
+    /// (xiaoyuanzhu `sub` tier) on the user's behalf. `default` so older cookies still
+    /// load (they just carry no token → no `sub` upgrade until the next sign-in).
     #[serde(default)]
     access_token: String,
 }
@@ -584,8 +584,8 @@ async fn callback(
         sub,
         label,
         exp: Utc::now().timestamp() + SESSION_TTL_SECS,
-        // Kept for the broker (login mode). Note it expires far sooner than the
-        // session — fine for the right-after-login fetch; a refresh-token flow to
+        // Kept for the broker (xiaoyuanzhu `sub` tier). Note it expires far sooner than
+        // the session — fine for the right-after-login fetch; a refresh-token flow to
         // keep it fresh long-term is future work.
         access_token: token.access_token().secret().clone(),
     };

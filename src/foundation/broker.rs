@@ -1,12 +1,13 @@
-//! Broker client — bootstrap a free account and fetch configs + energy from the
-//! broker (hi.xiaoyuanzhu.com).
+//! Broker client — bootstrap a xiaoyuanzhu account and fetch configs + energy from
+//! the broker (hi.xiaoyuanzhu.com).
 //!
-//! Free mode: the `device_id` seeds a one-time **bootstrap** that auto-creates
-//! the account at the broker and returns OAuth tokens; thereafter the access
-//! token authenticates `/configs` (rare) and `/energy` (frequent), refreshed via
-//! the refresh token. After bootstrap the broker only ever sees one identity —
-//! the account token — so free and (future) sub are unified. Login/sub bootstrap
-//! (Authentik-authenticated) is future work.
+//! Xiaoyuanzhu mode: the `device_id` seeds a one-time **bootstrap** that
+//! auto-creates the account at the broker and returns OAuth tokens; thereafter the
+//! access token authenticates `/configs` (rare) and `/energy` (frequent), refreshed
+//! via the refresh token. After bootstrap the broker only ever sees one identity —
+//! the account token — so the anonymous (`free` tier) and signed-in (`sub` tier)
+//! accounts share one path. Signed-in bootstrap (Authentik-authenticated, seeded by
+//! `bearer`) is future work; today an anonymous device account is always minted.
 
 use std::path::Path;
 use std::time::Duration;
@@ -182,26 +183,19 @@ async fn ensure_tokens(store: &Credentials) -> anyhow::Result<Tokens> {
     bootstrap(&store.device_id).await
 }
 
-/// In free mode: ensure account tokens (bootstrap/refresh), fetch configs +
+/// In xiaoyuanzhu mode: ensure account tokens (bootstrap/refresh), fetch configs +
 /// energy, and persist. Best-effort — failures log and keep any cached configs.
-/// Mints a `device_id` on first need. No-op in BYOK. Login/sub bootstrap
-/// (Authentik-authenticated, seeded by `bearer`) is future work. v1 runs at
-/// startup and on mode-select; a periodic loop is wired in `lib.rs`.
+/// Mints a `device_id` on first need. No-op in BYOK. The `bearer` (a signed-in
+/// Authentik session, when present) will seed the `sub`-tier bootstrap once that's
+/// wired; today an anonymous device account is always minted. v1 runs at startup
+/// and on mode-select; a periodic loop is wired in `lib.rs`.
 pub async fn refresh(data_dir: &Path, bearer: Option<&str>) {
     let mut store = Credentials::load(data_dir);
     match store.mode {
         Mode::Byok => return,
-        Mode::Login => {
-            // The bearer (when present, from a Settings request) will seed the
-            // login/sub account bootstrap once it's wired.
-            tracing::debug!(
-                has_bearer = bearer.is_some(),
-                "login mode: account bootstrap not yet wired; keeping cached configs"
-            );
-            return;
-        }
-        Mode::Free => {}
+        Mode::Xiaoyuanzhu => {}
     }
+    let _ = bearer; // reserved for signed-in (`sub`-tier) bootstrap; unused today.
 
     let mut dirty = false;
     if store.device_id.trim().is_empty() {

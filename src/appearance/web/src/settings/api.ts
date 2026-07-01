@@ -10,9 +10,9 @@ export interface VendorView {
 }
 
 /** How the agent obtains its credentials. */
-export type Mode = "byok" | "login" | "free";
+export type Mode = "byok" | "xiaoyuanzhu";
 
-/** The broker account snapshot (login/free), absent until energy is fetched. */
+/** The broker account snapshot (xiaoyuanzhu), absent until energy is fetched. */
 export interface Account {
   tier: string;
   energy_remaining: number;

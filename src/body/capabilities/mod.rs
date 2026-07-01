@@ -44,7 +44,7 @@ pub mod voiceprint;
 
 /// Initialize the keyed capabilities (STT, TTS, vision, image/video gen) from the
 /// credentials in effect for the current mode — the user's BYOK keys, or the
-/// broker-minted bundle (login/free) — falling back to `.env` per vendor. Fails
+/// broker-minted bundle (xiaoyuanzhu) — falling back to `.env` per vendor. Fails
 /// fast if a configured provider is missing its key or names an unknown provider.
 /// The recognition capabilities are provisioned separately by [`init_recognition`].
 pub fn init(creds: &crate::foundation::credentials::Credentials) -> anyhow::Result<()> {

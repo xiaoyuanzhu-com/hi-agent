@@ -46,7 +46,7 @@ pub async fn get_credentials(State(state): State<Arc<AppState>>) -> Json<Value> 
     let creds = Credentials::load(&state.data_dir);
     let key = creds.llm.api_key.trim();
     let llm_configured = !key.is_empty();
-    // In free/login mode, the broker's energy snapshot — for the UI to show the
+    // In xiaoyuanzhu mode, the broker's energy snapshot — for the UI to show the
     // tier + remaining/total energy. Absent until energy has been fetched.
     let account = creds.energy.as_ref().map(|e| {
         json!({
@@ -99,7 +99,7 @@ pub struct VendorUpdate {
 }
 
 /// A settings update. Every section is optional — the UI may send only the ones
-/// it changed. `mode` switches the credential source (byok / login / free).
+/// it changed. `mode` switches the credential source (byok / xiaoyuanzhu).
 #[derive(Deserialize)]
 pub struct CredentialsUpdate {
     #[serde(default)]
@@ -127,7 +127,7 @@ fn apply_vendor(vk: &mut credentials::VendorKey, upd: Option<VendorUpdate>) {
 
 /// Persist the credential store. Always 200; the body's `ok` flag reports success
 /// (mirrors the reflex route's convention). `restart_required` is always true —
-/// the change takes effect on the next start. Selecting login/free triggers a
+/// the change takes effect on the next start. Selecting xiaoyuanzhu triggers a
 /// broker fetch now (so the UI can show the account) but the running agent still
 /// applies the new credentials on restart.
 pub async fn post_credentials(
@@ -156,16 +156,13 @@ pub async fn post_credentials(
         tracing::warn!(error = %e, "failed to save credentials");
         return Json(json!({ "ok": false, "error": e.to_string() }));
     }
-    // If the user just selected login/free, fetch the bundle now so the account
-    // shows immediately and is cached for the next restart. Login forwards the
-    // signed-in user's Authentik token from the session (this is a logged-in
-    // browser request); free authenticates by device id.
-    if matches!(mode_selected, Some(credentials::Mode::Login | credentials::Mode::Free)) {
-        let bearer = if creds.mode == credentials::Mode::Login {
-            state.auth.as_ref().and_then(|a| a.session_bearer(&headers))
-        } else {
-            None
-        };
+    // If the user just selected xiaoyuanzhu, fetch the bundle now so the account
+    // shows immediately and is cached for the next restart. Forward the signed-in
+    // user's Authentik session token when present (this may be a logged-in browser
+    // request) so the broker can mint a `sub`-tier account once that's wired;
+    // absent, it authenticates by device id (anonymous `free` tier).
+    if matches!(mode_selected, Some(credentials::Mode::Xiaoyuanzhu)) {
+        let bearer = state.auth.as_ref().and_then(|a| a.session_bearer(&headers));
         crate::foundation::broker::refresh(&state.data_dir, bearer.as_deref()).await;
     }
     Json(json!({ "ok": true, "restart_required": true }))

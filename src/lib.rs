@@ -72,13 +72,13 @@ async fn run_with_shutdown(config: Config, shutdown: Arc<Notify>) -> anyhow::Res
         .context("resolving cwd to absolutize data dir")?;
     tracing::debug!(?config, "starting hi-agent");
 
-    // Login/Free: refresh the managed credential bundle from the broker, then
+    // Xiaoyuanzhu: refresh the managed credential bundle from the broker, then
     // re-resolve the LLM credential from the (possibly updated) store —
     // `build_config` resolved it before this point, and BYOK mode is a no-op so
     // this changes nothing there. Best-effort: a broker failure leaves the cached
     // bundle (or boots unconfigured). No request context here, so no Authentik
-    // token — login mode keeps its cached bundle (a fresh one is fetched when the
-    // user selects login in Settings, where the session token is available).
+    // token — a signed-in `sub` upgrade only happens on mode-select in Settings,
+    // where the session token is available; startup mints/keeps the device account.
     foundation::broker::refresh(&config.data_dir, None).await;
     config.agent = foundation::config::AgentConfig::resolve(&config.data_dir);
 
