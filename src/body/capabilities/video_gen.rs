@@ -5,8 +5,8 @@
 //! wait honest instead of hiding it behind a single blocking call.
 //!
 //! The capability is a module of free functions over a process-global,
-//! once-initialized config: [`init`] reads `VIDEO_GEN_PROVIDER`,
-//! [`available`] reports whether a provider is configured, and [`submit`] /
+//! once-initialized config: [`init`] resolves the vendor from the credential
+//! store, [`available`] reports whether a provider is configured, and [`submit`] /
 //! [`poll`] dispatch to it. The config never appears in a signature.
 //!
 //! **No caller wires this in yet.** The module is built and unit-tested
@@ -96,16 +96,14 @@ enum Backend {
 
 static BACKEND: OnceLock<Backend> = OnceLock::new();
 
-const ENV_PROVIDER: &str = "VIDEO_GEN_PROVIDER";
-
 /// The default wire when the store selects none — the only video-gen impl today.
 const DEFAULT_WIRE: &str = "doubao";
 
-/// Resolve the video-gen backend into the process-global config. With a BYOK key
-/// the configured `wire` selects the impl (`None` → [`DEFAULT_WIRE`]); otherwise
-/// `VIDEO_GEN_PROVIDER` decides (unset/`none` disables). An unknown wire or provider
-/// name is an error. Adding a vendor is a new `Backend` variant plus a match arm
-/// here. Idempotent — the first init wins.
+/// Resolve the video-gen backend into the process-global config from the credential
+/// store. A non-empty `store_key` (BYOK or broker-managed) enables the capability
+/// on the configured `wire` (`None` → [`DEFAULT_WIRE`]); no key → disabled. An
+/// unknown wire is an error. Adding a vendor is a new `Backend` variant plus a
+/// match arm here. Idempotent — the first init wins.
 pub fn init(
     store_key: Option<&str>,
     base_url: Option<&str>,
@@ -114,15 +112,11 @@ pub fn init(
 ) -> anyhow::Result<()> {
     let backend = if store_key.map(|k| !k.trim().is_empty()).unwrap_or(false) {
         match wire.unwrap_or(DEFAULT_WIRE) {
-            "doubao" => Backend::Doubao(doubao_video_gen::Config::from_env_with(store_key, base_url, model)?),
+            "doubao" => Backend::Doubao(doubao_video_gen::Config::from_store(store_key, base_url, model)?),
             other => anyhow::bail!("unknown video-gen wire: {other}"),
         }
     } else {
-        match std::env::var(ENV_PROVIDER).unwrap_or_default().as_str() {
-            "" | "none" => Backend::Disabled,
-            "doubao" => Backend::Doubao(doubao_video_gen::Config::from_env()?),
-            other => anyhow::bail!("unknown {ENV_PROVIDER}: {other}"),
-        }
+        Backend::Disabled
     };
     let _ = BACKEND.set(backend);
     Ok(())
@@ -138,7 +132,7 @@ pub fn available() -> bool {
 pub async fn submit(req: &VideoRequest) -> anyhow::Result<String> {
     match BACKEND.get() {
         Some(Backend::Doubao(cfg)) => doubao_video_gen::submit(cfg, req).await,
-        _ => anyhow::bail!("video generation not configured (set {ENV_PROVIDER})"),
+        _ => anyhow::bail!("video generation not configured (set a video key in Settings)"),
     }
 }
 
@@ -147,6 +141,6 @@ pub async fn submit(req: &VideoRequest) -> anyhow::Result<String> {
 pub async fn poll(task_id: &str) -> anyhow::Result<VideoTask> {
     match BACKEND.get() {
         Some(Backend::Doubao(cfg)) => doubao_video_gen::poll(cfg, task_id).await,
-        _ => anyhow::bail!("video generation not configured (set {ENV_PROVIDER})"),
+        _ => anyhow::bail!("video generation not configured (set a video key in Settings)"),
     }
 }

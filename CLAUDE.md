@@ -56,7 +56,7 @@ The tray **auto-skips when `SSH_CONNECTION` is set** (no window server over SSH)
 
 ## Testing user journeys live (Mac mini)
 
-Journeys in [docs/user-journeys/](docs/user-journeys/) are specs of *intended* behavior — test them against a real running instance, not by code-reading. Standing setup: clone at `~/projects/hi-agent` on the Mac mini (`ssh macmini`), `cargo build --release`, run from the repo root (`.env` with `AI_API_KEY` etc. lives there):
+Journeys in [docs/user-journeys/](docs/user-journeys/) are specs of *intended* behavior — test them against a real running instance, not by code-reading. Standing setup: clone at `~/projects/hi-agent` on the Mac mini (`ssh macmini`), `cargo build --release`, run from the repo root. Model credentials are no longer in `.env`: the default `xiaoyuanzhu` mode auto-bootstraps a broker account and mints the LLM key OOTB, so a fresh box just works; to force BYOK keys headlessly, write them into the config store (`sqlite3 data/config.db` — the `app_settings` mode flag + `credential` rows) or set them in Settings. The `.env` still carries the non-credential knobs (`HI_AGENT_PULSE`, auth, etc.):
 
     nohup ./target/release/hi-agent --port 12358 > server.log 2>&1 &
 

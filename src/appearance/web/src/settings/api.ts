@@ -7,7 +7,6 @@
 export interface VendorView {
   configured: boolean;
   key_hint: string;
-  env_fallback: boolean;
   base_url: string;
   model: string | null;
 }
@@ -31,7 +30,6 @@ export interface CredentialsView {
     model: string | null;
     configured: boolean;
     key_hint: string;
-    env_fallback: boolean;
   };
   stt: VendorView;
   tts: VendorView;

@@ -5,7 +5,7 @@
 //! as everything else.
 //!
 //! The capability is a module of free functions over a process-global,
-//! once-initialized config: [`init`] reads `VISION_PROVIDER`,
+//! once-initialized config: [`init`] resolves the vendor from the config store,
 //! [`available`] reports whether a provider is configured, and [`understand`]
 //! dispatches to it. The config never appears in a signature.
 //!
@@ -68,16 +68,14 @@ enum Backend {
 
 static BACKEND: OnceLock<Backend> = OnceLock::new();
 
-const ENV_PROVIDER: &str = "VISION_PROVIDER";
-
 /// The default wire when the store selects none — the only vision impl today.
 const DEFAULT_WIRE: &str = "doubao";
 
-/// Resolve the vision backend into the process-global config. With a BYOK key the
-/// configured `wire` selects the impl (`None` → [`DEFAULT_WIRE`]); otherwise
-/// `VISION_PROVIDER` decides (unset/`none` disables). An unknown wire or provider
-/// name is an error. Adding a vendor is a new `Backend` variant plus a match arm
-/// here. Idempotent — the first init wins.
+/// Resolve the vision backend into the process-global config from the credential
+/// store. A non-empty `store_key` (BYOK or broker-managed) enables the capability
+/// on the configured `wire` (`None` → [`DEFAULT_WIRE`]); no key → disabled. An
+/// unknown wire is an error. Adding a vendor is a new `Backend` variant plus a
+/// match arm here. Idempotent — the first init wins.
 pub fn init(
     store_key: Option<&str>,
     base_url: Option<&str>,
@@ -86,15 +84,11 @@ pub fn init(
 ) -> anyhow::Result<()> {
     let backend = if store_key.map(|k| !k.trim().is_empty()).unwrap_or(false) {
         match wire.unwrap_or(DEFAULT_WIRE) {
-            "doubao" => Backend::Doubao(doubao_vision::Config::from_env_with(store_key, base_url, model)?),
+            "doubao" => Backend::Doubao(doubao_vision::Config::from_store(store_key, base_url, model)?),
             other => anyhow::bail!("unknown vision wire: {other}"),
         }
     } else {
-        match std::env::var(ENV_PROVIDER).unwrap_or_default().as_str() {
-            "" | "none" => Backend::Disabled,
-            "doubao" => Backend::Doubao(doubao_vision::Config::from_env()?),
-            other => anyhow::bail!("unknown {ENV_PROVIDER}: {other}"),
-        }
+        Backend::Disabled
     };
     let _ = BACKEND.set(backend);
     Ok(())
@@ -110,6 +104,6 @@ pub fn available() -> bool {
 pub async fn understand(media: VisualMedia, prompt: &str) -> anyhow::Result<String> {
     match BACKEND.get() {
         Some(Backend::Doubao(cfg)) => doubao_vision::understand(cfg, media, prompt).await,
-        _ => anyhow::bail!("vision not configured (set {ENV_PROVIDER})"),
+        _ => anyhow::bail!("vision not configured (set a vision key in Settings)"),
     }
 }

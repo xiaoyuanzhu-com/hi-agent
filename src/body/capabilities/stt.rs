@@ -1,12 +1,11 @@
 //! Speech-to-text capability — audio bytes in, text out.
 //!
 //! The capability is a module of free functions over a process-global,
-//! once-initialized config: [`init`] reads `STT_PROVIDER` and the
-//! selected vendor's credentials into the global, [`available`] reports whether
-//! a provider is configured, and [`transcribe`] / [`transcribe_streaming`]
-//! dispatch to it. The config never appears in a signature — it is transparent
-//! to the caller. An uninitialized global means "not configured", the same
-//! state as `STT_PROVIDER` unset.
+//! once-initialized config: [`init`] resolves the vendor + credentials from the
+//! config store into the global, [`available`] reports whether a provider is
+//! configured, and [`transcribe`] / [`transcribe_streaming`] dispatch to it. The
+//! config never appears in a signature — it is transparent to the caller. An
+//! uninitialized global (or no stored key) means "not configured".
 
 use std::sync::OnceLock;
 
@@ -55,16 +54,13 @@ enum Backend {
 
 static BACKEND: OnceLock<Backend> = OnceLock::new();
 
-const ENV_PROVIDER: &str = "STT_PROVIDER";
-
 /// The default wire when the store selects none — the only STT impl today.
 const DEFAULT_WIRE: &str = "volcengine";
 
-/// Resolve the STT backend into the process-global config. BYOK-first: a
-/// non-empty `store_key` (the user's key from the config store) selects the
-/// configured `wire` (which vendor impl backs STT; `None` → [`DEFAULT_WIRE`]) and
-/// overrides the env key. With no store key, fall back to `STT_PROVIDER` —
-/// unset/`none` disables. An unknown wire or provider name is an error so a typo
+/// Resolve the STT backend into the process-global config from the credential
+/// store. A non-empty `store_key` (the user's BYOK key, or the broker-minted
+/// managed key) enables the capability on the configured `wire` (`None` →
+/// [`DEFAULT_WIRE`]); no key → disabled. An unknown wire is an error so a typo
 /// fails at startup rather than as a 501 at request time. Adding a vendor is a new
 /// `Backend` variant plus a match arm here. Idempotent — the first init wins.
 pub fn init(
@@ -75,15 +71,11 @@ pub fn init(
 ) -> anyhow::Result<()> {
     let backend = if store_key.map(|k| !k.trim().is_empty()).unwrap_or(false) {
         match wire.unwrap_or(DEFAULT_WIRE) {
-            "volcengine" => Backend::Volcengine(volcengine_stt::Config::from_env_with(store_key, base_url, model)?),
+            "volcengine" => Backend::Volcengine(volcengine_stt::Config::from_store(store_key, base_url, model)?),
             other => anyhow::bail!("unknown STT wire: {other}"),
         }
     } else {
-        match std::env::var(ENV_PROVIDER).unwrap_or_default().as_str() {
-            "" | "none" => Backend::Disabled,
-            "volcengine" => Backend::Volcengine(volcengine_stt::Config::from_env()?),
-            other => anyhow::bail!("unknown {ENV_PROVIDER}: {other}"),
-        }
+        Backend::Disabled
     };
     let _ = BACKEND.set(backend);
     Ok(())
@@ -101,7 +93,7 @@ pub fn available() -> bool {
 pub async fn transcribe(audio: Bytes, mime: &str) -> anyhow::Result<String> {
     match BACKEND.get() {
         Some(Backend::Volcengine(cfg)) => volcengine_stt::transcribe(cfg, audio, mime).await,
-        _ => anyhow::bail!("STT not configured (set {ENV_PROVIDER})"),
+        _ => anyhow::bail!("STT not configured (set an STT key in Settings)"),
     }
 }
 
@@ -118,6 +110,6 @@ pub async fn transcribe_streaming(
         Some(Backend::Volcengine(cfg)) => {
             volcengine_stt::transcribe_streaming(cfg, audio_rx, out).await
         }
-        _ => anyhow::bail!("STT not configured (set {ENV_PROVIDER})"),
+        _ => anyhow::bail!("STT not configured (set an STT key in Settings)"),
     }
 }

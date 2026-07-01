@@ -211,8 +211,9 @@ async fn run_with_shutdown(config: Config, shutdown: Arc<Notify>) -> anyhow::Res
     };
     if !config.agent.is_configured() {
         tracing::warn!(
-            "no LLM credentials configured — set them in Settings (or AI_API_KEY in .env); \
-             the agent will boot but prompts fail until a key is set"
+            "no LLM credentials configured — the broker (xiaoyuanzhu) should mint them \
+             automatically; otherwise set a key in Settings (BYOK). The agent boots but \
+             prompts fail until a key is set"
         );
     }
     config.agent.render_settings_json(&claude_config_dir)?;
@@ -399,10 +400,9 @@ pub fn run_with_tray(
                 }
             };
             // Build the config here, on the server thread, so a bad/missing config
-            // (e.g. a fresh `.app` whose seeded `.env` has no AI_API_KEY) doesn't
-            // abort before the menu-bar item is up. On failure keep the app alive:
-            // mark the icon, put the `.env` to edit in front of the user, and wait
-            // for Quit — rather than vanishing with no trace.
+            // doesn't abort before the menu-bar item is up. On failure keep the app
+            // alive: mark the icon, put the `.env` to edit in front of the user, and
+            // wait for Quit — rather than vanishing with no trace.
             let config = match build_config() {
                 Ok(config) => config,
                 Err(e) => {

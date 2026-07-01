@@ -1,10 +1,11 @@
 //! Credential store: the user's BYOK keys, or (xiaoyuanzhu) the broker-issued
 //! account tokens plus the configs the broker hands back. Persisted under the
 //! data dir as `config.db` (SQLite; see the [`db`] submodule), resolved at
-//! startup, refreshed by the broker client. When a managed key is unset the agent
-//! falls back to `.env` (`AI_API_KEY`, `VOLCENGINE_*`, `DOUBAO_*`, …) so dev /
-//! journey-test flows keep working. A vendor key in effect also implies that
-//! vendor is the provider for its capability.
+//! startup, refreshed by the broker client. There is no `.env` credential
+//! fallback: the default `xiaoyuanzhu` mode auto-bootstraps a broker account and
+//! mints the keys OOTB, and BYOK keys are entered in Settings. A vendor key in
+//! effect also implies that vendor is the provider for its capability; a capability
+//! with no key is simply off.
 //!
 //! Both modes' configs are stored side by side (one row per `(mode, feature)`),
 //! so switching mode in Settings surfaces whatever was last entered for it. The

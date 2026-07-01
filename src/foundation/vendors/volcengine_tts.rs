@@ -67,12 +67,6 @@ const DEFAULT_VOICE: &str = "zh_female_vv_uranus_bigtts";
 const DEFAULT_ENCODING: &str = "mp3";
 const DEFAULT_SAMPLE_RATE: u32 = 24_000;
 
-const ENV_API_KEY: &str = "VOLCENGINE_TTS_API_KEY";
-const ENV_VOICE: &str = "VOLCENGINE_TTS_VOICE";
-const ENV_ENCODING: &str = "VOLCENGINE_TTS_ENCODING";
-const ENV_RESOURCE_ID: &str = "VOLCENGINE_TTS_RESOURCE_ID";
-const ENV_ENDPOINT: &str = "VOLCENGINE_TTS_ENDPOINT";
-
 const NAMESPACE: &str = "BidirectionalTTS";
 /// Max quiet gap to wait for the server to flush audio *after* we've finished
 /// sending text (FinishSession), before assuming the session hung. It does NOT
@@ -118,44 +112,26 @@ pub struct Config {
 }
 
 impl Config {
-    pub fn from_env() -> anyhow::Result<Self> {
-        Self::from_env_with(None, None)
-    }
-
-    /// Back-compat: BYOK key override only; other params stay env-driven.
-    pub fn from_env_with_key(key_override: Option<&str>) -> anyhow::Result<Self> {
-        Self::from_env_with(key_override, None)
-    }
-
-    /// Resolve config, taking managed overrides when present: `key_override`
-    /// replaces `VOLCENGINE_TTS_API_KEY` and `base_url_override` host-rebases the
-    /// endpoint onto the gateway (songguo). Empty overrides fall back to env.
-    pub fn from_env_with(
-        key_override: Option<&str>,
-        base_url_override: Option<&str>,
-    ) -> anyhow::Result<Self> {
-        let api_key = match key_override {
-            Some(k) if !k.trim().is_empty() => k.trim().to_string(),
-            _ => std::env::var(ENV_API_KEY).map_err(|_| {
-                anyhow::anyhow!("{ENV_API_KEY} is required when TTS_PROVIDER=volcengine")
-            })?,
-        };
-        let resource_id =
-            std::env::var(ENV_RESOURCE_ID).unwrap_or_else(|_| DEFAULT_RESOURCE_ID.to_string());
-        let mut endpoint =
-            std::env::var(ENV_ENDPOINT).unwrap_or_else(|_| DEFAULT_ENDPOINT.to_string());
-        if let Some(base) = base_url_override {
+    /// Resolve config from the credential store. `key` is the vendor API key
+    /// (required — the caller builds a config only when a key is present); `base_url`
+    /// host-rebases the endpoint onto the gateway (songguo) when the broker supplies
+    /// one. Voice, encoding, and resource id use built-in defaults — no env.
+    pub fn from_store(key: Option<&str>, base_url: Option<&str>) -> anyhow::Result<Self> {
+        let api_key = key
+            .map(str::trim)
+            .filter(|k| !k.is_empty())
+            .ok_or_else(|| anyhow::anyhow!("TTS (volcengine) requires an API key"))?
+            .to_string();
+        let mut endpoint = DEFAULT_ENDPOINT.to_string();
+        if let Some(base) = base_url.map(str::trim).filter(|b| !b.is_empty()) {
             endpoint = super::rebase_host(&endpoint, base);
         }
-        let voice = std::env::var(ENV_VOICE).unwrap_or_else(|_| DEFAULT_VOICE.to_string());
-        let encoding =
-            std::env::var(ENV_ENCODING).unwrap_or_else(|_| DEFAULT_ENCODING.to_string());
         Ok(Self {
             api_key,
-            resource_id,
+            resource_id: DEFAULT_RESOURCE_ID.to_string(),
             endpoint,
-            voice,
-            encoding,
+            voice: DEFAULT_VOICE.to_string(),
+            encoding: DEFAULT_ENCODING.to_string(),
         })
     }
 }

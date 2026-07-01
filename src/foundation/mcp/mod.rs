@@ -1000,7 +1000,7 @@ async fn perceive_still(bytes: Bytes, mime: &str, prompt: &str) -> Value {
         Handling::Polyfill => {
             use crate::body::capabilities::vision::{self as vision_cap, VisualMedia};
             if !vision_cap::available() {
-                return tool_error("can't see stills here — no vision provider configured (set VISION_PROVIDER)");
+                return tool_error("can't see stills here — no vision provider configured (set a vision key in Settings)");
             }
             let q = if prompt.trim().is_empty() { "Describe what you see." } else { prompt };
             match vision_cap::understand(VisualMedia::image_bytes(bytes, mime.to_string()), q).await {
@@ -1022,7 +1022,7 @@ async fn perceive_clip(bytes: Bytes, mime: &str, prompt: &str) -> Value {
     // native-vs-polyfill decision in one place for the day a native-video model lands.
     let _ = bundle::current().handling(Modality::Video);
     if !vision_cap::available() {
-        return tool_error("can't watch video here — no vision provider configured (set VISION_PROVIDER)");
+        return tool_error("can't watch video here — no vision provider configured (set a vision key in Settings)");
     }
     let q = if prompt.trim().is_empty() { "Describe what happens in this clip." } else { prompt };
     match vision_cap::understand(VisualMedia::video_bytes(bytes, mime.to_string()), q).await {

@@ -7,9 +7,9 @@
 //! per-sentence clips — the brain consolidates, the client just plays.
 //!
 //! The capability is a module of free functions over a process-global,
-//! once-initialized config: [`init`] reads `TTS_PROVIDER`, [`available`]
-//! reports whether a provider is configured, and [`start`] dispatches to it. The
-//! config never appears in a signature.
+//! once-initialized config: [`init`] resolves the vendor from the config store,
+//! [`available`] reports whether a provider is configured, and [`start`]
+//! dispatches to it. The config never appears in a signature.
 
 use std::sync::OnceLock;
 
@@ -43,28 +43,22 @@ enum Backend {
 
 static BACKEND: OnceLock<Backend> = OnceLock::new();
 
-const ENV_PROVIDER: &str = "TTS_PROVIDER";
-
 /// The default wire when the store selects none — the only TTS impl today.
 const DEFAULT_WIRE: &str = "volcengine";
 
-/// Resolve the TTS backend into the process-global config. With a BYOK key the
-/// configured `wire` selects the impl (`None` → [`DEFAULT_WIRE`]); otherwise
-/// `TTS_PROVIDER` decides (unset/`none` disables). An unknown wire or provider name
-/// is an error. Adding a vendor is a new `Backend` variant plus a match arm here.
-/// Idempotent — the first init wins.
+/// Resolve the TTS backend into the process-global config from the credential
+/// store. A non-empty `store_key` (BYOK or broker-managed) enables the capability
+/// on the configured `wire` (`None` → [`DEFAULT_WIRE`]); no key → disabled. An
+/// unknown wire is an error. Adding a vendor is a new `Backend` variant plus a
+/// match arm here. Idempotent — the first init wins.
 pub fn init(store_key: Option<&str>, base_url: Option<&str>, wire: Option<&str>) -> anyhow::Result<()> {
     let backend = if store_key.map(|k| !k.trim().is_empty()).unwrap_or(false) {
         match wire.unwrap_or(DEFAULT_WIRE) {
-            "volcengine" => Backend::Volcengine(volcengine_tts::Config::from_env_with(store_key, base_url)?),
+            "volcengine" => Backend::Volcengine(volcengine_tts::Config::from_store(store_key, base_url)?),
             other => anyhow::bail!("unknown TTS wire: {other}"),
         }
     } else {
-        match std::env::var(ENV_PROVIDER).unwrap_or_default().as_str() {
-            "" | "none" => Backend::Disabled,
-            "volcengine" => Backend::Volcengine(volcengine_tts::Config::from_env()?),
-            other => anyhow::bail!("unknown {ENV_PROVIDER}: {other}"),
-        }
+        Backend::Disabled
     };
     let _ = BACKEND.set(backend);
     Ok(())
@@ -80,6 +74,6 @@ pub fn available() -> bool {
 pub async fn start() -> anyhow::Result<TtsStream> {
     match BACKEND.get() {
         Some(Backend::Volcengine(cfg)) => volcengine_tts::start(cfg).await,
-        _ => anyhow::bail!("TTS not configured (set {ENV_PROVIDER})"),
+        _ => anyhow::bail!("TTS not configured (set a TTS key in Settings)"),
     }
 }

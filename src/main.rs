@@ -124,11 +124,12 @@ fn main() -> anyhow::Result<()> {
     let data_dir = cli.data_dir.unwrap_or_else(default_data_dir);
 
     // A packaged `.app` launched from Finder has cwd `/`, so the cwd `.env` load
-    // at the top of `main` found nothing. Without it `AI_API_KEY` is unset and the
-    // agent bails before the tray or server starts — the app "does nothing" when
-    // clicked. Fall back to `<data_dir>/.env` (the OS data dir for a bundle, stable
-    // across launches and user-writable); on first launch seed it from the bundled
-    // `.env.example` so the user has a clear template to drop a key into.
+    // at the top of `main` found nothing. Model credentials no longer live in
+    // `.env` (the default xiaoyuanzhu mode mints them from the broker, so a bundle
+    // works with no setup), but `.env` still carries optional non-credential knobs
+    // (auth, effort, pulse, …). Fall back to `<data_dir>/.env` (the OS data dir for
+    // a bundle, stable across launches and user-writable); on first launch seed it
+    // from the bundled `.env.example` as a template.
     if hi_agent::bundle::resources_dir().is_some() {
         let env_path = data_dir.join(".env");
         if !env_path.is_file() {
@@ -139,7 +140,7 @@ fn main() -> anyhow::Result<()> {
             } else {
                 tracing::info!(
                     path = %env_path.display(),
-                    "seeded .env from template — edit it (set AI_API_KEY=…) and relaunch"
+                    "seeded .env from template — optional; edit it for auth / cognition knobs"
                 );
             }
         }
@@ -166,9 +167,9 @@ fn main() -> anyhow::Result<()> {
     // On macOS the default install shape is a desktop app: AppKit owns the main
     // thread and shows a menu-bar icon, while the HTTP server runs on a background
     // thread (see `hi_agent::run_with_tray`). The config is built *there*, on the
-    // server thread — so a missing/invalid key (e.g. a fresh `.app` whose seeded
-    // `.env` has no AI_API_KEY) surfaces in the menu bar instead of aborting `main`
-    // before the tray appears (which looked like "the app does nothing" when
+    // server thread — so a missing/invalid key (e.g. the broker was unreachable on
+    // first run, so no key got minted) surfaces in the menu bar instead of aborting
+    // `main` before the tray appears (which looked like "the app does nothing" when
     // clicked). Skip the tray — keeping the server on the main thread, where a
     // misconfig is a fatal startup error as a server should have — when explicitly
     // disabled (`--no-tray`) or when there is no window server (over SSH, where

@@ -33,10 +33,6 @@ const DEFAULT_VIDEO_MODEL: &str = "doubao-seedance-2.0";
 /// Submit/poll calls are quick, but one generous timeout covers the slow path.
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(180);
 
-const ENV_VIDEO_API_KEY: &str = "DOUBAO_VIDEO_API_KEY";
-const ENV_VIDEO_API_BASE: &str = "DOUBAO_VIDEO_API_BASE";
-const ENV_VIDEO_MODEL: &str = "DOUBAO_VIDEO_MODEL";
-
 impl ImageRef {
     /// Resolve to a URL the API accepts: a passthrough URL, or raw bytes encoded
     /// as a base64 `data:` URL.
@@ -59,39 +55,29 @@ pub struct Config {
 }
 
 impl Config {
-    /// Resolve config from the environment. `DOUBAO_VIDEO_API_KEY` is required;
-    /// base URL and model fall back to the plan endpoint and seedance default.
-    pub fn from_env() -> anyhow::Result<Self> {
-        Self::from_env_with(None, None, None)
-    }
-
-    /// Back-compat: BYOK key override only.
-    pub fn from_env_with_key(key_override: Option<&str>) -> anyhow::Result<Self> {
-        Self::from_env_with(key_override, None, None)
-    }
-
-    /// Resolve config, taking managed overrides when present: key, api-base host
-    /// (rebased onto the gateway), and model.
-    pub fn from_env_with(
-        key_override: Option<&str>,
-        base_url_override: Option<&str>,
-        model_override: Option<&str>,
+    /// Resolve config from the credential store. `key` is the vendor API key
+    /// (required — the caller builds a config only when a key is present); `base_url`
+    /// host-rebases the api base onto the gateway (songguo) when the broker supplies
+    /// one; `model` overrides the seedance default. No env.
+    pub fn from_store(
+        key: Option<&str>,
+        base_url: Option<&str>,
+        model: Option<&str>,
     ) -> anyhow::Result<Self> {
-        let api_key = match key_override {
-            Some(k) if !k.trim().is_empty() => k.trim().to_string(),
-            _ => std::env::var(ENV_VIDEO_API_KEY).map_err(|_| {
-                anyhow::anyhow!("{ENV_VIDEO_API_KEY} is required when VIDEO_GEN_PROVIDER=doubao")
-            })?,
-        };
-        let mut api_base =
-            std::env::var(ENV_VIDEO_API_BASE).unwrap_or_else(|_| DEFAULT_API_BASE.to_string());
-        if let Some(base) = base_url_override {
+        let api_key = key
+            .map(str::trim)
+            .filter(|k| !k.is_empty())
+            .ok_or_else(|| anyhow::anyhow!("video generation (doubao) requires an API key"))?
+            .to_string();
+        let mut api_base = DEFAULT_API_BASE.to_string();
+        if let Some(base) = base_url.map(str::trim).filter(|b| !b.is_empty()) {
             api_base = super::rebase_host(&api_base, base);
         }
-        let model = match model_override {
-            Some(m) if !m.trim().is_empty() => m.trim().to_string(),
-            _ => std::env::var(ENV_VIDEO_MODEL).unwrap_or_else(|_| DEFAULT_VIDEO_MODEL.to_string()),
-        };
+        let model = model
+            .map(str::trim)
+            .filter(|m| !m.is_empty())
+            .unwrap_or(DEFAULT_VIDEO_MODEL)
+            .to_string();
         let client = reqwest::Client::builder()
             .timeout(REQUEST_TIMEOUT)
             .build()

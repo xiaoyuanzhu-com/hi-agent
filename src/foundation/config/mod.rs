@@ -1,20 +1,14 @@
-//! Dev-managed cognition config: all from the environment (`.env`) → child env
-//! + settings.json.
+//! Cognition config → child env + settings.json. The LLM credential (base URL,
+//! key, model) is resolved from the config store (Settings / broker); the cognition
+//! tunables (effort, permission mode, pulse, reflection cadence, …) are still
+//! dev-managed from the environment (`.env`).
 
 use std::path::Path;
 
 use anyhow::Context;
 
-/// Env var holding the upstream LLM credential (kept out of git; loaded via .env).
-pub const ENV_AI_API_KEY: &str = "AI_API_KEY";
-/// Env var holding the upstream LLM base URL (loaded via .env). Defaults to the
-/// Anthropic API when unset.
-pub const ENV_AI_API_BASE: &str = "AI_API_BASE";
-/// Default upstream base URL when `AI_API_BASE` is unset.
+/// Default upstream base URL when the stored LLM base URL is empty.
 pub const DEFAULT_AI_API_BASE: &str = "https://api.anthropic.com";
-/// Env var selecting the model handed to the bundled Claude adapter
-/// (`ANTHROPIC_MODEL`). Unset → the adapter's default.
-pub const ENV_MODEL: &str = "HI_AGENT_MODEL";
 /// Env var setting the adapter's `effortLevel` in its managed settings.json.
 pub const ENV_EFFORT: &str = "HI_AGENT_EFFORT";
 /// Env var setting the adapter's `permissions.defaultMode` in settings.json.
@@ -103,33 +97,24 @@ fn env_opt(name: &str) -> Option<String> {
 }
 
 impl AgentConfig {
-    /// Resolve the upstream LLM credential for startup. Uses the credentials in
-    /// effect for the current mode — the user's BYOK key, or (xiaoyuanzhu) the
-    /// broker-minted bundle — and falls back to `.env` (`AI_API_KEY` / `AI_API_BASE`
-    /// / `HI_AGENT_MODEL`) when neither has a key, so dev / journey-test flows keep
-    /// working. Never errors — with no key the agent boots **unconfigured** (see
-    /// [`is_configured`](Self::is_configured)), the server + Settings UI come up,
-    /// and prompts fail clearly until a key is set. `effort` / `permission_mode`
-    /// stay env-driven (they aren't credentials).
+    /// Resolve the upstream LLM credential for startup from the credential store —
+    /// the user's BYOK key, or (xiaoyuanzhu) the broker-minted bundle. There is no
+    /// `.env` fallback: a fresh install works out of the box because xiaoyuanzhu
+    /// auto-bootstraps a device account and the broker mints the key. Never errors —
+    /// with no key the agent boots **unconfigured** (see
+    /// [`is_configured`](Self::is_configured)), the server + Settings UI come up, and
+    /// prompts fail clearly until a key is set (via Settings or by signing in).
+    /// `effort` / `permission_mode` stay env-driven (they aren't credentials).
     pub fn resolve(data_dir: &Path) -> Self {
         let store = crate::foundation::credentials::Credentials::load(data_dir);
-        let llm = store.effective().map(|e| e.llm.clone());
-        let (base_url, key, model) = match llm {
-            Some(l) if !l.api_key.trim().is_empty() => {
-                (l.base_url, l.api_key, l.model.or_else(|| env_opt(ENV_MODEL)))
-            }
-            _ => (
-                std::env::var(ENV_AI_API_BASE).unwrap_or_default(),
-                std::env::var(ENV_AI_API_KEY).unwrap_or_default(),
-                env_opt(ENV_MODEL),
-            ),
-        };
+        let llm = store.effective().map(|e| e.llm.clone()).unwrap_or_default();
+        let model = llm.model.map(|m| m.trim().to_string()).filter(|m| !m.is_empty());
         Self::new(
             model,
             env_opt(ENV_EFFORT),
             env_opt(ENV_PERMISSION_MODE),
-            base_url,
-            key,
+            llm.base_url,
+            llm.api_key,
         )
     }
 

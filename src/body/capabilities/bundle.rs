@@ -11,12 +11,9 @@
 //! video; this module absorbs the per-model variation so that assumption holds.
 //!
 //! One bundle ships today: the Claude family understands images natively but takes
-//! no video, so image is [`Handling::Native`] and video is [`Handling::Polyfill`]. A
-//! text-only deployment sets `HI_AGENT_VISION_NATIVE=false`; adding another base
-//! model is an additive change to [`model_is_native_image`].
-
-const ENV_MODEL: &str = "HI_AGENT_MODEL";
-const ENV_VISION_NATIVE: &str = "HI_AGENT_VISION_NATIVE";
+//! no video, so image is [`Handling::Native`] and video is [`Handling::Polyfill`].
+//! Adding another base model (e.g. a text-only one) is an additive change to
+//! [`model_is_native_image`], threaded from the resolved LLM model.
 
 /// A kind of visual input the agent might need to understand.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -42,13 +39,12 @@ pub struct Bundle {
     native_image: bool,
 }
 
-/// The bundle for the configured model, resolved from the environment (cheap, and
-/// resolved per call to dodge init-ordering). An explicit `HI_AGENT_VISION_NATIVE`
-/// wins; otherwise [`model_is_native_image`] infers from `HI_AGENT_MODEL`.
+/// The bundle for the currently-shipped model family (Claude → native image). The
+/// single bundle today is model-independent; [`model_is_native_image`] is the seam
+/// a future non-native (e.g. text-only) model extends, threaded from the resolved
+/// LLM model rather than an env var.
 pub fn current() -> Bundle {
-    let native_image = parse_bool(std::env::var(ENV_VISION_NATIVE).ok().as_deref())
-        .unwrap_or_else(|| model_is_native_image(std::env::var(ENV_MODEL).ok().as_deref()));
-    Bundle { native_image }
+    Bundle { native_image: model_is_native_image(None) }
 }
 
 impl Bundle {
@@ -64,22 +60,11 @@ impl Bundle {
 }
 
 /// Whether the named model understands images natively. We ship the Claude family
-/// (native image), and unset means the adapter's default (also Claude), so the
-/// default is `true`. Text-only chat models exist, but aren't reliably identifiable
-/// from the id string, so they are *not* guessed here — deploy those with
-/// `HI_AGENT_VISION_NATIVE=false`. This is the seam future model families extend.
+/// (native image), and `None` means the adapter's default (also Claude), so the
+/// default is `true`. This is the seam future model families extend: a text-only
+/// model would return `false` here, threaded from the resolved LLM model.
 fn model_is_native_image(_model: Option<&str>) -> bool {
     true
-}
-
-/// Parse an explicit boolean env override; `None` when unset/blank/unrecognized, so
-/// the caller falls back to inference.
-fn parse_bool(s: Option<&str>) -> Option<bool> {
-    match s.unwrap_or("").trim().to_ascii_lowercase().as_str() {
-        "1" | "true" | "yes" | "on" => Some(true),
-        "0" | "false" | "no" | "off" => Some(false),
-        _ => None,
-    }
 }
 
 #[cfg(test)]
@@ -97,14 +82,6 @@ mod tests {
     fn image_follows_native_flag() {
         assert_eq!(Bundle { native_image: true }.handling(Modality::Image), Handling::Native);
         assert_eq!(Bundle { native_image: false }.handling(Modality::Image), Handling::Polyfill);
-    }
-
-    #[test]
-    fn explicit_override_parses() {
-        assert_eq!(parse_bool(Some("false")), Some(false));
-        assert_eq!(parse_bool(Some("ON")), Some(true));
-        assert_eq!(parse_bool(Some("  ")), None);
-        assert_eq!(parse_bool(None), None);
     }
 
     #[test]

@@ -126,7 +126,6 @@ export function Settings() {
   };
 
   const llmConfigured = view?.llm.configured ?? false;
-  const llmEnvFallback = view?.llm.env_fallback ?? false;
 
   return (
     <div className="settings-page">
@@ -160,8 +159,6 @@ export function Settings() {
                 <h2>LLM · Claude</h2>
                 {llmConfigured ? (
                   <span className="tag ok">configured · {view?.llm.key_hint}</span>
-                ) : llmEnvFallback ? (
-                  <span className="tag mute">using AI_API_KEY from .env</span>
                 ) : (
                   <span className="tag warn">not configured</span>
                 )}
@@ -300,12 +297,7 @@ function VendorCard({
   onModelChange: (v: string) => void;
 }) {
   const configured = view?.configured ?? false;
-  const envFallback = view?.env_fallback ?? false;
-  const placeholder = configured
-    ? "•••• (unchanged)"
-    : envFallback
-      ? "•••• (from .env)"
-      : "paste key to enable";
+  const placeholder = configured ? "•••• (unchanged)" : "paste key to enable";
   return (
     <section className="settings-card">
       <div className="settings-card-head">
@@ -314,8 +306,6 @@ function VendorCard({
         </h2>
         {configured ? (
           <span className="tag ok">configured · {view?.key_hint}</span>
-        ) : envFallback ? (
-          <span className="tag mute">using .env key</span>
         ) : (
           <span className="tag off">off</span>
         )}

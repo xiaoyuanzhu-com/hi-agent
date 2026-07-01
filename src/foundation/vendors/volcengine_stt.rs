@@ -71,12 +71,6 @@ const DEFAULT_ENDPOINT: &str = "wss://openspeech.bytedance.com/api/v3/sauc/bigmo
 const DEFAULT_RESOURCE_ID: &str = "volc.seedasr.sauc.duration";
 const SUCCESS_STATUS: i64 = 20_000_000;
 
-const ENV_API_KEY: &str = "VOLCENGINE_STT_API_KEY";
-const ENV_MODEL: &str = "VOLCENGINE_STT_MODEL";
-const ENV_RESOURCE_ID: &str = "VOLCENGINE_STT_RESOURCE_ID";
-const ENV_ENDPOINT: &str = "VOLCENGINE_STT_ENDPOINT";
-const ENV_SPEAKER_INFO: &str = "VOLCENGINE_STT_SPEAKER_INFO";
-
 const DEFAULT_MODEL: &str = "bigmodel";
 
 // One PCM chunk per WS frame. 3200 bytes = 100 ms of 16 kHz mono 16-bit.
@@ -110,55 +104,37 @@ pub struct Config {
 }
 
 impl Config {
-    pub fn from_env() -> anyhow::Result<Self> {
-        Self::from_env_with(None, None, None)
-    }
-
-    /// Back-compat: BYOK key override only; other params stay env-driven.
-    pub fn from_env_with_key(key_override: Option<&str>) -> anyhow::Result<Self> {
-        Self::from_env_with(key_override, None, None)
-    }
-
-    /// Resolve config, taking managed overrides when present (the broker bundle):
-    /// `key_override` replaces `VOLCENGINE_STT_API_KEY`, `base_url_override`
-    /// host-rebases the endpoint onto the gateway (songguo), `model_override`
-    /// replaces the model. Empty overrides fall back to env.
-    pub fn from_env_with(
-        key_override: Option<&str>,
-        base_url_override: Option<&str>,
-        model_override: Option<&str>,
+    /// Resolve config from the credential store. `key` is the vendor API key
+    /// (required — the caller builds a config only when a key is present);
+    /// `base_url` host-rebases the endpoint onto the gateway (songguo) when the
+    /// broker supplies one; `model` overrides the default. The remaining params
+    /// (resource id, endpoint host, speaker clustering) use built-in defaults —
+    /// no env. Speaker clustering stays on (the voiceprint path depends on it).
+    pub fn from_store(
+        key: Option<&str>,
+        base_url: Option<&str>,
+        model: Option<&str>,
     ) -> anyhow::Result<Self> {
-        let api_key = match key_override {
-            Some(k) if !k.trim().is_empty() => k.trim().to_string(),
-            _ => std::env::var(ENV_API_KEY).map_err(|_| {
-                anyhow::anyhow!("{ENV_API_KEY} is required when STT_PROVIDER=volcengine")
-            })?,
-        };
-        let model = match model_override {
-            Some(m) if !m.trim().is_empty() => m.trim().to_string(),
-            _ => std::env::var(ENV_MODEL).unwrap_or_else(|_| DEFAULT_MODEL.to_string()),
-        };
-        let resource_id =
-            std::env::var(ENV_RESOURCE_ID).unwrap_or_else(|_| DEFAULT_RESOURCE_ID.to_string());
-        let mut endpoint =
-            std::env::var(ENV_ENDPOINT).unwrap_or_else(|_| DEFAULT_ENDPOINT.to_string());
-        if let Some(base) = base_url_override {
+        let api_key = key
+            .map(str::trim)
+            .filter(|k| !k.is_empty())
+            .ok_or_else(|| anyhow::anyhow!("STT (volcengine) requires an API key"))?
+            .to_string();
+        let model = model
+            .map(str::trim)
+            .filter(|m| !m.is_empty())
+            .unwrap_or(DEFAULT_MODEL)
+            .to_string();
+        let mut endpoint = DEFAULT_ENDPOINT.to_string();
+        if let Some(base) = base_url.map(str::trim).filter(|b| !b.is_empty()) {
             endpoint = super::rebase_host(&endpoint, base);
         }
-        // Speaker clustering is on by default; set the env to 0/false/off to disable.
-        let speaker_info = match std::env::var(ENV_SPEAKER_INFO) {
-            Ok(v) => {
-                let v = v.trim();
-                !(v == "0" || v.eq_ignore_ascii_case("false") || v.eq_ignore_ascii_case("off"))
-            }
-            Err(_) => true,
-        };
         Ok(Self {
             api_key,
             model,
-            resource_id,
+            resource_id: DEFAULT_RESOURCE_ID.to_string(),
             endpoint,
-            speaker_info,
+            speaker_info: true,
         })
     }
 }

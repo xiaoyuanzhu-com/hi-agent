@@ -217,7 +217,7 @@ pub async fn post_audio(
     if !stt::available() {
         return (
             StatusCode::NOT_IMPLEMENTED,
-            "audio capability not configured (set STT_PROVIDER)\n",
+            "audio capability not configured (set an STT key in Settings)\n",
         )
             .into_response();
     }
@@ -353,7 +353,7 @@ pub async fn get_audio_stream(
     if !stt::available() {
         return (
             StatusCode::NOT_IMPLEMENTED,
-            "audio capability not configured (set STT_PROVIDER)\n",
+            "audio capability not configured (set an STT key in Settings)\n",
         )
             .into_response();
     }

@@ -8,8 +8,8 @@
 //!
 //! The Agent Plan exposes the OpenAI-compatible Responses API at `/api/plan/v3` and
 //! takes the plan's **dedicated** API key (distinct from a regular platform key). A
-//! pay-as-you-go platform key instead uses `/api/v3` — override via
-//! `DOUBAO_VISION_API_BASE`.
+//! pay-as-you-go platform key instead uses `/api/v3` — override via the vendor's
+//! base URL in Settings.
 //!
 //! Multimodal input rides the Responses `input` array — a `user` message whose
 //! `content` mixes the media part with the text prompt:
@@ -21,10 +21,10 @@
 //! The answer comes back in `output[]`: the assistant `message` item's `content[]`
 //! carries `{"type":"output_text","text": …}` parts, which we concatenate.
 //!
-//! The model is a quality/speed tier picked by `DOUBAO_VISION_PRESET` —
-//! `fast`→`doubao-seed-2.0-mini`, `balanced`→`doubao-seed-2.0-lite` (default),
-//! `accurate`→`doubao-seed-2.0-pro` — so a caller reaches for speed or quality by
-//! name. `DOUBAO_VISION_MODEL` overrides the tier with any other id verbatim.
+//! With no stored model override, the model is the balanced tier
+//! (`doubao-seed-2.0-lite`); the other tiers are `fast`→`doubao-seed-2.0-mini` and
+//! `accurate`→`doubao-seed-2.0-pro`. A stored model (Settings) overrides the tier
+//! with any id verbatim.
 //!
 //! NOTE (verify against the live API): the Responses-API **video** content part —
 //! the `input_video`/`video_url`/`fps` shape above — is modeled on the `input_image`
@@ -49,22 +49,17 @@ const VIDEO_FPS: f32 = 1.0;
 /// Vision — especially video — is slow; budget generously.
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(120);
 
-const ENV_API_KEY: &str = "DOUBAO_VISION_API_KEY";
-const ENV_API_BASE: &str = "DOUBAO_VISION_API_BASE";
-const ENV_PRESET: &str = "DOUBAO_VISION_PRESET";
-const ENV_MODEL: &str = "DOUBAO_VISION_MODEL";
-/// The tier used when `DOUBAO_VISION_PRESET` is unset.
+/// The model tier used when no explicit model override is stored.
 const DEFAULT_PRESET: &str = "balanced";
 
-/// Map a quality/speed preset to its Seed 2.0 model id: `mini` is fastest/cheapest,
-/// `pro` the most capable, `lite` the balanced middle. Unknown names error so a typo
-/// in `DOUBAO_VISION_PRESET` fails at startup rather than silently picking a tier.
+/// Map a quality/speed preset to its Seed 2.0 model id: `fast` is cheapest,
+/// `accurate` the most capable, `balanced` the middle. Unknown names error.
 fn preset_model(name: &str) -> anyhow::Result<&'static str> {
     Ok(match name {
         "fast" => "doubao-seed-2.0-mini",
         "balanced" => "doubao-seed-2.0-lite",
         "accurate" => "doubao-seed-2.0-pro",
-        other => anyhow::bail!("unknown {ENV_PRESET}: {other} (expected fast|balanced|accurate)"),
+        other => anyhow::bail!("unknown vision preset: {other} (expected fast|balanced|accurate)"),
     })
 }
 
@@ -76,47 +71,28 @@ pub struct Config {
 }
 
 impl Config {
-    /// Resolve config from the environment. `DOUBAO_VISION_API_KEY` is required; the
-    /// base URL defaults to the Beijing Ark endpoint; the model comes from the
-    /// `DOUBAO_VISION_PRESET` tier (default `balanced`), with `DOUBAO_VISION_MODEL`
-    /// overriding it verbatim. Required-and-missing / an unknown preset fails fast at
-    /// startup rather than as an error at first use.
-    pub fn from_env() -> anyhow::Result<Self> {
-        Self::from_env_with(None, None, None)
-    }
-
-    /// Back-compat: BYOK key override only.
-    pub fn from_env_with_key(key_override: Option<&str>) -> anyhow::Result<Self> {
-        Self::from_env_with(key_override, None, None)
-    }
-
-    /// Resolve config, taking managed overrides when present: `key_override`
-    /// replaces `DOUBAO_VISION_API_KEY`, `base_url_override` host-rebases the api
-    /// base onto the gateway (songguo), `model_override` replaces the model.
-    pub fn from_env_with(
-        key_override: Option<&str>,
-        base_url_override: Option<&str>,
-        model_override: Option<&str>,
+    /// Resolve config from the credential store. `key` is the vendor API key
+    /// (required — the caller builds a config only when a key is present); `base_url`
+    /// host-rebases the api base onto the gateway (songguo) when the broker supplies
+    /// one; `model` overrides the default. With no model, the balanced-preset model
+    /// is used — no env.
+    pub fn from_store(
+        key: Option<&str>,
+        base_url: Option<&str>,
+        model: Option<&str>,
     ) -> anyhow::Result<Self> {
-        let api_key = match key_override {
-            Some(k) if !k.trim().is_empty() => k.trim().to_string(),
-            _ => std::env::var(ENV_API_KEY)
-                .map_err(|_| anyhow::anyhow!("{ENV_API_KEY} is required when VISION_PROVIDER=doubao"))?,
-        };
-        let mut api_base =
-            std::env::var(ENV_API_BASE).unwrap_or_else(|_| DEFAULT_API_BASE.to_string());
-        if let Some(base) = base_url_override {
+        let api_key = key
+            .map(str::trim)
+            .filter(|k| !k.is_empty())
+            .ok_or_else(|| anyhow::anyhow!("vision (doubao) requires an API key"))?
+            .to_string();
+        let mut api_base = DEFAULT_API_BASE.to_string();
+        if let Some(base) = base_url.map(str::trim).filter(|b| !b.is_empty()) {
             api_base = super::rebase_host(&api_base, base);
         }
-        let model = match model_override {
-            Some(m) if !m.trim().is_empty() => m.trim().to_string(),
-            _ => match std::env::var(ENV_MODEL) {
-                Ok(m) if !m.trim().is_empty() => m,
-                _ => {
-                    let preset = std::env::var(ENV_PRESET).unwrap_or_else(|_| DEFAULT_PRESET.to_string());
-                    preset_model(&preset)?.to_string()
-                }
-            },
+        let model = match model.map(str::trim).filter(|m| !m.is_empty()) {
+            Some(m) => m.to_string(),
+            None => preset_model(DEFAULT_PRESET)?.to_string(),
         };
 
         let client = reqwest::Client::builder()
