@@ -38,6 +38,8 @@ export function Settings() {
   const [model, setModel] = useState("");
   const [apiKey, setApiKey] = useState("");
   const [vendorKeys, setVendorKeys] = useState<Record<string, string>>({});
+  const [vendorBaseUrls, setVendorBaseUrls] = useState<Record<string, string>>({});
+  const [vendorModels, setVendorModels] = useState<Record<string, string>>({});
   const [status, setStatus] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [saving, setSaving] = useState(false);
@@ -52,6 +54,9 @@ export function Settings() {
         setModel(v.llm.model ?? "");
         setApiKey(""); // never prefill a key
         setVendorKeys({});
+        // Prefill the non-secret vendor overrides so edits start from the stored value.
+        setVendorBaseUrls(Object.fromEntries(VENDORS.map((x) => [x.id, v[x.id].base_url])));
+        setVendorModels(Object.fromEntries(VENDORS.map((x) => [x.id, v[x.id].model ?? ""])));
       })
       .catch((e) => {
         if (!ctrl.signal.aborted) setError(String(e));
@@ -96,7 +101,13 @@ export function Settings() {
       };
       for (const v of VENDORS) {
         const k = (vendorKeys[v.id] ?? "").trim();
-        if (k) update[v.id] = { api_key: k };
+        // Send the non-secret overrides always (prefilled, so this is idempotent
+        // unless edited); include the key only when one was typed.
+        update[v.id] = {
+          base_url: (vendorBaseUrls[v.id] ?? "").trim(),
+          model: (vendorModels[v.id] ?? "").trim(),
+          ...(k ? { api_key: k } : {}),
+        };
       }
       const res = await saveCredentials(update);
       if (res.ok) {
@@ -198,6 +209,10 @@ export function Settings() {
                 view={view?.[v.id]}
                 value={vendorKeys[v.id] ?? ""}
                 onChange={(val) => setVendorKeys((m) => ({ ...m, [v.id]: val }))}
+                baseUrl={vendorBaseUrls[v.id] ?? ""}
+                onBaseUrlChange={(val) => setVendorBaseUrls((m) => ({ ...m, [v.id]: val }))}
+                model={vendorModels[v.id] ?? ""}
+                onModelChange={(val) => setVendorModels((m) => ({ ...m, [v.id]: val }))}
               />
             ))}
           </>
@@ -261,19 +276,28 @@ function fmtDate(iso: string): string {
   return Number.isNaN(d.getTime()) ? iso : d.toLocaleDateString();
 }
 
-/** A key-only vendor card (speech, vision, media). Unset is "off", not an error. */
+/** A vendor card (speech, vision, media): API key plus optional base-URL / model
+ * overrides. Unset key is "off", not an error. */
 function VendorCard({
   label,
   vendor,
   view,
   value,
   onChange,
+  baseUrl,
+  onBaseUrlChange,
+  model,
+  onModelChange,
 }: {
   label: string;
   vendor: string;
   view?: VendorView;
   value: string;
   onChange: (v: string) => void;
+  baseUrl: string;
+  onBaseUrlChange: (v: string) => void;
+  model: string;
+  onModelChange: (v: string) => void;
 }) {
   const configured = view?.configured ?? false;
   const envFallback = view?.env_fallback ?? false;
@@ -304,6 +328,28 @@ function VendorCard({
           placeholder={placeholder}
           onChange={(e) => onChange(e.target.value)}
           autoComplete="off"
+        />
+      </label>
+      <label className="field">
+        <span>
+          Base URL <em>optional</em>
+        </span>
+        <input
+          type="text"
+          value={baseUrl}
+          placeholder="vendor default"
+          onChange={(e) => onBaseUrlChange(e.target.value)}
+        />
+      </label>
+      <label className="field">
+        <span>
+          Model <em>optional</em>
+        </span>
+        <input
+          type="text"
+          value={model}
+          placeholder="vendor default"
+          onChange={(e) => onModelChange(e.target.value)}
         />
       </label>
     </section>

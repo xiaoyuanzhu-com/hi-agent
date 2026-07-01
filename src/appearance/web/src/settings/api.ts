@@ -2,11 +2,14 @@
 // route. The raw key is never sent to the browser; the view shows `configured`
 // plus a `key_hint`.
 
-/** The redacted view of a key-only vendor (STT/TTS/vision/image/video). */
+/** The redacted view of a vendor (STT/TTS/vision/image/video). The key is never
+ * returned (only `configured` + `key_hint`); `base_url`/`model` are non-secret. */
 export interface VendorView {
   configured: boolean;
   key_hint: string;
   env_fallback: boolean;
+  base_url: string;
+  model: string | null;
 }
 
 /** How the agent obtains its credentials. */
@@ -37,9 +40,13 @@ export interface CredentialsView {
   video: VendorView;
 }
 
-/** Tri-state `api_key`: omit to keep the stored key, "" clears it, a value sets it. */
+/** `api_key` is tri-state: omit to keep the stored key, "" clears it, a value sets
+ * it. `base_url` / `model` are non-secret: omit to keep, a value ("" clears to the
+ * default) sets. */
 export interface VendorUpdate {
   api_key?: string;
+  base_url?: string;
+  model?: string;
 }
 
 export interface CredentialsUpdate {

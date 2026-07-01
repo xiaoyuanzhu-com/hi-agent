@@ -30,7 +30,8 @@ fn env_set(var: &str) -> bool {
     std::env::var(var).map(|v| !v.trim().is_empty()).unwrap_or(false)
 }
 
-/// The `{ configured, key_hint, env_fallback }` view for a key-only vendor.
+/// The redacted view for a vendor: configured state + key hint, plus the
+/// non-secret `base_url` / `model` overrides so the UI can show and edit them.
 fn vendor_view(vk: &credentials::VendorKey, env_var: &str) -> Value {
     let key = vk.api_key.trim();
     let configured = !key.is_empty();
@@ -38,6 +39,8 @@ fn vendor_view(vk: &credentials::VendorKey, env_var: &str) -> Value {
         "configured": configured,
         "key_hint": if configured { format!("••••{}", last4(key)) } else { String::new() },
         "env_fallback": env_set(env_var),
+        "base_url": vk.base_url,
+        "model": vk.model,
     })
 }
 
@@ -91,11 +94,17 @@ pub struct LlmUpdate {
     api_key: Option<String>,
 }
 
-/// A key-only vendor update. `api_key` is tri-state, same as the LLM's.
+/// A vendor update. `api_key` is tri-state like the LLM's (absent keeps, "" clears,
+/// a value sets). `base_url` / `model` are non-secret overrides: absent keeps the
+/// stored value; a value (including "") sets it (empty clears back to the default).
 #[derive(Deserialize)]
 pub struct VendorUpdate {
     #[serde(default)]
     api_key: Option<String>,
+    #[serde(default)]
+    base_url: Option<String>,
+    #[serde(default)]
+    model: Option<String>,
 }
 
 /// A settings update. Every section is optional — the UI may send only the ones
@@ -118,10 +127,20 @@ pub struct CredentialsUpdate {
     video: Option<VendorUpdate>,
 }
 
-/// Apply a key-only vendor update in place (tri-state `api_key`: absent keeps).
+/// Apply a vendor update in place. Each field is independent and absent-keeps:
+/// `api_key` (secret) is set when present; `base_url` / `model` are set when
+/// present, with an empty string clearing the override back to the code default.
 fn apply_vendor(vk: &mut credentials::VendorKey, upd: Option<VendorUpdate>) {
-    if let Some(VendorUpdate { api_key: Some(k) }) = upd {
+    let Some(u) = upd else { return };
+    if let Some(k) = u.api_key {
         vk.api_key = k.trim().to_string();
+    }
+    if let Some(b) = u.base_url {
+        vk.base_url = b.trim().to_string();
+    }
+    if let Some(m) = u.model {
+        let m = m.trim();
+        vk.model = if m.is_empty() { None } else { Some(m.to_string()) };
     }
 }
 
