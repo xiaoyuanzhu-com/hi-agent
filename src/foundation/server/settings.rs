@@ -6,13 +6,13 @@
 //! `POST` writes credentials via [`Credentials::save`] and the tunables via
 //! [`credentials::set_setting`]. Persist-only: the running agent resolved everything
 //! at startup, so the response flags `restart_required` — a restart re-resolves the
-//! store. The credential routes are browser-facing, so they sit behind the OIDC
-//! login gate when auth is enabled (only the owner should set them).
+//! store. Like every route these are public — there is no access gate; the response
+//! never returns a raw key, and protecting an exposed instance is an operator
+//! concern (reverse proxy / VPN).
 //!
-//! `GET /api/account` is the exception: a public, read-only view of the anonymous
-//! free-tier account (tier + energy + sync state). It carries no secrets and is
-//! deliberately *outside* the gate, so a fresh user sees their auto-provisioned
-//! free account on the Settings page without being forced through a sign-in.
+//! `GET /api/account` is a read-only view of the anonymous free-tier account (tier +
+//! energy + sync state). It carries no secrets, so a fresh user sees their
+//! auto-provisioned free account on the Settings page without any sign-in.
 
 use std::sync::Arc;
 

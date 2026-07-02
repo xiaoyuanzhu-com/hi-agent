@@ -96,9 +96,9 @@ function devImportMap(): Plugin {
 // false). We disable timeouts so a quiet long-poll is not killed mid-flight.
 const proxy: Record<string, ProxyOptions> = Object.fromEntries(
   // `/api/*` — the human-interface channels. `/views/*` — compiled agent view
-  // modules and images the Rust server serves from disk. `/auth/*` — the OIDC
-  // login gate's endpoints (login redirect + IdP callback + logout), so the
-  // browser completes the sign-in round-trip against the backend in dev exactly
+  // modules and images the Rust server serves from disk. `/auth/*` — the opt-in
+  // OIDC sign-in endpoints (login redirect + IdP callback + logout; gates nothing),
+  // so the browser completes the sign-in round-trip against the backend in dev exactly
   // as it does same-origin in prod. The browser fetches these by URL, so dev
   // must reach the backend the same way prod (same-origin embed) does, or every
   // `show_view` 404s and sign-in dead-ends.

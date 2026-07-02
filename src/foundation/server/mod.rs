@@ -518,15 +518,16 @@ pub fn build(
         .route("/api/reflex/invoke", post(reflex::post_invoke))
         // BYOK credential store — the Settings UI reads the configured state
         // (key never returned, only a hint) and writes the user's vendor keys.
-        // Browser-facing, so it sits behind the OIDC gate when auth is enabled.
+        // Public like every route (there is no access gate); protecting an exposed
+        // instance is an operator concern (reverse proxy / VPN).
         .route(
             "/api/settings/credentials",
             get(settings::get_credentials).post(settings::post_credentials),
         )
-        // Public, read-only broker account status (tier + energy + sync state) for
-        // the Settings page. Deliberately NOT under `/api/settings`, so it stays
-        // outside the owner gate — a fresh user sees their anonymous free account
-        // without a login; only editing credentials prompts a sign-in.
+        // Read-only broker account status (tier + energy + sync state) for the
+        // Settings page — a fresh user sees their anonymous free account with no
+        // login. Public like the rest; kept off `/api/settings` only as a naming
+        // split (status vs. the credential editor), not a trust boundary.
         .route("/api/account", get(settings::get_account))
         // A scene's channels, observed live as one merged presence stream — the
         // channel inspector's window onto every in/out channel of one scene.
