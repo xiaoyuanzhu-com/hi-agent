@@ -12,6 +12,7 @@
 //! A status item is AppKit, which **must run on the process main thread** and own
 //! the AppKit event loop — so [`run`] blocks the caller for the process lifetime.
 
+use std::path::PathBuf;
 use std::sync::Arc;
 
 use tokio::sync::Notify;
@@ -30,14 +31,14 @@ pub fn available() -> bool {
 ///
 /// Errors (rather than blocking) if the platform has no impl or the status item
 /// can't be created — e.g. no window-server session (running over SSH / headless).
-pub fn run(url: String, shutdown: Arc<Notify>) -> anyhow::Result<()> {
+pub fn run(url: String, data_dir: PathBuf, shutdown: Arc<Notify>) -> anyhow::Result<()> {
     #[cfg(target_os = "macos")]
     {
-        crate::foundation::vendors::macos_tray::run(url, shutdown)
+        crate::foundation::vendors::macos_tray::run(url, data_dir, shutdown)
     }
     #[cfg(not(target_os = "macos"))]
     {
-        let _ = (url, shutdown);
+        let _ = (url, data_dir, shutdown);
         anyhow::bail!("menu-bar status item is not supported on this platform")
     }
 }

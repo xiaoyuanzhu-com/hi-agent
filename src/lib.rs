@@ -390,6 +390,10 @@ pub fn run_with_tray(
     let url = format!("http://127.0.0.1:{port}/");
     let shutdown = Arc::new(Notify::new());
 
+    // The tray's Account submenu reads/writes the credential store, so it needs the
+    // data dir too; clone it before the server thread's closure moves the original.
+    let tray_data_dir = data_dir.clone();
+
     let server_shutdown = shutdown.clone();
     let server = std::thread::Builder::new()
         .name("hi-agent-server".to_string())
@@ -437,7 +441,7 @@ pub fn run_with_tray(
     // Blocks on the AppKit run loop until the process exits via the server thread
     // above. Returns early only if the status item can't be created — in which
     // case fall back to running headless by joining the server.
-    if let Err(e) = body::capabilities::tray::run(url, shutdown) {
+    if let Err(e) = body::capabilities::tray::run(url, tray_data_dir, shutdown) {
         tracing::warn!(error = %e, "menu-bar item unavailable; running without it");
     }
     let _ = server.join();

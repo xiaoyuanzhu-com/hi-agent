@@ -31,7 +31,6 @@ pub mod mcp;
 pub mod observe;
 pub mod reflex;
 pub mod sessions;
-pub mod settings;
 pub mod stubs;
 pub mod text;
 pub mod text_bus;
@@ -335,10 +334,10 @@ pub struct AppState {
     /// incoming bytes here before journaling the reference.
     pub data_dir: PathBuf,
 
-    /// Owner xiaoyuanzhu sign-in (`Some` only when OIDC is configured). Not a gate:
-    /// the settings handler reads the signed-in owner's session token from it to
-    /// forward to the broker for a `sub`-tier account, and reports the signed-in
-    /// identity to the account view. `None` ⇒ sign-in unavailable (free tier only).
+    /// Owner xiaoyuanzhu sign-in (`Some` only when OIDC is configured). Not a gate.
+    /// Retained for a future `sub`-tier account link; no request handler reads it
+    /// today — the credential/account routes that did were removed when the config
+    /// surface moved to the native tray. `None` ⇒ sign-in unavailable (free tier).
     pub auth: Option<Arc<crate::foundation::auth::AuthState>>,
 
     /// Scene→tool-sink table. The `/mcp` handler looks a scene up here to route a
@@ -516,19 +515,6 @@ pub fn build(
         // accessibility tree and type the stored value, no model in the loop. The
         // v1 trigger (a later hotkey/gesture would call the same path).
         .route("/api/reflex/invoke", post(reflex::post_invoke))
-        // BYOK credential store — the Settings UI reads the configured state
-        // (key never returned, only a hint) and writes the user's vendor keys.
-        // Public like every route (there is no access gate); protecting an exposed
-        // instance is an operator concern (reverse proxy / VPN).
-        .route(
-            "/api/settings/credentials",
-            get(settings::get_credentials).post(settings::post_credentials),
-        )
-        // Read-only broker account status (tier + energy + sync state) for the
-        // Settings page — a fresh user sees their anonymous free account with no
-        // login. Public like the rest; kept off `/api/settings` only as a naming
-        // split (status vs. the credential editor), not a trust boundary.
-        .route("/api/account", get(settings::get_account))
         // A scene's channels, observed live as one merged presence stream — the
         // channel inspector's window onto every in/out channel of one scene.
         .route("/api/scenes/{scene}/channels", get(channels::get_scene_channels))

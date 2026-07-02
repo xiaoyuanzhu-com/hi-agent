@@ -128,6 +128,11 @@ objc2-app-kit = { version = "0.3", features = [
     "NSViewController",
     "NSPopover",
     "NSEvent",
+    # BYOK config popup (`crate::vendors::macos_account`): a modal NSAlert whose
+    # accessory view stacks text fields (secure key + optional base URL / model).
+    "NSAlert",
+    "NSTextField",
+    "NSSecureTextField",
 ] }
 # WebKit for the face popover (`crate::vendors::macos_popover`): a WKWebView renders the
 # face inside the NSPopover, with a WKUIDelegate that auto-grants mic/camera (the

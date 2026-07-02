@@ -41,24 +41,29 @@
 //! into another app's *menus*.
 
 use std::cell::Cell;
+use std::path::PathBuf;
 use std::sync::{Arc, Mutex, OnceLock};
 
 use anyhow::anyhow;
 use objc2::rc::Retained;
-use objc2::runtime::{AnyObject, NSObject, NSObjectProtocol};
+use objc2::runtime::{AnyObject, NSObject, NSObjectProtocol, ProtocolObject};
 use objc2::{define_class, msg_send, sel, AnyThread, ClassType, DefinedClass, MainThreadOnly};
 use objc2_app_kit::{
-    NSApplication, NSApplicationActivationPolicy, NSCellImagePosition, NSEventModifierFlags,
-    NSEventType, NSImage, NSMenu, NSMenuItem, NSStatusBar, NSStatusBarButton, NSStatusItem,
-    NSVariableStatusItemLength,
+    NSApplication, NSApplicationActivationPolicy, NSCellImagePosition, NSControlStateValue,
+    NSEventModifierFlags, NSEventType, NSImage, NSMenu, NSMenuDelegate, NSMenuItem, NSStatusBar,
+    NSStatusBarButton, NSStatusItem, NSVariableStatusItemLength,
 };
 use objc2_foundation::{MainThreadMarker, NSData, NSSize, NSString};
 use tokio::sync::Notify;
 
-/// State the menu actions close over: where to point the browser, and the trigger
-/// that asks the server to drain. Held as the target object's instance variables.
+use crate::foundation::credentials::{Credentials, Mode};
+
+/// State the menu actions close over: where to point the browser, where the
+/// credential store lives (for the Account submenu), and the trigger that asks the
+/// server to drain. Held as the target object's instance variables.
 struct Ivars {
     url: String,
+    data_dir: PathBuf,
     shutdown: Arc<Notify>,
 }
 
@@ -92,12 +97,89 @@ define_class!(
         fn quit(&self, _sender: Option<&AnyObject>) {
             self.ivars().shutdown.notify_waiters();
         }
+
+        /// "Account ▸ Xiaoyuanzhu" → use the free broker tier. Persist the mode
+        /// (the broker resumes provisioning free energy on its own loop). Applies on
+        /// the next restart; the checkmark refreshes when the submenu next opens.
+        #[unsafe(method(selectXiaoyuanzhu:))]
+        fn select_xiaoyuanzhu(&self, _sender: Option<&AnyObject>) {
+            let data_dir = &self.ivars().data_dir;
+            let mut creds = Credentials::load(data_dir);
+            creds.mode = Mode::Xiaoyuanzhu;
+            if let Err(e) = creds.save(data_dir) {
+                tracing::error!(error = %e, "tray: failed to switch to Xiaoyuanzhu");
+            }
+        }
+
+        /// "Account ▸ BYOK…" → open the native config popup to enter your own API
+        /// key. The popup writes the store and flips the mode to BYOK on Save.
+        #[unsafe(method(selectByok:))]
+        fn select_byok(&self, _sender: Option<&AnyObject>) {
+            let mtm = MainThreadMarker::new().expect("tray menu action runs on the main thread");
+            crate::foundation::vendors::macos_account::configure(mtm, &self.ivars().data_dir);
+        }
     }
 );
 
 impl TrayTarget {
-    fn new(mtm: MainThreadMarker, url: String, shutdown: Arc<Notify>) -> Retained<Self> {
-        let this = Self::alloc(mtm).set_ivars(Ivars { url, shutdown });
+    fn new(
+        mtm: MainThreadMarker,
+        url: String,
+        data_dir: PathBuf,
+        shutdown: Arc<Notify>,
+    ) -> Retained<Self> {
+        let this = Self::alloc(mtm).set_ivars(Ivars { url, data_dir, shutdown });
+        unsafe { msg_send![super(this), init] }
+    }
+}
+
+/// Set the Account submenu's checkmarks from `mode` — the Xiaoyuanzhu item (tag 1)
+/// and the BYOK item (tag 2). Called at build time and, via [`AccountMenu`]'s
+/// delegate, whenever the submenu is about to open — so a change made in the BYOK
+/// popup shows without rebuilding the menu.
+fn set_account_states(menu: &NSMenu, mode: Mode) {
+    let on = NSControlStateValue(1);
+    let off = NSControlStateValue(0);
+    let n = menu.numberOfItems();
+    for i in 0..n {
+        let Some(item) = menu.itemAtIndex(i) else { continue };
+        match item.tag() {
+            1 => item.setState(if mode == Mode::Xiaoyuanzhu { on } else { off }),
+            2 => item.setState(if mode == Mode::Byok { on } else { off }),
+            _ => {}
+        }
+    }
+}
+
+/// What the Account submenu's delegate needs to refresh checkmarks: where the
+/// credential store lives.
+struct AccountIvars {
+    data_dir: PathBuf,
+}
+
+define_class!(
+    // Delegate on the Account submenu: refreshes the Xiaoyuanzhu/BYOK checkmarks
+    // from the stored mode each time the submenu is about to open.
+    #[unsafe(super(NSObject))]
+    #[thread_kind = MainThreadOnly]
+    #[name = "HiAgentAccountMenu"]
+    #[ivars = AccountIvars]
+    struct AccountMenu;
+
+    unsafe impl NSObjectProtocol for AccountMenu {}
+
+    unsafe impl NSMenuDelegate for AccountMenu {
+        #[unsafe(method(menuNeedsUpdate:))]
+        fn menu_needs_update(&self, menu: &NSMenu) {
+            let mode = Credentials::load(&self.ivars().data_dir).mode;
+            set_account_states(menu, mode);
+        }
+    }
+);
+
+impl AccountMenu {
+    fn new(mtm: MainThreadMarker, data_dir: PathBuf) -> Retained<Self> {
+        let this = Self::alloc(mtm).set_ivars(AccountIvars { data_dir });
         unsafe { msg_send![super(this), init] }
     }
 }
@@ -416,7 +498,7 @@ impl TrayClick {
 /// thread. **Blocks for the process lifetime.** Errors only if we are not on the
 /// main thread; a missing window-server session surfaces as the item simply not
 /// drawing (the caller already treats this path as best-effort).
-pub fn run(url: String, shutdown: Arc<Notify>) -> anyhow::Result<()> {
+pub fn run(url: String, data_dir: PathBuf, shutdown: Arc<Notify>) -> anyhow::Result<()> {
     let mtm = MainThreadMarker::new()
         .ok_or_else(|| anyhow!("the menu bar must be set up on the main thread"))?;
 
@@ -428,7 +510,7 @@ pub fn run(url: String, shutdown: Arc<Notify>) -> anyhow::Result<()> {
     // moved into the menu's "Open" target below.
     let popover_url = url.clone();
 
-    let target = TrayTarget::new(mtm, url, shutdown);
+    let target = TrayTarget::new(mtm, url, data_dir.clone(), shutdown);
 
     // SAFETY: all of these are standard AppKit setup calls made on the main thread
     // (guaranteed by `mtm`); the objects are kept alive by the locals below, which
@@ -510,6 +592,47 @@ pub fn run(url: String, shutdown: Arc<Notify>) -> anyhow::Result<()> {
         );
         open_item.setTarget(Some(&target));
         menu.addItem(&open_item);
+
+        menu.addItem(&NSMenuItem::separatorItem(mtm));
+
+        // Account ▸ Xiaoyuanzhu / BYOK… — the one bootstrap decision (which AI
+        // powers the agent), replacing the deleted web Settings page. The submenu's
+        // delegate keeps the checkmarks in sync with the stored mode.
+        let account_menu = NSMenu::new(mtm);
+        let xyz_item = NSMenuItem::initWithTitle_action_keyEquivalent(
+            NSMenuItem::alloc(mtm),
+            &NSString::from_str("Xiaoyuanzhu"),
+            Some(sel!(selectXiaoyuanzhu:)),
+            &NSString::from_str(""),
+        );
+        xyz_item.setTarget(Some(&target));
+        xyz_item.setTag(1);
+        account_menu.addItem(&xyz_item);
+
+        let byok_item = NSMenuItem::initWithTitle_action_keyEquivalent(
+            NSMenuItem::alloc(mtm),
+            &NSString::from_str("BYOK…"),
+            Some(sel!(selectByok:)),
+            &NSString::from_str(""),
+        );
+        byok_item.setTarget(Some(&target));
+        byok_item.setTag(2);
+        account_menu.addItem(&byok_item);
+
+        // Tick the current mode now; refresh on each open via the delegate.
+        set_account_states(&account_menu, Credentials::load(&data_dir).mode);
+        let acct_delegate = AccountMenu::new(mtm, data_dir.clone());
+        account_menu.setDelegate(Some(ProtocolObject::from_ref(&*acct_delegate)));
+        std::mem::forget(acct_delegate);
+
+        let account_parent = NSMenuItem::initWithTitle_action_keyEquivalent(
+            NSMenuItem::alloc(mtm),
+            &NSString::from_str("Account"),
+            None,
+            &NSString::from_str(""),
+        );
+        account_parent.setSubmenu(Some(&*account_menu));
+        menu.addItem(&account_parent);
 
         menu.addItem(&NSMenuItem::separatorItem(mtm));
 

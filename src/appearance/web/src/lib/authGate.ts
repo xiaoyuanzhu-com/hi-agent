@@ -1,9 +1,9 @@
 // Login redirect for the owner surface.
 //
-// With `HI_AGENT_AUTH=on` the backend gates only the owner surface (Settings,
-// inspect and their APIs) — the appearance page and its channels are public, so
+// With `HI_AGENT_AUTH=on` the backend gates only the owner surface (the inspect
+// console and its APIs) — the appearance page and its channels are public, so
 // loading the SPA at `/` no longer implies a session. A 401 therefore means the
-// tab reached a protected endpoint without one: the owner opened Settings/inspect
+// tab reached a protected endpoint without one: the owner opened inspect
 // unauthenticated, or a live session cookie expired mid-use.
 //
 // This installs a one-time `fetch` wrapper that catches any 401 and does a
