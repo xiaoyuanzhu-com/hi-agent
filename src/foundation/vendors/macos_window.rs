@@ -1,20 +1,23 @@
 //! macOS window vendor — the dedicated desktop window that hosts the agent **face**.
 //!
-//! A borderless `NSWindow` hosting a `WKWebView` that loads the face (`/`) — the same
-//! appearance UI the tray popover used to show, but as a free-standing, movable window
-//! instead of a menu-bar popup. Opened by a left-click on the tray icon, the "Open Hi
-//! Agent" menu item, or a single right-⌘ tap ([`crate::body::gesture`]).
+//! A standard titled `NSWindow` hosting a `WKWebView` that loads the face (`/`) — the
+//! same appearance UI the tray popover used to show, but as a free-standing window with
+//! native macOS chrome (titlebar, traffic lights, drag, resize) instead of a menu-bar
+//! popup. Opened by a left-click on the tray icon, the "Open Hi Agent" menu item, or a
+//! single right-⌘ tap ([`crate::body::gesture`]).
 //!
-//! **Borderless, but a real interactive window.** A borderless `NSWindow` refuses to
-//! become key by default, which would leave the web view's text input dead under the
-//! Accessory activation policy — so [`KeyWindow`] overrides `canBecomeKeyWindow` /
-//! `canBecomeMainWindow`. Dragging is by the window background (there's no titlebar to
-//! grab) and the mask carries `Resizable` so the edges still resize. To swap the naked
-//! borderless look for a native-chrome-hidden window instead (traffic-light-free but
-//! with system corner rounding, drag, and resize), give the window the
-//! `Titled | Closable | Miniaturizable | Resizable | FullSizeContentView` mask, set
-//! `titlebarAppearsTransparent`/`titleVisibility(Hidden)`, and hide the standard
-//! buttons — the web view still fills to all four edges.
+//! **A real interactive window under the Accessory policy.** A titled window becomes key
+//! on its own, but [`KeyWindow`] still overrides `canBecomeKeyWindow` /
+//! `canBecomeMainWindow` as a belt-and-braces guarantee that the web view's text input
+//! takes keystrokes even though the app runs Accessory (no Dock icon). The mask carries
+//! `Titled | Closable | Miniaturizable | Resizable`, so the standard titlebar handles
+//! dragging and the traffic lights close/minimize/zoom the window.
+//!
+//! **Themed, centered title bar.** The native titlebar is made transparent and its text
+//! hidden; with `FullSizeContentView` the content view spans under it, so the window's
+//! background color paints a flat bar (white for now — the single knob to recolor once
+//! the face has a theme) and a centered `NSTextField` stands in for the title, clearing
+//! the traffic lights on the left. The web view is inset below the bar strip.
 //!
 //! Media permission mirrors the popover: a [`MediaGrant`] `WKUIDelegate` auto-grants
 //! the page's mic/camera so WebKit never shows its per-site prompt. (The macOS *system*
@@ -31,7 +34,10 @@ use std::sync::OnceLock;
 use objc2::rc::Retained;
 use objc2::runtime::{AnyObject, NSObject, NSObjectProtocol, ProtocolObject, Sel};
 use objc2::{DefinedClass, MainThreadOnly, define_class, msg_send, sel};
-use objc2_app_kit::{NSApplication, NSBackingStoreType, NSWindow, NSWindowStyleMask};
+use objc2_app_kit::{
+    NSApplication, NSAutoresizingMaskOptions, NSBackingStoreType, NSColor, NSTextAlignment,
+    NSTextField, NSView, NSWindow, NSWindowStyleMask, NSWindowTitleVisibility,
+};
 use objc2_foundation::{MainThreadMarker, NSPoint, NSRect, NSSize, NSString, NSURL, NSURLRequest};
 use objc2_web_kit::{
     WKFrameInfo, WKMediaCaptureType, WKPermissionDecision, WKSecurityOrigin, WKUIDelegate,
@@ -41,6 +47,13 @@ use objc2_web_kit::{
 /// The window's initial content size in points — a roomy desktop column for the face.
 const WINDOW_W: f64 = 1000.0;
 const WINDOW_H: f64 = 720.0;
+
+/// Height of the title-bar strip, matching the standard macOS titlebar so the traffic
+/// lights sit centered in it.
+const BAR_H: f64 = 28.0;
+/// Height of the centered title label; kept near the font's line height and centered
+/// vertically within [`BAR_H`].
+const LABEL_H: f64 = 18.0;
 
 // ---------------------------------------------------------------------------
 // Media-permission delegate — auto-grant so WebKit never prompts per-site
@@ -77,9 +90,9 @@ define_class!(
 // ---------------------------------------------------------------------------
 
 define_class!(
-    // A borderless NSWindow that can still become key/main. AppKit refuses key status
-    // to borderless windows by default, which would starve the web view's text input of
-    // keystrokes under the Accessory activation policy; overriding these restores it.
+    // A titled NSWindow that can still become key/main. Titled windows do so by default;
+    // these overrides are a belt-and-braces guarantee that the web view's text input
+    // keeps taking keystrokes under the Accessory activation policy.
     #[unsafe(super(NSWindow))]
     #[thread_kind = MainThreadOnly]
     #[name = "HiAgentFaceWindow"]
@@ -101,6 +114,10 @@ define_class!(
 /// What the host needs to show/focus the window. Touched only on the main thread.
 struct Ivars {
     window: Retained<KeyWindow>,
+    /// Kept so [`Host::present`] can re-issue the load if the initial attempt (fired at
+    /// install, possibly before the server bound its listener) never committed.
+    webview: Retained<WKWebView>,
+    request: Retained<NSURLRequest>,
 }
 
 define_class!(
@@ -134,6 +151,14 @@ impl Host {
         // activation call but still works; the window then becomes key so its web view's
         // input can take keystrokes despite the Accessory activation policy.
         unsafe {
+            // If the load fired at install never committed — the server thread hadn't
+            // bound its listener yet, so the page is still about:blank — re-issue it now.
+            // By the time the user opens the window the server is up, so this succeeds.
+            // A committed page reports its URL; a failed provisional load leaves it nil.
+            if iv.webview.URL().is_none() {
+                let _: Option<Retained<objc2_web_kit::WKNavigation>> =
+                    iv.webview.loadRequest(&iv.request);
+            }
             let _: () = msg_send![&*app, activateIgnoringOtherApps: true];
             let window: &KeyWindow = &iv.window;
             let _: () = msg_send![window, center];
@@ -160,9 +185,18 @@ pub fn install(mtm: MainThreadMarker, url: &str) {
     // after free; they live for the process, like the tray's items.
     unsafe {
         let config = WKWebViewConfiguration::new(mtm);
-        let frame = NSRect::new(NSPoint::new(0.0, 0.0), NSSize::new(WINDOW_W, WINDOW_H));
+        let full = NSRect::new(NSPoint::new(0.0, 0.0), NSSize::new(WINDOW_W, WINDOW_H));
+
+        // The web view fills the window below the title-bar strip and grows with it.
+        let web_frame = NSRect::new(
+            NSPoint::new(0.0, 0.0),
+            NSSize::new(WINDOW_W, WINDOW_H - BAR_H),
+        );
         let webview: Retained<WKWebView> =
-            WKWebView::initWithFrame_configuration(WKWebView::alloc(mtm), frame, &config);
+            WKWebView::initWithFrame_configuration(WKWebView::alloc(mtm), web_frame, &config);
+        webview.setAutoresizingMask(
+            NSAutoresizingMaskOptions::ViewWidthSizable | NSAutoresizingMaskOptions::ViewHeightSizable,
+        );
 
         // Auto-grant the page's mic/camera (no per-site WebKit prompt). The delegate is
         // weakly held by the web view, so leak our strong reference to keep it alive.
@@ -174,35 +208,71 @@ pub fn install(mtm: MainThreadMarker, url: &str) {
         // Element) — it's the app's own content, so leaving it on lets the UI be debugged.
         webview.setInspectable(true);
 
-        if let Some(nsurl) = NSURL::URLWithString(&NSString::from_str(url)) {
-            let req = NSURLRequest::requestWithURL(&nsurl);
-            let _: Option<Retained<objc2_web_kit::WKNavigation>> = webview.loadRequest(&req);
-        } else {
-            tracing::warn!(url, "window: bad URL; nothing to load");
-        }
+        let Some(nsurl) = NSURL::URLWithString(&NSString::from_str(url)) else {
+            tracing::warn!(url, "window: bad URL; face window not installed");
+            return;
+        };
+        let request = NSURLRequest::requestWithURL(&nsurl);
+        // Kick off the first load. It may fail silently if the server thread hasn't bound
+        // its listener yet (config bootstrap can lag startup); `present` re-issues it when
+        // the user first opens the window, by which point the server is listening.
+        let _: Option<Retained<objc2_web_kit::WKNavigation>> = webview.loadRequest(&request);
 
-        // A naked borderless window (no titlebar / traffic lights) that is still
-        // resizable at the edges; see the module doc for the native-chrome-hidden
-        // alternative if the missing affordances get in the way.
-        let style = NSWindowStyleMask::Borderless | NSWindowStyleMask::Resizable;
+        // Native window chrome (traffic lights, drag, resize), but with the titlebar made
+        // transparent and its text hidden so the window background paints a flat bar we own.
+        // `FullSizeContentView` lets the content view span under the titlebar so our label
+        // can sit in that strip.
+        let style = NSWindowStyleMask::Titled
+            | NSWindowStyleMask::Closable
+            | NSWindowStyleMask::Miniaturizable
+            | NSWindowStyleMask::Resizable
+            | NSWindowStyleMask::FullSizeContentView;
         let window: Retained<KeyWindow> = msg_send![
             KeyWindow::alloc(mtm),
-            initWithContentRect: frame,
+            initWithContentRect: full,
             styleMask: style,
             backing: NSBackingStoreType::Buffered,
             defer: false,
         ];
-        // Drag the window by its background — there's no titlebar to grab. Don't free
-        // the window when it's dismissed; we keep it hidden and reopen the same one.
-        let _: () = msg_send![&*window, setMovableByWindowBackground: true];
+        window.setTitlebarAppearsTransparent(true);
+        window.setTitleVisibility(NSWindowTitleVisibility::Hidden);
+        // The bar/background tint. White until the face grows a theme; this is the single
+        // knob to recolor the bar to match it.
+        window.setBackgroundColor(Some(&NSColor::whiteColor()));
+        // Don't free the window when its close button dismisses it; we keep it around
+        // and reopen the same one on the next tray click.
         let _: () = msg_send![&*window, setReleasedWhenClosed: false];
-        let _: () = msg_send![&*window, setContentView: &*webview];
 
-        let host = Host::alloc(mtm).set_ivars(Ivars { window });
+        // Our own centered title, standing in for the hidden native one — vertically
+        // centered in the title-bar strip, horizontally centered across the full width so
+        // it clears the traffic lights on the left.
+        let label = NSTextField::labelWithString(&NSString::from_str("Hi Agent"), mtm);
+        // NSTextAlignmentCenter (1) — omitted from the generated bindings, so spelled out.
+        label.setAlignment(NSTextAlignment(1));
+        label.setTextColor(Some(&NSColor::blackColor()));
+        label.setFrame(NSRect::new(
+            NSPoint::new(0.0, WINDOW_H - BAR_H + (BAR_H - LABEL_H) / 2.0),
+            NSSize::new(WINDOW_W, LABEL_H),
+        ));
+        // Stay pinned to the top edge and stretch horizontally as the window resizes.
+        label.setAutoresizingMask(
+            NSAutoresizingMaskOptions::ViewWidthSizable | NSAutoresizingMaskOptions::ViewMinYMargin,
+        );
+
+        // Content view: the web view below, the title label floating in the bar strip.
+        let container = NSView::initWithFrame(NSView::alloc(mtm), full);
+        container.addSubview(&webview);
+        container.addSubview(&label);
+        let _: () = msg_send![&*window, setContentView: &*container];
+        std::mem::forget(label);
+        std::mem::forget(container);
+
+        // The host owns the window, web view, and request for the process lifetime (the
+        // ivars keep them alive; the host itself is leaked below).
+        let host = Host::alloc(mtm).set_ivars(Ivars { window, webview, request });
         let host: Retained<Host> = msg_send![super(host), init];
         let ptr: *const Host = &*host;
         std::mem::forget(host);
-        std::mem::forget(webview);
         std::mem::forget(config);
         let _ = HOST.set(HostPtr(ptr));
     }

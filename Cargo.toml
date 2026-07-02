@@ -133,6 +133,10 @@ objc2-app-kit = { version = "0.3", features = [
     "NSAlert",
     "NSTextField",
     "NSSecureTextField",
+    # Face window (`crate::vendors::macos_window`): a titled window whose native title is
+    # hidden in favour of a centered NSTextField label sitting in the title-bar strip,
+    # tinted by the window's NSColor background (the themeable bar color).
+    "NSColor",
 ] }
 # WebKit for the face popover (`crate::vendors::macos_popover`): a WKWebView renders the
 # face inside the NSPopover, with a WKUIDelegate that auto-grants mic/camera (the
