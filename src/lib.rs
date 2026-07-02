@@ -222,9 +222,6 @@ async fn run_with_shutdown(config: Config, shutdown: Arc<Notify>) -> anyhow::Res
         );
     }
     config.agent.render_settings_json(&claude_config_dir)?;
-    // Pre-approve the upstream key, else Claude Code rejects the env-supplied
-    // `ANTHROPIC_API_KEY` ("Please run /login") and prompts fail with -32000.
-    config.agent.approve_api_key(&claude_config_dir)?;
 
     // Spawn config for the agent session layer. The subprocess itself is spawned
     // lazily, one per scene, on that scene's first session (Chrome-style isolation);
@@ -242,7 +239,7 @@ async fn run_with_shutdown(config: Config, shutdown: Arc<Notify>) -> anyhow::Res
     child_env.push(("HI_AGENT_PROMPTS_DIR".to_string(), prompts_dir.display().to_string()));
     // Diagnostic: surface exactly what differs between launchers (terminal vs.
     // cmux etc.) — cwd, the resolved runtime binaries, the config dir claude
-    // will read, and the upstream key's fingerprint vs. what we seeded.
+    // will read, and the upstream key's fingerprint.
     {
         let get = |k: &str| {
             child_env
@@ -251,7 +248,7 @@ async fn run_with_shutdown(config: Config, shutdown: Arc<Notify>) -> anyhow::Res
                 .map(|(_, v)| v.as_str())
                 .unwrap_or("<unset>")
         };
-        let key = get("ANTHROPIC_API_KEY");
+        let key = get("ANTHROPIC_AUTH_TOKEN");
         let fp = &key[key.len().saturating_sub(20)..];
         tracing::info!(
             cwd = ?std::env::current_dir().ok(),
@@ -263,7 +260,7 @@ async fn run_with_shutdown(config: Config, shutdown: Arc<Notify>) -> anyhow::Res
             anthropic_base_url = get("ANTHROPIC_BASE_URL"),
             claude_config_dir_env = get("CLAUDE_CONFIG_DIR"),
             claude_code_executable = get("CLAUDE_CODE_EXECUTABLE"),
-            api_key_fp = fp,
+            auth_token_fp = fp,
             path_head = child_env.iter().find(|(n,_)| n == "PATH").map(|(_,v)| v.split(':').next().unwrap_or("")).unwrap_or(""),
             "child auth/runtime env resolved"
         );

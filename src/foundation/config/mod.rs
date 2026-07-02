@@ -178,46 +178,6 @@ impl AgentConfig {
         Ok(())
     }
 
-    /// Pre-approve the upstream key in the managed config dir's `.claude.json`.
-    ///
-    /// Claude Code treats any key supplied via `ANTHROPIC_API_KEY` as a "custom"
-    /// key and refuses to use it unless its last-20-char fingerprint appears in
-    /// `customApiKeyResponses.approved`. Without this, `session/prompt` fails with
-    /// "Please run /login", which the ACP adapter surfaces as
-    /// `-32000 Authentication required`. We seed the approval so the child's
-    /// `ANTHROPIC_API_KEY` is accepted without an interactive `/login`.
-    ///
-    /// We pin `approved` to exactly the current key's fingerprint — this dir is
-    /// hi-agent-owned and the only custom key is ours, so there is nothing else to
-    /// preserve and the list stays bounded. Re-run whenever the key changes.
-    pub fn approve_api_key(&self, config_dir: &Path) -> anyhow::Result<()> {
-        std::fs::create_dir_all(config_dir)
-            .with_context(|| format!("creating config dir {}", config_dir.display()))?;
-        let path = config_dir.join(".claude.json");
-
-        // Read-modify-write: `.claude.json` also holds userID, caches, etc.
-        let mut root: serde_json::Map<String, serde_json::Value> = match std::fs::read(&path) {
-            Ok(bytes) => {
-                serde_json::from_slice(&bytes).with_context(|| format!("parsing {}", path.display()))?
-            }
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => serde_json::Map::new(),
-            Err(e) => return Err(e).with_context(|| format!("reading {}", path.display())),
-        };
-
-        // Claude matches approvals by the key's last 20 chars (`key.slice(-20)`).
-        let key = self.upstream_key.as_str();
-        let fingerprint = &key[key.len().saturating_sub(20)..];
-
-        root.insert(
-            "customApiKeyResponses".to_string(),
-            serde_json::json!({ "approved": [fingerprint], "rejected": [] }),
-        );
-
-        std::fs::write(&path, serde_json::to_vec_pretty(&serde_json::Value::Object(root))?)
-            .with_context(|| format!("writing {}", path.display()))?;
-        Ok(())
-    }
-
     /// Build the env var pairs for the ACP child process.
     ///
     /// `server_port` is hi-agent's own HTTP port (handed to the child as
@@ -387,31 +347,5 @@ mod tests {
         assert_eq!(map["CLAUDE_CONFIG_DIR"], "/cache/config");
         assert_eq!(map["CLAUDE_CODE_EXECUTABLE"], "/cache/runtime/claude");
         assert!(map["PATH"].starts_with("/cache/runtime/node/bin"));
-    }
-
-    #[test]
-    fn approve_api_key_seeds_fingerprint_and_preserves_other_fields() {
-        let cfg = AgentConfig::new(
-            None,
-            None,
-            None,
-            "https://x/v1".to_string(),
-            "sk-ant-super-secret-key-1234567890".to_string(),
-        );
-        let dir = std::env::temp_dir().join(format!("hi-agent-test-{}", uuid::Uuid::now_v7()));
-        std::fs::create_dir_all(&dir).unwrap();
-        // Pre-existing managed state that must survive the read-modify-write.
-        std::fs::write(dir.join(".claude.json"), br#"{"userID":"abc"}"#).unwrap();
-
-        cfg.approve_api_key(&dir).unwrap();
-
-        let v: serde_json::Value =
-            serde_json::from_slice(&std::fs::read(dir.join(".claude.json")).unwrap()).unwrap();
-        assert_eq!(v["userID"], "abc");
-        let key = &cfg.upstream_key;
-        let fp = &key[key.len().saturating_sub(20)..];
-        assert_eq!(v["customApiKeyResponses"]["approved"][0], fp);
-
-        std::fs::remove_dir_all(&dir).ok();
     }
 }
