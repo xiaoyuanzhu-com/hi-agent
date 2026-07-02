@@ -21,6 +21,14 @@ use crate::foundation::credentials::{Credentials, Energy, LlmCredentials, Manage
 const ENV_BROKER_URL: &str = "HI_AGENT_BROKER_URL";
 const DEFAULT_BROKER_URL: &str = "https://hi.xiaoyuanzhu.com";
 
+/// `app_settings` keys recording the outcome of the last broker sync, so the
+/// Settings page can show a real state (connecting / connected / problem) instead
+/// of a perpetual "connecting". Written on every refresh + energy poll; read by
+/// the public `/api/account` status endpoint. Not secrets.
+pub const KEY_BROKER_STATE: &str = "broker_state"; // "ok" | "error"
+pub const KEY_BROKER_ERROR: &str = "broker_error"; // last error text (cleared on ok)
+pub const KEY_BROKER_CHECKED_AT: &str = "broker_checked_at"; // rfc3339 of last attempt
+
 fn base_url() -> String {
     std::env::var(ENV_BROKER_URL)
         .ok()
@@ -176,11 +184,26 @@ async fn ensure_tokens(store: &Credentials) -> anyhow::Result<Tokens> {
         if !t.refresh_token.trim().is_empty() {
             match refresh_access(&t.refresh_token).await {
                 Ok(nt) => return Ok(nt),
-                Err(e) => tracing::warn!(error = %e, "token refresh failed; re-bootstrapping"),
+                // Expected, self-healing path: the broker rotates/expires refresh
+                // tokens, and a stale one (prior run, broker DB reset) is idempotently
+                // recovered by re-bootstrapping on the stable device id. Not fatal.
+                Err(e) => tracing::warn!(error = %e, "broker refresh token stale; re-bootstrapping a fresh account (self-heals)"),
             }
         }
     }
     bootstrap(&store.device_id).await
+}
+
+/// Persist the last broker-sync outcome to `app_settings` (best-effort — a failed
+/// write just leaves the UI showing a slightly stale state). On success the stored
+/// error is cleared; on failure its text is kept so the Settings page can surface
+/// *why* the account is unavailable rather than spinning on "connecting".
+fn record_status(data_dir: &Path, ok: bool, error: &str) {
+    use crate::foundation::credentials::set_setting;
+    let now = chrono::Utc::now().to_rfc3339();
+    let _ = set_setting(data_dir, KEY_BROKER_STATE, if ok { "ok" } else { "error" });
+    let _ = set_setting(data_dir, KEY_BROKER_ERROR, if ok { "" } else { error });
+    let _ = set_setting(data_dir, KEY_BROKER_CHECKED_AT, &now);
 }
 
 /// In xiaoyuanzhu mode: ensure account tokens (bootstrap/refresh), fetch configs +
@@ -207,6 +230,7 @@ pub async fn refresh(data_dir: &Path, bearer: Option<&str>) {
         Ok(t) => t,
         Err(e) => {
             tracing::warn!(error = %e, "broker bootstrap/refresh failed; keeping cached configs");
+            record_status(data_dir, false, &e.to_string());
             if dirty {
                 if let Err(e) = store.save(data_dir) {
                     tracing::warn!(error = %e, "failed to persist credential store");
@@ -233,6 +257,10 @@ pub async fn refresh(data_dir: &Path, bearer: Option<&str>) {
         Err(e) => tracing::warn!(error = %e, "energy fetch failed; keeping cached"),
     }
 
+    // Tokens were obtained → the account exists and is healthy, even if a vendor
+    // sub-fetch above degraded. Record success so the UI leaves "connecting".
+    record_status(data_dir, true, "");
+
     if dirty {
         if let Err(e) = store.save(data_dir) {
             tracing::warn!(error = %e, "failed to persist credential store after broker refresh");
@@ -256,6 +284,8 @@ async fn poll_energy(data_dir: &Path) {
             if let Err(e) = store.save(data_dir) {
                 tracing::debug!(error = %e, "failed to persist energy poll");
             }
+            // Keeps the Settings page's "last checked" fresh between full refreshes.
+            record_status(data_dir, true, "");
         }
         Err(e) => tracing::debug!(error = %e, "energy poll failed; keeping last value"),
     }

@@ -6,8 +6,13 @@
 //! `POST` writes credentials via [`Credentials::save`] and the tunables via
 //! [`credentials::set_setting`]. Persist-only: the running agent resolved everything
 //! at startup, so the response flags `restart_required` — a restart re-resolves the
-//! store. These routes are browser-facing, so they sit behind the OIDC login gate
-//! when auth is enabled (only the owner should set them).
+//! store. The credential routes are browser-facing, so they sit behind the OIDC
+//! login gate when auth is enabled (only the owner should set them).
+//!
+//! `GET /api/account` is the exception: a public, read-only view of the anonymous
+//! free-tier account (tier + energy + sync state). It carries no secrets and is
+//! deliberately *outside* the gate, so a fresh user sees their auto-provisioned
+//! free account on the Settings page without being forced through a sign-in.
 
 use std::sync::Arc;
 
@@ -16,6 +21,7 @@ use axum::extract::State;
 use serde::Deserialize;
 use serde_json::{Value, json};
 
+use crate::foundation::broker;
 use crate::foundation::config;
 use crate::foundation::credentials::{self, Credentials};
 use crate::foundation::server::AppState;
@@ -43,6 +49,42 @@ fn vendor_view(vk: &credentials::VendorKey) -> Value {
 /// One agent tunable from the config store, for the Settings view (`null` if unset).
 fn creds_setting(state: &AppState, key: &str) -> Option<String> {
     credentials::get_setting(&state.data_dir, key)
+}
+
+/// Public, read-only account status for the Settings page (NOT owner-gated). Shows
+/// the anonymous free tier + remaining energy, plus a coarse sync `state`
+/// (`connecting` / `connected` / `error`) so the UI can render a real state rather
+/// than a perpetual "connecting". Carries no secrets. `auth_enabled` tells the UI
+/// whether a sign-in (for the gated credential editor, and the future sub-tier
+/// upgrade) is even available on this instance.
+pub async fn get_account(State(state): State<Arc<AppState>>) -> Json<Value> {
+    let creds = Credentials::load(&state.data_dir);
+    let energy = creds.energy.as_ref();
+    let broker_state = credentials::get_setting(&state.data_dir, broker::KEY_BROKER_STATE);
+    let broker_error = credentials::get_setting(&state.data_dir, broker::KEY_BROKER_ERROR);
+    let checked_at = credentials::get_setting(&state.data_dir, broker::KEY_BROKER_CHECKED_AT);
+
+    // Connected once an energy snapshot exists; else surface the last sync error if
+    // there was one, otherwise the first bootstrap is still in flight (connecting).
+    let ui_state = if energy.is_some() {
+        "connected"
+    } else if broker_state.as_deref() == Some("error") {
+        "error"
+    } else {
+        "connecting"
+    };
+
+    Json(json!({
+        "mode": creds.mode,
+        "state": ui_state,
+        "tier": energy.map(|e| &e.tier),
+        "energy_remaining": energy.map(|e| e.remaining),
+        "energy_total": energy.map(|e| e.total),
+        "resets_at": energy.map(|e| &e.resets_at),
+        "error": broker_error,
+        "checked_at": checked_at,
+        "auth_enabled": state.auth.is_some(),
+    }))
 }
 
 /// Report the credential state for the Settings UI. Never returns a raw key.

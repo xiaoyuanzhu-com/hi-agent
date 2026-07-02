@@ -1,8 +1,10 @@
 import { useEffect, useState } from "react";
 import {
+  fetchAccount,
   fetchCredentials,
   saveCredentials,
-  type Account,
+  UnauthorizedError,
+  type AccountStatus,
   type CredentialsUpdate,
   type CredentialsView,
   type Mode,
@@ -31,9 +33,18 @@ const MODES: { id: Mode; label: string }[] = [
  * vendor keys). Xiaoyuanzhu draws a credential bundle from the broker; BYOK uses the
  * keys entered here. A raw key is never returned from the server (only a hint);
  * changes apply on restart.
+ *
+ * The account status (public `GET /api/account`) always renders — the free tier is
+ * anonymous, so it's visible without a login. The credential *editor* sits behind
+ * the owner gate: when auth is on and the visitor isn't signed in, that read 401s
+ * and we show a sign-in prompt in place of the editor rather than an error.
  */
 export function Settings() {
+  const [account, setAccount] = useState<AccountStatus | null>(null);
   const [view, setView] = useState<CredentialsView | null>(null);
+  // Auth is on and this visitor isn't signed in — show the sign-in prompt for the
+  // (gated) editor while still rendering the public account status above it.
+  const [needsSignin, setNeedsSignin] = useState(false);
   const [baseUrl, setBaseUrl] = useState("");
   const [model, setModel] = useState("");
   const [apiKey, setApiKey] = useState("");
@@ -50,8 +61,19 @@ export function Settings() {
 
   useEffect(() => {
     const ctrl = new AbortController();
+    // The account status is public — always fetch it so the card renders even for
+    // a signed-out visitor behind the gate.
+    fetchAccount(ctrl.signal)
+      .then(setAccount)
+      .catch(() => {
+        // Public endpoint; a failure here just leaves the card in its neutral
+        // "connecting" state rather than surfacing a banner.
+        if (!ctrl.signal.aborted) setAccount(null);
+      });
+    // The credential editor is gated: a 401 means "sign in to manage", not an error.
     fetchCredentials(ctrl.signal)
       .then((v) => {
+        setNeedsSignin(false);
         setView(v);
         setBaseUrl(v.llm.base_url);
         setModel(v.llm.model ?? "");
@@ -65,12 +87,21 @@ export function Settings() {
         setPulse(v.agent.pulse ?? "");
       })
       .catch((e) => {
-        if (!ctrl.signal.aborted) setError(String(e));
+        if (ctrl.signal.aborted) return;
+        if (e instanceof UnauthorizedError) {
+          setNeedsSignin(true);
+          setView(null);
+        } else {
+          setError(String(e));
+        }
       });
     return () => ctrl.abort();
   }, [reloadKey]);
 
-  const mode: Mode = view?.mode ?? "xiaoyuanzhu";
+  const mode: Mode = view?.mode ?? account?.mode ?? "xiaoyuanzhu";
+  // The account card belongs to xiaoyuanzhu mode (broker credits); BYOK has no
+  // broker account. Before we know the mode, default to showing it (the default).
+  const showAccount = mode === "xiaoyuanzhu";
 
   const onSelectMode = async (m: Mode) => {
     if (m === mode) return;
@@ -168,178 +199,228 @@ export function Settings() {
 
         <p className="settings-intro">How the agent draws its model credits.</p>
 
-        <div className="mode-tabs" role="tablist">
-          {MODES.map((m) => (
-            <button
-              key={m.id}
-              className={m.id === mode ? "mode-tab sel" : "mode-tab"}
-              disabled={saving}
-              onClick={() => onSelectMode(m.id)}
-            >
-              {m.label}
-            </button>
-          ))}
-        </div>
+        {showAccount && <AccountStatusCard account={account} />}
 
-        {mode === "byok" ? (
+        {needsSignin ? (
+          <SignInPanel />
+        ) : (
           <>
+            <div className="mode-tabs" role="tablist">
+              {MODES.map((m) => (
+                <button
+                  key={m.id}
+                  className={m.id === mode ? "mode-tab sel" : "mode-tab"}
+                  disabled={saving}
+                  onClick={() => onSelectMode(m.id)}
+                >
+                  {m.label}
+                </button>
+              ))}
+            </div>
+
+            {mode === "byok" && (
+              <>
+                <section className="settings-card">
+                  <div className="settings-card-head">
+                    <h2>LLM · Claude</h2>
+                    {llmConfigured ? (
+                      <span className="tag ok">configured · {view?.llm.key_hint}</span>
+                    ) : (
+                      <span className="tag warn">not configured</span>
+                    )}
+                  </div>
+
+                  <label className="field">
+                    <span>API key</span>
+                    <input
+                      type="password"
+                      value={apiKey}
+                      placeholder={llmConfigured ? "•••• (unchanged)" : "sk-ant-…"}
+                      onChange={(e) => setApiKey(e.target.value)}
+                      autoComplete="off"
+                    />
+                  </label>
+
+                  <label className="field">
+                    <span>Base URL</span>
+                    <input
+                      type="text"
+                      value={baseUrl}
+                      placeholder="https://api.anthropic.com"
+                      onChange={(e) => setBaseUrl(e.target.value)}
+                    />
+                  </label>
+
+                  <label className="field">
+                    <span>
+                      Model <em>optional</em>
+                    </span>
+                    <input
+                      type="text"
+                      value={model}
+                      placeholder="adapter default"
+                      onChange={(e) => setModel(e.target.value)}
+                    />
+                  </label>
+                </section>
+
+                {VENDORS.map((v) => (
+                  <VendorCard
+                    key={v.id}
+                    label={v.label}
+                    vendor={v.vendor}
+                    view={view?.[v.id]}
+                    value={vendorKeys[v.id] ?? ""}
+                    onChange={(val) => setVendorKeys((m) => ({ ...m, [v.id]: val }))}
+                    baseUrl={vendorBaseUrls[v.id] ?? ""}
+                    onBaseUrlChange={(val) => setVendorBaseUrls((m) => ({ ...m, [v.id]: val }))}
+                    model={vendorModels[v.id] ?? ""}
+                    onModelChange={(val) => setVendorModels((m) => ({ ...m, [v.id]: val }))}
+                  />
+                ))}
+              </>
+            )}
+
+            <div className="settings-actions">
+              {mode === "byok" && (
+                <button className="primary" onClick={onSave} disabled={saving}>
+                  {saving ? "Saving…" : "Save"}
+                </button>
+              )}
+              {status && <span className="note ok">{status}</span>}
+              {error && <span className="note err">{error}</span>}
+            </div>
+
+            <p className="settings-intro">How the agent behaves. Applies in either mode.</p>
+
             <section className="settings-card">
               <div className="settings-card-head">
-                <h2>LLM · Claude</h2>
-                {llmConfigured ? (
-                  <span className="tag ok">configured · {view?.llm.key_hint}</span>
-                ) : (
-                  <span className="tag warn">not configured</span>
-                )}
+                <h2>Agent</h2>
               </div>
-
-              <label className="field">
-                <span>API key</span>
-                <input
-                  type="password"
-                  value={apiKey}
-                  placeholder={llmConfigured ? "•••• (unchanged)" : "sk-ant-…"}
-                  onChange={(e) => setApiKey(e.target.value)}
-                  autoComplete="off"
-                />
-              </label>
-
-              <label className="field">
-                <span>Base URL</span>
-                <input
-                  type="text"
-                  value={baseUrl}
-                  placeholder="https://api.anthropic.com"
-                  onChange={(e) => setBaseUrl(e.target.value)}
-                />
-              </label>
-
               <label className="field">
                 <span>
-                  Model <em>optional</em>
+                  Effort <em>optional</em>
                 </span>
                 <input
                   type="text"
-                  value={model}
-                  placeholder="adapter default"
-                  onChange={(e) => setModel(e.target.value)}
+                  value={effort}
+                  placeholder="adapter default (e.g. low · medium · high)"
+                  onChange={(e) => setEffort(e.target.value)}
+                />
+              </label>
+              <label className="field">
+                <span>
+                  Permission mode <em>optional</em>
+                </span>
+                <input
+                  type="text"
+                  value={permissionMode}
+                  placeholder="adapter default (e.g. acceptEdits)"
+                  onChange={(e) => setPermissionMode(e.target.value)}
+                />
+              </label>
+              <label className="field">
+                <span>
+                  Pulse interval <em>optional</em>
+                </span>
+                <input
+                  type="text"
+                  value={pulse}
+                  placeholder="default 30m (e.g. 90s · 30m · 1h · off)"
+                  onChange={(e) => setPulse(e.target.value)}
                 />
               </label>
             </section>
 
-            {VENDORS.map((v) => (
-              <VendorCard
-                key={v.id}
-                label={v.label}
-                vendor={v.vendor}
-                view={view?.[v.id]}
-                value={vendorKeys[v.id] ?? ""}
-                onChange={(val) => setVendorKeys((m) => ({ ...m, [v.id]: val }))}
-                baseUrl={vendorBaseUrls[v.id] ?? ""}
-                onBaseUrlChange={(val) => setVendorBaseUrls((m) => ({ ...m, [v.id]: val }))}
-                model={vendorModels[v.id] ?? ""}
-                onModelChange={(val) => setVendorModels((m) => ({ ...m, [v.id]: val }))}
-              />
-            ))}
+            <div className="settings-actions">
+              <button className="primary" onClick={onSaveAgent} disabled={saving}>
+                {saving ? "Saving…" : "Save agent settings"}
+              </button>
+            </div>
           </>
-        ) : (
-          <AccountCard account={view?.account ?? null} />
         )}
-
-        <div className="settings-actions">
-          {mode === "byok" && (
-            <button className="primary" onClick={onSave} disabled={saving}>
-              {saving ? "Saving…" : "Save"}
-            </button>
-          )}
-          {status && <span className="note ok">{status}</span>}
-          {error && <span className="note err">{error}</span>}
-        </div>
-
-        <p className="settings-intro">How the agent behaves. Applies in either mode.</p>
-
-        <section className="settings-card">
-          <div className="settings-card-head">
-            <h2>Agent</h2>
-          </div>
-          <label className="field">
-            <span>
-              Effort <em>optional</em>
-            </span>
-            <input
-              type="text"
-              value={effort}
-              placeholder="adapter default (e.g. low · medium · high)"
-              onChange={(e) => setEffort(e.target.value)}
-            />
-          </label>
-          <label className="field">
-            <span>
-              Permission mode <em>optional</em>
-            </span>
-            <input
-              type="text"
-              value={permissionMode}
-              placeholder="adapter default (e.g. acceptEdits)"
-              onChange={(e) => setPermissionMode(e.target.value)}
-            />
-          </label>
-          <label className="field">
-            <span>
-              Pulse interval <em>optional</em>
-            </span>
-            <input
-              type="text"
-              value={pulse}
-              placeholder="default 30m (e.g. 90s · 30m · 1h · off)"
-              onChange={(e) => setPulse(e.target.value)}
-            />
-          </label>
-        </section>
-
-        <div className="settings-actions">
-          <button className="primary" onClick={onSaveAgent} disabled={saving}>
-            {saving ? "Saving…" : "Save agent settings"}
-          </button>
-        </div>
       </div>
     </div>
   );
 }
 
-/** Xiaoyuanzhu: show the broker account — tier + remaining energy, or a connecting state. */
-function AccountCard({ account }: { account: Account | null }) {
-  const pct =
-    account && account.energy_total > 0
-      ? Math.max(0, Math.min(100, Math.round((account.energy_remaining / account.energy_total) * 100)))
-      : 0;
+/** Xiaoyuanzhu: the broker account, always visible (the free tier is anonymous, so
+ * no login is needed to see it). Driven by the public `/api/account`, in three
+ * states: `connected` (tier + energy bar), `connecting` (first bootstrap in
+ * flight), or `error` (last sync failed with no cached balance — surfaces why). */
+function AccountStatusCard({ account }: { account: AccountStatus | null }) {
+  const state = account?.state ?? "connecting";
+  const total = account?.energy_total ?? 0;
+  const remaining = account?.energy_remaining ?? 0;
+  const pct = total > 0 ? Math.max(0, Math.min(100, Math.round((remaining / total) * 100))) : 0;
   const resets = account?.resets_at ? fmtDate(account.resets_at) : "";
   return (
     <section className="settings-card">
       <div className="settings-card-head">
         <h2>Xiaoyuanzhu</h2>
-        {account ? (
-          <span className="tag ok">{account.tier}</span>
+        {state === "connected" ? (
+          <span className="tag ok">{account?.tier ?? "free"}</span>
+        ) : state === "error" ? (
+          <span className="tag warn">unavailable</span>
         ) : (
-          <span className="tag off">not connected</span>
+          <span className="tag off">connecting…</span>
         )}
       </div>
-      {account ? (
+      {state === "connected" ? (
         <div className="account-credits">
           <div className="account-bar">
             <i style={{ width: `${pct}%` }} />
           </div>
           <p className="settings-sub">
-            {account.energy_remaining.toLocaleString()} / {account.energy_total.toLocaleString()} energy
+            {remaining.toLocaleString()} / {total.toLocaleString()} energy
             {resets && <> · resets {resets}</>}
           </p>
         </div>
-      ) : (
+      ) : state === "error" ? (
         <p className="settings-sub">
-          Connecting to the gateway for daily free energy… Sign in at{" "}
-          <code>account.xiaoyuanzhu.com</code> to draw subscription energy instead.
+          Couldn't reach the gateway to provision your free account — it keeps
+          retrying in the background.
+          {account?.error && (
+            <>
+              {" "}
+              Last error: <code>{account.error}</code>
+            </>
+          )}
         </p>
+      ) : (
+        <p className="settings-sub">Provisioning your daily free energy…</p>
       )}
+    </section>
+  );
+}
+
+/** Shown at `/settings` when the owner login gate is on and the visitor isn't
+ * signed in. The account status above is public; switching modes, entering your
+ * own keys, and tuning agent behaviour are owner-only, so they live behind this
+ * sign-in. Navigates to the backend login (same-origin in prod; dev Vite proxies
+ * `/auth`), returning to wherever we are afterwards. */
+function SignInPanel() {
+  const next = encodeURIComponent(window.location.pathname + window.location.search);
+  return (
+    <section className="settings-card">
+      <div className="settings-card-head">
+        <h2>Manage settings</h2>
+        <span className="tag off">sign-in required</span>
+      </div>
+      <p className="settings-sub">
+        Your free account above needs no login. Sign in to switch modes, use your own
+        API keys, or tune how the agent behaves.
+      </p>
+      <div className="settings-actions">
+        <button
+          className="primary"
+          onClick={() => {
+            window.location.href = `/auth/login?next=${next}`;
+          }}
+        >
+          Sign in
+        </button>
+      </div>
     </section>
   );
 }

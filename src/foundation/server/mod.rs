@@ -522,6 +522,11 @@ pub fn build(
             "/api/settings/credentials",
             get(settings::get_credentials).post(settings::post_credentials),
         )
+        // Public, read-only broker account status (tier + energy + sync state) for
+        // the Settings page. Deliberately NOT under `/api/settings`, so it stays
+        // outside the owner gate — a fresh user sees their anonymous free account
+        // without a login; only editing credentials prompts a sign-in.
+        .route("/api/account", get(settings::get_account))
         // A scene's channels, observed live as one merged presence stream — the
         // channel inspector's window onto every in/out channel of one scene.
         .route("/api/scenes/{scene}/channels", get(channels::get_scene_channels))

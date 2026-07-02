@@ -3,10 +3,12 @@
 //! ## What this gives you
 //!
 //! When `HI_AGENT_AUTH=on`, the *owner surface* of the SPA requires a logged-in
-//! session — the Settings page and the inspect console, plus the APIs that back
-//! them. The agent's public face (the `/` appearance page and all its
-//! human `/api/in/*` · `/api/out/*` channels) stays open so anyone can walk up
-//! and interact; login is only ever provoked by reaching an owner surface. The
+//! session — the credential API behind the Settings page, and the inspect console
+//! plus the APIs that back it. The Settings *page shell* itself stays public so a
+//! signed-out user can see their anonymous free-tier account (via the public
+//! `GET /api/account`); only *editing* credentials provokes a login. The agent's
+//! public face (the `/` appearance page and all its human `/api/in/*` ·
+//! `/api/out/*` channels) stays open so anyone can walk up and interact. The
 //! login itself is delegated to an external OpenID Connect provider — in the
 //! intended deployment, the
 //! Authentik instance at `xiaoyuanzhu.com`, whose login screen offers "scan a
@@ -29,10 +31,14 @@
 //!
 //! The gate is deny-by-exception: only the owner surface is protected (see
 //! [`is_protected`]) and everything else is public. Protected are the Settings
-//! page (`/settings`) and its credential API (`/api/settings/*`), and the
-//! inspect console (`/inspect`) and the observability feeds it consumes
-//! (`/api/sessions*`, `/api/acp/*`) — those expose stored credentials and raw
-//! session transcripts, owner-only by nature. Everything else — the appearance
+//! *credential API* (`/api/settings/*`) — which reads back configured state and
+//! writes stored keys — and the inspect console (`/inspect`) plus the
+//! observability feeds it consumes (`/api/sessions*`, `/api/acp/*`), which expose
+//! raw session transcripts, owner-only by nature. The Settings *page shell*
+//! (`/settings`) and its account view (`/api/account`) are deliberately public:
+//! they carry no secrets, and the account is the anonymous free tier a fresh user
+//! must see without a login — a signed-out visitor to `/settings` sees the account
+//! and is prompted to sign in only to edit credentials. Everything else — the appearance
 //! page and its channels, the machine/token-scoped carriers (`/mcp`, the
 //! phone-upload `/api/handoff` · `/up/{token}` · `/api/up/{token}` · `/api/qr`),
 //! the sense stubs, `/healthz` — is served without a login. A shared bearer
@@ -373,16 +379,19 @@ fn routes(state: Arc<AuthState>) -> Router {
 }
 
 /// Paths that require an owner session (deny-by-exception — everything not listed
-/// here is public). The owner surface is the Settings page and its credential API,
-/// and the inspect console plus the observability feeds it consumes; those carry
-/// stored credentials and raw session transcripts. The public agent face (`/` and
-/// its `/api/in/*` · `/api/out/*` channels), the machine/token carriers, the sense
-/// stubs, and health are all *not* protected. Note `/auth/*` must stay public here
-/// so the login flow itself isn't gated.
+/// here is public). The owner surface is the Settings *credential API* and the
+/// inspect console plus the observability feeds it consumes; those carry stored
+/// credentials and raw session transcripts. Deliberately *not* here: the Settings
+/// *page shell* (`/settings`) and its account view (`/api/account`) — public so a
+/// fresh user sees their anonymous free tier without a login — the public agent
+/// face (`/` and its `/api/in/*` · `/api/out/*` channels), the machine/token
+/// carriers, the sense stubs, and health. Note `/auth/*` must stay public here so
+/// the login flow itself isn't gated.
 fn is_protected(path: &str) -> bool {
     const PREFIXES: &[&str] = &[
-        "/settings",     // owner Settings page (and any nested path)
-        "/api/settings", // BYOK credential store
+        // NB: `/settings` (the page shell) is intentionally absent — it's public;
+        // only its credential API below is gated.
+        "/api/settings", // credential store: read configured state + write keys
         "/inspect",      // operator console page (and any nested path)
         "/api/sessions", // session list/events feed the console reads
         "/api/acp/",     // raw ACP wire frames the console reads
@@ -771,11 +780,9 @@ mod tests {
 
     #[test]
     fn protected_paths_classified() {
-        // Owner surface — gated behind login.
+        // Owner surface — gated behind login. The credential API and the inspect
+        // console + its feeds; NOT the Settings page shell (that's public below).
         for p in [
-            "/settings",
-            "/settings/",
-            "/settings/deep/link",
             "/api/settings/credentials",
             "/inspect",
             "/inspect/sessions",
@@ -785,9 +792,14 @@ mod tests {
         ] {
             assert!(is_protected(p), "expected protected: {p}");
         }
-        // Public agent face, machine carriers, auth flow, health — never gated.
+        // Public: the Settings page shell + its account view (anonymous free tier,
+        // no login), the agent face, machine carriers, auth flow, health.
         for p in [
             "/",
+            "/settings",
+            "/settings/",
+            "/settings/deep/link",
+            "/api/account",
             "/auth/login",
             "/auth/callback",
             "/mcp",
