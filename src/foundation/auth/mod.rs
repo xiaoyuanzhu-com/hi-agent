@@ -1,62 +1,40 @@
-//! Authentication front — gate the browser-facing web app behind an OIDC login.
+//! Xiaoyuanzhu account sign-in — an optional OIDC login for the instance owner.
 //!
-//! ## What this gives you
+//! ## What this is (and is NOT)
 //!
-//! When `HI_AGENT_AUTH=on`, the *owner surface* of the SPA requires a logged-in
-//! session — the credential API behind the Settings page, and the inspect console
-//! plus the APIs that back it. The Settings *page shell* itself stays public so a
-//! signed-out user can see their anonymous free-tier account (via the public
-//! `GET /api/account`); only *editing* credentials provokes a login. The agent's
-//! public face (the `/` appearance page and all its human `/api/in/*` ·
-//! `/api/out/*` channels) stays open so anyone can walk up and interact. The
-//! login itself is delegated to an external OpenID Connect provider — in the
-//! intended deployment, the
-//! Authentik instance at `xiaoyuanzhu.com`, whose login screen offers "scan a
-//! WeChat QR". hi-agent is a plain OIDC *relying party*: it never touches
-//! WeChat's non-standard OAuth and never mints identity. Authentik owns the
-//! WeChat source and auto-creates the account on first scan; we just run the
-//! authorization-code dance and set an encrypted session cookie.
+//! hi-agent has **no access gate**. The agent's face (`/` and its `/api/in/*` ·
+//! `/api/out/*` channels), the owner's Settings page, the inspect console — all of
+//! it is served without a login. A hi-agent instance is single-tenant: it *is*
+//! one person's agent, and whoever can reach the URL can use it. If you expose it
+//! on a shared network and want to keep the control surface private, put it behind
+//! your own reverse proxy / VPN — that's an operator concern, not something the
+//! app gates.
 //!
-//! ## Who is allowed in (owner-gate)
+//! The only thing this module does is let the owner **sign in to their
+//! xiaoyuanzhu account**, so the broker can (in future) mint a paid `sub`-tier
+//! account instead of the anonymous `free` one. It's surfaced as a single opt-in
+//! action in Settings; it never gates anything. When the OIDC vars are unset (the
+//! default), sign-in is simply unavailable and the instance runs on the free tier.
 //!
-//! hi-agent is single-tenant: one data dir is one agent with one shared
-//! memory/soul. So a successful OIDC login is necessary but not sufficient — the
-//! identity must also be an *owner*:
-//! - `HI_AGENT_OWNERS` set → the identity (sub / preferred_username / email)
-//!   must be in that allowlist.
-//! - unset → **trust on first use**: the first identity to log in is recorded in
-//!   `<data_dir>/auth/owner.json` and is the only one accepted thereafter.
-//!
-//! ## What IS gated
-//!
-//! The gate is deny-by-exception: only the owner surface is protected (see
-//! [`is_protected`]) and everything else is public. Protected are the Settings
-//! *credential API* (`/api/settings/*`) — which reads back configured state and
-//! writes stored keys — and the inspect console (`/inspect`) plus the
-//! observability feeds it consumes (`/api/sessions*`, `/api/acp/*`), which expose
-//! raw session transcripts, owner-only by nature. The Settings *page shell*
-//! (`/settings`) and its account view (`/api/account`) are deliberately public:
-//! they carry no secrets, and the account is the anonymous free tier a fresh user
-//! must see without a login — a signed-out visitor to `/settings` sees the account
-//! and is prompted to sign in only to edit credentials. Everything else — the appearance
-//! page and its channels, the machine/token-scoped carriers (`/mcp`, the
-//! phone-upload `/api/handoff` · `/up/{token}` · `/api/up/{token}` · `/api/qr`),
-//! the sense stubs, `/healthz` — is served without a login. A shared bearer
-//! (`HI_AGENT_SERVICE_TOKEN`) additionally bypasses the gate on the protected
-//! routes, so Feishu and the curl journey-tests keep working.
+//! The login is delegated to an external OpenID Connect provider — in the intended
+//! deployment, the Authentik instance at `account.xiaoyuanzhu.com`, whose login
+//! screen offers "scan a WeChat QR". hi-agent is a plain OIDC *relying party*: it
+//! never touches WeChat's non-standard OAuth and never mints identity. Authentik
+//! owns the WeChat source and auto-creates the account on first scan; we run the
+//! authorization-code dance and set an encrypted session cookie holding the
+//! provider access token, which the settings handler forwards to the broker.
 //!
 //! Security-sensitive primitives are delegated to vetted crates: `openidconnect`
 //! for discovery / code exchange / ID-token (JWT) verification, and
 //! `axum-extra`'s `PrivateCookieJar` (AEAD-encrypted cookies) for the session.
 
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::sync::Arc;
 
 use anyhow::Context as _;
 use axum::Router;
-use axum::extract::{Query, Request, State};
-use axum::http::{HeaderMap, StatusCode, header};
-use axum::middleware::Next;
+use axum::extract::{Query, State};
+use axum::http::{HeaderMap, StatusCode};
 use axum::response::{Html, IntoResponse, Redirect, Response};
 use axum::routing::get;
 use axum_extra::extract::cookie::{Cookie, Key, PrivateCookieJar, SameSite};
@@ -68,7 +46,7 @@ use openidconnect::{
 };
 use serde::{Deserialize, Serialize};
 
-/// Name of the long-lived, encrypted session cookie carrying the logged-in owner.
+/// Name of the long-lived, encrypted session cookie carrying the signed-in owner.
 const SESSION_COOKIE: &str = "hi_session";
 /// Name of the short-lived, encrypted cookie holding in-flight OAuth state
 /// (PKCE verifier, nonce, CSRF token, post-login destination) between the
@@ -85,10 +63,9 @@ const FLOW_TTL_SECS: i64 = 15 * 60;
 // Config
 // ---------------------------------------------------------------------------
 
-/// Auth parameters, all from the environment (`.env` in dev). When `enabled` is
-/// false (the default), the rest is empty and the server runs wide-open exactly
-/// as it did before auth existed — so existing dev/test instances are
-/// unaffected until an operator opts in with `HI_AGENT_AUTH=on`.
+/// OIDC parameters for the owner sign-in, from the environment (`.env` in dev).
+/// When `enabled` is false (the default — no `HI_AGENT_OIDC_ISSUER`), sign-in is
+/// unavailable and the instance runs on the anonymous free tier.
 #[derive(Clone)]
 pub struct AuthConfig {
     pub enabled: bool,
@@ -96,16 +73,10 @@ pub struct AuthConfig {
     pub client_id: String,
     pub client_secret: String,
     pub redirect_url: String,
-    /// Allowed identities (matched against sub / preferred_username / email).
-    /// Empty ⇒ trust-on-first-use.
-    pub owners: Vec<String>,
-    /// Shared bearer that bypasses the browser login on any route (machine
-    /// callers, journey-tests). `None` ⇒ no bypass.
-    pub service_token: Option<String>,
 }
 
-// Hand-written so the client secret and service token never land in logs
-// (`Config` derives Debug and is traced at startup).
+// Hand-written so the client secret never lands in logs (`Config` derives Debug
+// and is traced at startup).
 impl std::fmt::Debug for AuthConfig {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("AuthConfig")
@@ -114,8 +85,6 @@ impl std::fmt::Debug for AuthConfig {
             .field("client_id", &self.client_id)
             .field("client_secret", &redact(&self.client_secret))
             .field("redirect_url", &self.redirect_url)
-            .field("owners", &self.owners)
-            .field("service_token", &self.service_token.as_deref().map(redact))
             .finish()
     }
 }
@@ -125,8 +94,8 @@ fn redact(s: &str) -> &'static str {
 }
 
 impl AuthConfig {
-    /// Auth turned off — the historical wide-open behavior. Used by tests and as
-    /// the default when `HI_AGENT_AUTH` is not truthy.
+    /// Sign-in disabled — no OIDC configured. The default; the instance uses the
+    /// free tier and Settings shows no sign-in action.
     pub fn disabled() -> Self {
         Self {
             enabled: false,
@@ -134,41 +103,26 @@ impl AuthConfig {
             client_id: String::new(),
             client_secret: String::new(),
             redirect_url: String::new(),
-            owners: Vec::new(),
-            service_token: None,
         }
     }
 
-    /// Load from the environment. `HI_AGENT_AUTH` must be truthy
-    /// (`on`/`1`/`true`/`yes`) to enable; when enabled, the four OIDC fields are
-    /// required and a missing one is a hard startup error (failing closed beats
-    /// silently serving unprotected).
+    /// Load from the environment. Presence of `HI_AGENT_OIDC_ISSUER` opts the
+    /// owner sign-in in; when set, the other three OIDC fields are required and a
+    /// missing one is a hard startup error (a half-configured sign-in would only
+    /// fail confusingly at click time). Absent issuer → sign-in disabled.
     pub fn from_env() -> anyhow::Result<Self> {
-        if !env_flag("HI_AGENT_AUTH") {
+        let Some(issuer) = env_opt("HI_AGENT_OIDC_ISSUER") else {
             return Ok(Self::disabled());
-        }
-        let issuer = env_req("HI_AGENT_OIDC_ISSUER")?;
+        };
         let client_id = env_req("HI_AGENT_OIDC_CLIENT_ID")?;
         let client_secret = env_req("HI_AGENT_OIDC_CLIENT_SECRET")?;
         let redirect_url = env_req("HI_AGENT_OIDC_REDIRECT_URL")?;
-        let owners = env_opt("HI_AGENT_OWNERS")
-            .map(|s| {
-                s.split(',')
-                    .map(str::trim)
-                    .filter(|x| !x.is_empty())
-                    .map(str::to_owned)
-                    .collect()
-            })
-            .unwrap_or_default();
-        let service_token = env_opt("HI_AGENT_SERVICE_TOKEN");
         Ok(Self {
             enabled: true,
             issuer,
             client_id,
             client_secret,
             redirect_url,
-            owners,
-            service_token,
         })
     }
 }
@@ -181,22 +135,15 @@ fn env_opt(name: &str) -> Option<String> {
 }
 
 fn env_req(name: &str) -> anyhow::Result<String> {
-    env_opt(name).with_context(|| format!("{name} is required when HI_AGENT_AUTH=on"))
-}
-
-fn env_flag(name: &str) -> bool {
-    matches!(
-        env_opt(name).as_deref().map(str::to_ascii_lowercase).as_deref(),
-        Some("on" | "1" | "true" | "yes")
-    )
+    env_opt(name).with_context(|| format!("{name} is required when HI_AGENT_OIDC_ISSUER is set"))
 }
 
 // ---------------------------------------------------------------------------
 // Runtime state
 // ---------------------------------------------------------------------------
 
-/// Shared auth state for the `/auth/*` handlers and the gate middleware. Built
-/// only when auth is enabled (see [`AuthState::from_config`]).
+/// Shared state for the `/auth/*` handlers. Built only when sign-in is enabled
+/// (see [`AuthState::from_config`]).
 pub struct AuthState {
     cfg: AuthConfig,
     /// AEAD key for the encrypted session/flow cookies. Persisted under the data
@@ -208,18 +155,13 @@ pub struct AuthState {
     /// SSRF-hardened HTTP client for OIDC discovery / token exchange (no
     /// redirects — an OIDC endpoint must never bounce us elsewhere).
     http: reqwest::Client,
-    /// Where `auth/owner.json` lives (trust-on-first-use record).
-    data_dir: PathBuf,
 }
 
 impl AuthState {
-    /// Build the auth state when enabled, returning `Ok(None)` when disabled so
-    /// the caller can leave the router untouched. Fallible: it generates or reads
-    /// the cookie key file under `<data_dir>/auth/`.
-    pub fn from_config(
-        cfg: AuthConfig,
-        data_dir: &Path,
-    ) -> anyhow::Result<Option<Arc<AuthState>>> {
+    /// Build the auth state when sign-in is enabled, returning `Ok(None)` when
+    /// disabled so the caller can leave the router untouched. Fallible: it
+    /// generates or reads the cookie key file under `<data_dir>/auth/`.
+    pub fn from_config(cfg: AuthConfig, data_dir: &Path) -> anyhow::Result<Option<Arc<AuthState>>> {
         if !cfg.enabled {
             return Ok(None);
         }
@@ -229,13 +171,7 @@ impl AuthState {
             .redirect(reqwest::redirect::Policy::none())
             .build()
             .context("building OIDC http client")?;
-        Ok(Some(Arc::new(AuthState {
-            cfg,
-            key,
-            secure,
-            http,
-            data_dir: data_dir.to_path_buf(),
-        })))
+        Ok(Some(Arc::new(AuthState { cfg, key, secure, http })))
     }
 
     /// Discover the provider's OIDC metadata (and its signing keys). Done per
@@ -265,7 +201,7 @@ impl AuthState {
             .http_only(true)
             // Lax (not Strict) so the cookie rides the top-level GET redirect
             // back from the IdP; the flow cookie must, and the session cookie
-            // should so the post-login landing is already authenticated.
+            // should so the post-login landing already sees the signed-in state.
             .same_site(SameSite::Lax)
             .secure(self.secure)
             .max_age(time::Duration::seconds(ttl))
@@ -276,19 +212,26 @@ impl AuthState {
         PrivateCookieJar::from_headers(headers, self.key.clone())
     }
 
-    /// The signed-in user's provider access token from a valid session cookie, for
-    /// forwarding to the broker (xiaoyuanzhu `sub` tier). `None` when there is no session, it's
-    /// expired, or it carries no token (an older cookie). The settings handler calls
-    /// this; the request reached it only because the gate already accepted the
-    /// session, but re-checking validity here keeps this self-contained.
+    /// The signed-in owner's provider access token from a valid session cookie, for
+    /// forwarding to the broker (xiaoyuanzhu `sub` tier). `None` when there is no
+    /// session, it's expired, or it carries no token (an older cookie).
     pub fn session_bearer(&self, headers: &HeaderMap) -> Option<String> {
-        let cookie = self.jar(headers).get(SESSION_COOKIE)?;
-        let s: Session = serde_json::from_str(cookie.value()).ok()?;
-        if !s.valid_now() {
-            return None;
-        }
+        let s = self.session(headers)?;
         let t = s.access_token.trim();
         (!t.is_empty()).then(|| t.to_string())
+    }
+
+    /// The signed-in owner's display label from a valid session cookie, for the
+    /// Settings account card ("signed in as …"). `None` when signed out/expired.
+    pub fn session_identity(&self, headers: &HeaderMap) -> Option<String> {
+        self.session(headers).map(|s| s.label)
+    }
+
+    /// The decoded, still-valid session from the cookie jar, if any.
+    fn session(&self, headers: &HeaderMap) -> Option<Session> {
+        let cookie = self.jar(headers).get(SESSION_COOKIE)?;
+        let s: Session = serde_json::from_str(cookie.value()).ok()?;
+        s.valid_now().then_some(s)
     }
 }
 
@@ -298,17 +241,17 @@ fn removal(name: &str) -> Cookie<'static> {
     Cookie::build((name.to_owned(), "")).path("/").build()
 }
 
-/// The encrypted session payload. `exp` is a unix timestamp; expiry is checked
-/// on every gated request so a stale cookie can't outlive its window even if the
-/// browser keeps sending it.
+/// The encrypted session payload. `exp` is a unix timestamp; expiry is re-checked
+/// whenever the session is read, so a stale cookie can't outlive its window even
+/// if the browser keeps sending it.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct Session {
     sub: String,
     label: String,
     exp: i64,
     /// The provider's access token, kept so the agent can forward it to the broker
-    /// (xiaoyuanzhu `sub` tier) on the user's behalf. `default` so older cookies still
-    /// load (they just carry no token → no `sub` upgrade until the next sign-in).
+    /// (xiaoyuanzhu `sub` tier) on the owner's behalf. `default` so older cookies
+    /// still load (they just carry no token → no `sub` upgrade until next sign-in).
     #[serde(default)]
     access_token: String,
 }
@@ -361,13 +304,10 @@ fn write_new_key(path: &Path) -> anyhow::Result<Key> {
 // Router wiring
 // ---------------------------------------------------------------------------
 
-/// Merge the `/auth/*` routes onto `router` and wrap everything in the gate
-/// middleware. The middleware lets public paths and valid service tokens / valid
-/// sessions through, and redirects/401s everyone else.
-pub fn apply(router: Router, state: Arc<AuthState>) -> Router {
-    router.merge(routes(state.clone())).layer(
-        axum::middleware::from_fn_with_state(state, require_auth),
-    )
+/// Merge the `/auth/*` sign-in routes onto `router`. No gate/middleware layer —
+/// these routes are the sign-in flow itself; everything on the server is public.
+pub fn mount(router: Router, state: Arc<AuthState>) -> Router {
+    router.merge(routes(state))
 }
 
 fn routes(state: Arc<AuthState>) -> Router {
@@ -376,78 +316,6 @@ fn routes(state: Arc<AuthState>) -> Router {
         .route("/auth/callback", get(callback))
         .route("/auth/logout", get(logout))
         .with_state(state)
-}
-
-/// Paths that require an owner session (deny-by-exception — everything not listed
-/// here is public). The owner surface is the Settings *credential API* and the
-/// inspect console plus the observability feeds it consumes; those carry stored
-/// credentials and raw session transcripts. Deliberately *not* here: the Settings
-/// *page shell* (`/settings`) and its account view (`/api/account`) — public so a
-/// fresh user sees their anonymous free tier without a login — the public agent
-/// face (`/` and its `/api/in/*` · `/api/out/*` channels), the machine/token
-/// carriers, the sense stubs, and health. Note `/auth/*` must stay public here so
-/// the login flow itself isn't gated.
-fn is_protected(path: &str) -> bool {
-    const PREFIXES: &[&str] = &[
-        // NB: `/settings` (the page shell) is intentionally absent — it's public;
-        // only its credential API below is gated.
-        "/api/settings", // credential store: read configured state + write keys
-        "/inspect",      // operator console page (and any nested path)
-        "/api/sessions", // session list/events feed the console reads
-        "/api/acp/",     // raw ACP wire frames the console reads
-    ];
-    PREFIXES.iter().any(|p| path == p.trim_end_matches('/') || path.starts_with(p))
-}
-
-/// The gate. Order: unprotected path → service token → session cookie → reject.
-async fn require_auth(State(st): State<Arc<AuthState>>, req: Request, next: Next) -> Response {
-    let path = req.uri().path();
-    if !is_protected(path) {
-        return next.run(req).await;
-    }
-
-    if let Some(expected) = &st.cfg.service_token {
-        if bearer(req.headers()).as_deref() == Some(expected.as_str()) {
-            return next.run(req).await;
-        }
-    }
-
-    if let Some(session) = st.jar(req.headers()).get(SESSION_COOKIE) {
-        if let Ok(s) = serde_json::from_str::<Session>(session.value()) {
-            if s.valid_now() {
-                return next.run(req).await;
-            }
-        }
-    }
-
-    // Unauthenticated. A top-level navigation (the browser asking for HTML) gets
-    // bounced to login with a sanitized return path; an XHR/asset/API request
-    // gets a plain 401 so the SPA can react without following an opaque redirect.
-    if wants_html(req.headers()) {
-        let next_to = req
-            .uri()
-            .path_and_query()
-            .map(|pq| pq.as_str())
-            .unwrap_or("/");
-        let url = format!("/auth/login?next={}", encode_param(next_to));
-        Redirect::to(&url).into_response()
-    } else {
-        (StatusCode::UNAUTHORIZED, "authentication required\n").into_response()
-    }
-}
-
-fn bearer(headers: &HeaderMap) -> Option<String> {
-    let raw = headers.get(header::AUTHORIZATION)?.to_str().ok()?.trim();
-    let token = raw.strip_prefix("Bearer ").or_else(|| raw.strip_prefix("bearer "))?;
-    let token = token.trim();
-    (!token.is_empty()).then(|| token.to_owned())
-}
-
-fn wants_html(headers: &HeaderMap) -> bool {
-    headers
-        .get(header::ACCEPT)
-        .and_then(|v| v.to_str().ok())
-        .is_some_and(|a| a.contains("text/html"))
 }
 
 // ---------------------------------------------------------------------------
@@ -509,8 +377,10 @@ struct CallbackQuery {
 }
 
 /// `GET /auth/callback` — the IdP redirect target: verify CSRF, exchange the
-/// code, verify the ID token, enforce the owner-gate, and on success set the
-/// session cookie and land the user back where they came from.
+/// code, verify the ID token, and on success set the session cookie (carrying the
+/// provider access token for the broker) and land the owner back where they came
+/// from. There is no owner allowlist — whoever runs the instance signs in as
+/// themselves; the session only marks "this owner linked their xiaoyuanzhu account".
 async fn callback(
     State(st): State<Arc<AuthState>>,
     Query(q): Query<CallbackQuery>,
@@ -531,12 +401,8 @@ async fn callback(
         .and_then(|c| serde_json::from_str(c.value()).ok())
         .ok_or_else(|| AppError::user("Your sign-in session expired. Please try again."))?;
 
-    let code = q
-        .code
-        .ok_or_else(|| AppError::user("Missing authorization code."))?;
-    let state = q
-        .state
-        .ok_or_else(|| AppError::user("Missing state parameter."))?;
+    let code = q.code.ok_or_else(|| AppError::user("Missing authorization code."))?;
+    let state = q.state.ok_or_else(|| AppError::user("Missing state parameter."))?;
     if state != flow.csrf {
         return Err(AppError::user("State mismatch — possible CSRF; sign-in aborted."));
     }
@@ -566,41 +432,22 @@ async fn callback(
         .context("ID token verification failed")?;
 
     let sub = claims.subject().as_str().to_string();
-    let username = claims
+    let label = claims
         .preferred_username()
-        .map(|u| u.as_str().to_string());
-    let email = claims
-        .email()
-        .map(|e| e.as_str().to_string());
-    let label = username
-        .clone()
-        .or_else(|| email.clone())
+        .map(|u| u.as_str().to_string())
+        .or_else(|| claims.email().map(|e| e.as_str().to_string()))
         .unwrap_or_else(|| sub.clone());
-
-    let ids: Vec<String> = std::iter::once(sub.clone())
-        .chain(username)
-        .chain(email)
-        .collect();
-    if !authorize_owner(&st.cfg, &st.data_dir, &ids, &sub, &label)? {
-        return Ok(message_page(
-            StatusCode::FORBIDDEN,
-            "Not authorized",
-            "This account is not an owner of this hi-agent instance.",
-        ));
-    }
 
     let session = Session {
         sub,
         label,
         exp: Utc::now().timestamp() + SESSION_TTL_SECS,
-        // Kept for the broker (xiaoyuanzhu `sub` tier). Note it expires far sooner than
-        // the session — fine for the right-after-login fetch; a refresh-token flow to
-        // keep it fresh long-term is future work.
+        // Kept for the broker (xiaoyuanzhu `sub` tier). Note it expires far sooner
+        // than the session — fine for the right-after-login fetch; a refresh-token
+        // flow to keep it fresh long-term is future work.
         access_token: token.access_token().secret().clone(),
     };
-    let jar = jar
-        .remove(removal(FLOW_COOKIE))
-        .add(st.session_cookie(&session)?);
+    let jar = jar.remove(removal(FLOW_COOKIE)).add(st.session_cookie(&session)?);
     Ok((jar, Redirect::to(&safe_next(Some(&flow.next)))).into_response())
 }
 
@@ -608,56 +455,7 @@ async fn callback(
 /// trigger IdP-side single-logout in v1.)
 async fn logout(State(st): State<Arc<AuthState>>, headers: HeaderMap) -> Response {
     let jar = st.jar(&headers).remove(removal(SESSION_COOKIE));
-    (jar, Redirect::to("/")).into_response()
-}
-
-// ---------------------------------------------------------------------------
-// Owner-gate
-// ---------------------------------------------------------------------------
-
-/// Stored trust-on-first-use record: the single identity bound to this instance.
-#[derive(Debug, Serialize, Deserialize)]
-struct OwnerRecord {
-    sub: String,
-    label: String,
-}
-
-/// Decide whether a freshly-authenticated identity may use this instance.
-/// - explicit allowlist (`owners`) → membership test over its candidate ids.
-/// - empty allowlist → trust-on-first-use against `<data_dir>/auth/owner.json`.
-fn authorize_owner(
-    cfg: &AuthConfig,
-    data_dir: &Path,
-    ids: &[String],
-    sub: &str,
-    label: &str,
-) -> anyhow::Result<bool> {
-    if !cfg.owners.is_empty() {
-        return Ok(ids.iter().any(|id| cfg.owners.iter().any(|o| o == id)));
-    }
-
-    let path = data_dir.join("auth").join("owner.json");
-    match std::fs::read(&path) {
-        Ok(bytes) => {
-            let rec: OwnerRecord =
-                serde_json::from_slice(&bytes).with_context(|| format!("parsing {}", path.display()))?;
-            Ok(rec.sub == sub)
-        }
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-            let rec = OwnerRecord {
-                sub: sub.to_string(),
-                label: label.to_string(),
-            };
-            if let Some(parent) = path.parent() {
-                std::fs::create_dir_all(parent).ok();
-            }
-            std::fs::write(&path, serde_json::to_vec_pretty(&rec)?)
-                .with_context(|| format!("writing {}", path.display()))?;
-            tracing::info!(owner = %label, "bound instance owner on first login (TOFU)");
-            Ok(true)
-        }
-        Err(e) => Err(e).with_context(|| format!("reading {}", path.display())),
-    }
+    (jar, Redirect::to("/settings")).into_response()
 }
 
 // ---------------------------------------------------------------------------
@@ -666,30 +464,15 @@ fn authorize_owner(
 
 /// Sanitize a post-login redirect target to a same-origin absolute path,
 /// defending against open-redirect (`//evil.com`, `https://evil.com`). Anything
-/// that isn't a clean `/path` collapses to `/`.
+/// that isn't a clean `/path` collapses to `/settings` (where sign-in starts).
 fn safe_next(next: Option<&str>) -> String {
     match next {
         Some(n) if n.starts_with('/') && !n.starts_with("//") => n.to_string(),
-        _ => "/".to_string(),
+        _ => "/settings".to_string(),
     }
 }
 
-/// Percent-encode a query-parameter value (RFC 3986 unreserved set passes
-/// through; everything else is `%`-escaped). Small and dependency-free.
-fn encode_param(s: &str) -> String {
-    let mut out = String::with_capacity(s.len());
-    for b in s.bytes() {
-        match b {
-            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
-                out.push(b as char)
-            }
-            _ => out.push_str(&format!("%{b:02X}")),
-        }
-    }
-    out
-}
-
-/// Minimal HTML page for terminal sign-in outcomes (errors, not-authorized).
+/// Minimal HTML page for terminal sign-in outcomes (errors).
 fn message_page(status: StatusCode, title: &str, body: &str) -> Response {
     let html = format!(
         "<!doctype html><html lang=\"en\"><head><meta charset=\"utf-8\">\
@@ -698,7 +481,7 @@ fn message_page(status: StatusCode, title: &str, body: &str) -> Response {
          <style>body{{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif;\
          margin:0;padding:64px 24px;display:flex;justify-content:center}}main{{max-width:480px}}\
          a{{color:inherit}}</style></head><body><main><h1>{title}</h1><p>{body}</p>\
-         <p><a href=\"/auth/login\">Try again</a></p></main></body></html>"
+         <p><a href=\"/settings\">Back to Settings</a></p></main></body></html>"
     );
     (status, Html(html)).into_response()
 }
@@ -747,101 +530,38 @@ impl IntoResponse for AppError {
 mod tests {
     use super::*;
 
-    fn cfg_with_owners(owners: &[&str]) -> AuthConfig {
+    fn cfg() -> AuthConfig {
         AuthConfig {
             enabled: true,
             issuer: "https://idp.example/".into(),
             client_id: "cid".into(),
             client_secret: "secret".into(),
             redirect_url: "https://app.example/auth/callback".into(),
-            owners: owners.iter().map(|s| s.to_string()).collect(),
-            service_token: None,
         }
     }
 
     #[test]
-    fn disabled_config_is_wide_open() {
+    fn disabled_config_builds_no_state() {
         let cfg = AuthConfig::disabled();
         assert!(!cfg.enabled);
-        assert!(cfg.owners.is_empty());
         assert!(AuthState::from_config(cfg, Path::new("/tmp")).unwrap().is_none());
     }
 
     #[test]
-    fn debug_redacts_secrets() {
-        let mut cfg = cfg_with_owners(&["alice"]);
-        cfg.client_secret = "s3cr3t-client-value".into();
-        cfg.service_token = Some("s3cr3t-service-token".into());
-        let rendered = format!("{cfg:?}");
+    fn debug_redacts_client_secret() {
+        let mut c = cfg();
+        c.client_secret = "s3cr3t-client-value".into();
+        let rendered = format!("{c:?}");
         assert!(!rendered.contains("s3cr3t-client-value"), "client secret leaked: {rendered}");
-        assert!(!rendered.contains("s3cr3t-service-token"), "service token leaked: {rendered}");
         assert!(rendered.contains("<redacted>"));
     }
 
     #[test]
-    fn protected_paths_classified() {
-        // Owner surface — gated behind login. The credential API and the inspect
-        // console + its feeds; NOT the Settings page shell (that's public below).
-        for p in [
-            "/api/settings/credentials",
-            "/inspect",
-            "/inspect/sessions",
-            "/api/sessions",
-            "/api/sessions/events",
-            "/api/acp/frames/events",
-        ] {
-            assert!(is_protected(p), "expected protected: {p}");
-        }
-        // Public: the Settings page shell + its account view (anonymous free tier,
-        // no login), the agent face, machine carriers, auth flow, health.
-        for p in [
-            "/",
-            "/settings",
-            "/settings/",
-            "/settings/deep/link",
-            "/api/account",
-            "/auth/login",
-            "/auth/callback",
-            "/mcp",
-            "/api/handoff",
-            "/up/abc",
-            "/api/up/abc",
-            "/api/qr",
-            "/api/in/text",
-            "/api/in/touch",
-            "/api/out/text",
-            "/api/out/view",
-            "/views/x.mjs",
-            "/assets/a.js",
-            "/healthz",
-        ] {
-            assert!(!is_protected(p), "expected public: {p}");
-        }
-    }
-
-    #[test]
-    fn bearer_parsing() {
-        let mut h = HeaderMap::new();
-        h.insert(header::AUTHORIZATION, "Bearer tok123".parse().unwrap());
-        assert_eq!(bearer(&h).as_deref(), Some("tok123"));
-        h.insert(header::AUTHORIZATION, "bearer tok123".parse().unwrap());
-        assert_eq!(bearer(&h).as_deref(), Some("tok123"));
-        h.insert(header::AUTHORIZATION, "Basic abc".parse().unwrap());
-        assert_eq!(bearer(&h), None);
-    }
-
-    #[test]
     fn safe_next_blocks_open_redirect() {
-        assert_eq!(safe_next(Some("/inspect/sessions")), "/inspect/sessions");
-        assert_eq!(safe_next(Some("//evil.com")), "/");
-        assert_eq!(safe_next(Some("https://evil.com")), "/");
-        assert_eq!(safe_next(None), "/");
-    }
-
-    #[test]
-    fn encode_param_escapes() {
-        assert_eq!(encode_param("/a/b"), "%2Fa%2Fb");
-        assert_eq!(encode_param("plain-._~"), "plain-._~");
+        assert_eq!(safe_next(Some("/settings")), "/settings");
+        assert_eq!(safe_next(Some("//evil.com")), "/settings");
+        assert_eq!(safe_next(Some("https://evil.com")), "/settings");
+        assert_eq!(safe_next(None), "/settings");
     }
 
     #[test]
@@ -850,31 +570,6 @@ mod tests {
         let stale = Session { sub: "s".into(), label: "l".into(), exp: Utc::now().timestamp() - 1, access_token: String::new() };
         assert!(fresh.valid_now());
         assert!(!stale.valid_now());
-    }
-
-    #[test]
-    fn owner_allowlist_matches_any_id() {
-        let cfg = cfg_with_owners(&["alice@example.com"]);
-        let dir = tempfile::tempdir().unwrap();
-        let ids = vec!["sub-123".to_string(), "alice@example.com".to_string()];
-        assert!(authorize_owner(&cfg, dir.path(), &ids, "sub-123", "alice").unwrap());
-
-        let ids_no = vec!["sub-999".to_string(), "bob@example.com".to_string()];
-        assert!(!authorize_owner(&cfg, dir.path(), &ids_no, "sub-999", "bob").unwrap());
-    }
-
-    #[test]
-    fn owner_tofu_binds_first_then_rejects_others() {
-        let cfg = cfg_with_owners(&[]); // empty ⇒ TOFU
-        let dir = tempfile::tempdir().unwrap();
-        std::fs::create_dir_all(dir.path().join("auth")).unwrap();
-
-        // First login binds.
-        assert!(authorize_owner(&cfg, dir.path(), &["sub-1".into()], "sub-1", "owner").unwrap());
-        // Same identity again: accepted.
-        assert!(authorize_owner(&cfg, dir.path(), &["sub-1".into()], "sub-1", "owner").unwrap());
-        // A different identity: rejected.
-        assert!(!authorize_owner(&cfg, dir.path(), &["sub-2".into()], "sub-2", "intruder").unwrap());
     }
 
     #[test]

@@ -51,18 +51,22 @@ fn creds_setting(state: &AppState, key: &str) -> Option<String> {
     credentials::get_setting(&state.data_dir, key)
 }
 
-/// Public, read-only account status for the Settings page (NOT owner-gated). Shows
-/// the anonymous free tier + remaining energy, plus a coarse sync `state`
-/// (`connecting` / `connected` / `error`) so the UI can render a real state rather
-/// than a perpetual "connecting". Carries no secrets. `auth_enabled` tells the UI
-/// whether a sign-in (for the gated credential editor, and the future sub-tier
-/// upgrade) is even available on this instance.
-pub async fn get_account(State(state): State<Arc<AppState>>) -> Json<Value> {
+/// Public, read-only account status for the Settings page. Shows the anonymous
+/// free tier + remaining energy, plus a coarse sync `state` (`connecting` /
+/// `connected` / `error`) so the UI can render a real state rather than a
+/// perpetual "connecting". Carries no secrets. `auth_enabled` tells the UI whether
+/// owner sign-in (for the future sub-tier) is configured; `signed_in` / `identity`
+/// reflect whether the owner has linked their xiaoyuanzhu account.
+pub async fn get_account(
+    State(state): State<Arc<AppState>>,
+    headers: axum::http::HeaderMap,
+) -> Json<Value> {
     let creds = Credentials::load(&state.data_dir);
     let energy = creds.energy.as_ref();
     let broker_state = credentials::get_setting(&state.data_dir, broker::KEY_BROKER_STATE);
     let broker_error = credentials::get_setting(&state.data_dir, broker::KEY_BROKER_ERROR);
     let checked_at = credentials::get_setting(&state.data_dir, broker::KEY_BROKER_CHECKED_AT);
+    let identity = state.auth.as_ref().and_then(|a| a.session_identity(&headers));
 
     // Connected once an energy snapshot exists; else surface the last sync error if
     // there was one, otherwise the first bootstrap is still in flight (connecting).
@@ -84,6 +88,8 @@ pub async fn get_account(State(state): State<Arc<AppState>>) -> Json<Value> {
         "error": broker_error,
         "checked_at": checked_at,
         "auth_enabled": state.auth.is_some(),
+        "signed_in": identity.is_some(),
+        "identity": identity,
     }))
 }
 

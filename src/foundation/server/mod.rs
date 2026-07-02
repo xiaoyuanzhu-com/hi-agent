@@ -335,9 +335,10 @@ pub struct AppState {
     /// incoming bytes here before journaling the reference.
     pub data_dir: PathBuf,
 
-    /// The auth gate (`Some` only when `HI_AGENT_AUTH=on`). The settings handler
-    /// reads the signed-in user's session token from it to forward to the broker for
-    /// a xiaoyuanzhu `sub`-tier account. `None` ⇒ no auth, so no signed-in token source.
+    /// Owner xiaoyuanzhu sign-in (`Some` only when OIDC is configured). Not a gate:
+    /// the settings handler reads the signed-in owner's session token from it to
+    /// forward to the broker for a `sub`-tier account, and reports the signed-in
+    /// identity to the account view. `None` ⇒ sign-in unavailable (free tier only).
     pub auth: Option<Arc<crate::foundation::auth::AuthState>>,
 
     /// Scene→tool-sink table. The `/mcp` handler looks a scene up here to route a
@@ -538,12 +539,11 @@ pub fn build(
         .merge(crate::appearance::router())
         .fallback(not_found);
 
-    // Gate the browser-facing routes behind the OIDC login when auth is enabled.
-    // Applied beneath `TraceLayer` (so auth outcomes are still traced); a disabled
-    // instance is byte-for-byte the historical router. The gate itself leaves the
-    // machine/token carriers (`/mcp`, phone-upload) public — see `auth::is_public`.
+    // Mount the owner sign-in routes (`/auth/*`) when OIDC is configured. There is
+    // no access gate — every route is public; sign-in is an opt-in action that only
+    // links the owner's xiaoyuanzhu account for a `sub`-tier upgrade.
     let router = match auth {
-        Some(auth) => crate::foundation::auth::apply(router, auth),
+        Some(auth) => crate::foundation::auth::mount(router, auth),
         None => router,
     };
     let router = router.layer(TraceLayer::new_for_http());

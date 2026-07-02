@@ -68,8 +68,8 @@ fn build_config(port: u16, data_dir: PathBuf) -> anyhow::Result<hi_agent::Config
     // credential store (`<data_dir>/credentials.json`) wins, else `.env`. Never
     // fails — with no key the agent boots unconfigured and Settings can set one.
     let agent = hi_agent::foundation::config::AgentConfig::resolve(&data_dir);
-    // Auth gate config (HI_AGENT_AUTH + OIDC/owner vars). Off by default; when
-    // enabled, a missing OIDC var is a hard startup error (fail closed).
+    // Owner xiaoyuanzhu sign-in config (the OIDC vars). Disabled unless
+    // HI_AGENT_OIDC_ISSUER is set; then a missing OIDC var is a hard startup error.
     let auth = hi_agent::foundation::auth::AuthConfig::from_env()?;
     Ok(hi_agent::Config { port, data_dir, agent, auth })
 }

@@ -3,7 +3,6 @@ import {
   fetchAccount,
   fetchCredentials,
   saveCredentials,
-  UnauthorizedError,
   type AccountStatus,
   type CredentialsUpdate,
   type CredentialsView,
@@ -34,17 +33,14 @@ const MODES: { id: Mode; label: string }[] = [
  * keys entered here. A raw key is never returned from the server (only a hint);
  * changes apply on restart.
  *
- * The account status (public `GET /api/account`) always renders — the free tier is
- * anonymous, so it's visible without a login. The credential *editor* sits behind
- * the owner gate: when auth is on and the visitor isn't signed in, that read 401s
- * and we show a sign-in prompt in place of the editor rather than an error.
+ * There is no access gate: the whole page (account status + editor) is served to
+ * whoever reaches it. Signing in to xiaoyuanzhu is an optional action in the
+ * account card — it links the owner's account for a future subscription tier and
+ * gates nothing.
  */
 export function Settings() {
   const [account, setAccount] = useState<AccountStatus | null>(null);
   const [view, setView] = useState<CredentialsView | null>(null);
-  // Auth is on and this visitor isn't signed in — show the sign-in prompt for the
-  // (gated) editor while still rendering the public account status above it.
-  const [needsSignin, setNeedsSignin] = useState(false);
   const [baseUrl, setBaseUrl] = useState("");
   const [model, setModel] = useState("");
   const [apiKey, setApiKey] = useState("");
@@ -70,10 +66,8 @@ export function Settings() {
         // "connecting" state rather than surfacing a banner.
         if (!ctrl.signal.aborted) setAccount(null);
       });
-    // The credential editor is gated: a 401 means "sign in to manage", not an error.
     fetchCredentials(ctrl.signal)
       .then((v) => {
-        setNeedsSignin(false);
         setView(v);
         setBaseUrl(v.llm.base_url);
         setModel(v.llm.model ?? "");
@@ -87,13 +81,7 @@ export function Settings() {
         setPulse(v.agent.pulse ?? "");
       })
       .catch((e) => {
-        if (ctrl.signal.aborted) return;
-        if (e instanceof UnauthorizedError) {
-          setNeedsSignin(true);
-          setView(null);
-        } else {
-          setError(String(e));
-        }
+        if (!ctrl.signal.aborted) setError(String(e));
       });
     return () => ctrl.abort();
   }, [reloadKey]);
@@ -201,11 +189,7 @@ export function Settings() {
 
         {showAccount && <AccountStatusCard account={account} />}
 
-        {needsSignin ? (
-          <SignInPanel />
-        ) : (
-          <>
-            <div className="mode-tabs" role="tablist">
+        <div className="mode-tabs" role="tablist">
               {MODES.map((m) => (
                 <button
                   key={m.id}
@@ -337,8 +321,6 @@ export function Settings() {
                 {saving ? "Saving…" : "Save agent settings"}
               </button>
             </div>
-          </>
-        )}
       </div>
     </div>
   );
@@ -390,38 +372,32 @@ function AccountStatusCard({ account }: { account: AccountStatus | null }) {
       ) : (
         <p className="settings-sub">Provisioning your daily free energy…</p>
       )}
+      <AccountSignIn account={account} />
     </section>
   );
 }
 
-/** Shown at `/settings` when the owner login gate is on and the visitor isn't
- * signed in. The account status above is public; switching modes, entering your
- * own keys, and tuning agent behaviour are owner-only, so they live behind this
- * sign-in. Navigates to the backend login (same-origin in prod; dev Vite proxies
- * `/auth`), returning to wherever we are afterwards. */
-function SignInPanel() {
+/** Optional xiaoyuanzhu sign-in footer for the account card. Signing in links the
+ * owner's account so the broker can later grant a subscription tier — that upgrade
+ * isn't live yet, so the copy says so. It gates nothing. Hidden entirely when
+ * sign-in isn't configured (OIDC unset): a plain free-tier instance shows nothing
+ * here. Uses the backend login (same-origin in prod; dev Vite proxies `/auth`). */
+function AccountSignIn({ account }: { account: AccountStatus | null }) {
+  if (!account?.auth_enabled) return null;
+  if (account.signed_in) {
+    return (
+      <p className="settings-sub">
+        Signed in as {account.identity ?? "your account"} · subscription coming soon ·{" "}
+        <a href="/auth/logout">sign out</a>
+      </p>
+    );
+  }
   const next = encodeURIComponent(window.location.pathname + window.location.search);
   return (
-    <section className="settings-card">
-      <div className="settings-card-head">
-        <h2>Manage settings</h2>
-        <span className="tag off">sign-in required</span>
-      </div>
-      <p className="settings-sub">
-        Your free account above needs no login. Sign in to switch modes, use your own
-        API keys, or tune how the agent behaves.
-      </p>
-      <div className="settings-actions">
-        <button
-          className="primary"
-          onClick={() => {
-            window.location.href = `/auth/login?next=${next}`;
-          }}
-        >
-          Sign in
-        </button>
-      </div>
-    </section>
+    <p className="settings-sub">
+      <a href={`/auth/login?next=${next}`}>Sign in to xiaoyuanzhu</a> for subscription
+      energy (coming soon).
+    </p>
   );
 }
 
