@@ -224,8 +224,15 @@ impl AgentConfig {
     /// `HI_AGENT_BASE_URL` so a session can reach the channels); `config_dir` is the
     /// managed `CLAUDE_CONFIG_DIR`; `node_bin_dir` is the directory containing the
     /// resolved `node`; `claude_bin` is the resolved claude executable. The child
-    /// talks to the upstream LLM directly via `ANTHROPIC_BASE_URL` / the real
-    /// `ANTHROPIC_API_KEY` (pre-approved by [`approve_api_key`]).
+    /// talks to the upstream LLM directly via `ANTHROPIC_BASE_URL` / the real key.
+    ///
+    /// The key rides `ANTHROPIC_AUTH_TOKEN`, which the CLI sends as
+    /// `Authorization: Bearer <key>` — the scheme the managed songguo gateway (and
+    /// most gateways) require. We deliberately do *not* set `ANTHROPIC_API_KEY`
+    /// (which would send Anthropic's native `x-api-key` header): songguo rejects that
+    /// with `401 missing authorization`. The trade-off: a BYOK user pointing at
+    /// Anthropic's *native* endpoint (which wants `x-api-key`) would need this
+    /// revisited — today every path goes through a Bearer gateway.
     pub fn child_env(
         &self,
         server_port: u16,
@@ -238,7 +245,7 @@ impl AgentConfig {
                 "ANTHROPIC_BASE_URL".to_string(),
                 self.upstream_base_url.clone(),
             ),
-            ("ANTHROPIC_API_KEY".to_string(), self.upstream_key.clone()),
+            ("ANTHROPIC_AUTH_TOKEN".to_string(), self.upstream_key.clone()),
             (
                 ENV_SERVER_BASE_URL.to_string(),
                 format!("http://127.0.0.1:{server_port}"),
@@ -371,7 +378,9 @@ mod tests {
         let map: std::collections::HashMap<_, _> = env.into_iter().collect();
         // The child talks to the upstream directly — no local proxy in between.
         assert_eq!(map["ANTHROPIC_BASE_URL"], "https://x/v1");
-        assert_eq!(map["ANTHROPIC_API_KEY"], "k");
+        // Key rides AUTH_TOKEN (→ `Authorization: Bearer`), not API_KEY (→ x-api-key).
+        assert_eq!(map["ANTHROPIC_AUTH_TOKEN"], "k");
+        assert!(!map.contains_key("ANTHROPIC_API_KEY"));
         assert_eq!(map["HI_AGENT_BASE_URL"], "http://127.0.0.1:8080");
         assert_eq!(map["ANTHROPIC_MODEL"], "claude-opus-4-8");
         assert!(!map.contains_key("MAX_THINKING_TOKENS"));
