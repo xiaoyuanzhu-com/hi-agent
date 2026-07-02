@@ -58,11 +58,10 @@ use tokio::sync::Notify;
 
 use crate::foundation::credentials::{Credentials, Mode};
 
-/// State the menu actions close over: where to point the browser, where the
-/// credential store lives (for the Account submenu), and the trigger that asks the
-/// server to drain. Held as the target object's instance variables.
+/// State the menu actions close over: where the credential store lives (for the
+/// Account submenu) and the trigger that asks the server to drain. Held as the target
+/// object's instance variables.
 struct Ivars {
-    url: String,
     data_dir: PathBuf,
     shutdown: Arc<Notify>,
 }
@@ -78,16 +77,12 @@ define_class!(
     unsafe impl NSObjectProtocol for TrayTarget {}
 
     impl TrayTarget {
-        /// "Open hi-agent" → open the web UI in the default browser. `open(1)` is
-        /// the standard launch-services CLI; spawning it avoids pulling NSWorkspace.
+        /// "Open Hi Agent" → show the dedicated face window (a borderless `WKWebView`
+        /// window; see [`super::macos_window`]). Idempotent — reopening just brings the
+        /// existing window forward.
         #[unsafe(method(open:))]
         fn open(&self, _sender: Option<&AnyObject>) {
-            if let Err(e) = std::process::Command::new("open")
-                .arg(&self.ivars().url)
-                .spawn()
-            {
-                tracing::warn!(error = %e, "tray: failed to open the web UI");
-            }
+            super::macos_window::open();
         }
 
         /// "Quit hi-agent" → ask the server to shut down. The server thread runs the
@@ -122,13 +117,8 @@ define_class!(
 );
 
 impl TrayTarget {
-    fn new(
-        mtm: MainThreadMarker,
-        url: String,
-        data_dir: PathBuf,
-        shutdown: Arc<Notify>,
-    ) -> Retained<Self> {
-        let this = Self::alloc(mtm).set_ivars(Ivars { url, data_dir, shutdown });
+    fn new(mtm: MainThreadMarker, data_dir: PathBuf, shutdown: Arc<Notify>) -> Retained<Self> {
+        let this = Self::alloc(mtm).set_ivars(Ivars { data_dir, shutdown });
         unsafe { msg_send![super(this), init] }
     }
 }
@@ -448,7 +438,7 @@ define_class!(
 
     impl TrayClick {
         /// The button's action (fired on left *and* right mouse-up — see
-        /// `sendActionOn:` in [`run`]). A primary click toggles the chat popover; a
+        /// `sendActionOn:` in [`run`]). A primary click opens the face window; a
         /// secondary click (right button, or control-click) shows the Open/Quit menu.
         ///
         /// We never keep a permanent `statusItem.menu` — that would hijack *every*
@@ -476,7 +466,7 @@ define_class!(
                 }
                 iv.status_item.setMenu(None);
             } else {
-                crate::foundation::vendors::macos_popover::toggle();
+                crate::foundation::vendors::macos_window::open();
             }
         }
     }
@@ -506,11 +496,11 @@ pub fn run(url: String, data_dir: PathBuf, shutdown: Arc<Notify>) -> anyhow::Res
     // Accessory: live in the menu bar only — no Dock icon, no app menu.
     app.setActivationPolicy(NSApplicationActivationPolicy::Accessory);
 
-    // The popover's web view loads the face at this base URL; cloned before `url` is
-    // moved into the menu's "Open" target below.
-    let popover_url = url.clone();
+    // The face window's web view loads the base URL; moved into `install` below. The
+    // menu target no longer needs it (the "Open" action just shows the window).
+    let window_url = url;
 
-    let target = TrayTarget::new(mtm, url, data_dir.clone(), shutdown);
+    let target = TrayTarget::new(mtm, data_dir.clone(), shutdown);
 
     // SAFETY: all of these are standard AppKit setup calls made on the main thread
     // (guaranteed by `mtm`); the objects are kept alive by the locals below, which
@@ -645,12 +635,16 @@ pub fn run(url: String, data_dir: PathBuf, shutdown: Arc<Notify>) -> anyhow::Res
         quit_item.setTarget(Some(&target));
         menu.addItem(&quit_item);
 
-        // A left-click on the icon toggles the chat popover; a right-/control-click
-        // shows the menu above. So the button drives a `TrayClick` action rather than
-        // owning the menu permanently (a permanent menu would route *every* click to
-        // the menu and the button action would never fire).
+        // A left-click on the icon opens the face window; a right-/control-click shows
+        // the menu above. So the button drives a `TrayClick` action rather than owning
+        // the menu permanently (a permanent menu would route *every* click to the menu
+        // and the button action would never fire).
         if let Some(button) = &button {
-            crate::foundation::vendors::macos_popover::install(mtm, button.clone(), &popover_url);
+            // The face window is button-independent (it's not anchored to the tray), so
+            // it's installed unconditionally; the single right-⌘ tap still opens the
+            // menu-bar popover, so that's installed too (anchored to the button).
+            crate::foundation::vendors::macos_window::install(mtm, &window_url);
+            crate::foundation::vendors::macos_popover::install(mtm, button.clone(), &window_url);
 
             let click = TrayClick::new(mtm, status_item.clone(), button.clone(), menu.clone());
             button.setTarget(Some(&click));

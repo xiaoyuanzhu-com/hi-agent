@@ -76,9 +76,10 @@ pub fn set_text(text: &str) {
 
 /// Open the menu-bar conversation popup — the iMessage-style chat surface anchored
 /// to the tray icon ([`crate::foundation::vendors::macos_popover`]). Driven by the
-/// single right-⌘ tap ([`crate::body::gesture`]); a left-click on the icon toggles
-/// the same popup from the tray itself. Idempotent (showing an already-open popup is
-/// a no-op) and best-effort: a no-op off macOS or before the tray is up.
+/// single right-⌘ tap ([`crate::body::gesture`]). (The tray's left-click and the "Open
+/// Hi Agent" menu item open the larger face *window* instead — see
+/// [`crate::foundation::vendors::macos_window`].) Idempotent (showing an already-open
+/// popup is a no-op) and best-effort: a no-op off macOS or before the tray is up.
 pub fn open_chat() {
     #[cfg(target_os = "macos")]
     crate::foundation::vendors::macos_popover::open();
