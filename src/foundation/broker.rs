@@ -116,9 +116,9 @@ fn origin_of(url: &str) -> String {
     u.to_string()
 }
 
-/// Reduce one task's `wire → endpoint` map to (wire, origin, api_key, model):
+/// Reduce one task's `wire → endpoint` map to (wire, full url, api_key, model):
 /// the single wire (one per task today; lexically-first for determinism) and the
-/// highest-`quality` model.
+/// highest-`quality` model. Callers keep the full URL or reduce it to its origin.
 fn pick_wire(wires: &std::collections::HashMap<String, WireDto>) -> Option<(String, String, String, Option<String>)> {
     let (wire, w) = wires.iter().min_by(|a, b| a.0.cmp(b.0))?;
     let model = w
@@ -127,35 +127,41 @@ fn pick_wire(wires: &std::collections::HashMap<String, WireDto>) -> Option<(Stri
         .max_by_key(|m| m.quality)
         .map(|m| m.model.trim().to_string())
         .filter(|s| !s.is_empty());
-    Some((wire.clone(), origin_of(&w.url), w.api_key.clone(), model))
+    Some((wire.clone(), w.url.trim().to_string(), w.api_key.clone(), model))
 }
 
 /// Collapse the broker menu into the internal per-slot [`Managed`], selecting the
-/// best-quality model per task. The LLM (text-generation / anthropic-messages) is
-/// fully wired: origin → `ANTHROPIC_BASE_URL`, token → Bearer, model → the pick.
-/// Media vendors adopt the URL origin + token + selected model but keep `wire`
-/// empty, so each capability uses its existing default adapter — routing the new
-/// wires (openai-responses / openai-images / ark-video / volc-*) through the vendor
-/// adapters is the follow-up. Missing tasks default (capability stays off / on env).
+/// best-quality model per task.
+///
+/// URL handling differs by consumer. The LLM and the WebSocket vendors (STT/TTS)
+/// take the bare **origin**: the Claude CLI re-appends `/v1/messages`, and the volc
+/// adapters host-rebase their own paths — which already equal songguo's
+/// (`/api/v3/sauc/…`, `/api/v3/tts/…`) — onto it. The HTTP media vendors
+/// (vision/image/video) take the **full URL** verbatim, because songguo's paths
+/// (`/v1/responses`, `/v1/images/generations`, `/api/v3/contents/…`) differ from
+/// the vendors' native `/api/plan/v3/…` and can't be reached by host-rebase. Every
+/// slot keeps `wire` empty, so each capability uses its single default adapter.
 fn managed_from(c: &ConfigsDto) -> Managed {
-    let vendor = |task: &str| -> VendorKey {
+    fn resolve(c: &ConfigsDto, task: &str, full: bool) -> Option<(String, String, Option<String>)> {
         c.get(task)
             .and_then(|w| pick_wire(w))
-            .map(|(_wire, base_url, api_key, model)| VendorKey { wire: String::new(), base_url, api_key, model })
+            .map(|(_wire, url, api_key, model)| (if full { url } else { origin_of(&url) }, api_key, model))
+    }
+    let vendor = |task: &str, full: bool| -> VendorKey {
+        resolve(c, task, full)
+            .map(|(base_url, api_key, model)| VendorKey { wire: String::new(), base_url, api_key, model })
             .unwrap_or_default()
     };
-    let llm = c
-        .get("text-generation")
-        .and_then(|w| pick_wire(w))
-        .map(|(_wire, base_url, api_key, model)| LlmCredentials { wire: String::new(), base_url, api_key, model })
+    let llm = resolve(c, "text-generation", false)
+        .map(|(base_url, api_key, model)| LlmCredentials { wire: String::new(), base_url, api_key, model })
         .unwrap_or_default();
     Managed {
         llm,
-        stt: vendor("automatic-speech-recognition"),
-        tts: vendor("text-to-speech"),
-        vision: vendor("image-text-to-text"),
-        image: vendor("text-to-image"),
-        video: vendor("text-to-video"),
+        stt: vendor("automatic-speech-recognition", false),
+        tts: vendor("text-to-speech", false),
+        vision: vendor("image-text-to-text", true),
+        image: vendor("text-to-image", true),
+        video: vendor("text-to-video", true),
     }
 }
 

@@ -50,15 +50,17 @@ impl ImageRef {
 pub struct Config {
     client: reqwest::Client,
     api_key: String,
-    api_base: String,
+    endpoint: String,
     model: String,
 }
 
 impl Config {
     /// Resolve config from the credential store. `key` is the vendor API key
-    /// (required — the caller builds a config only when a key is present); `base_url`
-    /// host-rebases the api base onto the gateway (songguo) when the broker supplies
-    /// one; `model` overrides the seedance default. No env.
+    /// (required — the caller builds a config only when a key is present); `base_url`,
+    /// when set, is the gateway's **full** task-submit endpoint (songguo, whose path
+    /// differs from the vendor's native one) and is used verbatim; with no `base_url`
+    /// (BYOK) the vendor's own endpoint is used. `model` overrides the seedance
+    /// default. No env.
     pub fn from_store(
         key: Option<&str>,
         base_url: Option<&str>,
@@ -69,10 +71,10 @@ impl Config {
             .filter(|k| !k.is_empty())
             .ok_or_else(|| anyhow::anyhow!("video generation (doubao) requires an API key"))?
             .to_string();
-        let mut api_base = DEFAULT_API_BASE.to_string();
-        if let Some(base) = base_url.map(str::trim).filter(|b| !b.is_empty()) {
-            api_base = super::rebase_host(&api_base, base);
-        }
+        let endpoint = match base_url.map(str::trim).filter(|b| !b.is_empty()) {
+            Some(base) => base.trim_end_matches('/').to_string(),
+            None => format!("{}/contents/generations/tasks", DEFAULT_API_BASE),
+        };
         let model = model
             .map(str::trim)
             .filter(|m| !m.is_empty())
@@ -82,7 +84,7 @@ impl Config {
             .timeout(REQUEST_TIMEOUT)
             .build()
             .context("building doubao video-gen HTTP client")?;
-        Ok(Self { client, api_key, api_base, model })
+        Ok(Self { client, api_key, endpoint, model })
     }
 }
 
@@ -121,7 +123,9 @@ fn build_create_request(cfg: &Config, req: &VideoRequest) -> Value {
 }
 
 fn tasks_url(cfg: &Config) -> String {
-    format!("{}/contents/generations/tasks", cfg.api_base.trim_end_matches('/'))
+    // `endpoint` already is the full task-submit URL (gateway URL, or the vendor
+    // default `{api_base}/contents/generations/tasks`); poll appends `/{task_id}`.
+    cfg.endpoint.clone()
 }
 
 pub async fn submit(cfg: &Config, req: &VideoRequest) -> anyhow::Result<String> {
@@ -244,7 +248,7 @@ mod tests {
         Config {
             client: reqwest::Client::new(),
             api_key: "test-key".to_string(),
-            api_base: DEFAULT_API_BASE.to_string(),
+            endpoint: format!("{}/contents/generations/tasks", DEFAULT_API_BASE),
             model: DEFAULT_VIDEO_MODEL.to_string(),
         }
     }
