@@ -391,6 +391,19 @@ mod reflection_schedule_tests {
     }
 
     #[test]
+    fn is_auth_error_matches_the_gateway_401() {
+        // The real shape from a live run: the adapter's `errorKind` is stringified
+        // into the anyhow message. The heal path keys off exactly this.
+        let e = anyhow::anyhow!(
+            "session/prompt failed: Internal error: Failed to authenticate. \
+             API Error: 401 invalid user key: {{ \"errorKind\": \"authentication_failed\" }}"
+        );
+        assert!(is_auth_error(&e));
+        // An ordinary failure must not trigger a broker refresh + restart.
+        assert!(!is_auth_error(&anyhow::anyhow!("session/prompt failed: connection reset")));
+    }
+
+    #[test]
     fn busy_scene_fires_base_after_the_last_reflection() {
         let t0 = Instant::now();
         // Reflected at t0+60s; a later turn keeps activity ahead of the anchor, so
@@ -786,6 +799,16 @@ fn recent_scenes(data_dir: &std::path::Path, window: Duration) -> Vec<Scene> {
         }
     }
     scenes
+}
+
+/// Whether a failed prompt is an upstream authentication failure (a 401 from the
+/// LLM gateway), which the retry loop heals by refreshing broker credentials. The
+/// ACP adapter reports it as `errorKind: "authentication_failed"`, and that kind is
+/// stringified into the `anyhow` error message today — so we match on it rather than
+/// a typed variant (centralized here to harden later if the acp crate exposes the
+/// structured `data`).
+fn is_auth_error(err: &anyhow::Error) -> bool {
+    err.to_string().contains("authentication_failed")
 }
 
 impl Reactor {
@@ -1577,6 +1600,7 @@ async fn run_turn(
         // `Reorganized` (not an error) and is handled below, outside the retry loop.
         const MAX_ATTEMPTS: u32 = 3;
         let mut attempt: u32 = 0;
+        let mut healed = false;
         let mut prompt_chars = 0usize;
         let drive: anyhow::Result<DriveOutcome> = loop {
             attempt += 1;
@@ -1622,6 +1646,17 @@ async fn run_turn(
                     discard_reactor_session(reactor, scene, reactor_session, seeded, budget).await;
                     if attempt >= MAX_ATTEMPTS {
                         break Err(err);
+                    }
+                    // A 401 means the upstream key the child was spawned with is
+                    // stale (broker re-mint / revocation). Re-fetch from the broker
+                    // once per turn so the store holds a fresh key; the next attempt
+                    // spawns a session that re-resolves it (see AgentLayer::session).
+                    // No-op in BYOK, so safe in every mode; a genuinely bad BYOK key
+                    // just exhausts the remaining attempts and surfaces, as before.
+                    if is_auth_error(&err) && !healed {
+                        healed = true;
+                        tracing::info!(scene = %scene, "auth failure; refreshing broker credentials before restart");
+                        crate::foundation::broker::refresh(reactor.inner.memory.data_dir(), None).await;
                     }
                     // Exponential backoff before the restart: 250ms, then 500ms.
                     let backoff = Duration::from_millis(250u64 << (attempt - 1));

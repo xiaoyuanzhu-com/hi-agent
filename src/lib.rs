@@ -239,17 +239,20 @@ async fn run_with_shutdown(config: Config, shutdown: Arc<Notify>) -> anyhow::Res
     child_env.push(("HI_AGENT_PROMPTS_DIR".to_string(), prompts_dir.display().to_string()));
     // Diagnostic: surface exactly what differs between launchers (terminal vs.
     // cmux etc.) — cwd, the resolved runtime binaries, the config dir claude
-    // will read, and the upstream key's fingerprint.
+    // will read, and the upstream key's fingerprint. The upstream credential vars
+    // are no longer frozen into `child_env` (they're re-resolved per session
+    // spawn), so read them from a fresh `auth_child_env` for this snapshot.
     {
-        let get = |k: &str| {
-            child_env
-                .iter()
+        let auth_env = config.agent.auth_child_env();
+        let get_in = |env: &[(String, String)], k: &str| {
+            env.iter()
                 .find(|(n, _)| n == k)
-                .map(|(_, v)| v.as_str())
-                .unwrap_or("<unset>")
+                .map(|(_, v)| v.clone())
+                .unwrap_or_else(|| "<unset>".to_string())
         };
-        let key = get("ANTHROPIC_AUTH_TOKEN");
-        let fp = &key[key.len().saturating_sub(20)..];
+        let get = |k: &str| get_in(&child_env, k);
+        let key = get_in(&auth_env, "ANTHROPIC_AUTH_TOKEN");
+        let fp = key[key.len().saturating_sub(20)..].to_string();
         tracing::info!(
             cwd = ?std::env::current_dir().ok(),
             config_dir = %claude_config_dir.display(),
@@ -257,7 +260,7 @@ async fn run_with_shutdown(config: Config, shutdown: Arc<Notify>) -> anyhow::Res
             runtime_origin = runtime.origin,
             claude_bin = %runtime.claude_bin.display(),
             node_bin = %runtime.node_bin.display(),
-            anthropic_base_url = get("ANTHROPIC_BASE_URL"),
+            anthropic_base_url = get_in(&auth_env, "ANTHROPIC_BASE_URL"),
             claude_config_dir_env = get("CLAUDE_CONFIG_DIR"),
             claude_code_executable = get("CLAUDE_CODE_EXECUTABLE"),
             auth_token_fp = fp,
@@ -277,6 +280,7 @@ async fn run_with_shutdown(config: Config, shutdown: Arc<Notify>) -> anyhow::Res
             args: vec![adapter_entry],
             env: child_env,
         },
+        config.data_dir.clone(),
         acp_tap,
         format!("http://127.0.0.1:{}", config.port),
     );

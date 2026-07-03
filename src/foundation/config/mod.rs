@@ -178,13 +178,13 @@ impl AgentConfig {
         Ok(())
     }
 
-    /// Build the env var pairs for the ACP child process.
-    ///
-    /// `server_port` is hi-agent's own HTTP port (handed to the child as
-    /// `HI_AGENT_BASE_URL` so a session can reach the channels); `config_dir` is the
-    /// managed `CLAUDE_CONFIG_DIR`; `node_bin_dir` is the directory containing the
-    /// resolved `node`; `claude_bin` is the resolved claude executable. The child
-    /// talks to the upstream LLM directly via `ANTHROPIC_BASE_URL` / the real key.
+    /// The **volatile** env vars — the upstream endpoint + key + model — that the
+    /// child sends to the LLM gateway. Split out from [`child_env`](Self::child_env)
+    /// because these are the only vars sourced from the credential store, and the
+    /// store changes under a running app (broker re-mint, Settings edit, mode
+    /// switch). Callers re-resolve these at each session spawn (see
+    /// [`crate::foundation::agent`]) so a fresh child never carries a stale key,
+    /// rather than freezing them at boot.
     ///
     /// The key rides `ANTHROPIC_AUTH_TOKEN`, which the CLI sends as
     /// `Authorization: Bearer <key>` — the scheme the managed songguo gateway (and
@@ -193,6 +193,30 @@ impl AgentConfig {
     /// with `401 missing authorization`. The trade-off: a BYOK user pointing at
     /// Anthropic's *native* endpoint (which wants `x-api-key`) would need this
     /// revisited — today every path goes through a Bearer gateway.
+    pub fn auth_child_env(&self) -> Vec<(String, String)> {
+        let mut env = vec![
+            (
+                "ANTHROPIC_BASE_URL".to_string(),
+                self.upstream_base_url.clone(),
+            ),
+            ("ANTHROPIC_AUTH_TOKEN".to_string(), self.upstream_key.clone()),
+        ];
+        if let Some(model) = &self.model {
+            env.push(("ANTHROPIC_MODEL".to_string(), model.clone()));
+        }
+        env
+    }
+
+    /// Build the **static** env var pairs for the ACP child process — everything
+    /// fixed for the process lifetime (resolved runtime paths, config dir, the
+    /// server URL). The volatile upstream credential vars come from
+    /// [`auth_child_env`](Self::auth_child_env), re-resolved per spawn and merged in
+    /// by the agent layer.
+    ///
+    /// `server_port` is hi-agent's own HTTP port (handed to the child as
+    /// `HI_AGENT_BASE_URL` so a session can reach the channels); `config_dir` is the
+    /// managed `CLAUDE_CONFIG_DIR`; `node_bin_dir` is the directory containing the
+    /// resolved `node`; `claude_bin` is the resolved claude executable.
     pub fn child_env(
         &self,
         server_port: u16,
@@ -201,11 +225,6 @@ impl AgentConfig {
         claude_bin: &Path,
     ) -> Vec<(String, String)> {
         let mut env = vec![
-            (
-                "ANTHROPIC_BASE_URL".to_string(),
-                self.upstream_base_url.clone(),
-            ),
-            ("ANTHROPIC_AUTH_TOKEN".to_string(), self.upstream_key.clone()),
             (
                 ENV_SERVER_BASE_URL.to_string(),
                 format!("http://127.0.0.1:{server_port}"),
@@ -219,9 +238,6 @@ impl AgentConfig {
                 claude_bin.to_string_lossy().into_owned(),
             ),
         ];
-        if let Some(model) = &self.model {
-            env.push(("ANTHROPIC_MODEL".to_string(), model.clone()));
-        }
         // Prepend the resolved node dir to PATH so the adapter resolves `node`.
         let sep = if cfg!(windows) { ';' } else { ':' };
         let existing = std::env::var("PATH").unwrap_or_default();
@@ -321,7 +337,7 @@ mod tests {
     }
 
     #[test]
-    fn child_env_sets_upstream_and_managed_vars() {
+    fn child_env_sets_static_vars() {
         let cfg = AgentConfig::new(
             Some("claude-opus-4-8".to_string()),
             None,
@@ -336,16 +352,66 @@ mod tests {
             std::path::Path::new("/cache/runtime/claude"),
         );
         let map: std::collections::HashMap<_, _> = env.into_iter().collect();
+        assert_eq!(map["HI_AGENT_BASE_URL"], "http://127.0.0.1:8080");
+        assert_eq!(map["CLAUDE_CONFIG_DIR"], "/cache/config");
+        assert_eq!(map["CLAUDE_CODE_EXECUTABLE"], "/cache/runtime/claude");
+        assert!(map["PATH"].starts_with("/cache/runtime/node/bin"));
+        // The volatile credential vars are NOT frozen into the static env — they
+        // come from `auth_child_env`, re-resolved per session spawn.
+        assert!(!map.contains_key("ANTHROPIC_AUTH_TOKEN"));
+        assert!(!map.contains_key("ANTHROPIC_BASE_URL"));
+        assert!(!map.contains_key("ANTHROPIC_MODEL"));
+    }
+
+    #[test]
+    fn auth_child_env_carries_the_upstream_credential() {
+        let cfg = AgentConfig::new(
+            Some("claude-opus-4-8".to_string()),
+            None,
+            None,
+            "https://x/v1".to_string(),
+            "k".to_string(),
+        );
+        let map: std::collections::HashMap<_, _> = cfg.auth_child_env().into_iter().collect();
         // The child talks to the upstream directly — no local proxy in between.
         assert_eq!(map["ANTHROPIC_BASE_URL"], "https://x/v1");
         // Key rides AUTH_TOKEN (→ `Authorization: Bearer`), not API_KEY (→ x-api-key).
         assert_eq!(map["ANTHROPIC_AUTH_TOKEN"], "k");
         assert!(!map.contains_key("ANTHROPIC_API_KEY"));
-        assert_eq!(map["HI_AGENT_BASE_URL"], "http://127.0.0.1:8080");
         assert_eq!(map["ANTHROPIC_MODEL"], "claude-opus-4-8");
-        assert!(!map.contains_key("MAX_THINKING_TOKENS"));
-        assert_eq!(map["CLAUDE_CONFIG_DIR"], "/cache/config");
-        assert_eq!(map["CLAUDE_CODE_EXECUTABLE"], "/cache/runtime/claude");
-        assert!(map["PATH"].starts_with("/cache/runtime/node/bin"));
+    }
+
+    #[test]
+    fn auth_child_env_omits_model_when_unset() {
+        let cfg = AgentConfig::new(None, None, None, "https://x/v1".to_string(), "k".to_string());
+        let map: std::collections::HashMap<_, _> = cfg.auth_child_env().into_iter().collect();
+        assert!(!map.contains_key("ANTHROPIC_MODEL"));
+    }
+
+    #[test]
+    fn resolve_reflects_the_current_stored_key() {
+        // The whole point of re-resolving per spawn: a key change written to the
+        // store (broker re-mint, Settings edit) is visible on the next resolve,
+        // without freezing anything at boot. Uses BYOK so the stored key is the
+        // effective one directly.
+        use crate::foundation::credentials::{Credentials, LlmCredentials, Mode};
+        let dir = tempfile::tempdir().unwrap();
+
+        let mut store = Credentials {
+            mode: Mode::Byok,
+            llm: LlmCredentials { api_key: "key-A".into(), ..Default::default() },
+            ..Default::default()
+        };
+        store.save(dir.path()).unwrap();
+        let a: std::collections::HashMap<_, _> =
+            AgentConfig::resolve(dir.path()).auth_child_env().into_iter().collect();
+        assert_eq!(a["ANTHROPIC_AUTH_TOKEN"], "key-A");
+
+        // Rotate the stored key; a fresh resolve must carry the new one.
+        store.llm.api_key = "key-B".into();
+        store.save(dir.path()).unwrap();
+        let b: std::collections::HashMap<_, _> =
+            AgentConfig::resolve(dir.path()).auth_child_env().into_iter().collect();
+        assert_eq!(b["ANTHROPIC_AUTH_TOKEN"], "key-B");
     }
 }

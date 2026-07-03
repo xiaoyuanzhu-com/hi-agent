@@ -18,7 +18,7 @@ use std::sync::Arc;
 use agent_client_protocol::schema::{HttpHeader, McpServer, McpServerHttp};
 
 use crate::foundation::acp::{AcpProcess, AcpSession, AcpTap, ProcessRegistry, SessionOpts};
-use crate::foundation::config::{HEADER_ROLE, HEADER_SCENE, HEADER_WORKER_ID};
+use crate::foundation::config::{AgentConfig, HEADER_ROLE, HEADER_SCENE, HEADER_WORKER_ID};
 use crate::types::Scene;
 
 /// Which tool surface a session gets, carried as `X-HI-Role` on its MCP attach so
@@ -44,9 +44,11 @@ impl SessionRole {
     }
 }
 
-/// How to spawn one ACP subprocess. Cloned per session: the same pinned runtime
-/// and managed env back every session's process (they share one rendered config
-/// dir, resolved once at startup).
+/// How to spawn one ACP subprocess. Cloned per session: the pinned runtime, args,
+/// and **static** env (config dir, server URL, PATH — resolved once at startup).
+/// The volatile upstream credential vars (`ANTHROPIC_*`) are NOT frozen here — they
+/// are re-resolved from the credential store at each [`session`](AgentLayer::session)
+/// spawn and merged onto this env, so a fresh child never carries a stale key.
 #[derive(Debug, Clone)]
 pub struct SpawnConfig {
     pub program: PathBuf,
@@ -62,6 +64,10 @@ pub struct AgentLayer {
 
 struct Inner {
     spawn: SpawnConfig,
+    /// Data dir, so each spawn can re-resolve the upstream credential from the
+    /// store ([`AgentConfig::resolve`]) rather than freeze a boot-time key. Cheap
+    /// SQLite read, dwarfed by the subprocess spawn + ACP `initialize` it precedes.
+    data_dir: PathBuf,
     /// hi-agent's own HTTP base URL (e.g. `http://127.0.0.1:12358`), used to build
     /// each session's MCP attach URL (`<base>/mcp`). The same value the child gets
     /// as `HI_AGENT_BASE_URL`.
@@ -76,10 +82,11 @@ struct Inner {
 }
 
 impl AgentLayer {
-    pub fn new(spawn: SpawnConfig, tap: AcpTap, server_base_url: String) -> Self {
+    pub fn new(spawn: SpawnConfig, data_dir: PathBuf, tap: AcpTap, server_base_url: String) -> Self {
         Self {
             inner: Arc::new(Inner {
                 spawn,
+                data_dir,
                 server_base_url,
                 tap,
                 registry: ProcessRegistry::new(),
@@ -116,11 +123,16 @@ impl AgentLayer {
         let SessionOpts { system_prompt, cwd } = opts;
 
         let spawn = &self.inner.spawn;
+        // Merge the current upstream credential onto the static env at spawn time,
+        // so this child always carries the freshest key from the store (broker
+        // re-mint, Settings edit, mode switch) — never a stale boot-time snapshot.
+        let mut env = spawn.env.clone();
+        env.extend(AgentConfig::resolve(&self.inner.data_dir).auth_child_env());
         tracing::info!(scene = %scene, role = role.as_str(), "spawning ACP subprocess for session");
         let (process, rx) = AcpProcess::spawn(
             spawn.program.clone(),
             spawn.args.clone(),
-            spawn.env.clone(),
+            env,
             self.inner.tap.clone(),
             scene.0.clone(),
             &self.inner.registry,
