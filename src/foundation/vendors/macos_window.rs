@@ -11,7 +11,9 @@
 //! `canBecomeMainWindow` as a belt-and-braces guarantee that the web view's text input
 //! takes keystrokes even though the app runs Accessory (no Dock icon). The mask carries
 //! `Titled | Closable | Miniaturizable | Resizable`, so the standard titlebar handles
-//! dragging and the traffic lights close/minimize/zoom the window.
+//! dragging and the traffic lights close/minimize the window. The window opts into
+//! `FullScreenPrimary` collection behavior so the green button enters native full-screen
+//! (⌥-click still zooms).
 //!
 //! **Themed, centered title bar.** The native titlebar is made transparent and its text
 //! hidden; with `FullSizeContentView` the content view spans under it, so the window's
@@ -42,8 +44,9 @@ use objc2::rc::Retained;
 use objc2::runtime::{AnyObject, NSObject, NSObjectProtocol, ProtocolObject, Sel};
 use objc2::{DefinedClass, MainThreadOnly, define_class, msg_send, sel};
 use objc2_app_kit::{
-    NSApplication, NSAutoresizingMaskOptions, NSBackingStoreType, NSColor, NSTextAlignment,
-    NSTextField, NSView, NSWindow, NSWindowStyleMask, NSWindowTitleVisibility,
+    NSApplication, NSAutoresizingMaskOptions, NSBackingStoreType, NSColor,
+    NSWindowCollectionBehavior, NSTextAlignment, NSTextField, NSView, NSWindow, NSWindowStyleMask,
+    NSWindowTitleVisibility,
 };
 use objc2_foundation::{
     MainThreadMarker, NSPoint, NSRect, NSSize, NSString, NSURL, NSURLRequest, NSUserDefaults,
@@ -291,6 +294,9 @@ pub fn install(mtm: MainThreadMarker, url: &str) {
         ];
         window.setTitlebarAppearsTransparent(true);
         window.setTitleVisibility(NSWindowTitleVisibility::Hidden);
+        // Make the green traffic light enter native full-screen (not zoom/maximize):
+        // without `FullScreenPrimary` in the collection behavior the button just zooms.
+        window.setCollectionBehavior(NSWindowCollectionBehavior::FullScreenPrimary);
         // Don't free the window when its close button dismisses it; we keep it around
         // and reopen the same one on the next tray click.
         let _: () = msg_send![&*window, setReleasedWhenClosed: false];
