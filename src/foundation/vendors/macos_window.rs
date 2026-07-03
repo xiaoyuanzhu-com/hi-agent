@@ -20,8 +20,13 @@
 //! the traffic lights on the left. The web view is inset below the bar strip.
 //!
 //! Media permission mirrors the popover: a [`MediaGrant`] `WKUIDelegate` auto-grants
-//! the page's mic/camera so WebKit never shows its per-site prompt. (The macOS *system*
-//! TCC prompt is separate and still fires once on first real use.)
+//! the page's mic/camera so WebKit never shows its per-site *page-level* prompt. That is
+//! only the first of two gates — the macOS *system* prompt (TCC) is separate, and it only
+//! works when the host process is a bundled `.app` (Info.plist usage strings + a code
+//! signature) that is its own "responsible process". A packaged build gets both for free;
+//! under `make dev` they're arranged by scripts/dev.sh + `reexec_disclaiming_responsibility`
+//! in src/main.rs — see dev.sh for the full explanation. A bare binary satisfies neither,
+//! so `getUserMedia` there hangs with no prompt.
 //!
 //! Like the tray, the AppKit objects live on the process main thread and are leaked for
 //! the process lifetime; cross-thread opens (the gesture runs off a background thread)

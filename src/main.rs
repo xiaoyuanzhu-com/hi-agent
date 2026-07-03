@@ -102,11 +102,16 @@ async fn provision(into: PathBuf) -> anyhow::Result<()> {
 /// macOS: re-exec ourselves disclaiming TCC "responsibility" so the process is its
 /// own responsible party for camera/mic prompts.
 ///
+/// This is one half of making the native face window's camera/mic work in dev; the
+/// other half (wrapping the binary in a signed .app so TCC has a bundle identity to
+/// prompt for) lives in scripts/dev.sh, which also documents the full picture.
+///
 /// When launched from a shell (e.g. `make dev` via cargo-watch), a process inherits
 /// the *terminal's* responsible process, so WebKit's `getUserMedia` gets attributed
 /// to the terminal — which has no camera/mic usage strings — and the request hangs
-/// with no prompt. A LaunchServices launch (a packaged `.app`) is already its own
-/// responsible process, so this is only needed for the shell path.
+/// with no prompt (no resolve, no reject, nothing in Privacy settings). A
+/// LaunchServices launch (a packaged `.app`) is already its own responsible process,
+/// so this is only needed for the shell path.
 ///
 /// `POSIX_SPAWN_SETEXEC` replaces this image in place (same PID, same env/PATH — so
 /// `node`/`claude` on the dev PATH still resolve, and cargo-watch keeps tracking the

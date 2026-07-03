@@ -68,14 +68,38 @@ cleanup() {
 }
 trap cleanup INT TERM EXIT
 
+# --- macOS: make the native face window's camera/mic actually work in dev ---------
+#
 # On macOS the backend's default shape is the menu-bar app, whose face window is a
-# WKWebView — and camera/mic there need a bundle identity (Info.plist usage strings +
-# a code signature), which a bare `cargo run` binary lacks. So instead of running the
-# binary bare, wrap each rebuild in a minimal signed HiAgent.app: build → drop the
-# fresh binary into the bundle → codesign → run the bundled exe. Signed with a stable
-# self-signed identity (see ensure-dev-signing-id.sh) so the camera/mic grant survives
-# rebuilds instead of re-prompting. Set HI_AGENT_DEV_NO_BUNDLE=1 to keep the old bare
-# path. Non-macOS is unchanged.
+# WKWebView. For `getUserMedia` (camera/mic) to work there, macOS's privacy system
+# (TCC) needs BOTH of these to be true — and a bare `cargo run` binary satisfies
+# NEITHER, which is why the window's camera/mic silently hangs with no prompt:
+#
+#   1. A bundle IDENTITY. TCC only prompts for a client that is a real .app: an
+#      Info.plist carrying NSCamera/NSMicrophoneUsageDescription plus a code
+#      signature. A loose Mach-O has no Info.plist, so TCC can't even present the
+#      prompt. → We wrap the binary in a minimal HiAgent.app (scripts/Info.plist)
+#      and codesign it on every rebuild.
+#
+#   2. Being its own RESPONSIBLE PROCESS. TCC attributes a request to the launching
+#      "responsible process". A process started from a shell inherits the TERMINAL
+#      as its responsible process — so the prompt would be attributed to this
+#      terminal (which has no usage strings) and the request hangs forever. A
+#      LaunchServices launch (double-clicking a .app) is its own responsible
+#      process; to get the same effect while still running under cargo-watch (and
+#      keeping the shell's PATH so node/claude resolve), the binary re-execs itself
+#      disclaiming responsibility when it sees HI_AGENT_DISCLAIM=1, set below.
+#      See reexec_disclaiming_responsibility() in src/main.rs.
+#
+# So each rebuild: build → drop the fresh binary into the bundle → codesign → run
+# the bundled exe with HI_AGENT_DISCLAIM=1. The signature uses a STABLE self-signed
+# identity (ensure-dev-signing-id.sh) rather than ad-hoc, because an ad-hoc
+# signature's code requirement is keyed to the binary's cdhash — which changes every
+# rebuild — so TCC would re-prompt on every save; a stable cert keeps one code
+# requirement, so you approve once and it sticks.
+#
+# Set HI_AGENT_DEV_NO_BUNDLE=1 to opt out and run the binary bare (no camera/mic in
+# the native window). Non-macOS is unchanged — it runs `cargo run` directly.
 if [ "$(uname -s)" = "Darwin" ] && [ -z "${HI_AGENT_DEV_NO_BUNDLE:-}" ]; then
   APP="target/dev-app/HiAgent.app"
   EXE="$APP/Contents/MacOS/hi-agent"
@@ -87,12 +111,10 @@ if [ "$(uname -s)" = "Darwin" ] && [ -z "${HI_AGENT_DEV_NO_BUNDLE:-}" ]; then
   else
     echo ">> native dev window: signing with stable dev identity — camera/mic enabled (approve once)"
   fi
-  # clonefile the binary in (instant on APFS) with a plain-cp fallback; each `&&`
-  # short-circuits so a compile error just skips the run, as `cargo run` would.
-  # HI_AGENT_DISCLAIM=1 tells the binary to re-exec itself disclaiming TCC
-  # responsibility (see reexec_disclaiming_responsibility in src/main.rs), so the
-  # face window's camera/mic prompt as "Hi Agent" instead of being misattributed to
-  # this terminal (where they'd hang with no prompt).
+  # Per-rebuild chain (see the requirements above): clonefile the fresh binary into
+  # the bundle (instant on APFS, plain-cp fallback), re-sign, then run it with
+  # HI_AGENT_DISCLAIM=1 (requirement 2). Each `&&` short-circuits, so a compile error
+  # just skips the run, exactly as `cargo run` would.
   RUN_CMD="cargo build \
     && { cp -c target/debug/hi-agent '$EXE' 2>/dev/null || cp target/debug/hi-agent '$EXE'; } \
     && codesign --force -s '$SIGN_ID' '$APP' \
