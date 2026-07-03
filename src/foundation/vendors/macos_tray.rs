@@ -49,7 +49,8 @@ use objc2::rc::Retained;
 use objc2::runtime::{AnyObject, NSObject, NSObjectProtocol, ProtocolObject};
 use objc2::{define_class, msg_send, sel, AnyThread, ClassType, DefinedClass, MainThreadOnly};
 use objc2_app_kit::{
-    NSApplication, NSApplicationActivationPolicy, NSCellImagePosition, NSControlStateValue,
+    NSApplication, NSApplicationActivationPolicy, NSCellImagePosition, NSControlStateValueOff,
+    NSControlStateValueOn,
     NSEventModifierFlags, NSEventType, NSImage, NSMenu, NSMenuDelegate, NSMenuItem, NSStatusBar,
     NSStatusBarButton, NSStatusItem, NSVariableStatusItemLength,
 };
@@ -220,7 +221,7 @@ fn fmt_energy(n: i64) -> String {
 
 /// Set the state (checkmark) of the menu item carrying `tag`, if present.
 fn set_item_state(menu: &NSMenu, tag: isize, on: bool) {
-    let v = NSControlStateValue(if on { 1 } else { 0 });
+    let v = if on { NSControlStateValueOn } else { NSControlStateValueOff };
     for i in 0..menu.numberOfItems() {
         if let Some(item) = menu.itemAtIndex(i) {
             if item.tag() == tag {
