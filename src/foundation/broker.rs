@@ -68,20 +68,95 @@ struct TokenDto {
     expires_in: i64,
 }
 
-#[derive(Deserialize, Default)]
-struct ConfigsDto {
+/// One model the broker offers for a task, with editorial 0–100 scores. Today we
+/// select purely on `quality`; `speed`/`price` are parsed so the shape round-trips
+/// and a smarter policy can weigh them later.
+#[derive(Deserialize, Default, Clone)]
+struct ModelDto {
     #[serde(default)]
-    llm: LlmCredentials,
+    model: String,
     #[serde(default)]
-    stt: VendorKey,
+    quality: i64,
+    // Parsed for round-trip + a future weighted policy; selection uses quality today.
     #[serde(default)]
-    tts: VendorKey,
+    #[allow(dead_code)]
+    speed: i64,
     #[serde(default)]
-    vision: VendorKey,
+    #[allow(dead_code)]
+    price: i64,
+}
+
+/// One wire's endpoint: the full songguo URL for that protocol, the shared token,
+/// and the models served over it.
+#[derive(Deserialize, Default, Clone)]
+struct WireDto {
     #[serde(default)]
-    image: VendorKey,
+    url: String,
     #[serde(default)]
-    video: VendorKey,
+    api_key: String,
+    #[serde(default)]
+    models: Vec<ModelDto>,
+}
+
+/// GET /api/agent/configs — a three-layer menu: HF task name → wire name →
+/// endpoint. Collapsed into the internal per-slot [`Managed`] by [`managed_from`].
+type ConfigsDto = std::collections::HashMap<String, std::collections::HashMap<String, WireDto>>;
+
+/// The `scheme://host[:port]` origin of a full URL, dropping the path. The LLM CLI
+/// (`ANTHROPIC_BASE_URL`) and the vendor adapters re-append their own paths, so the
+/// internal `base_url` stays a bare origin — matching what the broker sent before
+/// it moved to full per-wire URLs. Falls back to the input if it isn't URL-shaped.
+fn origin_of(url: &str) -> String {
+    let u = url.trim();
+    if let Some(after) = u.find("://").map(|i| i + 3) {
+        if let Some(slash) = u[after..].find('/') {
+            return u[..after + slash].to_string();
+        }
+    }
+    u.to_string()
+}
+
+/// Reduce one task's `wire → endpoint` map to (wire, origin, api_key, model):
+/// the single wire (one per task today; lexically-first for determinism) and the
+/// highest-`quality` model.
+fn pick_wire(wires: &std::collections::HashMap<String, WireDto>) -> Option<(String, String, String, Option<String>)> {
+    let (wire, w) = wires.iter().min_by(|a, b| a.0.cmp(b.0))?;
+    let model = w
+        .models
+        .iter()
+        .max_by_key(|m| m.quality)
+        .map(|m| m.model.trim().to_string())
+        .filter(|s| !s.is_empty());
+    Some((wire.clone(), origin_of(&w.url), w.api_key.clone(), model))
+}
+
+/// Collapse the broker menu into the internal per-slot [`Managed`], selecting the
+/// best-quality model per task. The LLM (text-generation / anthropic-messages) is
+/// fully wired: origin → `ANTHROPIC_BASE_URL`, token → Bearer, model → the pick.
+/// Media vendors adopt the URL origin + token + selected model but keep `wire`
+/// empty, so each capability uses its existing default adapter — routing the new
+/// wires (openai-responses / openai-images / ark-video / volc-*) through the vendor
+/// adapters is the follow-up. Missing tasks default (capability stays off / on env).
+fn managed_from(c: &ConfigsDto) -> Managed {
+    let vendor = |task: &str| -> VendorKey {
+        c.get(task)
+            .and_then(|w| pick_wire(w))
+            .map(|(_wire, base_url, api_key, model)| VendorKey { wire: String::new(), base_url, api_key, model })
+            .unwrap_or_default()
+    };
+    let llm = c
+        .get("text-generation")
+        .and_then(|w| pick_wire(w))
+        .map(|(_wire, base_url, api_key, model)| LlmCredentials { wire: String::new(), base_url, api_key, model })
+        .unwrap_or_default();
+    Managed {
+        llm,
+        stt: vendor("automatic-speech-recognition"),
+        tts: vendor("text-to-speech"),
+        vision: vendor("image-text-to-text"),
+        image: vendor("text-to-image"),
+        video: vendor("text-to-video"),
+    }
 }
 
 #[derive(Deserialize, Default)]
@@ -157,7 +232,7 @@ async fn fetch_configs(access: &str) -> anyhow::Result<Managed> {
         anyhow::bail!("configs {url} returned {status}: {}", resp.text().await.unwrap_or_default());
     }
     let c: ConfigsDto = resp.json().await.context("parsing configs")?;
-    Ok(Managed { llm: c.llm, stt: c.stt, tts: c.tts, vision: c.vision, image: c.image, video: c.video })
+    Ok(managed_from(&c))
 }
 
 /// GET /api/agent/energy — the user-facing balance (frequent poll).
