@@ -133,22 +133,19 @@ fn pick_wire(wires: &std::collections::HashMap<String, WireDto>) -> Option<(Stri
 /// Collapse the broker menu into the internal per-slot [`Managed`], selecting the
 /// best-quality model per task.
 ///
-/// URL handling differs by consumer. The LLM and the WebSocket vendors (STT/TTS)
-/// take the bare **origin**: the Claude CLI re-appends `/v1/messages`, and the volc
-/// adapters host-rebase their own paths — which already equal songguo's
-/// (`/api/v3/sauc/…`, `/api/v3/tts/…`) — onto it. The HTTP media vendors
-/// (vision/image/video) take the **full URL** verbatim, because songguo's paths
-/// (`/v1/responses`, `/v1/images/generations`, `/api/v3/contents/…`) differ from
-/// the vendors' native `/api/plan/v3/…` and can't be reached by host-rebase. Every
-/// slot keeps `wire` empty, so each capability uses its single default adapter.
+/// Our code uses the broker's **full URL** verbatim for every capability — that's
+/// the single source of truth for each endpoint. The one exception is the LLM: its
+/// URL is handed to the Claude CLI via `ANTHROPIC_BASE_URL`, and the CLI appends
+/// `/v1/messages` itself, so the LLM slot takes just the **origin**. Every slot
+/// keeps `wire` empty, so each capability uses its single default adapter.
 fn managed_from(c: &ConfigsDto) -> Managed {
     fn resolve(c: &ConfigsDto, task: &str, full: bool) -> Option<(String, String, Option<String>)> {
         c.get(task)
             .and_then(|w| pick_wire(w))
             .map(|(_wire, url, api_key, model)| (if full { url } else { origin_of(&url) }, api_key, model))
     }
-    let vendor = |task: &str, full: bool| -> VendorKey {
-        resolve(c, task, full)
+    let vendor = |task: &str| -> VendorKey {
+        resolve(c, task, true)
             .map(|(base_url, api_key, model)| VendorKey { wire: String::new(), base_url, api_key, model })
             .unwrap_or_default()
     };
@@ -157,11 +154,11 @@ fn managed_from(c: &ConfigsDto) -> Managed {
         .unwrap_or_default();
     Managed {
         llm,
-        stt: vendor("automatic-speech-recognition", false),
-        tts: vendor("text-to-speech", false),
-        vision: vendor("image-text-to-text", true),
-        image: vendor("text-to-image", true),
-        video: vendor("text-to-video", true),
+        stt: vendor("automatic-speech-recognition"),
+        tts: vendor("text-to-speech"),
+        vision: vendor("image-text-to-text"),
+        image: vendor("text-to-image"),
+        video: vendor("text-to-video"),
     }
 }
 

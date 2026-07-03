@@ -122,10 +122,12 @@ impl Config {
             .filter(|k| !k.is_empty())
             .ok_or_else(|| anyhow::anyhow!("TTS (volcengine) requires an API key"))?
             .to_string();
-        let mut endpoint = DEFAULT_ENDPOINT.to_string();
-        if let Some(base) = base_url.map(str::trim).filter(|b| !b.is_empty()) {
-            endpoint = super::rebase_host(&endpoint, base);
-        }
+        // The gateway (songguo) supplies the full `wss://` endpoint; use it verbatim.
+        // With no base_url (BYOK) fall back to the vendor's own endpoint.
+        let endpoint = match base_url.map(str::trim).filter(|b| !b.is_empty()) {
+            Some(base) => base.trim_end_matches('/').to_string(),
+            None => DEFAULT_ENDPOINT.to_string(),
+        };
         Ok(Self {
             api_key,
             resource_id: DEFAULT_RESOURCE_ID.to_string(),
