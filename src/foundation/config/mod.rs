@@ -79,6 +79,37 @@ pub const HEADER_SCENE: &str = "X-HI-Scene";
 pub const HEADER_ROLE: &str = "X-HI-Role";
 pub const HEADER_WORKER_ID: &str = "X-HI-Worker-Id";
 
+/// Models that serve a 1M-token context window. The ACP child (the Claude CLI)
+/// only requests the larger window when the model id carries a `[1m]` suffix;
+/// without it a session is capped at the 200K default. The suffix is a CLI-side
+/// convention — the CLI strips it before calling the gateway — so it is the
+/// child, never hi-agent, that talks to the vendor. We tag only ids we know serve
+/// 1M through the gateway; any BYOK / custom / unrecognized model is left bare,
+/// since requesting 1M from an endpoint that can't serve it would error.
+///
+/// Keep in sync when a new 1M model is offered. A missing entry only means that
+/// model runs at 200K (degraded, not broken); a wrong entry is the loud failure,
+/// so the set stays conservative — known 1M ids only.
+const ONE_M_MODELS: &[&str] = &[
+    "claude-fable-5",
+    "claude-opus-4-8",
+    "glm-5.2",
+    "deepseek-v4-pro",
+    "deepseek-v4-flash",
+];
+
+/// Apply the `[1m]` context-window suffix when `model` is a known 1M-capable id,
+/// otherwise return it unchanged. Idempotent: an id that already carries the
+/// suffix is normalized to its bare form and re-tagged at most once.
+fn with_context_window(model: &str) -> String {
+    let base = model.strip_suffix("[1m]").unwrap_or(model);
+    if ONE_M_MODELS.contains(&base) {
+        format!("{base}[1m]")
+    } else {
+        model.to_string()
+    }
+}
+
 /// Dev-managed cognition parameters. Everything comes from the environment
 /// (loaded from `.env` in dev); the upstream credential never lives in git.
 #[derive(Clone)]
@@ -202,7 +233,7 @@ impl AgentConfig {
             ("ANTHROPIC_AUTH_TOKEN".to_string(), self.upstream_key.clone()),
         ];
         if let Some(model) = &self.model {
-            env.push(("ANTHROPIC_MODEL".to_string(), model.clone()));
+            env.push(("ANTHROPIC_MODEL".to_string(), with_context_window(model)));
         }
         env
     }
@@ -378,7 +409,8 @@ mod tests {
         // Key rides AUTH_TOKEN (→ `Authorization: Bearer`), not API_KEY (→ x-api-key).
         assert_eq!(map["ANTHROPIC_AUTH_TOKEN"], "k");
         assert!(!map.contains_key("ANTHROPIC_API_KEY"));
-        assert_eq!(map["ANTHROPIC_MODEL"], "claude-opus-4-8");
+        // A known 1M model is tagged so the CLI requests the larger window.
+        assert_eq!(map["ANTHROPIC_MODEL"], "claude-opus-4-8[1m]");
     }
 
     #[test]
@@ -386,6 +418,20 @@ mod tests {
         let cfg = AgentConfig::new(None, None, None, "https://x/v1".to_string(), "k".to_string());
         let map: std::collections::HashMap<_, _> = cfg.auth_child_env().into_iter().collect();
         assert!(!map.contains_key("ANTHROPIC_MODEL"));
+    }
+
+    #[test]
+    fn context_window_tags_only_known_1m_models() {
+        // Known 1M ids get the suffix (Anthropic and non-Anthropic alike).
+        assert_eq!(with_context_window("claude-opus-4-8"), "claude-opus-4-8[1m]");
+        assert_eq!(with_context_window("deepseek-v4-pro"), "deepseek-v4-pro[1m]");
+        assert_eq!(with_context_window("glm-5.2"), "glm-5.2[1m]");
+        // Unlisted / BYOK / custom ids pass through untouched (tagging one would
+        // break an endpoint that can't serve 1M).
+        assert_eq!(with_context_window("claude-haiku-4-5"), "claude-haiku-4-5");
+        assert_eq!(with_context_window("gpt-4o"), "gpt-4o");
+        // Idempotent: an already-tagged id is not doubled.
+        assert_eq!(with_context_window("claude-opus-4-8[1m]"), "claude-opus-4-8[1m]");
     }
 
     #[test]
