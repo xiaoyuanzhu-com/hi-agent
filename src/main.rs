@@ -99,7 +99,94 @@ async fn provision(into: PathBuf) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// macOS: re-exec ourselves disclaiming TCC "responsibility" so the process is its
+/// own responsible party for camera/mic prompts.
+///
+/// When launched from a shell (e.g. `make dev` via cargo-watch), a process inherits
+/// the *terminal's* responsible process, so WebKit's `getUserMedia` gets attributed
+/// to the terminal — which has no camera/mic usage strings — and the request hangs
+/// with no prompt. A LaunchServices launch (a packaged `.app`) is already its own
+/// responsible process, so this is only needed for the shell path.
+///
+/// `POSIX_SPAWN_SETEXEC` replaces this image in place (same PID, same env/PATH — so
+/// `node`/`claude` on the dev PATH still resolve, and cargo-watch keeps tracking the
+/// process), and `responsibility_spawnattrs_setdisclaim` makes the replacement
+/// disclaim the inherited responsibility. Gated on `HI_AGENT_DISCLAIM` (set only by
+/// dev.sh); `HI_AGENT_DISCLAIMED` marks the re-exec'd image so it runs once. Purely
+/// best-effort: on any failure we fall through and run normally.
+#[cfg(target_os = "macos")]
+fn reexec_disclaiming_responsibility() {
+    use std::ffi::CString;
+    use std::os::unix::ffi::{OsStrExt, OsStringExt};
+
+    if std::env::var_os("HI_AGENT_DISCLAIM").is_none() {
+        return; // not requested (production / normal run)
+    }
+    if std::env::var_os("HI_AGENT_DISCLAIMED").is_some() {
+        return; // this is already the re-exec'd, disclaimed image
+    }
+
+    unsafe extern "C" {
+        fn responsibility_spawnattrs_setdisclaim(
+            attrs: *mut libc::posix_spawnattr_t,
+            disclaim: libc::c_int,
+        ) -> libc::c_int;
+    }
+
+    let Ok(exe) = std::env::current_exe() else { return };
+    let Ok(exe_c) = CString::new(exe.as_os_str().as_bytes()) else { return };
+
+    // argv unchanged; keep the CStrings alive until after posix_spawn.
+    let arg_cs: Vec<CString> = std::env::args_os()
+        .filter_map(|a| CString::new(a.as_bytes()).ok())
+        .collect();
+    let mut argv: Vec<*mut libc::c_char> =
+        arg_cs.iter().map(|c| c.as_ptr() as *mut libc::c_char).collect();
+    argv.push(std::ptr::null_mut());
+
+    // envp = current env + HI_AGENT_DISCLAIMED=1 so the replacement skips this.
+    let mut env_cs: Vec<CString> = std::env::vars_os()
+        .filter_map(|(k, v)| {
+            let mut kv = k.into_vec();
+            kv.push(b'=');
+            kv.extend_from_slice(v.as_bytes());
+            CString::new(kv).ok()
+        })
+        .collect();
+    env_cs.push(CString::new("HI_AGENT_DISCLAIMED=1").expect("static literal"));
+    let mut envp: Vec<*mut libc::c_char> =
+        env_cs.iter().map(|c| c.as_ptr() as *mut libc::c_char).collect();
+    envp.push(std::ptr::null_mut());
+
+    // SAFETY: standard posix_spawn FFI; the argv/envp CString backing vectors outlive
+    // the call. With SETEXEC a successful spawn replaces this image and never returns.
+    unsafe {
+        let mut attr: libc::posix_spawnattr_t = std::mem::zeroed();
+        if libc::posix_spawnattr_init(&mut attr) != 0 {
+            return;
+        }
+        libc::posix_spawnattr_setflags(&mut attr, libc::POSIX_SPAWN_SETEXEC as libc::c_short);
+        responsibility_spawnattrs_setdisclaim(&mut attr, 1);
+        let mut pid: libc::pid_t = 0;
+        libc::posix_spawn(
+            &mut pid,
+            exe_c.as_ptr(),
+            std::ptr::null(),
+            &attr,
+            argv.as_ptr(),
+            envp.as_ptr(),
+        );
+        // Only reached if the spawn failed — run on without the disclaim.
+        libc::posix_spawnattr_destroy(&mut attr);
+    }
+}
+
 fn main() -> anyhow::Result<()> {
+    // Before anything else: on the dev shell path, become our own TCC responsible
+    // process so the face window's camera/mic actually prompt (no-op elsewhere).
+    #[cfg(target_os = "macos")]
+    reexec_disclaiming_responsibility();
+
     let _ = dotenvy::dotenv();
 
     let cli = Cli::parse();

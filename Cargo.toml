@@ -95,6 +95,10 @@ rusqlite = { version = "0.32", features = ["bundled"] }
 [target.'cfg(target_os = "macos")'.dependencies]
 core-graphics = "0.24"
 core-foundation = "0.10"
+# posix_spawn + the private responsibility_spawnattrs_setdisclaim, used by main() to
+# re-exec ourselves as our own TCC "responsible process" under `make dev` (see the
+# reexec_disclaiming_responsibility comment in src/main.rs).
+libc = "0.2"
 
 # macOS menu-bar (tray) status item — see `crate::vendors::macos_tray`. The tray
 # needs an Objective-C action target for the menu clicks, so this uses the modern

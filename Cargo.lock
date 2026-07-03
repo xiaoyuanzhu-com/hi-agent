@@ -1786,6 +1786,7 @@ dependencies = [
  "futures",
  "image",
  "knf-rs",
+ "libc",
  "nalgebra",
  "ndarray 0.16.1",
  "objc2",

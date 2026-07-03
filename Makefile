@@ -1,4 +1,4 @@
-.PHONY: help build dev run test docker dmg exe installer bump-version
+.PHONY: help build dev run test docker dmg app exe installer bump-version
 
 # Windows target for the `exe` build check. MSVC (not gnu) because `ort`'s
 # prebuilt ONNX Runtime ships for MSVC only.
@@ -30,6 +30,9 @@ docker: ## build the docker image
 
 dmg: ## build a hermetic Hi Agent.app + styled .dmg (Apple Silicon macOS only)
 	./scripts/make-dmg.sh
+
+app: ## wrap the dev binary in a minimal ad-hoc-signed Hi Agent.app for local mic/camera testing (macOS)
+	./scripts/make-app.sh
 
 # `make exe` is a Windows *build check*: it cross-compiles the binary from a
 # mac/linux host (proving the Windows code paths compile + link) without running
