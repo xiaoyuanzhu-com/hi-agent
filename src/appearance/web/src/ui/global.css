@@ -12,24 +12,61 @@
  * `--presence-*` tokens at runtime).
  */
 
+/* ── Theme: "Paper & Ink" ─────────────────────────────────────────────────
+   A warm, matte, static skin — warm cream paper in light, espresso in dark.
+   No colour lives in the background any more; the whole surface is themed from
+   the tokens below. The only colour is the accent (terracotta / amber) and a
+   *very* faint state-glow the presence layer breathes into the paper.
+
+   Light is the default (`:root`); dark applies automatically when the OS asks
+   for it, and either can be forced with `<html data-theme="light|dark">`. To
+   re-skin the whole face, swap these token blocks alone — nothing downstream
+   hardcodes a colour. */
 :root {
-  /* neutral white paper — light, clean; colour lives only in the state halos */
-  --bg-0: #f6f8fb;
-  --bg-1: #eef1f6;
+  /* warm paper */
+  --bg-0: #f4ede0;
+  --bg-1: #ece2d1;
 
-  --fg: #25282e;
-  --fg-dim: #5d646f;
-  --fg-mute: #99a0ac;
+  --fg: #3a352c;      /* ink */
+  --fg-dim: #6b6354;
+  --fg-mute: #9a9284;
 
-  /* calm chrome accent (used by wake dot, user text, history tag) */
-  --accent: #5b87c8;
-  --accent-2: #8a7fd0;
+  /* accent = terracotta; secondary = sage (wake dot, user text, history tag) */
+  --accent: #c06a3f;
+  --accent-2: #7a8c6a;
+  --accent-soft: rgba(192, 106, 63, 0.22); /* focus rings / on-state tint */
+  --accent-line: rgba(192, 106, 63, 0.45);
+  --accent-wash: rgba(192, 106, 63, 0.06); /* faint fills (history item) */
 
-  /* The halo colours are a curated "tech" spectrum defined in Presence.tsx
-     (see the PALETTE constant) — edit there, not here. */
+  --line: rgba(58, 53, 44, 0.12);
+  --line-strong: rgba(58, 53, 44, 0.22);
 
-  --line: rgba(48, 60, 84, 0.12);
-  --line-strong: rgba(48, 60, 84, 0.24);
+  /* floating surfaces (cards, pills, controls) over the paper */
+  --surface: rgba(255, 253, 248, 0.72);
+  --surface-strong: rgba(255, 253, 248, 0.9);
+  --surface-border: rgba(58, 53, 44, 0.12);
+  --scrim: rgba(244, 237, 224, 0.6);       /* wake veil */
+  --shadow: rgba(58, 53, 44, 0.14);
+  --shadow-strong: rgba(58, 53, 44, 0.2);
+
+  --sentence-halo: rgba(255, 251, 244, 0.9); /* text legibility on paper */
+
+  /* dark scrim pills for captions over a view — legible in both modes */
+  --caption-bg: rgba(46, 41, 33, 0.6);
+  --caption-fg: rgba(255, 252, 246, 0.96);
+  --caption-user: #d98a5c;
+
+  --selection: rgba(192, 106, 63, 0.22);
+  --selfview-veil: rgba(244, 237, 224, 0.34);
+
+  /* presence state-glow — the whisper of colour the paper breathes by state.
+     idle is essentially none; the others warm the room a touch. */
+  --glow-idle: rgba(122, 140, 106, 0);
+  --glow-listening: rgba(122, 140, 106, 0.5); /* sage — human has the floor */
+  --glow-thinking: rgba(201, 144, 63, 0.5);   /* amber — cognition */
+  --glow-speaking: rgba(192, 106, 63, 0.55);  /* terracotta — agent voice */
+  --glow-offline: rgba(154, 146, 132, 0.35);
+  --glow-waking: rgba(192, 106, 63, 0.3);
 
   --font-display:
     "Geist", "Inter", -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto,
@@ -39,6 +76,96 @@
     "SF Mono", Menlo, Consolas, monospace;
 
   --ease: cubic-bezier(0.22, 0.7, 0.2, 1);
+}
+
+/* Dark "espresso" — applied when the OS prefers dark (unless forced light),
+   or explicitly via <html data-theme="dark">. Only the colour tokens change. */
+@media (prefers-color-scheme: dark) {
+  :root:not([data-theme="light"]) {
+    --bg-0: #232019;
+    --bg-1: #2b2720;
+
+    --fg: #e8dfce;
+    --fg-dim: #b3a894;
+    --fg-mute: #7d7361;
+
+    --accent: #e0975a;   /* warm amber */
+    --accent-2: #c9a06a;
+    --accent-soft: rgba(224, 151, 90, 0.24);
+    --accent-line: rgba(224, 151, 90, 0.5);
+    --accent-wash: rgba(224, 151, 90, 0.08);
+
+    --line: rgba(232, 223, 206, 0.12);
+    --line-strong: rgba(232, 223, 206, 0.22);
+
+    --surface: rgba(58, 52, 42, 0.55);
+    --surface-strong: rgba(52, 47, 38, 0.82);
+    --surface-border: rgba(232, 223, 206, 0.12);
+    --scrim: rgba(20, 18, 14, 0.55);
+    --shadow: rgba(0, 0, 0, 0.4);
+    --shadow-strong: rgba(0, 0, 0, 0.5);
+
+    --sentence-halo: rgba(10, 8, 5, 0.45);
+
+    --caption-bg: rgba(10, 8, 5, 0.55);
+    --caption-fg: rgba(255, 252, 246, 0.96);
+    --caption-user: #e0975a;
+
+    --selection: rgba(224, 151, 90, 0.28);
+    --selfview-veil: rgba(20, 18, 14, 0.4);
+
+    /* light-on-dark glows read far stronger — keep them a whisper */
+    --glow-idle: rgba(201, 160, 106, 0);
+    --glow-listening: rgba(160, 178, 150, 0.16);
+    --glow-thinking: rgba(224, 180, 120, 0.16);
+    --glow-speaking: rgba(224, 151, 90, 0.2);
+    --glow-offline: rgba(125, 115, 97, 0.14);
+    --glow-waking: rgba(224, 151, 90, 0.12);
+  }
+}
+
+/* Explicit override wins over the OS preference in both directions. The forced
+   light values are already the `:root` defaults; this block carries forced dark
+   so it applies even when the OS is in light mode. */
+:root[data-theme="dark"] {
+  --bg-0: #232019;
+  --bg-1: #2b2720;
+  --fg: #e8dfce;
+  --fg-dim: #b3a894;
+  --fg-mute: #7d7361;
+  --accent: #e0975a;
+  --accent-2: #c9a06a;
+  --accent-soft: rgba(224, 151, 90, 0.24);
+  --accent-line: rgba(224, 151, 90, 0.5);
+  --accent-wash: rgba(224, 151, 90, 0.08);
+  --line: rgba(232, 223, 206, 0.12);
+  --line-strong: rgba(232, 223, 206, 0.22);
+  --surface: rgba(58, 52, 42, 0.55);
+  --surface-strong: rgba(52, 47, 38, 0.82);
+  --surface-border: rgba(232, 223, 206, 0.12);
+  --scrim: rgba(20, 18, 14, 0.55);
+  --shadow: rgba(0, 0, 0, 0.4);
+  --shadow-strong: rgba(0, 0, 0, 0.5);
+  --sentence-halo: rgba(10, 8, 5, 0.45);
+  --caption-bg: rgba(10, 8, 5, 0.55);
+  --caption-fg: rgba(255, 252, 246, 0.96);
+  --caption-user: #e0975a;
+  --selection: rgba(224, 151, 90, 0.28);
+  --selfview-veil: rgba(20, 18, 14, 0.4);
+  --glow-idle: rgba(201, 160, 106, 0);
+  --glow-listening: rgba(160, 178, 150, 0.16);
+  --glow-thinking: rgba(224, 180, 120, 0.16);
+  --glow-speaking: rgba(224, 151, 90, 0.2);
+  --glow-offline: rgba(125, 115, 97, 0.14);
+  --glow-waking: rgba(224, 151, 90, 0.12);
+}
+
+/* Cross-fade the state-glow colour on state change (needs @property to animate a
+   custom-prop colour). Registered once here. */
+@property --glow {
+  syntax: "<color>";
+  inherits: false;
+  initial-value: transparent;
 }
 
 * {
@@ -59,6 +186,14 @@ body,
 html {
   color-scheme: light;
 }
+@media (prefers-color-scheme: dark) {
+  html:not([data-theme="light"]) {
+    color-scheme: dark;
+  }
+}
+html[data-theme="dark"] {
+  color-scheme: dark;
+}
 
 body {
   font-family: var(--font-display);
@@ -75,7 +210,7 @@ body {
 }
 
 ::selection {
-  background: rgba(91, 135, 200, 0.24);
+  background: var(--selection);
   color: var(--fg);
 }
 
@@ -96,7 +231,10 @@ button {
   isolation: isolate;
 }
 
-/* --- Presence (background field) -------------------------------------- */
+/* --- Presence (themed background) ------------------------------------
+   The paper itself: a soft warm gradient from the theme tokens, with a single
+   very faint state-glow breathing into it (colour set by data-state below). No
+   canvas, no audio — a calm, matte, static skin. */
 .hi-presence {
   position: absolute;
   inset: 0;
@@ -104,27 +242,44 @@ button {
   width: 100%;
   height: 100%;
   display: block;
+  background: radial-gradient(140% 120% at 50% 0%, var(--bg-1), var(--bg-0) 62%);
 }
 
-/* --- Atmosphere (frosted glass + grain over the field) ---------------- */
+/* The whisper of colour: three soft pools in the current state's glow hue,
+   breathing slowly. `--glow` cross-fades on state change (@property, above);
+   `--presence` (set inline from `demote`) recedes it when a surface is up. */
+.hi-presence-glow {
+  position: absolute;
+  inset: 0;
+  --glow: var(--glow-idle);
+  background:
+    radial-gradient(52% 55% at 18% 22%, var(--glow), transparent 70%),
+    radial-gradient(55% 55% at 84% 30%, var(--glow), transparent 72%),
+    radial-gradient(60% 60% at 60% 94%, var(--glow), transparent 74%);
+  opacity: var(--presence, 1);
+  transition: --glow 1200ms var(--ease);
+  animation: hi-breathe 9s ease-in-out infinite;
+  will-change: opacity;
+}
+.hi-presence[data-state="idle"] .hi-presence-glow { --glow: var(--glow-idle); }
+.hi-presence[data-state="listening"] .hi-presence-glow { --glow: var(--glow-listening); }
+.hi-presence[data-state="thinking"] .hi-presence-glow { --glow: var(--glow-thinking); }
+.hi-presence[data-state="speaking"] .hi-presence-glow { --glow: var(--glow-speaking); }
+.hi-presence[data-state="offline"] .hi-presence-glow { --glow: var(--glow-offline); }
+.hi-presence[data-state="waking"] .hi-presence-glow { --glow: var(--glow-waking); }
+
+@keyframes hi-breathe {
+  0%, 100% { opacity: calc(var(--presence, 1) * 0.62); }
+  50%      { opacity: calc(var(--presence, 1) * 1); }
+}
+
+/* --- Atmosphere (grain over the paper) -------------------------------- */
 .hi-atmosphere {
   position: absolute;
   inset: 0;
   z-index: 1;
   overflow: hidden;
   pointer-events: none;
-}
-
-/* Frosted white sheet: blurs the colour-pools on the canvas behind it so they
-   bloom as soft light *through* glass. A neutral-white veil keeps the whole
-   surface clean and bright; the only colour is the state halos showing through.
-   Tune the white alpha (frostiness) and blur radius to taste. */
-.hi-glass {
-  position: absolute;
-  inset: 0;
-  background: rgba(255, 255, 255, 0.4);
-  backdrop-filter: blur(50px) saturate(1.7);
-  -webkit-backdrop-filter: blur(50px) saturate(1.7);
 }
 
 .hi-atmo-grain {
@@ -165,8 +320,8 @@ button {
   color: var(--fg);
   text-wrap: balance;
   text-shadow:
-    0 0 24px rgba(255, 255, 255, 0.92),
-    0 2px 30px rgba(255, 255, 255, 0.75);
+    0 0 24px var(--sentence-halo),
+    0 2px 30px var(--sentence-halo);
   transition:
     opacity 600ms var(--ease),
     transform 600ms var(--ease),
@@ -184,7 +339,7 @@ button {
    lighter, slightly smaller, accented treatment. */
 .hi-sentence--user {
   font-size: clamp(15px, 2.1vw, 36px);
-  color: var(--accent, #5b87c8);
+  color: var(--accent, #c06a3f);
   font-weight: 400;
 }
 
@@ -215,21 +370,21 @@ button {
 .hi-stage--captions .hi-sentence {
   padding: 7px 16px;
   border-radius: 14px;
-  background: rgba(17, 21, 28, 0.55);
+  background: var(--caption-bg);
   backdrop-filter: blur(10px);
   -webkit-backdrop-filter: blur(10px);
-  color: rgba(255, 255, 255, 0.96);
+  color: var(--caption-fg);
   text-shadow: none;
   font-size: clamp(15px, 2vw, 38px);
 }
 
 .hi-stage--captions .hi-sentence--prev {
   opacity: 0.45;
-  color: rgba(255, 255, 255, 0.85);
+  color: var(--caption-fg);
 }
 
 .hi-stage--captions .hi-sentence--user {
-  color: #b9d2f4;
+  color: var(--caption-user);
 }
 
 /* Caption dock side follows the region the floor placed the words in — the edge
@@ -346,13 +501,13 @@ button {
   max-height: 100%;
   overflow: auto;
   color: var(--fg);
-  /* The default surface — a light card legible over the frosted-white stage.
-     This is the floor; a view can still paint its own on top. */
+  /* The default surface — a warm card legible over the paper. This is the
+     floor; a view can still paint its own on top. */
   padding: 24px;
   border-radius: 24px;
-  background: rgba(255, 255, 255, 0.86);
-  border: 1px solid rgba(255, 255, 255, 0.7);
-  box-shadow: 0 18px 60px rgba(17, 21, 28, 0.18);
+  background: var(--surface-strong);
+  border: 1px solid var(--surface-border);
+  box-shadow: 0 18px 60px var(--shadow-strong);
   backdrop-filter: blur(14px) saturate(1.4);
   -webkit-backdrop-filter: blur(14px) saturate(1.4);
 }
@@ -385,7 +540,7 @@ button {
   align-items: center;
   justify-content: center;
   gap: 22px;
-  background: rgba(255, 255, 255, 0.6);
+  background: var(--scrim);
   backdrop-filter: blur(6px);
   -webkit-backdrop-filter: blur(6px);
 }
@@ -450,7 +605,7 @@ button {
   padding: 12px 18px;
   border-radius: 999px;
   border: 1px solid var(--line-strong);
-  background: rgba(255, 255, 255, 0.8);
+  background: var(--surface);
   backdrop-filter: blur(12px);
   -webkit-backdrop-filter: blur(12px);
   color: var(--fg);
@@ -458,13 +613,13 @@ button {
   font-size: 14px;
   letter-spacing: 0.01em;
   outline: none;
-  box-shadow: 0 8px 34px rgba(40, 52, 74, 0.14);
+  box-shadow: 0 8px 34px var(--shadow);
   transition: border-color 200ms var(--ease), box-shadow 200ms var(--ease);
 }
 
 .hi-kbd input:focus {
-  border-color: rgba(91, 135, 200, 0.5);
-  box-shadow: 0 0 0 1px rgba(91, 135, 200, 0.28), 0 8px 34px rgba(40, 52, 74, 0.14);
+  border-color: var(--accent-line);
+  box-shadow: 0 0 0 1px var(--accent-soft), 0 8px 34px var(--shadow);
 }
 
 .hi-kbd input::placeholder {
@@ -490,11 +645,11 @@ button {
   height: 38px;
   border-radius: 50%;
   border: 1px solid var(--line);
-  background: rgba(255, 255, 255, 0.7);
+  background: var(--surface);
   backdrop-filter: blur(12px);
   -webkit-backdrop-filter: blur(12px);
   color: var(--fg-mute);
-  box-shadow: 0 6px 22px rgba(40, 52, 74, 0.1);
+  box-shadow: 0 6px 22px var(--shadow);
   transition: color 200ms var(--ease), border-color 200ms var(--ease),
     box-shadow 200ms var(--ease);
 }
@@ -505,8 +660,8 @@ button {
 
 .hi-channel.is-on {
   color: var(--accent);
-  border-color: rgba(91, 135, 200, 0.45);
-  box-shadow: 0 0 0 1px rgba(91, 135, 200, 0.22), 0 6px 22px rgba(40, 52, 74, 0.1);
+  border-color: var(--accent-line);
+  box-shadow: 0 0 0 1px var(--accent-soft), 0 6px 22px var(--shadow);
 }
 
 /* --- Camera self-view -------------------------------------------------
@@ -542,8 +697,8 @@ button {
   inset: 0;
   background: radial-gradient(
     120% 120% at 50% 30%,
-    rgba(246, 248, 251, 0) 42%,
-    rgba(246, 248, 251, 0.34)
+    transparent 42%,
+    var(--selfview-veil)
   );
 }
 
@@ -597,7 +752,7 @@ button {
   letter-spacing: 0.22em;
   text-transform: uppercase;
   color: var(--fg-mute);
-  background: rgba(255, 255, 255, 0.72);
+  background: var(--surface);
   backdrop-filter: blur(10px);
   -webkit-backdrop-filter: blur(10px);
   border: 1px solid var(--line);
@@ -619,7 +774,7 @@ button {
   display: flex;
   flex-direction: column;
   gap: 6px;
-  background: rgba(255, 255, 255, 0.8);
+  background: var(--surface-strong);
   backdrop-filter: blur(14px);
   -webkit-backdrop-filter: blur(14px);
   border: 1px solid var(--line);
@@ -634,7 +789,7 @@ button {
   border-radius: 8px;
   color: var(--fg-dim);
   border: 1px solid var(--line);
-  background: rgba(91, 135, 200, 0.05);
+  background: var(--accent-wash);
   transition: color 160ms var(--ease), border-color 160ms var(--ease);
 }
 .hi-history-item:hover {

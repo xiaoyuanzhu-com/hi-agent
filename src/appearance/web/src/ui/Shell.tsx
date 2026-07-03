@@ -57,13 +57,7 @@ export function Shell() {
   return (
     <div className="hi-root">
       <Atmosphere />
-      <Presence
-        bus={presence.bus}
-        state={presence.state}
-        reactive={presence.reactive}
-        activity={presence.activity}
-        demote={demote}
-      />
+      <Presence state={presence.state} demote={demote} />
 
       {/* PINNED participant — mounted once, here, across every layout. The layout
           only flips `pip` (fullscreen backdrop ↔ corner thumbnail); the same

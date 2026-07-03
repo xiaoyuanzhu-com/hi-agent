@@ -15,9 +15,11 @@
 //!
 //! **Themed, centered title bar.** The native titlebar is made transparent and its text
 //! hidden; with `FullSizeContentView` the content view spans under it, so the window's
-//! background color paints a flat bar (white for now — the single knob to recolor once
-//! the face has a theme) and a centered `NSTextField` stands in for the title, clearing
-//! the traffic lights on the left. The web view is inset below the bar strip.
+//! background color paints a flat bar. That bar and the centered `NSTextField` title are
+//! tinted to the face's "Paper & Ink" theme — warm paper/ink in light, espresso/ivory in
+//! dark, following the OS appearance so the native chrome matches the web content below
+//! (see [`apply_face_theme`]). The label clears the traffic lights on the left, and the
+//! web view is inset below the bar strip.
 //!
 //! Media permission mirrors the popover: a [`MediaGrant`] `WKUIDelegate` auto-grants
 //! the page's mic/camera so WebKit never shows its per-site *page-level* prompt. That is
@@ -43,7 +45,9 @@ use objc2_app_kit::{
     NSApplication, NSAutoresizingMaskOptions, NSBackingStoreType, NSColor, NSTextAlignment,
     NSTextField, NSView, NSWindow, NSWindowStyleMask, NSWindowTitleVisibility,
 };
-use objc2_foundation::{MainThreadMarker, NSPoint, NSRect, NSSize, NSString, NSURL, NSURLRequest};
+use objc2_foundation::{
+    MainThreadMarker, NSPoint, NSRect, NSSize, NSString, NSURL, NSURLRequest, NSUserDefaults,
+};
 use objc2_web_kit::{
     WKFrameInfo, WKMediaCaptureType, WKPermissionDecision, WKSecurityOrigin, WKUIDelegate,
     WKWebView, WKWebViewConfiguration,
@@ -59,6 +63,47 @@ const BAR_H: f64 = 28.0;
 /// Height of the centered title label; kept near the font's line height and centered
 /// vertically within [`BAR_H`].
 const LABEL_H: f64 = 18.0;
+
+// ---------------------------------------------------------------------------
+// Title-bar theme — match the face's "Paper & Ink" skin so the native bar reads
+// as one surface with the web content below it.
+// ---------------------------------------------------------------------------
+
+/// Whether the OS is in dark mode. The face themes via `prefers-color-scheme`
+/// (i.e. the OS appearance), so reading the same signal here keeps the native
+/// bar in step with the web content. Reads the global `AppleInterfaceStyle`
+/// default — `"Dark"` in dark mode, absent in light; we set no per-window
+/// appearance, so this is the effective appearance for our window too.
+fn os_is_dark() -> bool {
+    unsafe {
+        let defaults = NSUserDefaults::standardUserDefaults();
+        defaults
+            .stringForKey(&NSString::from_str("AppleInterfaceStyle"))
+            .is_some_and(|s| s.to_string().eq_ignore_ascii_case("dark"))
+    }
+}
+
+/// An sRGB colour (opaque) — matches how the web tokens are authored (hex/sRGB).
+fn srgb(r: f64, g: f64, b: f64) -> Retained<NSColor> {
+    unsafe { NSColor::colorWithSRGBRed_green_blue_alpha(r, g, b, 1.0) }
+}
+
+/// Paint the bar background + centered title to the current theme's paper/ink.
+/// These are the same values as the `--bg-0` / `--fg` tokens in `ui/global.css`
+/// (light: warm paper `#f4ede0` on ink `#3a352c`; dark: espresso `#232019` on
+/// ivory `#e8dfce`). Called at install and again on each open so a light/dark
+/// switch since the last open is picked up.
+fn apply_face_theme(window: &NSWindow, label: &NSTextField) {
+    let (bg, fg) = if os_is_dark() {
+        (srgb(0.137, 0.125, 0.098), srgb(0.910, 0.875, 0.808))
+    } else {
+        (srgb(0.957, 0.929, 0.878), srgb(0.227, 0.208, 0.173))
+    };
+    unsafe {
+        window.setBackgroundColor(Some(&bg));
+        label.setTextColor(Some(&fg));
+    }
+}
 
 // ---------------------------------------------------------------------------
 // Media-permission delegate — auto-grant so WebKit never prompts per-site
@@ -123,6 +168,8 @@ struct Ivars {
     /// install, possibly before the server bound its listener) never committed.
     webview: Retained<WKWebView>,
     request: Retained<NSURLRequest>,
+    /// The centered title label — kept so the bar theme can be re-applied on reopen.
+    label: Retained<NSTextField>,
 }
 
 define_class!(
@@ -152,6 +199,9 @@ impl Host {
         let mtm = MainThreadMarker::new().expect("window host runs on the main thread");
         let iv = self.ivars();
         let app = NSApplication::sharedApplication(mtm);
+        // Re-match the bar to the OS appearance in case dark/light toggled since the
+        // last open (the window is reused, not rebuilt).
+        apply_face_theme(&iv.window, &iv.label);
         // SAFETY: main-thread AppKit calls. `activateIgnoringOtherApps:` is the pre-Sonoma
         // activation call but still works; the window then becomes key so its web view's
         // input can take keystrokes despite the Accessory activation policy.
@@ -241,9 +291,6 @@ pub fn install(mtm: MainThreadMarker, url: &str) {
         ];
         window.setTitlebarAppearsTransparent(true);
         window.setTitleVisibility(NSWindowTitleVisibility::Hidden);
-        // The bar/background tint. White until the face grows a theme; this is the single
-        // knob to recolor the bar to match it.
-        window.setBackgroundColor(Some(&NSColor::whiteColor()));
         // Don't free the window when its close button dismisses it; we keep it around
         // and reopen the same one on the next tray click.
         let _: () = msg_send![&*window, setReleasedWhenClosed: false];
@@ -254,7 +301,6 @@ pub fn install(mtm: MainThreadMarker, url: &str) {
         let label = NSTextField::labelWithString(&NSString::from_str("Hi Agent"), mtm);
         // NSTextAlignmentCenter (1) — omitted from the generated bindings, so spelled out.
         label.setAlignment(NSTextAlignment(1));
-        label.setTextColor(Some(&NSColor::blackColor()));
         label.setFrame(NSRect::new(
             NSPoint::new(0.0, WINDOW_H - BAR_H + (BAR_H - LABEL_H) / 2.0),
             NSSize::new(WINDOW_W, LABEL_H),
@@ -264,17 +310,20 @@ pub fn install(mtm: MainThreadMarker, url: &str) {
             NSAutoresizingMaskOptions::ViewWidthSizable | NSAutoresizingMaskOptions::ViewMinYMargin,
         );
 
+        // Paint the bar + title to the face's theme (paper/ink, following the OS
+        // light/dark appearance) so the native chrome matches the web content.
+        apply_face_theme(&window, &label);
+
         // Content view: the web view below, the title label floating in the bar strip.
         let container = NSView::initWithFrame(NSView::alloc(mtm), full);
         container.addSubview(&webview);
         container.addSubview(&label);
         let _: () = msg_send![&*window, setContentView: &*container];
-        std::mem::forget(label);
         std::mem::forget(container);
 
-        // The host owns the window, web view, and request for the process lifetime (the
-        // ivars keep them alive; the host itself is leaked below).
-        let host = Host::alloc(mtm).set_ivars(Ivars { window, webview, request });
+        // The host owns the window, web view, request, and title label for the process
+        // lifetime (the ivars keep them alive; the host itself is leaked below).
+        let host = Host::alloc(mtm).set_ivars(Ivars { window, webview, request, label });
         let host: Retained<Host> = msg_send![super(host), init];
         let ptr: *const Host = &*host;
         std::mem::forget(host);
