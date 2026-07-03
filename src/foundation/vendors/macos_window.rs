@@ -75,17 +75,15 @@ const LABEL_H: f64 = 18.0;
 /// default — `"Dark"` in dark mode, absent in light; we set no per-window
 /// appearance, so this is the effective appearance for our window too.
 fn os_is_dark() -> bool {
-    unsafe {
-        let defaults = NSUserDefaults::standardUserDefaults();
-        defaults
-            .stringForKey(&NSString::from_str("AppleInterfaceStyle"))
-            .is_some_and(|s| s.to_string().eq_ignore_ascii_case("dark"))
-    }
+    let defaults = NSUserDefaults::standardUserDefaults();
+    defaults
+        .stringForKey(&NSString::from_str("AppleInterfaceStyle"))
+        .is_some_and(|s| s.to_string().eq_ignore_ascii_case("dark"))
 }
 
 /// An sRGB colour (opaque) — matches how the web tokens are authored (hex/sRGB).
 fn srgb(r: f64, g: f64, b: f64) -> Retained<NSColor> {
-    unsafe { NSColor::colorWithSRGBRed_green_blue_alpha(r, g, b, 1.0) }
+    NSColor::colorWithSRGBRed_green_blue_alpha(r, g, b, 1.0)
 }
 
 /// Paint the bar background + centered title to the current theme's paper/ink.
@@ -99,10 +97,8 @@ fn apply_face_theme(window: &NSWindow, label: &NSTextField) {
     } else {
         (srgb(0.957, 0.929, 0.878), srgb(0.227, 0.208, 0.173))
     };
-    unsafe {
-        window.setBackgroundColor(Some(&bg));
-        label.setTextColor(Some(&fg));
-    }
+    window.setBackgroundColor(Some(&bg));
+    label.setTextColor(Some(&fg));
 }
 
 // ---------------------------------------------------------------------------
