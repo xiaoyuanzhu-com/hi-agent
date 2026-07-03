@@ -87,15 +87,19 @@ fn srgb(r: f64, g: f64, b: f64) -> Retained<NSColor> {
 }
 
 /// Paint the bar background + centered title to the current theme's paper/ink.
-/// These are the same values as the `--bg-0` / `--fg` tokens in `ui/global.css`
-/// (light: warm paper `#f4ede0` on ink `#3a352c`; dark: espresso `#232019` on
-/// ivory `#e8dfce`). Called at install and again on each open so a light/dark
-/// switch since the last open is picked up.
+/// The bar is matched to `--bg-1`, not `--bg-0`: the face's visible background
+/// is the `.hi-presence` radial gradient centered at the top edge — `--bg-1` at
+/// `50% 0%` fading to `--bg-0` at 62% — so the strip of web content directly
+/// under the title bar is `--bg-1`. Painting the bar `--bg-1` (light warm paper
+/// `#ece2d1`, dark espresso `#2b2720`) makes the native chrome read as one
+/// surface with the content where they actually meet. The title uses `--fg`
+/// (light ink `#3a352c`, dark ivory `#e8dfce`). Called at install and again on
+/// each open so a light/dark switch since the last open is picked up.
 fn apply_face_theme(window: &NSWindow, label: &NSTextField) {
     let (bg, fg) = if os_is_dark() {
-        (srgb(0.137, 0.125, 0.098), srgb(0.910, 0.875, 0.808))
+        (srgb(0.169, 0.153, 0.125), srgb(0.910, 0.875, 0.808))
     } else {
-        (srgb(0.957, 0.929, 0.878), srgb(0.227, 0.208, 0.173))
+        (srgb(0.925, 0.886, 0.820), srgb(0.227, 0.208, 0.173))
     };
     window.setBackgroundColor(Some(&bg));
     label.setTextColor(Some(&fg));
