@@ -87,6 +87,22 @@ const DEFAULT_PREFS: ChannelPrefs = {
   audioOutput: true,
 };
 
+// True only when the browser can confirm a device permission is already granted,
+// so a saved-on channel can be restored *silently* — no prompt, no gesture. A
+// "prompt"/"denied" state, or a browser that can't answer the query (older
+// Safari / Firefox), both read as "can't restore silently": the channel stays
+// off and a click re-requests it.
+async function permissionGranted(name: "microphone" | "camera"): Promise<boolean> {
+  const perms = navigator.permissions;
+  if (!perms?.query) return false;
+  try {
+    const status = await perms.query({ name: name as PermissionName });
+    return status.state === "granted";
+  } catch {
+    return false;
+  }
+}
+
 function loadPrefs(): ChannelPrefs {
   try {
     const raw = localStorage.getItem(PREFS_KEY);
@@ -110,9 +126,8 @@ export interface AgentSession {
   /** Live cognition cadence (streamed-chunk pulses) the field reacts to. */
   activity: ActivityMeter;
   sentences: SpeechItem[];
+  /** Whether the session's output graph is up (auto-started on mount). */
   woken: boolean;
-  waking: boolean;
-  wakeError: string | null;
   /** Whether the mic (audio input) channel is currently live. */
   audioInput: boolean;
   /** Surfaced if turning the audio channel on failed (denied / no device). */
@@ -127,10 +142,6 @@ export interface AgentSession {
   audioOutput: boolean;
   /** Whether the text input channel is on (the input line is shown). */
   textInput: boolean;
-  /** Begin the session with the audio channel on (the default tap). */
-  wake: () => void;
-  /** Begin the session text-only — no mic prompt; audio can be toggled on later. */
-  startTextOnly: () => void;
   /** Flip the audio-input channel on/off independently of the others. */
   toggleAudio: () => void;
   /** Flip the vision-input channel on/off independently of the others. */
@@ -173,8 +184,6 @@ export function useAgentSession(): AgentSession {
   }, []);
 
   const [woken, setWoken] = useState(false);
-  const [waking, setWaking] = useState(false);
-  const [wakeError, setWakeError] = useState<string | null>(null);
   const [bus, setBus] = useState<AudioBus | null>(null);
   const [sentences, setSentences] = useState<SpeechItem[]>([]);
 
@@ -609,91 +618,63 @@ export function useAgentSession(): AgentSession {
     [persistPrefs],
   );
 
-  // ---- start the session: build the output graph (no mic required) -------
-  // A single user gesture is the one unavoidable interaction — browsers need it
-  // to unlock audio *playback*. The mic is a separate, optional channel layered
-  // on top via enableAudio(), so the session (and the text channel) work even
-  // when audio can't be used at all.
-  const startSession = useCallback(
-    (opts?: { textOnly?: boolean }) => {
-      if (woken || waking) return;
-      setWaking(true);
-      setWakeError(null);
-      void (async () => {
-        try {
-          const audioBus = new AudioBus();
-          await audioBus.resume();
-          // Autoplay policy: on an auto-start with no gesture this page load the
-          // context can stay suspended — which mutes TTS. Resume on the first
-          // incidental interaction so audio unlocks without a dedicated tap.
-          if (audioBus.ctx.state !== "running") {
-            const events = ["pointerdown", "keydown", "touchstart"];
-            const resumeOnGesture = () => {
-              void audioBus.resume();
-              for (const ev of events) window.removeEventListener(ev, resumeOnGesture);
-            };
-            for (const ev of events) window.addEventListener(ev, resumeOnGesture);
-          }
-          const voice = new VoicePlayer(
-            audioBus,
-            () => setTtsPlaying(true),
-            () => setTtsPlaying(false),
-          );
-          busRef.current = audioBus;
-          voiceRef.current = voice;
-          // Reapply the saved channel state. Voice output is the only one that
-          // can be set before any device work; the input channels acquire below.
-          const prefs = prefsRef.current;
-          voice.setMuted(!prefs.audioOutput);
-          setBus(audioBus);
-          setWoken(true);
-          setWaking(false);
-
-          if (opts?.textOnly) {
-            // The "type instead" entry (no usable audio): force text on, don't
-            // touch the mic this session. The saved audio intent is left as-is.
-            if (!prefs.textInput) setTextChannel(true);
-          } else {
-            if (prefs.audioInput) void enableAudio();
-            if (prefs.videoInput) void enableVision();
-          }
-        } catch (err) {
-          const msg = (err instanceof Error ? err.message : String(err)).toLowerCase();
-          setWakeError(
-            msg.includes("denied") || msg.includes("permission") || msg.includes("notallowed")
-              ? "audio playback blocked — tap to retry"
-              : "couldn't start the session — tap to retry",
-          );
-          setWaking(false);
+  // ---- start the session: build the output graph, restore channels -------
+  // Runs once on mount — no wake gate, no dedicated gesture. Building the
+  // AudioBus is always allowed; the context may start suspended (autoplay
+  // policy), so we resume on the first incidental interaction, which unlocks TTS
+  // without a tap. Input channels are then restored *honestly*: a saved-on
+  // mic/camera is re-acquired only when its permission is already granted (a
+  // silent restore). If it can't be restored silently the channel stays off —
+  // the control shows it off, and a click re-requests the device (that click is
+  // the gesture/permission prompt the browser wants).
+  const startSession = useCallback(() => {
+    if (woken) return;
+    void (async () => {
+      try {
+        const audioBus = new AudioBus();
+        await audioBus.resume();
+        if (audioBus.ctx.state !== "running") {
+          const events = ["pointerdown", "keydown", "touchstart"];
+          const resumeOnGesture = () => {
+            void audioBus.resume();
+            for (const ev of events) window.removeEventListener(ev, resumeOnGesture);
+          };
+          for (const ev of events) window.addEventListener(ev, resumeOnGesture);
         }
-      })();
-    },
-    [woken, waking, enableAudio, enableVision, setTextChannel],
-  );
+        const voice = new VoicePlayer(
+          audioBus,
+          () => setTtsPlaying(true),
+          () => setTtsPlaying(false),
+        );
+        busRef.current = audioBus;
+        voiceRef.current = voice;
+        const prefs = prefsRef.current;
+        voice.setMuted(!prefs.audioOutput);
+        setBus(audioBus);
+        setWoken(true);
+        // Restore input channels only when they can be restored silently. A
+        // saved-on channel whose permission isn't already granted stays off,
+        // honestly reflecting that we couldn't restore it — a click enables it.
+        if (prefs.audioInput && (await permissionGranted("microphone"))) void enableAudio();
+        if (prefs.videoInput && (await permissionGranted("camera"))) void enableVision();
+      } catch (err) {
+        // The output graph couldn't be built (no Web Audio, etc.). The text
+        // channel still works, so mark the session up and leave audio off.
+        console.debug("[session] audio graph unavailable", err);
+        setWoken(true);
+      }
+    })();
+  }, [woken, enableAudio, enableVision]);
 
-  const wake = useCallback(() => startSession(), [startSession]);
-  const startTextOnly = useCallback(() => startSession({ textOnly: true }), [startSession]);
-
-  // Auto-start on repeat visits: if the mic was already granted on a prior
-  // visit, skip the "tap to begin" gate and start listening straight away. The
-  // gate still appears on the first-ever visit (permission "prompt") or after a
-  // denial, where a user gesture is genuinely required to request the mic.
+  // Auto-start on mount — the session builds itself and restores channels per
+  // the honest policy above. The ref guard keeps StrictMode's double-invoke (and
+  // any re-render of startSession) from starting a second graph.
+  const startedRef = useRef(false);
   useEffect(() => {
-    let cancelled = false;
-    const perms = navigator.permissions;
-    if (!perms?.query) return;
-    perms
-      .query({ name: "microphone" as PermissionName })
-      .then((status) => {
-        if (!cancelled && status.state === "granted") wake();
-      })
-      .catch(() => {
-        /* 'microphone' not queryable (e.g. Firefox) — keep the manual gate. */
-      });
-    return () => {
-      cancelled = true;
-    };
-  }, [wake]);
+    if (startedRef.current) return;
+    startedRef.current = true;
+    startSession();
+  }, [startSession]);
 
   // cleanup on unmount
   useEffect(() => {
@@ -755,8 +736,6 @@ export function useAgentSession(): AgentSession {
     activity: activityRef.current,
     sentences: displaySentences,
     woken,
-    waking,
-    wakeError,
     audioInput,
     audioError,
     videoInput,
@@ -764,8 +743,6 @@ export function useAgentSession(): AgentSession {
     visionStream,
     audioOutput,
     textInput,
-    wake,
-    startTextOnly,
     toggleAudio,
     toggleVideo,
     toggleAudioOutput,

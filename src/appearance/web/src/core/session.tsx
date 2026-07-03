@@ -36,16 +36,11 @@ export function usePresence() {
   return { state: s.state, reactive: s.reactive, activity: s.activity, bus: s.bus };
 }
 
-/** Session entry/wake state for the host gate (not for agent views). */
+/** Whether the session's output graph is up. The session auto-starts on mount
+ * (no wake gate); this only gates the channel loops that need the graph to exist. */
 export function useWake() {
   const s = useSession();
-  return {
-    woken: s.woken,
-    waking: s.waking,
-    wakeError: s.wakeError,
-    wake: s.wake,
-    startTextOnly: s.startTextOnly,
-  };
+  return { woken: s.woken };
 }
 
 /** Every in/out channel's live on/off state and its toggle. */
