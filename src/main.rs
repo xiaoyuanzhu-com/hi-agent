@@ -196,10 +196,18 @@ fn main() -> anyhow::Result<()> {
 
     let cli = Cli::parse();
 
-    tracing_subscriber::fmt()
-        .with_env_filter(EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info")))
-        .with_target(false)
-        .init();
+    // `ort` bridges ONNX Runtime's logs into `tracing`, and it opens the ONNX
+    // environment with a VERBOSE logger — so per-session graph-optimization
+    // ("GraphTransformer … modified: 0") and arena ("Reserving memory in
+    // BFCArena …") chatter would flood at INFO on every model load. Floor the
+    // `ort` target at WARN unless the operator opts back in by naming it in
+    // RUST_LOG (e.g. `RUST_LOG=ort=info`).
+    let mut env_filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"));
+    let ort_opt_in = std::env::var("RUST_LOG").map(|v| v.contains("ort")).unwrap_or(false);
+    if !ort_opt_in {
+        env_filter = env_filter.add_directive("ort=warn".parse().expect("valid tracing directive"));
+    }
+    tracing_subscriber::fmt().with_env_filter(env_filter).with_target(false).init();
 
     // Package-time provisioning: fill a `.app`'s Resources with the managed
     // runtime + models + static ffmpeg, then exit. Forces the managed downloads
