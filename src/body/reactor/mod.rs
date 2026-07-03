@@ -1696,7 +1696,7 @@ async fn run_turn(
                 };
                 if flipped {
                     let line = if out_of_energy {
-                        "能量用完了。我先把你说的记下来，等能量恢复就接着处理。想现在就继续的话，可以在设置里订阅，或填入自己的 API key。".to_string()
+                        "能量用完了。我先把你说的记下来，等能量恢复就接着处理。想现在就继续的话，点菜单栏的 hi 图标就能订阅，或换用自己的 API key。".to_string()
                     } else {
                         "我暂时连不上模型，先攒着你的消息，等恢复了一起处理。".to_string()
                     };
