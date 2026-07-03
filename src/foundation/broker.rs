@@ -177,6 +177,49 @@ pub async fn fetch_energy(access: &str) -> anyhow::Result<Energy> {
     Ok(Energy { remaining: e.remaining, total: e.total, resets_at: e.resets_at, tier: e.tier })
 }
 
+#[derive(Deserialize, Default)]
+struct WebTicketDto {
+    #[serde(default)]
+    ticket: String,
+    #[serde(default)]
+    path: String,
+}
+
+/// Mint a one-time web-handoff ticket and return the browser URL that lands the
+/// user on the pricing page **already signed in as this device account**
+/// (`<broker>/pricing?ticket=…`). The tray's "Subscribe" opens this. Xiaoyuanzhu
+/// mode only — it needs the bootstrapped access token; errors if bootstrap hasn't
+/// produced one yet (the caller surfaces that, e.g. "try again in a moment"). The
+/// ticket is a URL-safe JWT (base64url + dots), so no query-encoding is needed.
+pub async fn subscribe_url(data_dir: &Path) -> anyhow::Result<String> {
+    let store = Credentials::load(data_dir);
+    let access = store
+        .tokens
+        .as_ref()
+        .map(|t| t.access_token.trim().to_string())
+        .unwrap_or_default();
+    if access.is_empty() {
+        anyhow::bail!("no broker access token yet (account bootstrap hasn't completed)");
+    }
+    let url = format!("{}/api/agent/web-ticket", base_url());
+    let resp = http()?
+        .post(&url)
+        .bearer_auth(&access)
+        .send()
+        .await
+        .with_context(|| format!("calling {url}"))?;
+    let status = resp.status();
+    if !status.is_success() {
+        anyhow::bail!("web-ticket {url} returned {status}: {}", resp.text().await.unwrap_or_default());
+    }
+    let dto: WebTicketDto = resp.json().await.context("parsing web-ticket response")?;
+    if dto.ticket.trim().is_empty() {
+        anyhow::bail!("broker returned an empty web ticket");
+    }
+    let path = if dto.path.trim().is_empty() { "/pricing" } else { dto.path.trim() };
+    Ok(format!("{}{}?ticket={}", base_url(), path, dto.ticket.trim()))
+}
+
 /// Get a usable access token: refresh if we hold a refresh token, else bootstrap.
 /// Re-bootstraps on a failed refresh (device_id makes that idempotent).
 async fn ensure_tokens(store: &Credentials) -> anyhow::Result<Tokens> {

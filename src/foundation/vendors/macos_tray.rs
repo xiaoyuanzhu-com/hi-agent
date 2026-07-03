@@ -93,26 +93,58 @@ define_class!(
             self.ivars().shutdown.notify_waiters();
         }
 
-        /// "Account ▸ Xiaoyuanzhu" → use the free broker tier. Persist the mode
-        /// (the broker resumes provisioning free energy on its own loop). Applies on
-        /// the next restart; the checkmark refreshes when the submenu next opens.
+        /// "小圆猪 ▸ Use 小圆猪" → select the managed broker account (free tier works
+        /// immediately; the broker keeps energy topped up on its own loop). Applies
+        /// on the next restart; checkmarks refresh when the submenu next opens.
         #[unsafe(method(selectXiaoyuanzhu:))]
         fn select_xiaoyuanzhu(&self, _sender: Option<&AnyObject>) {
-            let data_dir = &self.ivars().data_dir;
-            let mut creds = Credentials::load(data_dir);
-            creds.mode = Mode::Xiaoyuanzhu;
-            if let Err(e) = creds.save(data_dir) {
-                tracing::error!(error = %e, "tray: failed to switch to Xiaoyuanzhu");
-            }
+            self.set_mode(Mode::Xiaoyuanzhu);
         }
 
-        /// "Account ▸ BYOK…" → open the native config popup to enter your own API
-        /// key. The popup writes the store and flips the mode to BYOK on Save.
-        #[unsafe(method(selectByok:))]
-        fn select_byok(&self, _sender: Option<&AnyObject>) {
-            let mtm = MainThreadMarker::new().expect("tray menu action runs on the main thread");
-            crate::foundation::vendors::macos_account::configure(mtm, &self.ivars().data_dir);
+        /// "Your own keys ▸ Use my own keys" → select BYOK. Only switches the active
+        /// source; it does NOT require a key to be configured first (a valid, if
+        /// not-yet-working, state). Keys are entered separately per feature.
+        #[unsafe(method(useByok:))]
+        fn use_byok(&self, _sender: Option<&AnyObject>) {
+            self.set_mode(Mode::Byok);
         }
+
+        /// A per-feature "…" row under "Your own keys" → open that feature's key
+        /// dialog. The sender's tag identifies the feature ([`feature_from_tag`]);
+        /// editing a key does not switch the active mode.
+        #[unsafe(method(configureFeature:))]
+        fn configure_feature(&self, sender: Option<&AnyObject>) {
+            let mtm = MainThreadMarker::new().expect("tray menu action runs on the main thread");
+            let tag: isize = sender.map(|s| unsafe { msg_send![s, tag] }).unwrap_or(0);
+            let Some(feature) = feature_from_tag(tag) else { return };
+            crate::foundation::vendors::macos_account::configure_feature(mtm, &self.ivars().data_dir, feature);
+        }
+
+        /// "小圆猪 ▸ Subscribe…" → open the pricing page in the browser, signed in as
+        /// this device account. The broker round-trip (mint a one-time ticket) runs
+        /// off the main thread; the resulting URL is handed to `open`.
+        #[unsafe(method(subscribe:))]
+        fn subscribe(&self, _sender: Option<&AnyObject>) {
+            let data_dir = self.ivars().data_dir.clone();
+            std::thread::spawn(move || {
+                let rt = match tokio::runtime::Builder::new_current_thread().enable_all().build() {
+                    Ok(rt) => rt,
+                    Err(e) => {
+                        tracing::error!(error = %e, "tray: subscribe runtime build failed");
+                        return;
+                    }
+                };
+                match rt.block_on(crate::foundation::broker::subscribe_url(&data_dir)) {
+                    Ok(url) => {
+                        if let Err(e) = std::process::Command::new("open").arg(&url).spawn() {
+                            tracing::error!(error = %e, "tray: failed to open subscribe url");
+                        }
+                    }
+                    Err(e) => tracing::warn!(error = %e, "tray: could not open subscribe page"),
+                }
+            });
+        }
+
     }
 );
 
@@ -121,39 +153,170 @@ impl TrayTarget {
         let this = Self::alloc(mtm).set_ivars(Ivars { data_dir, shutdown });
         unsafe { msg_send![super(this), init] }
     }
-}
 
-/// Set the Account submenu's checkmarks from `mode` — the Xiaoyuanzhu item (tag 1)
-/// and the BYOK item (tag 2). Called at build time and, via [`AccountMenu`]'s
-/// delegate, whenever the submenu is about to open — so a change made in the BYOK
-/// popup shows without rebuilding the menu.
-fn set_account_states(menu: &NSMenu, mode: Mode) {
-    let on = NSControlStateValue(1);
-    let off = NSControlStateValue(0);
-    let n = menu.numberOfItems();
-    for i in 0..n {
-        let Some(item) = menu.itemAtIndex(i) else { continue };
-        match item.tag() {
-            1 => item.setState(if mode == Mode::Xiaoyuanzhu { on } else { off }),
-            2 => item.setState(if mode == Mode::Byok { on } else { off }),
-            _ => {}
+    /// Persist the selected credential mode (best-effort; applies on restart). Used
+    /// by both `Use …` rows — selection is independent of configuration.
+    fn set_mode(&self, mode: Mode) {
+        let data_dir = &self.ivars().data_dir;
+        let mut creds = Credentials::load(data_dir);
+        creds.mode = mode;
+        if let Err(e) = creds.save(data_dir) {
+            tracing::error!(error = %e, ?mode, "tray: failed to switch mode");
         }
     }
 }
 
-/// What the Account submenu's delegate needs to refresh checkmarks: where the
-/// credential store lives.
-struct AccountIvars {
+/// The BYOK feature rows under "Your own keys", as `(label, tag)`. The tag routes
+/// a click to a [`macos_account::Feature`] via [`feature_from_tag`] and, on open,
+/// selects which stored key drives that row's "configured / not set" suffix.
+const BYOK_FEATURES: &[(&str, isize)] = &[
+    ("LLM", 10),
+    ("Speech-to-text", 11),
+    ("Text-to-speech", 12),
+    ("Vision", 13),
+    ("Image", 14),
+    ("Video", 15),
+];
+
+/// Map a feature row's tag back to the credential feature it configures.
+fn feature_from_tag(tag: isize) -> Option<crate::foundation::vendors::macos_account::Feature> {
+    use crate::foundation::vendors::macos_account::Feature;
+    Some(match tag {
+        10 => Feature::Llm,
+        11 => Feature::Stt,
+        12 => Feature::Tts,
+        13 => Feature::Vision,
+        14 => Feature::Image,
+        15 => Feature::Video,
+        _ => return None,
+    })
+}
+
+/// Whether a feature's BYOK key is set (drives the row's "configured / not set"
+/// suffix). Tag order mirrors [`BYOK_FEATURES`].
+fn feature_key_set(creds: &Credentials, tag: isize) -> bool {
+    let vk = match tag {
+        10 => return !creds.llm.api_key.trim().is_empty(),
+        11 => &creds.stt,
+        12 => &creds.tts,
+        13 => &creds.vision,
+        14 => &creds.image,
+        15 => &creds.video,
+        _ => return false,
+    };
+    !vk.api_key.trim().is_empty()
+}
+
+/// Format an energy count compactly: 3_000_000 → "3.0M", 82_000 → "82K".
+fn fmt_energy(n: i64) -> String {
+    if n >= 1_000_000 {
+        format!("{:.1}M", (n as f64) / 1_000_000.0)
+    } else if n >= 1_000 {
+        format!("{}K", n / 1_000)
+    } else {
+        n.to_string()
+    }
+}
+
+/// Set the state (checkmark) of the menu item carrying `tag`, if present.
+fn set_item_state(menu: &NSMenu, tag: isize, on: bool) {
+    let v = NSControlStateValue(if on { 1 } else { 0 });
+    for i in 0..menu.numberOfItems() {
+        if let Some(item) = menu.itemAtIndex(i) {
+            if item.tag() == tag {
+                item.setState(v);
+            }
+        }
+    }
+}
+
+/// Set the title of the menu item carrying `tag`, if present.
+fn set_item_title(menu: &NSMenu, tag: isize, title: &str) {
+    let s = NSString::from_str(title);
+    for i in 0..menu.numberOfItems() {
+        if let Some(item) = menu.itemAtIndex(i) {
+            if item.tag() == tag {
+                item.setTitle(&s);
+            }
+        }
+    }
+}
+
+/// Refresh the top Account submenu: tick which mode is active on the parent rows
+/// (小圆猪 = tag 100, Your own keys = tag 101).
+fn refresh_account(menu: &NSMenu, mode: Mode) {
+    set_item_state(menu, 100, mode == Mode::Xiaoyuanzhu);
+    set_item_state(menu, 101, mode == Mode::Byok);
+}
+
+/// Refresh the 小圆猪 submenu: the Use checkmark (tag 1) + the plan/energy/resets
+/// info rows (tags 20/21/22) from the last energy snapshot.
+fn refresh_xiaoyuanzhu(menu: &NSMenu, creds: &Credentials) {
+    set_item_state(menu, 1, creds.mode == Mode::Xiaoyuanzhu);
+    let (plan, energy, resets) = match &creds.energy {
+        Some(e) => (
+            format!(
+                "Plan: {}",
+                match e.tier.as_str() {
+                    "pro" => "Pro",
+                    "max" => "Max",
+                    _ => "Standard",
+                }
+            ),
+            format!("Energy: {} / {}", fmt_energy(e.remaining), fmt_energy(e.total)),
+            if e.resets_at.len() >= 10 {
+                format!("Resets: {}", &e.resets_at[..10])
+            } else {
+                "Resets: —".to_string()
+            },
+        ),
+        None => (
+            "Plan: Standard".to_string(),
+            "Energy: —".to_string(),
+            "Resets: —".to_string(),
+        ),
+    };
+    set_item_title(menu, 20, &plan);
+    set_item_title(menu, 21, &energy);
+    set_item_title(menu, 22, &resets);
+}
+
+/// Refresh the "Your own keys" submenu: the Use checkmark (tag 2) + each feature
+/// row's "configured / not set" suffix.
+fn refresh_byok(menu: &NSMenu, creds: &Credentials) {
+    set_item_state(menu, 2, creds.mode == Mode::Byok);
+    for &(label, tag) in BYOK_FEATURES {
+        let state = if feature_key_set(creds, tag) { "configured" } else { "not set" };
+        set_item_title(menu, tag, &format!("{label} — {state}"));
+    }
+}
+
+/// Which submenu an [`AccountMenu`] delegate refreshes on open.
+#[derive(Clone, Copy)]
+enum SubmenuKind {
+    /// The top Account submenu — checkmarks on the 小圆猪 / BYOK parent rows.
+    Account,
+    /// The 小圆猪 submenu — the Use checkmark + plan/energy/resets info rows.
+    Xiaoyuanzhu,
+    /// The "Your own keys" submenu — the Use checkmark + per-feature status rows.
+    Byok,
+}
+
+/// What an Account-family submenu delegate needs to refresh on open: the store
+/// location and which submenu it is.
+struct SubmenuIvars {
     data_dir: PathBuf,
+    kind: SubmenuKind,
 }
 
 define_class!(
-    // Delegate on the Account submenu: refreshes the Xiaoyuanzhu/BYOK checkmarks
-    // from the stored mode each time the submenu is about to open.
+    // Delegate shared by the Account submenu and its two child submenus. On open it
+    // reloads the store and refreshes that submenu's checkmarks / info rows, so a
+    // mode switch or key edit shows without rebuilding the menu.
     #[unsafe(super(NSObject))]
     #[thread_kind = MainThreadOnly]
     #[name = "HiAgentAccountMenu"]
-    #[ivars = AccountIvars]
+    #[ivars = SubmenuIvars]
     struct AccountMenu;
 
     unsafe impl NSObjectProtocol for AccountMenu {}
@@ -161,15 +324,19 @@ define_class!(
     unsafe impl NSMenuDelegate for AccountMenu {
         #[unsafe(method(menuNeedsUpdate:))]
         fn menu_needs_update(&self, menu: &NSMenu) {
-            let mode = Credentials::load(&self.ivars().data_dir).mode;
-            set_account_states(menu, mode);
+            let creds = Credentials::load(&self.ivars().data_dir);
+            match self.ivars().kind {
+                SubmenuKind::Account => refresh_account(menu, creds.mode),
+                SubmenuKind::Xiaoyuanzhu => refresh_xiaoyuanzhu(menu, &creds),
+                SubmenuKind::Byok => refresh_byok(menu, &creds),
+            }
         }
     }
 );
 
 impl AccountMenu {
-    fn new(mtm: MainThreadMarker, data_dir: PathBuf) -> Retained<Self> {
-        let this = Self::alloc(mtm).set_ivars(AccountIvars { data_dir });
+    fn new(mtm: MainThreadMarker, data_dir: PathBuf, kind: SubmenuKind) -> Retained<Self> {
+        let this = Self::alloc(mtm).set_ivars(SubmenuIvars { data_dir, kind });
         unsafe { msg_send![super(this), init] }
     }
 }
@@ -585,42 +752,66 @@ pub fn run(url: String, data_dir: PathBuf, shutdown: Arc<Notify>) -> anyhow::Res
 
         menu.addItem(&NSMenuItem::separatorItem(mtm));
 
-        // Account ▸ Xiaoyuanzhu / BYOK… — the one bootstrap decision (which AI
-        // powers the agent), replacing the deleted web Settings page. The submenu's
-        // delegate keeps the checkmarks in sync with the stored mode.
+        // Account ▸ [ 小圆猪 ▸ … ] [ Your own keys ▸ … ] — pick which source powers
+        // the agent, and set it up. Each mode is a submenu carrying its own detail;
+        // the top Account submenu just ticks which is active. Delegates refresh the
+        // checkmarks / info rows on open, so switches + key edits show live.
+        //
+        // A small builder to cut the repetition: title + optional action selector +
+        // tag. Items with an action are targeted at `target`; action-less rows (info
+        // rows, submenu parents) are left untargeted — with the menu's default
+        // auto-enable, that greys the info rows exactly as intended.
+        let make = |title: &str, action: Option<objc2::runtime::Sel>, tag: isize| -> Retained<NSMenuItem> {
+            let item = NSMenuItem::initWithTitle_action_keyEquivalent(
+                NSMenuItem::alloc(mtm),
+                &NSString::from_str(title),
+                action,
+                &NSString::from_str(""),
+            );
+            if action.is_some() {
+                item.setTarget(Some(&target));
+            }
+            item.setTag(tag);
+            item
+        };
+
+        // 小圆猪 submenu: use it · plan/energy/resets · subscribe.
+        let xyz_menu = NSMenu::new(mtm);
+        xyz_menu.addItem(&make("Use 小圆猪", Some(sel!(selectXiaoyuanzhu:)), 1));
+        xyz_menu.addItem(&NSMenuItem::separatorItem(mtm));
+        xyz_menu.addItem(&make("Plan: Free", None, 20));
+        xyz_menu.addItem(&make("Energy: —", None, 21));
+        xyz_menu.addItem(&make("Resets: —", None, 22));
+        xyz_menu.addItem(&NSMenuItem::separatorItem(mtm));
+        xyz_menu.addItem(&make("Subscribe…", Some(sel!(subscribe:)), 30));
+        let xyz_delegate = AccountMenu::new(mtm, data_dir.clone(), SubmenuKind::Xiaoyuanzhu);
+        xyz_menu.setDelegate(Some(ProtocolObject::from_ref(&*xyz_delegate)));
+        std::mem::forget(xyz_delegate);
+
+        // Your own keys submenu: use it · a status/config row per feature.
+        let byok_menu = NSMenu::new(mtm);
+        byok_menu.addItem(&make("Use my own keys", Some(sel!(useByok:)), 2));
+        byok_menu.addItem(&NSMenuItem::separatorItem(mtm));
+        for &(label, tag) in BYOK_FEATURES {
+            byok_menu.addItem(&make(&format!("{label} — not set"), Some(sel!(configureFeature:)), tag));
+        }
+        let byok_delegate = AccountMenu::new(mtm, data_dir.clone(), SubmenuKind::Byok);
+        byok_menu.setDelegate(Some(ProtocolObject::from_ref(&*byok_delegate)));
+        std::mem::forget(byok_delegate);
+
+        // Top Account submenu: the two mode parents (checkmark = active source).
         let account_menu = NSMenu::new(mtm);
-        let xyz_item = NSMenuItem::initWithTitle_action_keyEquivalent(
-            NSMenuItem::alloc(mtm),
-            &NSString::from_str("Xiaoyuanzhu"),
-            Some(sel!(selectXiaoyuanzhu:)),
-            &NSString::from_str(""),
-        );
-        xyz_item.setTarget(Some(&target));
-        xyz_item.setTag(1);
-        account_menu.addItem(&xyz_item);
-
-        let byok_item = NSMenuItem::initWithTitle_action_keyEquivalent(
-            NSMenuItem::alloc(mtm),
-            &NSString::from_str("BYOK…"),
-            Some(sel!(selectByok:)),
-            &NSString::from_str(""),
-        );
-        byok_item.setTarget(Some(&target));
-        byok_item.setTag(2);
-        account_menu.addItem(&byok_item);
-
-        // Tick the current mode now; refresh on each open via the delegate.
-        set_account_states(&account_menu, Credentials::load(&data_dir).mode);
-        let acct_delegate = AccountMenu::new(mtm, data_dir.clone());
+        let xyz_parent = make("小圆猪", None, 100);
+        xyz_parent.setSubmenu(Some(&*xyz_menu));
+        account_menu.addItem(&xyz_parent);
+        let byok_parent = make("Your own keys", None, 101);
+        byok_parent.setSubmenu(Some(&*byok_menu));
+        account_menu.addItem(&byok_parent);
+        let acct_delegate = AccountMenu::new(mtm, data_dir.clone(), SubmenuKind::Account);
         account_menu.setDelegate(Some(ProtocolObject::from_ref(&*acct_delegate)));
         std::mem::forget(acct_delegate);
 
-        let account_parent = NSMenuItem::initWithTitle_action_keyEquivalent(
-            NSMenuItem::alloc(mtm),
-            &NSString::from_str("Account"),
-            None,
-            &NSString::from_str(""),
-        );
+        let account_parent = make("Account", None, 0);
         account_parent.setSubmenu(Some(&*account_menu));
         menu.addItem(&account_parent);
 

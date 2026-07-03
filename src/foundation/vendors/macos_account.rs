@@ -1,32 +1,30 @@
-//! macOS account vendor — the **BYOK configuration popup**.
+//! macOS account vendor — the **per-feature BYOK configuration popup**.
 //!
-//! A small modal `NSAlert` with an accessory view of text fields (Anthropic API key
-//! + optional base URL / model), opened from the tray's `Account ▸ BYOK…` item
-//! ([`super::macos_tray`]). On *Save* it writes the credential store in-process
-//! ([`crate::foundation::credentials`]) — flipping `mode` to `Byok` and storing the
-//! LLM fields — so no HTTP round-trip is involved; the web Settings page it replaced
-//! is gone. Credentials are read at bootstrap, so a change applies on the next
-//! restart (the informative text says so).
+//! A small modal `NSAlert` with an accessory view of text fields (API key +
+//! optional base URL / model), opened from a row in the tray's
+//! `Account ▸ Your own keys ▸ <feature>` submenu ([`super::macos_tray`]). On *Save*
+//! it writes that feature's credential fields to the store in-process
+//! ([`crate::foundation::credentials`]); no HTTP round-trip. Credentials are read
+//! at bootstrap, so a change applies on the next restart (the text says so).
+//!
+//! Configuring a key does **not** switch the active mode — selection (which source
+//! powers the agent) is a separate choice made by the `Use my own keys` row. So a
+//! key can be entered while still on the managed account, and a mode can be BYOK
+//! with nothing configured yet (a valid, if not-yet-working, state).
 //!
 //! Runs entirely on the process main thread: it's invoked directly from a menu
 //! action (already main-thread) and `NSAlert::runModal` blocks there for the
-//! dialog's lifetime. Like the tray/popover, the AppKit objects are transient to
-//! this call — the alert is torn down when `runModal` returns.
-//!
-//! Only the LLM credential lives here. Vendor keys (speech/vision/media) are
-//! intentionally *not* surfaced — they're advanced/env, matching the collapse of
-//! the config surface down to the one bootstrap decision.
+//! dialog's lifetime. The AppKit objects are transient to this call — the alert is
+//! torn down when `runModal` returns.
 
 use std::path::Path;
 
 use objc2::rc::Retained;
 use objc2::{msg_send, MainThreadOnly};
-use objc2_app_kit::{
-    NSAlert, NSApplication, NSSecureTextField, NSTextField, NSView,
-};
+use objc2_app_kit::{NSAlert, NSApplication, NSSecureTextField, NSTextField, NSView};
 use objc2_foundation::{MainThreadMarker, NSPoint, NSRect, NSSize, NSString};
 
-use crate::foundation::credentials::{Credentials, Mode};
+use crate::foundation::credentials::{Credentials, VendorKey};
 
 /// `NSAlertFirstButtonReturn` — the first button added (Save) in a run-modal alert.
 const FIRST_BUTTON: isize = 1000;
@@ -37,12 +35,47 @@ const W: f64 = 320.0;
 const FIELD_H: f64 = 24.0;
 const GAP: f64 = 8.0;
 
-/// Show the BYOK configuration dialog and, on Save, persist to the credential store.
-/// Main-thread only (called from the tray's menu action). Best-effort: a save error
-/// is logged, not surfaced — the worst case is the user re-enters the key.
-pub fn configure(mtm: MainThreadMarker, data_dir: &Path) {
+/// A keyed capability whose BYOK credential can be configured from the tray. Each
+/// maps to a field on the credential store; `Llm` is the flat `llm` fields, the
+/// rest are `VendorKey`s. Face/voiceprint are local ONNX (no key) and absent here.
+#[derive(Clone, Copy)]
+pub enum Feature {
+    Llm,
+    Stt,
+    Tts,
+    Vision,
+    Image,
+    Video,
+}
+
+impl Feature {
+    /// Human title shown in the dialog.
+    fn title(self) -> &'static str {
+        match self {
+            Feature::Llm => "LLM (Anthropic-compatible)",
+            Feature::Stt => "Speech-to-text",
+            Feature::Tts => "Text-to-speech",
+            Feature::Vision => "Vision",
+            Feature::Image => "Image",
+            Feature::Video => "Video",
+        }
+    }
+
+    /// Placeholder for the key field when nothing is stored yet.
+    fn key_placeholder(self) -> &'static str {
+        match self {
+            Feature::Llm => "API key (sk-ant-…)",
+            _ => "API key",
+        }
+    }
+}
+
+/// Show the config dialog for `feature` and, on Save, persist its fields. Does not
+/// change the active mode. Main-thread only (called from a menu action). Best-
+/// effort: a save error is logged, not surfaced — worst case the user re-enters it.
+pub fn configure_feature(mtm: MainThreadMarker, data_dir: &Path, feature: Feature) {
     let mut creds = Credentials::load(data_dir);
-    let configured = !creds.llm.api_key.trim().is_empty();
+    let (configured, cur_base, cur_model) = read_fields(&creds, feature);
 
     // SAFETY: standard AppKit construction on the main thread (guaranteed by `mtm`).
     // Every object lives on the stack for the duration of `runModal` and is released
@@ -65,37 +98,33 @@ pub fn configure(mtm: MainThreadMarker, data_dir: &Path) {
             NSSecureTextField::alloc(mtm),
             initWithFrame: NSRect::new(NSPoint::new(0.0, y_key), NSSize::new(W, FIELD_H)),
         ];
-        let key_ph = if configured {
-            "•••• (unchanged)"
-        } else {
-            "Anthropic API key (sk-ant-…)"
-        };
+        let key_ph = if configured { "•••• (unchanged)" } else { feature.key_placeholder() };
         set_placeholder(&key_field, key_ph);
 
-        // Base URL — optional; prefill the stored value (empty ⇒ Anthropic default).
+        // Base URL — optional; prefill the stored value (empty ⇒ vendor default).
         let base_field: Retained<NSTextField> = msg_send![
             NSTextField::alloc(mtm),
             initWithFrame: NSRect::new(NSPoint::new(0.0, y_base), NSSize::new(W, FIELD_H)),
         ];
-        set_placeholder_plain(&base_field, "Base URL — optional (https://api.anthropic.com)");
-        base_field.setStringValue(&NSString::from_str(&creds.llm.base_url));
+        set_placeholder_plain(&base_field, "Base URL — optional");
+        base_field.setStringValue(&NSString::from_str(&cur_base));
 
-        // Model — optional; prefill the stored override (empty ⇒ adapter default).
+        // Model — optional; prefill the stored override (empty ⇒ vendor default).
         let model_field: Retained<NSTextField> = msg_send![
             NSTextField::alloc(mtm),
             initWithFrame: NSRect::new(NSPoint::new(0.0, y_model), NSSize::new(W, FIELD_H)),
         ];
-        set_placeholder_plain(&model_field, "Model — optional (adapter default)");
-        model_field.setStringValue(&NSString::from_str(creds.llm.model.as_deref().unwrap_or("")));
+        set_placeholder_plain(&model_field, "Model — optional (vendor default)");
+        model_field.setStringValue(&NSString::from_str(&cur_model));
 
         container.addSubview(&*key_field);
         container.addSubview(&*base_field);
         container.addSubview(&*model_field);
 
         let alert: Retained<NSAlert> = msg_send![NSAlert::alloc(mtm), init];
-        alert.setMessageText(&NSString::from_str("Use your own API key (BYOK)"));
+        alert.setMessageText(&NSString::from_str(&format!("Your own {} key", feature.title())));
         alert.setInformativeText(&NSString::from_str(
-            "Stored locally in this app. Restart Hi Agent to apply. Leave the key blank to keep the current one.",
+            "Stored locally in this app. Restart Hi Agent to apply. Leave the key blank to keep the current one. This does not switch which account is active.",
         ));
         // Buttons: first added becomes the default (Save → FIRST_BUTTON). We only
         // need the run-modal response code, so the returned NSButton is ignored.
@@ -110,30 +139,72 @@ pub fn configure(mtm: MainThreadMarker, data_dir: &Path) {
 
         let response: isize = msg_send![&*alert, runModal];
         if response != FIRST_BUTTON {
-            return; // Cancel — leave the store untouched (mode stays as it was).
+            return; // Cancel — leave the store untouched.
         }
 
-        // Save: switch to BYOK and store the LLM fields. A blank key keeps the
-        // existing one (matches the old web form); base/model are set as-is (empty
-        // clears back to the built-in default).
+        // Save this feature's fields. A blank key keeps the existing one; base/model
+        // are set as-is (empty clears back to the built-in default). Mode is left
+        // alone — selection is the `Use …` row's job.
         let key = field_string(&key_field);
         let base = field_string(&base_field);
         let model = field_string(&model_field);
-
-        creds.mode = Mode::Byok;
-        if !key.trim().is_empty() {
-            creds.llm.api_key = key.trim().to_string();
-        }
-        creds.llm.base_url = base.trim().to_string();
-        let m = model.trim();
-        creds.llm.model = if m.is_empty() { None } else { Some(m.to_string()) };
+        write_fields(&mut creds, feature, &key, &base, &model);
 
         if let Err(e) = creds.save(data_dir) {
             tracing::error!(error = %e, "account: failed to save BYOK credentials");
         } else {
-            tracing::info!("account: saved BYOK credentials (restart to apply)");
+            tracing::info!(feature = feature.title(), "account: saved BYOK credentials (restart to apply)");
         }
     }
+}
+
+/// Snapshot a feature's stored fields: `(has_key, base_url, model)`.
+fn read_fields(creds: &Credentials, feature: Feature) -> (bool, String, String) {
+    let vk = match feature {
+        Feature::Llm => {
+            return (
+                !creds.llm.api_key.trim().is_empty(),
+                creds.llm.base_url.clone(),
+                creds.llm.model.clone().unwrap_or_default(),
+            );
+        }
+        Feature::Stt => &creds.stt,
+        Feature::Tts => &creds.tts,
+        Feature::Vision => &creds.vision,
+        Feature::Image => &creds.image,
+        Feature::Video => &creds.video,
+    };
+    (!vk.api_key.trim().is_empty(), vk.base_url.clone(), vk.model.clone().unwrap_or_default())
+}
+
+/// Write a feature's fields back (blank key = keep existing).
+fn write_fields(creds: &mut Credentials, feature: Feature, key: &str, base: &str, model: &str) {
+    let key = key.trim();
+    let base = base.trim().to_string();
+    let m = model.trim();
+    let model = if m.is_empty() { None } else { Some(m.to_string()) };
+    match feature {
+        Feature::Llm => {
+            if !key.is_empty() {
+                creds.llm.api_key = key.to_string();
+            }
+            creds.llm.base_url = base;
+            creds.llm.model = model;
+        }
+        Feature::Stt => write_vendor(&mut creds.stt, key, base, model),
+        Feature::Tts => write_vendor(&mut creds.tts, key, base, model),
+        Feature::Vision => write_vendor(&mut creds.vision, key, base, model),
+        Feature::Image => write_vendor(&mut creds.image, key, base, model),
+        Feature::Video => write_vendor(&mut creds.video, key, base, model),
+    }
+}
+
+fn write_vendor(vk: &mut VendorKey, key: &str, base: String, model: Option<String>) {
+    if !key.is_empty() {
+        vk.api_key = key.to_string();
+    }
+    vk.base_url = base;
+    vk.model = model;
 }
 
 /// Read an `NSControl`'s string value as a Rust `String`.
