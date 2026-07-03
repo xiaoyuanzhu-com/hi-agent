@@ -218,12 +218,13 @@ impl AgentConfig {
     /// rather than freezing them at boot.
     ///
     /// The key rides `ANTHROPIC_AUTH_TOKEN`, which the CLI sends as
-    /// `Authorization: Bearer <key>` — the scheme the managed songguo gateway (and
-    /// most gateways) require. We deliberately do *not* set `ANTHROPIC_API_KEY`
-    /// (which would send Anthropic's native `x-api-key` header): songguo rejects that
-    /// with `401 missing authorization`. The trade-off: a BYOK user pointing at
-    /// Anthropic's *native* endpoint (which wants `x-api-key`) would need this
-    /// revisited — today every path goes through a Bearer gateway.
+    /// `Authorization: Bearer <key>` — the standard scheme for any custom gateway
+    /// in front of the Anthropic wire (a proxy authenticates the caller with a
+    /// bearer token). We deliberately do *not* set `ANTHROPIC_API_KEY` (which would
+    /// send Anthropic's native `x-api-key` header): a gateway expects the bearer
+    /// header, not the vendor's native key header. The trade-off: a BYOK user
+    /// pointing at Anthropic's *native* endpoint (which wants `x-api-key`) would
+    /// need this revisited — today every path goes through a Bearer gateway.
     pub fn auth_child_env(&self) -> Vec<(String, String)> {
         let mut env = vec![
             (

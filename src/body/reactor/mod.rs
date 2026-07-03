@@ -248,16 +248,32 @@ impl VendorHealth {
     }
 }
 
-/// Whether a terminal turn error is the gateway reporting "out of energy"
-/// (songguo 402) rather than a generic outage. The ACP adapter collapses the
-/// upstream HTTP status into an opaque string, so we match the markers it carries.
-/// A miss just degrades to the generic vendor-down message — input is still
-/// stashed and caught up either way.
+/// Whether a terminal turn error is the gateway reporting "out of energy" — an
+/// HTTP 402 Payment Required. We key on the standard status code, not a
+/// vendor-specific error slug, so any conforming gateway trips it and hi-agent
+/// stays ignorant of who the gateway is.
+///
+/// Caveat on where the 402 comes from: the LLM turn runs through the ACP adapter,
+/// which does *not* hand us a numeric HTTP status. It translates the upstream
+/// failure into a JSON-RPC `internalError` (code -32603) whose `message` is the
+/// `claude` CLI's free-text result; the HTTP status survives only as text inside
+/// that message. So we scan the flattened error for a `402` status token rather
+/// than reading a field. A miss just degrades to the generic vendor-down message
+/// — input is still stashed and caught up either way.
 fn is_out_of_energy(err: &anyhow::Error) -> bool {
-    let s = format!("{err:#}").to_ascii_lowercase();
-    s.contains("songguo_budget_exceeded")
-        || s.contains("budget exceeded")
-        || s.contains("payment required")
+    has_status_token(&format!("{err:#}"), 402)
+}
+
+/// Find `status` as a standalone status token in `text` — the digits bounded by
+/// non-digits, so "API Error: 402 …" matches but a longer number that merely
+/// contains those digits (a request id, a timestamp) does not.
+fn has_status_token(text: &str, status: u16) -> bool {
+    let needle = status.to_string();
+    text.match_indices(&needle).any(|(i, _)| {
+        let before = text[..i].chars().next_back();
+        let after = text[i + needle.len()..].chars().next();
+        before.is_none_or(|c| !c.is_ascii_digit()) && after.is_none_or(|c| !c.is_ascii_digit())
+    })
 }
 
 #[cfg(test)]
@@ -280,10 +296,21 @@ mod vendor_health_tests {
 
     #[test]
     fn detects_out_of_energy() {
+        // A 402 status token in the ACP-translated error → out of energy, whatever
+        // body the gateway attaches (we no longer read the vendor slug).
+        assert!(super::is_out_of_energy(&anyhow::anyhow!(
+            "session/prompt failed: API Error: 402 {{\"error\":\"quota\"}}"
+        )));
+        // The historical songguo shape still trips it (the 402 is what matters).
         assert!(super::is_out_of_energy(&anyhow::anyhow!(
             "session/prompt failed: 402 Payment Required songguo_budget_exceeded"
         )));
+        // Generic outage — no 402.
         assert!(!super::is_out_of_energy(&anyhow::anyhow!("connection reset by peer")));
+        // A longer number that merely contains "402" must not trip it.
+        assert!(!super::is_out_of_energy(&anyhow::anyhow!(
+            "session/prompt failed: request id 1140228 timed out"
+        )));
     }
 
     #[test]
