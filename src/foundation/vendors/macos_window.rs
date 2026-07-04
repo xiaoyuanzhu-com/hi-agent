@@ -13,7 +13,10 @@
 //! `Titled | Closable | Miniaturizable | Resizable`, so the standard titlebar handles
 //! dragging and the traffic lights close/minimize the window. The window opts into
 //! `FullScreenPrimary` collection behavior so the green button enters native full-screen
-//! (⌥-click still zooms).
+//! (⌥-click still zooms). Double-clicking the title-bar strip zooms (maximize / restore):
+//! AppKit's own handler for that never fires because `FullSizeContentView` puts our
+//! content under the transparent titlebar, so [`KeyWindow`] catches the double-click in
+//! `sendEvent:` and drives `zoom:` itself.
 //!
 //! **Themed, centered title bar.** The native titlebar is made transparent and its text
 //! hidden; with `FullSizeContentView` the content view spans under it, so the window's
@@ -44,7 +47,7 @@ use objc2::rc::Retained;
 use objc2::runtime::{AnyObject, NSObject, NSObjectProtocol, ProtocolObject, Sel};
 use objc2::{DefinedClass, MainThreadOnly, define_class, msg_send, sel};
 use objc2_app_kit::{
-    NSApplication, NSAutoresizingMaskOptions, NSBackingStoreType, NSColor,
+    NSApplication, NSAutoresizingMaskOptions, NSBackingStoreType, NSColor, NSEvent, NSEventType,
     NSWindowCollectionBehavior, NSTextAlignment, NSTextField, NSView, NSWindow, NSWindowStyleMask,
     NSWindowTitleVisibility,
 };
@@ -66,6 +69,9 @@ const BAR_H: f64 = 28.0;
 /// Height of the centered title label; kept near the font's line height and centered
 /// vertically within [`BAR_H`].
 const LABEL_H: f64 = 18.0;
+/// Left-edge inset that the three traffic-light buttons occupy. Double-clicks landing
+/// here are left to the buttons, not swallowed for a zoom (see [`KeyWindow::send_event`]).
+const TRAFFIC_LIGHT_W: f64 = 78.0;
 
 // ---------------------------------------------------------------------------
 // Title-bar theme — match the face's "Paper & Ink" skin so the native bar reads
@@ -160,6 +166,41 @@ define_class!(
         #[unsafe(method(canBecomeMainWindow))]
         fn can_become_main(&self) -> bool {
             true
+        }
+
+        /// Double-click the title-bar strip to zoom (maximize) and back — the standard
+        /// macOS title-bar gesture. AppKit's own handler for it never fires here: with
+        /// `FullSizeContentView` the content view (our web view + centered label) spans
+        /// under the transparent titlebar, so the double-click lands on our content, not
+        /// the native title-bar view. We catch it in the window's event funnel instead —
+        /// `sendEvent:` sees every event dispatched to the window regardless of which
+        /// subview would handle it — and drive `zoom:` ourselves.
+        #[unsafe(method(sendEvent:))]
+        fn send_event(&self, event: &NSEvent) {
+            // A left double-click landing in the title-bar strip (top `BAR_H` points),
+            // but clear of the traffic lights on the left. `locationInWindow` is in base
+            // coordinates (origin bottom-left); with `FullSizeContentView` the content
+            // view spans the full height, so the strip is the top `BAR_H` of it.
+            let in_titlebar_zoom_zone = event.r#type() == NSEventType::LeftMouseDown
+                && event.clickCount() == 2
+                && {
+                    let loc = event.locationInWindow();
+                    let height = self.contentView().map_or(0.0, |v| v.bounds().size.height);
+                    loc.y >= height - BAR_H && loc.x >= TRAFFIC_LIGHT_W
+                };
+            if in_titlebar_zoom_zone {
+                // SAFETY: main-thread AppKit call; `zoom:` toggles between the user frame
+                // and the zoomed (standard) frame, i.e. maximize / restore.
+                unsafe {
+                    let _: () = msg_send![self, zoom: core::ptr::null_mut::<AnyObject>()];
+                }
+                return;
+            }
+            // Not our gesture — hand the event back to AppKit untouched.
+            // SAFETY: forwarding to the superclass implementation on the main thread.
+            unsafe {
+                let _: () = msg_send![super(self), sendEvent: event];
+            }
         }
     }
 );
