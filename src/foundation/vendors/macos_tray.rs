@@ -86,11 +86,17 @@ define_class!(
             super::macos_window::open();
         }
 
-        /// "Quit hi-agent" → ask the server to shut down. The server thread runs the
-        /// normal graceful drain + ACP reap, then exits the process (which ends this
-        /// run loop). We do not stop AppKit here — the process exit does it.
+        /// "Quit hi-agent" → make the UI vanish now, then ask the server to shut down.
+        /// Cleanup is worth doing properly (drain in-flight requests, reap every ACP
+        /// subprocess), but it shouldn't be something the user waits on *looking at* —
+        /// so we hide the face window and the menu-bar icon this instant, on the main
+        /// thread, and let the server thread run the graceful drain + reap in the
+        /// background before it exits the process (which ends this run loop). We do
+        /// not stop AppKit here — the process exit does it.
         #[unsafe(method(quit:))]
         fn quit(&self, _sender: Option<&AnyObject>) {
+            super::macos_window::hide();
+            hide_status_item();
             self.ivars().shutdown.notify_waiters();
         }
 
@@ -515,6 +521,28 @@ unsafe impl Sync for BlinkerPtr {}
 
 static BLINKER: OnceLock<BlinkerPtr> = OnceLock::new();
 
+/// A raw pointer to the leaked status item so [`hide_status_item`] can reach it from
+/// the `quit:` action. Main-thread-only, and we only message it on the main thread,
+/// so holding the bare pointer is sound (same contract as [`BlinkerPtr`]).
+struct StatusItemPtr(*const NSStatusItem);
+unsafe impl Send for StatusItemPtr {}
+unsafe impl Sync for StatusItemPtr {}
+
+static STATUS_ITEM: OnceLock<StatusItemPtr> = OnceLock::new();
+
+/// Hide the menu-bar status item immediately. Called from `quit:` (on the main
+/// thread) so the icon vanishes the instant Quit is chosen, before the server
+/// thread's graceful drain + ACP reap runs. A no-op if the item isn't up yet.
+fn hide_status_item() {
+    let Some(item) = STATUS_ITEM.get() else { return };
+    // SAFETY: `item.0` is the leaked, process-lived status item; `quit:` runs on the
+    // main thread, so messaging it here is on the right thread.
+    unsafe {
+        let item: &NSStatusItem = &*item.0;
+        let _: () = msg_send![item, setVisible: false];
+    }
+}
+
 /// The latest text requested via [`set_text`], kept so a request that lands before
 /// the status item exists (e.g. an early config error surfaced from the server
 /// thread, which can win the race against this thread's AppKit setup) isn't
@@ -849,6 +877,12 @@ pub fn run(url: String, data_dir: PathBuf, shutdown: Arc<Notify>) -> anyhow::Res
             // outlives this function (mirrors `target` below).
             std::mem::forget(click);
         }
+
+        // Publish a pointer to the status item so `quit:` can hide it the instant
+        // Quit is chosen (see [`hide_status_item`]). It lives for the process, so the
+        // pointer never dangles.
+        let ptr: *const NSStatusItem = &*status_item;
+        let _ = STATUS_ITEM.set(StatusItemPtr(ptr));
 
         // Keep the status item and menu alive for the process lifetime. `run` below
         // never returns in the normal path (the process exits on Quit), so leaking

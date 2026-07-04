@@ -261,6 +261,20 @@ define_class!(
         fn open(&self, _arg: Option<&AnyObject>) {
             self.present();
         }
+
+        /// Hide the window this instant — used on Quit so the face disappears the
+        /// moment the user chooses it, ahead of the background shutdown. `orderOut:`
+        /// only hides (no `windowWillClose:`, so no lifecycle churn); the window is
+        /// never reopened because the process is on its way out.
+        #[unsafe(method(hide:))]
+        fn hide(&self, _arg: Option<&AnyObject>) {
+            // SAFETY: main-thread AppKit call; the window is kept alive by the host's
+            // ivars for the process lifetime.
+            unsafe {
+                let window: &KeyWindow = &self.ivars().window;
+                let _: () = msg_send![window, orderOut: core::ptr::null_mut::<AnyObject>()];
+            }
+        }
     }
 
     unsafe impl NSWindowDelegate for Host {
@@ -470,6 +484,13 @@ pub fn install(mtm: MainThreadMarker, url: &str) {
 /// until the window is installed (headless / before the tray loads).
 pub fn open() {
     hop(sel!(open:));
+}
+
+/// Hide the face window immediately (used on Quit, so the window vanishes before the
+/// background shutdown runs). Safe to call from any thread — a no-op until the window
+/// is installed.
+pub fn hide() {
+    hop(sel!(hide:));
 }
 
 /// Hop `selector` (`open:`) onto the main run loop where the window lives. A no-op until
