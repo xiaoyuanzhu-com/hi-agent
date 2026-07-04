@@ -18,7 +18,7 @@
 //! **Themed, centered title bar.** The native titlebar is made transparent and its text
 //! hidden; with `FullSizeContentView` the content view spans under it, so the window's
 //! background color paints a flat bar. That bar and the centered `NSTextField` title are
-//! tinted to the face's "Paper & Ink" theme — warm paper/ink in light, espresso/ivory in
+//! tinted to the face's "Paper & Ink" theme — white paper / ink in light, espresso / ivory in
 //! dark, following the OS appearance so the native chrome matches the web content below
 //! (see [`apply_face_theme`]). The label clears the traffic lights on the left, and the
 //! web view is inset below the bar strip.
@@ -93,8 +93,8 @@ fn srgb(r: f64, g: f64, b: f64) -> Retained<NSColor> {
 /// The bar is matched to `--bg-1`, not `--bg-0`: the face's visible background
 /// is the `.hi-presence` radial gradient centered at the top edge — `--bg-1` at
 /// `50% 0%` fading to `--bg-0` at 62% — so the strip of web content directly
-/// under the title bar is `--bg-1`. Painting the bar `--bg-1` (light warm paper
-/// `#ece2d1`, dark espresso `#2b2720`) makes the native chrome read as one
+/// under the title bar is `--bg-1`. Painting the bar `--bg-1` (light white
+/// `#ffffff`, dark espresso `#2b2720`) makes the native chrome read as one
 /// surface with the content where they actually meet. The title uses `--fg`
 /// (light ink `#3a352c`, dark ivory `#e8dfce`). Called at install and again on
 /// each open so a light/dark switch since the last open is picked up.
@@ -102,7 +102,7 @@ fn apply_face_theme(window: &NSWindow, label: &NSTextField) {
     let (bg, fg) = if os_is_dark() {
         (srgb(0.169, 0.153, 0.125), srgb(0.910, 0.875, 0.808))
     } else {
-        (srgb(0.925, 0.886, 0.820), srgb(0.227, 0.208, 0.173))
+        (srgb(1.0, 1.0, 1.0), srgb(0.227, 0.208, 0.173))
     };
     window.setBackgroundColor(Some(&bg));
     label.setTextColor(Some(&fg));
