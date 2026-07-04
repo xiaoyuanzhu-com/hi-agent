@@ -7,6 +7,7 @@ import { SpeechText } from "./SpeechText";
 import { ViewSlot } from "./ViewSlot";
 import { KeyboardFallback } from "./KeyboardFallback";
 import { ChannelControls } from "./ChannelControls";
+import { OutOfEnergyHint } from "./OutOfEnergyHint";
 import { CameraPreview } from "./CameraPreview";
 
 /**
@@ -76,6 +77,11 @@ export function Shell() {
       )}
 
       <ViewSlot placements={placements} />
+
+      {/* A quiet card just above the controls while the account is out of energy —
+          keep-typing reassurance + a signed-in 升级 link. Self-polling; renders
+          nothing when energy is flowing. */}
+      <OutOfEnergyHint />
 
       {/* Channel controls are always present — the session auto-starts, so there
           is no gate. Each control honestly reflects its channel's live state;

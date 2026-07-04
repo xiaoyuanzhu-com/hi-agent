@@ -611,6 +611,128 @@ button {
   box-shadow: 0 0 0 1px var(--accent-soft), 0 6px 22px var(--shadow);
 }
 
+/* --- Out-of-energy hint ----------------------------------------------
+   A quiet card pinned just above the channel controls (same right offset +
+   ~cluster width, so it reads as centered over them) while the account is out
+   of energy. Reassurance (keep typing, nothing lost) + a signed-in 升级 button.
+   Built from the surface tokens so it fits both themes; the button uses the
+   site's subscribe colour (--primary / logo red). Rendered by OutOfEnergyHint;
+   present only while out of energy. */
+.hi-oe {
+  position: fixed;
+  right: max(20px, env(safe-area-inset-right));
+  /* clears the 38px control row (bottom:20) with a small gap above it */
+  bottom: calc(max(20px, env(safe-area-inset-bottom)) + 50px);
+  z-index: 61;
+  width: 248px;
+  padding: 13px 14px 12px;
+  border-radius: 16px;
+  border: 1px solid var(--surface-border);
+  background: var(--surface-strong);
+  backdrop-filter: blur(12px);
+  -webkit-backdrop-filter: blur(12px);
+  box-shadow: 0 16px 40px -18px var(--shadow-strong), 0 2px 8px var(--shadow);
+  color: var(--fg);
+  font-family: var(--font-display);
+  animation: hi-oe-in 260ms var(--ease);
+}
+
+@keyframes hi-oe-in {
+  from { opacity: 0; transform: translateY(6px); }
+  to { opacity: 1; transform: none; }
+}
+
+.hi-oe-head {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.hi-oe-spark {
+  flex: none;
+  display: grid;
+  place-items: center;
+  width: 26px;
+  height: 26px;
+  border-radius: 9px;
+  background: rgba(253, 96, 94, 0.12);
+}
+
+.hi-oe-title {
+  font-size: 14px;
+  font-weight: 700;
+  letter-spacing: -0.01em;
+  color: var(--fg);
+}
+
+.hi-oe-body {
+  margin: 8px 0 11px;
+  font-size: 12px;
+  line-height: 1.55;
+  font-weight: 500;
+  color: var(--fg-dim);
+}
+
+.hi-oe-body b {
+  color: var(--fg);
+  font-weight: 700;
+}
+
+.hi-oe-foot {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+}
+
+.hi-oe-reset {
+  font-size: 11px;
+  font-weight: 600;
+  color: var(--fg-mute);
+}
+
+/* Same colour as the hi.xiaoyuanzhu.com subscribe buttons: solid logo red,
+   white text, a soft shadow, hover to ~primary/90. No gradient. */
+.hi-oe-btn {
+  flex: none;
+  padding: 7px 18px;
+  border-radius: 999px;
+  border: none;
+  font-family: var(--font-display);
+  font-size: 13px;
+  font-weight: 700;
+  letter-spacing: -0.01em;
+  color: #fff;
+  background: #fd605e;
+  box-shadow: 0 1px 2px var(--shadow);
+  cursor: pointer;
+  white-space: nowrap;
+  transition: background 160ms var(--ease), transform 160ms var(--ease);
+}
+
+.hi-oe-btn:hover {
+  background: #f0514f;
+  transform: scale(1.03);
+}
+
+.hi-oe-btn:active {
+  transform: scale(0.97);
+}
+
+.hi-oe-btn:disabled {
+  opacity: 0.7;
+  cursor: default;
+  transform: none;
+}
+
+@media (max-width: 640px) {
+  .hi-oe {
+    right: max(12px, env(safe-area-inset-right));
+    bottom: calc(max(12px, env(safe-area-inset-bottom)) + 44px);
+    width: min(248px, calc(100vw - 24px));
+  }
+}
+
 /* --- Camera self-view -------------------------------------------------
    The user's own camera while vision is on. Fullscreen backdrop above the
    atmosphere (z1) but below the words/controls/views, so the agent still

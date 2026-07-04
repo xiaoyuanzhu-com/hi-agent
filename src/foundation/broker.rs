@@ -264,12 +264,13 @@ struct WebTicketDto {
 }
 
 /// Mint a one-time web-handoff ticket and return the browser URL that lands the
-/// user on the pricing page **already signed in as this device account**
-/// (`<broker>/pricing?ticket=…`). The tray's "Subscribe" opens this. Xiaoyuanzhu
+/// user on the site **already signed in as this device account**
+/// (`<broker><path>?ticket=…`). The tray's "Subscribe" opens this (default landing
+/// page); the out-of-energy hint passes `prefer_path = Some("/account")`. Xiaoyuanzhu
 /// mode only — it needs the bootstrapped access token; errors if bootstrap hasn't
 /// produced one yet (the caller surfaces that, e.g. "try again in a moment"). The
 /// ticket is a URL-safe JWT (base64url + dots), so no query-encoding is needed.
-pub async fn subscribe_url(data_dir: &Path) -> anyhow::Result<String> {
+pub async fn subscribe_url(data_dir: &Path, prefer_path: Option<&str>) -> anyhow::Result<String> {
     let store = Credentials::load(data_dir);
     let access = store
         .tokens
@@ -294,7 +295,12 @@ pub async fn subscribe_url(data_dir: &Path) -> anyhow::Result<String> {
     if dto.ticket.trim().is_empty() {
         anyhow::bail!("broker returned an empty web ticket");
     }
-    let path = if dto.path.trim().is_empty() { "/pricing" } else { dto.path.trim() };
+    // The caller's preferred landing page wins (the hint wants `/account`); else the
+    // broker's suggested path, else the pricing page. The ticket is a login handoff,
+    // valid for any page on the domain, so overriding the path is safe.
+    let prefer = prefer_path.map(|p| p.trim()).filter(|p| !p.is_empty());
+    let broker_path = dto.path.trim();
+    let path = prefer.unwrap_or(if broker_path.is_empty() { "/pricing" } else { broker_path });
     Ok(format!("{}{}?ticket={}", base_url(), path, dto.ticket.trim()))
 }
 

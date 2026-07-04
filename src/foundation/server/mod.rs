@@ -20,6 +20,7 @@ use crate::foundation::observatory::Observatory;
 use crate::body::reactor::{InterruptRegistry, OutboundSignal, ToolRegistry};
 use crate::types::{Channel, Scene, Signal, ViewEnvelope};
 
+pub mod account;
 pub mod acp;
 pub mod audio;
 pub mod binder;
@@ -515,6 +516,10 @@ pub fn build(
         // accessibility tree and type the stored value, no model in the loop. The
         // v1 trigger (a later hotkey/gesture would call the same path).
         .route("/api/reflex/invoke", post(reflex::post_invoke))
+        // The device account's energy standing + a signed-in upgrade link. Public,
+        // like every route here; the out-of-energy card calls both.
+        .route("/api/account/energy", get(account::get_energy))
+        .route("/api/account/subscribe", get(account::get_subscribe))
         // A scene's channels, observed live as one merged presence stream — the
         // channel inspector's window onto every in/out channel of one scene.
         .route("/api/scenes/{scene}/channels", get(channels::get_scene_channels))

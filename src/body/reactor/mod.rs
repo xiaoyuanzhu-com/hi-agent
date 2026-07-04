@@ -324,6 +324,9 @@ impl Vendor {
         drop(st);
         if entering {
             self.oe_signal.notify_one();
+            // Mirror the flip to the process-wide flag the `/api/account/energy`
+            // handler reads, so the web app raises the out-of-energy hint at once.
+            crate::foundation::energy_state::set(true);
         }
         entering
     }
@@ -376,6 +379,13 @@ impl Vendor {
         self.generic_failures.store(0, Ordering::Relaxed);
         let was_down = !matches!(*st, VendorState::Up);
         *st = VendorState::Up;
+        drop(st);
+        // Energy is flowing again (this covers both recovery paths — a turn that
+        // completes and the balance poller's refill both land here). Drop the flag
+        // so the web app takes the out-of-energy hint down.
+        if was_down {
+            crate::foundation::energy_state::set(false);
+        }
         was_down
     }
 
@@ -421,7 +431,7 @@ fn resets_at_instant(resets_at: &str) -> Option<Instant> {
 
 /// A short human phrase for when the balance refills ("大约 3 小时后", "约 20 分钟后"),
 /// or a vague fallback when the reset time is unknown.
-fn humanize_until_reset(resets_at: &str) -> String {
+pub(crate) fn humanize_until_reset(resets_at: &str) -> String {
     let Ok(reset) = chrono::DateTime::parse_from_rfc3339(resets_at.trim()) else {
         return "过一会儿".to_string();
     };
@@ -1944,22 +1954,17 @@ async fn run_turn(
             }
             Err(err) => match classify_outage(err) {
                 Outage::OutOfEnergy => {
-                    // Definite: flip to out-of-energy immediately and announce once,
-                    // pointing at the reset time and the upgrade page. No more model
-                    // calls until the shared poller sees the balance refill — the
-                    // held mail then drains. The reset time comes from the cached
-                    // balance the broker keeps fresh; a 402 body carries none.
+                    // Definite: flip to out-of-energy immediately. That flip also
+                    // raises the process-wide flag the web app polls, so it shows the
+                    // out-of-energy hint (above the controls) — no spoken nudge. No
+                    // more model calls until the shared poller sees the balance refill;
+                    // the held mail then drains. `resets_at` paces the balance poll and
+                    // feeds the hint's reset line (a 402 body carries none).
                     let resets_at = crate::foundation::credentials::Credentials::load(reactor.inner.memory.data_dir())
                         .energy
                         .map(|e| e.resets_at)
                         .unwrap_or_default();
-                    if reactor.inner.vendor.note_out_of_energy(resets_at_instant(&resets_at)) {
-                        let when = humanize_until_reset(&resets_at);
-                        let line = format!(
-                            "能量用完了，{when}恢复。想现在就继续，可以到 https://hi.xiaoyuanzhu.com/account 升级套餐。我先把你说的记下来，等能量恢复就接着处理。"
-                        );
-                        let _ = beats.send(sequencer::Beat::Say(line)).await;
-                    }
+                    reactor.inner.vendor.note_out_of_energy(resets_at_instant(&resets_at));
                 }
                 Outage::RateLimited => {
                     // Transient throttle: back off and retry, silently — a rate limit

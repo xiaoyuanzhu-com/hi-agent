@@ -141,7 +141,7 @@ define_class!(
                         return;
                     }
                 };
-                match rt.block_on(crate::foundation::broker::subscribe_url(&data_dir)) {
+                match rt.block_on(crate::foundation::broker::subscribe_url(&data_dir, None)) {
                     Ok(url) => {
                         if let Err(e) = std::process::Command::new("open").arg(&url).spawn() {
                             tracing::error!(error = %e, "tray: failed to open subscribe url");
