@@ -13,7 +13,7 @@
  */
 
 /* ── Theme: "Paper & Ink" ─────────────────────────────────────────────────
-   A warm, matte, static skin — warm cream paper in light, espresso in dark.
+   A matte, static skin — white paper in light, espresso in dark.
    No colour lives in the background any more; the whole surface is themed from
    the tokens below. The only colour is the accent (terracotta / amber) and a
    *very* faint state-glow the presence layer breathes into the paper.
@@ -23,9 +23,9 @@
    re-skin the whole face, swap these token blocks alone — nothing downstream
    hardcodes a colour. */
 :root {
-  /* warm paper */
-  --bg-0: #f4ede0;
-  --bg-1: #ece2d1;
+  /* white paper */
+  --bg-0: #ffffff;
+  --bg-1: #ffffff;
 
   --fg: #3a352c;      /* ink */
   --fg-dim: #6b6354;
