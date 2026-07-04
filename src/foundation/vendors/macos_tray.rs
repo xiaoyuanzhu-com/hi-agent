@@ -533,13 +533,19 @@ static STATUS_ITEM: OnceLock<StatusItemPtr> = OnceLock::new();
 /// Hide the menu-bar status item immediately. Called from `quit:` (on the main
 /// thread) so the icon vanishes the instant Quit is chosen, before the server
 /// thread's graceful drain + ACP reap runs. A no-op if the item isn't up yet.
+///
+/// Uses `removeStatusItem:` rather than `setVisible:false` on purpose: the `visible`
+/// property is autosaved to user defaults, so hiding it that way makes macOS restore
+/// the icon *hidden* on the next launch (the icon would silently never come back).
+/// Removal from the bar is transient — the next launch creates a fresh item that
+/// shows normally.
 fn hide_status_item() {
     let Some(item) = STATUS_ITEM.get() else { return };
     // SAFETY: `item.0` is the leaked, process-lived status item; `quit:` runs on the
     // main thread, so messaging it here is on the right thread.
     unsafe {
         let item: &NSStatusItem = &*item.0;
-        let _: () = msg_send![item, setVisible: false];
+        NSStatusBar::systemStatusBar().removeStatusItem(item);
     }
 }
 
@@ -704,6 +710,12 @@ pub fn run(url: String, data_dir: PathBuf, shutdown: Arc<Notify>) -> anyhow::Res
     unsafe {
         let status_bar = NSStatusBar::systemStatusBar();
         let status_item = status_bar.statusItemWithLength(NSVariableStatusItemLength);
+        // Force the item visible. `visible` is autosaved to user defaults, so a build
+        // that once hid it via `setVisible:false` on quit would have persisted a
+        // hidden state that makes the icon never reappear; setting it true on every
+        // launch overrides that and re-persists the healthy state. (This item isn't
+        // user-removable, so there's no legitimate hidden state to respect.)
+        let _: () = msg_send![&*status_item, setVisible: true];
 
         // The button carries the icon. The resting icon is the hi mark as a
         // *template* image (the menu bar auto-tints it for light/dark); fall back
