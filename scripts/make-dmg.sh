@@ -16,7 +16,7 @@
 #   REUSE_RESOURCES=DIR  Copy an already-provisioned Resources tree (with
 #                      runtime/.complete) instead of downloading again.
 #
-# Output: "target/dmg/Hi Agent.app" and target/dmg/hi-agent-<version>-arm64.dmg
+# Output: "target/dmg/Hi Agent.app" and target/dmg/hi-agent-<version>-macos.dmg
 set -euo pipefail
 
 cd "$(dirname "$0")/.."
@@ -37,7 +37,7 @@ OUT="$ROOT/target/dmg"
 APP="$OUT/Hi Agent.app"
 RES="$APP/Contents/Resources"
 MACOS="$APP/Contents/MacOS"
-DMG="$OUT/hi-agent-$VERSION-arm64.dmg"
+DMG="$OUT/hi-agent-$VERSION-macos.dmg"
 
 # --- 1. build the binary + embedded SPA ------------------------------------
 if [ "${SKIP_BUILD:-}" != "1" ]; then
