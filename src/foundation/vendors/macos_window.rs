@@ -18,13 +18,18 @@
 //! content under the transparent titlebar, so [`KeyWindow`] catches the double-click in
 //! `sendEvent:` and drives `zoom:` itself.
 //!
-//! **Themed, centered title bar.** The native titlebar is made transparent and its text
-//! hidden; with `FullSizeContentView` the content view spans under it, so the window's
-//! background color paints a flat bar. That bar and the centered `NSTextField` title are
-//! tinted to the face's "Paper & Ink" theme — white paper / ink in light, espresso / ivory in
-//! dark, following the OS appearance so the native chrome matches the web content below
-//! (see [`apply_face_theme`]). The label clears the traffic lights on the left, and the
-//! web view is inset below the bar strip.
+//! **Seamless title bar — the page *is* the bar.** The native titlebar is made transparent
+//! and its text hidden; with `FullSizeContentView` the content view spans under it. Rather
+//! than inset the web view below the strip and paint that strip with a flat window colour
+//! (two surfaces that can't stay matched once the page's presence glow breathes by state),
+//! the `WKWebView` fills the *whole* window, so the page's own background — paper plus the
+//! live state-glow — paints under the titlebar too. Bar and content are then literally the
+//! same pixels in every state; nothing to keep in sync. The traffic lights float on top as
+//! usual, and the page already reserves ~[`BAR_H`] at the top for them. Because the web view
+//! now covers the titlebar's drag region, a transparent [`DragView`] strip on top restores
+//! window dragging; the window background colour ([`apply_face_theme`]) survives only as the
+//! pre-paint / live-resize fallback, and the centered `NSTextField` title floats over the
+//! page, clearing the traffic lights on the left.
 //!
 //! Media permission mirrors the popover: a [`MediaGrant`] `WKUIDelegate` auto-grants
 //! the page's mic/camera so WebKit never shows its per-site *page-level* prompt. That is
@@ -95,15 +100,15 @@ fn srgb(r: f64, g: f64, b: f64) -> Retained<NSColor> {
     NSColor::colorWithSRGBRed_green_blue_alpha(r, g, b, 1.0)
 }
 
-/// Paint the bar background + centered title to the current theme's paper/ink.
-/// The bar is matched to `--bg-1`, not `--bg-0`: the face's visible background
-/// is the `.hi-presence` radial gradient centered at the top edge — `--bg-1` at
-/// `50% 0%` fading to `--bg-0` at 62% — so the strip of web content directly
-/// under the title bar is `--bg-1`. Painting the bar `--bg-1` (light white
-/// `#ffffff`, dark espresso `#2b2720`) makes the native chrome read as one
-/// surface with the content where they actually meet. The title uses `--fg`
-/// (light ink `#3a352c`, dark ivory `#e8dfce`). Called at install and again on
-/// each open so a light/dark switch since the last open is picked up.
+/// Paint the window background + centered title to the current theme's paper/ink.
+/// The web view now paints the title-bar strip itself (it fills the whole window),
+/// so this background colour is only a fallback: it shows for the instant before the
+/// page first paints and along any edge a live resize briefly outruns the web view's
+/// repaint. It's matched to `--bg-1` — the page's colour at the top edge (`.hi-presence`
+/// is `--bg-1` at `50% 0%`) — so even that transient flash stays on-theme (light white
+/// `#ffffff`, dark espresso `#2b2720`). The title uses `--fg` (light ink `#3a352c`, dark
+/// ivory `#e8dfce`). Called at install and again on each open so a light/dark switch
+/// since the last open is picked up.
 fn apply_face_theme(window: &NSWindow, label: &NSTextField) {
     let (bg, fg) = if os_is_dark() {
         (srgb(0.169, 0.153, 0.125), srgb(0.910, 0.875, 0.808))
@@ -205,6 +210,28 @@ define_class!(
     }
 );
 
+define_class!(
+    // A transparent strip laid over the top `BAR_H` of the web view to restore window
+    // dragging there. Once the web view fills the whole window it covers the titlebar's
+    // native drag region, and `WKWebView` (interactive content) reports
+    // `mouseDownCanMoveWindow == false`, so a drag on the strip would otherwise be eaten
+    // by the page instead of moving the window. This view draws nothing (the web view
+    // shows through it) and just answers `true`, handing drags in the strip back to the
+    // window. Double-clicks still zoom: `KeyWindow::send_event` catches those in the
+    // window's event funnel before they ever reach a subview.
+    #[unsafe(super(NSView))]
+    #[thread_kind = MainThreadOnly]
+    #[name = "HiAgentTitlebarDrag"]
+    struct DragView;
+
+    impl DragView {
+        #[unsafe(method(mouseDownCanMoveWindow))]
+        fn mouse_down_can_move_window(&self) -> bool {
+            true
+        }
+    }
+);
+
 /// What the host needs to show/focus the window. Touched only on the main thread.
 struct Ivars {
     window: Retained<KeyWindow>,
@@ -286,13 +313,11 @@ pub fn install(mtm: MainThreadMarker, url: &str) {
         let config = WKWebViewConfiguration::new(mtm);
         let full = NSRect::new(NSPoint::new(0.0, 0.0), NSSize::new(WINDOW_W, WINDOW_H));
 
-        // The web view fills the window below the title-bar strip and grows with it.
-        let web_frame = NSRect::new(
-            NSPoint::new(0.0, 0.0),
-            NSSize::new(WINDOW_W, WINDOW_H - BAR_H),
-        );
+        // The web view fills the *whole* window — under the transparent titlebar too — so
+        // the page's own background (paper + live state-glow) paints the title-bar strip,
+        // melting the bar into the content. It grows with the window.
         let webview: Retained<WKWebView> =
-            WKWebView::initWithFrame_configuration(WKWebView::alloc(mtm), web_frame, &config);
+            WKWebView::initWithFrame_configuration(WKWebView::alloc(mtm), full, &config);
         webview.setAutoresizingMask(
             NSAutoresizingMaskOptions::ViewWidthSizable | NSAutoresizingMaskOptions::ViewHeightSizable,
         );
@@ -361,9 +386,25 @@ pub fn install(mtm: MainThreadMarker, url: &str) {
         // light/dark appearance) so the native chrome matches the web content.
         apply_face_theme(&window, &label);
 
-        // Content view: the web view below, the title label floating in the bar strip.
+        // Transparent drag strip across the top `BAR_H`, pinned to the top edge and
+        // stretching horizontally — restores window dragging over the region the web view
+        // now covers (see [`DragView`]). Draws nothing, so the page shows through.
+        let drag: Retained<DragView> = msg_send![
+            DragView::alloc(mtm),
+            initWithFrame: NSRect::new(
+                NSPoint::new(0.0, WINDOW_H - BAR_H),
+                NSSize::new(WINDOW_W, BAR_H),
+            )
+        ];
+        drag.setAutoresizingMask(
+            NSAutoresizingMaskOptions::ViewWidthSizable | NSAutoresizingMaskOptions::ViewMinYMargin,
+        );
+
+        // Content view, back to front: the full-window web view, the transparent drag strip
+        // over its top edge, then the title label floating above both in the bar strip.
         let container = NSView::initWithFrame(NSView::alloc(mtm), full);
         container.addSubview(&webview);
+        container.addSubview(&drag);
         container.addSubview(&label);
         let _: () = msg_send![&*window, setContentView: &*container];
         std::mem::forget(container);
