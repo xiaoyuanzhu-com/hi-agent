@@ -231,7 +231,15 @@ button {
 /* --- Presence (themed background) ------------------------------------
    The paper itself: a soft warm gradient from the theme tokens, with a single
    very faint state-glow breathing into it (colour set by data-state below). No
-   canvas, no audio — a calm, matte, static skin. */
+   canvas, no audio — a calm, matte, static skin.
+
+   The horizontal radius is deliberately huge (600%) so the top edge stays a flat
+   `--bg-1` across the full width — the vignette darkens only downward. That keeps
+   the strip directly under the native title bar uniformly `--bg-1`, which the macOS
+   window paints its flat titlebar to match (see macos_window.rs::apply_face_theme).
+   A tighter horizontal radius (the old 140%) let the top corners fade toward the
+   darker `--bg-0`, leaving a faint darker-at-the-ends seam under the bar in dark
+   mode (invisible in light, where --bg-0 == --bg-1 == white). */
 .hi-presence {
   position: absolute;
   inset: 0;
@@ -239,7 +247,7 @@ button {
   width: 100%;
   height: 100%;
   display: block;
-  background: radial-gradient(140% 120% at 50% 0%, var(--bg-1), var(--bg-0) 62%);
+  background: radial-gradient(600% 120% at 50% 0%, var(--bg-1), var(--bg-0) 62%);
 }
 
 /* The whisper of colour: three soft pools in the current state's glow hue,
