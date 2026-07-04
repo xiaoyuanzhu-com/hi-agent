@@ -53,11 +53,12 @@ use objc2::runtime::{AnyObject, NSObject, NSObjectProtocol, ProtocolObject, Sel}
 use objc2::{DefinedClass, MainThreadOnly, define_class, msg_send, sel};
 use objc2_app_kit::{
     NSApplication, NSAutoresizingMaskOptions, NSBackingStoreType, NSColor, NSEvent, NSEventType,
-    NSWindowCollectionBehavior, NSTextAlignment, NSTextField, NSView, NSWindow, NSWindowStyleMask,
-    NSWindowTitleVisibility,
+    NSWindowCollectionBehavior, NSTextAlignment, NSTextField, NSView, NSWindow, NSWindowDelegate,
+    NSWindowStyleMask, NSWindowTitleVisibility,
 };
 use objc2_foundation::{
-    MainThreadMarker, NSPoint, NSRect, NSSize, NSString, NSURL, NSURLRequest, NSUserDefaults,
+    MainThreadMarker, NSNotification, NSPoint, NSRect, NSSize, NSString, NSURL, NSURLRequest,
+    NSUserDefaults,
 };
 use objc2_web_kit::{
     WKFrameInfo, WKMediaCaptureType, WKPermissionDecision, WKSecurityOrigin, WKUIDelegate,
@@ -261,6 +262,19 @@ define_class!(
             self.present();
         }
     }
+
+    unsafe impl NSWindowDelegate for Host {
+        /// The close button sends the app to the *background*: the window is reused, not
+        /// destroyed (`setReleasedWhenClosed: false`), so the web view and its React tree
+        /// survive and the page's own unmount teardown never runs. Signal the transition so
+        /// the face can pause what a hidden window shouldn't keep doing — first among them
+        /// holding the mic/camera open. [`Host::present`] signals the matching `foreground`
+        /// on the next open, where the face restores whatever the user last had on.
+        #[unsafe(method(windowWillClose:))]
+        fn window_will_close(&self, _notification: &NSNotification) {
+            self.emit_lifecycle("background");
+        }
+    }
 );
 
 impl Host {
@@ -289,6 +303,31 @@ impl Host {
             let window: &KeyWindow = &iv.window;
             let _: () = msg_send![window, center];
             let _: () = msg_send![window, makeKeyAndOrderFront: core::ptr::null_mut::<AnyObject>()];
+        }
+        // Coming back to the front: let the face restore the capture channels it paused
+        // when the window was last closed. Best-effort and idempotent — on the very first
+        // open the page is still loading and no one is listening yet, which is fine (the
+        // face does its own honest restore at startup); it matters on every reopen after.
+        self.emit_lifecycle("foreground");
+    }
+
+    /// Push a foreground/background transition into the hosted page — the native half of
+    /// the desktop lifecycle bridge. The face subscribes on the web side (see
+    /// `nativeBridge.ts`, consumed by `useAgentSession.ts`) and pauses/restores its capture
+    /// accordingly; because the view is reused across close/open it depends on us for these
+    /// transitions rather than on page load/unmount. `phase` is a fixed `"foreground"` /
+    /// `"background"` literal, so the interpolation carries no untrusted input. Best-effort:
+    /// a page that hasn't finished loading simply has no listener yet.
+    fn emit_lifecycle(&self, phase: &str) {
+        let js = NSString::from_str(&format!(
+            "window.dispatchEvent(new CustomEvent('hi:lifecycle',{{detail:{{phase:'{phase}'}}}}))"
+        ));
+        // SAFETY: main-thread WebKit call (delegate callbacks + `present` both run on the
+        // main thread); the web view is kept alive by the host's ivars for the process.
+        unsafe {
+            self.ivars()
+                .webview
+                .evaluateJavaScript_completionHandler(&js, None);
         }
     }
 }
@@ -413,6 +452,12 @@ pub fn install(mtm: MainThreadMarker, url: &str) {
         // lifetime (the ivars keep them alive; the host itself is leaked below).
         let host = Host::alloc(mtm).set_ivars(Ivars { window, webview, request, label });
         let host: Retained<Host> = msg_send![super(host), init];
+        // The host doubles as the window's delegate so it learns when the close button
+        // dismisses the (reused) window and can tell the face to release its capture.
+        // The delegate is weakly held; the host is leaked below, so it outlives the window.
+        host.ivars()
+            .window
+            .setDelegate(Some(ProtocolObject::from_ref(&*host)));
         let ptr: *const Host = &*host;
         std::mem::forget(host);
         std::mem::forget(config);

@@ -10,6 +10,7 @@ import { PresenceStiller } from "../lib/presenceStiller";
 import { VoicePlayer } from "../lib/voicePlayer";
 import { SentenceBuffer } from "../lib/sentences";
 import { getScene } from "../lib/scene";
+import { onNativeLifecycle } from "../lib/nativeBridge";
 import type { PresenceState } from "../ui/Presence";
 import type { SpeechItem } from "../ui/SpeechText";
 
@@ -618,6 +619,18 @@ export function useAgentSession(): AgentSession {
     [persistPrefs],
   );
 
+  // Restore the input channels the user last had on — but *honestly*: a saved-on
+  // mic/camera is re-acquired only when its permission is already granted, so the
+  // restore is silent (no surprise prompt). A channel that can't be restored
+  // silently stays off; its control shows off and a click re-requests the device.
+  // Shared by the initial startup restore and the foreground restore below, and
+  // driven off `prefsRef` so a mid-session toggle is reflected next time.
+  const restoreInputChannels = useCallback(async () => {
+    const prefs = prefsRef.current;
+    if (prefs.audioInput && (await permissionGranted("microphone"))) void enableAudio();
+    if (prefs.videoInput && (await permissionGranted("camera"))) void enableVision();
+  }, [enableAudio, enableVision]);
+
   // ---- start the session: build the output graph, restore channels -------
   // Runs once on mount — no wake gate, no dedicated gesture. Building the
   // AudioBus is always allowed; the context may start suspended (autoplay
@@ -652,11 +665,8 @@ export function useAgentSession(): AgentSession {
         voice.setMuted(!prefs.audioOutput);
         setBus(audioBus);
         setWoken(true);
-        // Restore input channels only when they can be restored silently. A
-        // saved-on channel whose permission isn't already granted stays off,
-        // honestly reflecting that we couldn't restore it — a click enables it.
-        if (prefs.audioInput && (await permissionGranted("microphone"))) void enableAudio();
-        if (prefs.videoInput && (await permissionGranted("camera"))) void enableVision();
+        // Restore the mic/camera the user last had on, silently (see helper above).
+        void restoreInputChannels();
       } catch (err) {
         // The output graph couldn't be built (no Web Audio, etc.). The text
         // channel still works, so mark the session up and leave audio off.
@@ -664,7 +674,7 @@ export function useAgentSession(): AgentSession {
         setWoken(true);
       }
     })();
-  }, [woken, enableAudio, enableVision]);
+  }, [woken, restoreInputChannels]);
 
   // Auto-start on mount — the session builds itself and restores channels per
   // the honest policy above. The ref guard keeps StrictMode's double-invoke (and
@@ -675,6 +685,36 @@ export function useAgentSession(): AgentSession {
     startedRef.current = true;
     startSession();
   }, [startSession]);
+
+  // Native desktop lifecycle: pause on background (window closed), restore on
+  // foreground (window reopened). The macOS WKWebView is reused across close/open,
+  // so the React tree never unmounts and the unmount cleanup below never runs —
+  // without this a closed window would keep the mic/camera live and keep the agent
+  // talking out loud to an empty room. Handling per channel:
+  //   • input (mic/camera): released on background so the OS indicators actually go
+  //     off; re-acquired on foreground per the honest, permission-gated startup
+  //     restore. Preferences untouched — a hand-muted mic stays muted across cycles.
+  //   • voice output: silenced on background (and any utterance cut mid-flight) so
+  //     nothing is spoken to a closed window; restored to the user's output
+  //     preference on foreground.
+  //   • text output: deliberately left flowing — it's the persistent, observable
+  //     record, already there in the timeline when the window reopens.
+  // Note this only silences audible voice; the agent still *produces* its turns
+  // server-side while backgrounded (they arrive as text). Truly holding the floor
+  // until the user returns is a server-side, presence-aware turn-taking change, not
+  // this view's to make. Inert in a browser tab (no native lifecycle events there).
+  useEffect(() => {
+    return onNativeLifecycle((phase) => {
+      if (phase === "background") {
+        disableAudio();
+        disableVision();
+        voiceRef.current?.setMuted(true);
+      } else {
+        void restoreInputChannels();
+        voiceRef.current?.setMuted(!prefsRef.current.audioOutput);
+      }
+    });
+  }, [disableAudio, disableVision, restoreInputChannels]);
 
   // cleanup on unmount
   useEffect(() => {
