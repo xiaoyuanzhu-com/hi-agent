@@ -48,7 +48,7 @@
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use std::time::Duration;
 
 mod heartbeat;
@@ -165,25 +165,29 @@ fn reflect_max_interval() -> Duration {
         .unwrap_or(DEFAULT_REFLECT_MAX)
 }
 
-/// Default recovery-probe cadence while in vendor-down mode. The probe only
-/// fires when a scene has pending mail, so an idle outage costs nothing.
+/// Default base gap for a transient-outage retry (429 / generic). The gap doubles
+/// on each failed retry toward [`BACKOFF_CAP`]; 30s is unobtrusive and won't hammer
+/// a throttled gateway.
 const DEFAULT_VENDOR_PROBE: Duration = Duration::from_secs(30);
-/// Default consecutive terminal failures before flipping to vendor-down. Each
-/// terminal failure is already 3 failed model calls, so 2 = 6 failures across
-/// two turns — absorbs blips, catches real outages.
+/// Default consecutive *generic* terminal failures before flipping to an informed
+/// backoff. Each terminal failure is already up to 3 model calls, so 2 = a real
+/// outage, not a one-off blip. (402/429 bypass this — they flip immediately.)
 const DEFAULT_VENDOR_DOWN_AFTER: u32 = 2;
+/// A transient-outage retry never waits longer than this — the 1h ceiling.
+const BACKOFF_CAP: Duration = Duration::from_secs(3600);
+/// While out of energy, poll the balance no faster than this — the floor on
+/// `max(time-to-reset / 2, …)`.
+const OE_POLL_FLOOR: Duration = Duration::from_secs(10);
 
-/// The recovery-probe interval. `vendor_probe` in alarm-delay grammar;
-/// `off`/`0`/unset/unparseable → default. Probes only fire when a scene has
-/// pending mail, so an idle outage costs no vendor calls — there's no need to
-/// disable them.
-fn vendor_probe_interval() -> Duration {
+/// The base transient-outage retry gap. `vendor_probe` in alarm-delay grammar;
+/// `off`/`0`/unset/unparseable → default. (Kept under the historical config key.)
+fn backoff_base() -> Duration {
     duration_tunable(config::tunables::get(config::KEY_VENDOR_PROBE), DEFAULT_VENDOR_PROBE)
         .unwrap_or(DEFAULT_VENDOR_PROBE)
 }
 
-/// The consecutive terminal-failure count that flips the reactor into
-/// vendor-down mode. `vendor_down_after`; `0`/unparseable → default.
+/// The consecutive generic-failure count that flips the reactor into an informed
+/// backoff. `vendor_down_after`; `0`/unparseable → default.
 fn vendor_down_after() -> u32 {
     config::tunables::get(config::KEY_VENDOR_DOWN_AFTER)
         .and_then(|v| v.parse::<u32>().ok())
@@ -191,77 +195,245 @@ fn vendor_down_after() -> u32 {
         .unwrap_or(DEFAULT_VENDOR_DOWN_AFTER)
 }
 
-/// Shared, process-wide view of whether the upstream LLM vendor is reachable.
-/// All scene loops read it; `run_turn`'s terminal-failure path writes it. The
-/// vendor is a shared resource, so one scene detecting an outage flips the flag
-/// for every scene — the others stop burning retries too. Per-scene queues
-/// drain independently on recovery.
-///
-/// `record_failure` returns `true` only on the Up→Down transition (so the caller
-/// emits the canned "holding your mail" line exactly once); `record_success`
-/// returns `true` only on Down→Up.
-struct VendorHealth {
-    down: AtomicBool,
-    consecutive_failures: AtomicU32,
-    down_after: u32,
+/// The classified recovery policy for a terminal turn error — the two states the
+/// user asked for, plus the generic fallback.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum Outage {
+    /// Gateway 402: the account is out of energy. Retrying model calls is pointless
+    /// — the budget won't refill for a while — so we poll the balance and resume on
+    /// refill (or an upgrade). Announced, with the reset time + upgrade page.
+    OutOfEnergy,
+    /// Gateway 429 / 529: throttled or overloaded. Transient and self-healing —
+    /// back off and retry, silently (the user needn't hear about it).
+    RateLimited,
+    /// Anything else (5xx, transport, timeout, a missing response): a generic
+    /// outage. Informed once (after a blip is absorbed), then retried with backoff.
+    Unreachable,
 }
 
-impl VendorHealth {
-    fn new(down_after: u32) -> Self {
+/// Classify a terminal turn error by the HTTP status token the ACP adapter folds
+/// into its opaque message — the adapter hands us no numeric status, so we scan the
+/// flattened text for a standalone status token (same approach as [`has_status_token`]).
+/// A miss falls through to [`Outage::Unreachable`], the safe generic path: mail is
+/// stashed and retried either way.
+fn classify_outage(err: &anyhow::Error) -> Outage {
+    let s = format!("{err:#}");
+    if has_status_token(&s, 402) {
+        Outage::OutOfEnergy
+    } else if has_status_token(&s, 429) || has_status_token(&s, 529) {
+        Outage::RateLimited
+    } else {
+        Outage::Unreachable
+    }
+}
+
+/// How a scene loop should treat the vendor right now — the read side of [`Vendor`].
+#[derive(Clone, Copy, Debug)]
+enum SceneGate {
+    /// Reachable: drive turns normally.
+    Go,
+    /// Transient outage (429 / generic): hold mail, and drive a catch-up turn once
+    /// `at` (the current backoff deadline) passes. A failed retry grows the gap.
+    Retry { at: Instant },
+    /// Out of energy (402): hold mail but do **not** drive a model turn — recovery
+    /// is the shared energy poll, which flips the vendor back Up. `at` is a cheap
+    /// recheck so the loop notices the refill and drains its mail.
+    Hold { at: Instant },
+}
+
+/// The vendor's reachability and, when down, how to recover from it.
+#[derive(Clone, Copy, Debug)]
+enum VendorState {
+    Up,
+    /// Out of energy (402). `poll_at` is the next balance check; `resets_at` is the
+    /// broker's predicted refill instant when known (paces the poll).
+    OutOfEnergy { poll_at: Instant, resets_at: Option<Instant> },
+    /// Transient backoff (429 / generic). `try_at` is the next retry deadline;
+    /// `attempt` grows the gap toward [`BACKOFF_CAP`]; `silent` suppresses the user
+    /// notice for a pure rate-limit (429), which the user needn't hear about.
+    Backoff { try_at: Instant, attempt: u32, silent: bool },
+}
+
+/// Shared, process-wide view of the upstream LLM vendor and how to recover from an
+/// outage. Every scene loop reads it (via [`Vendor::scene_gate`]) to decide whether
+/// and when to drive a turn; `run_turn`'s terminal path writes it. The vendor is a
+/// shared resource, so one scene detecting an outage steers all of them — and a
+/// single [out-of-energy poller](out_of_energy_poller) owns balance polling so N
+/// scenes don't each hammer `/energy`.
+///
+/// The three `note_*` writers return whether the transition warrants a *one-time*
+/// user notice (so the reactor announces "out of energy" / "can't reach the model"
+/// exactly once), mirroring the old flip-once contract.
+struct Vendor {
+    state: std::sync::Mutex<VendorState>,
+    /// Consecutive *generic* (Unreachable) failures, to absorb a blip before an
+    /// informed backoff. Accessed only under `state`'s lock, so effectively part of
+    /// the same critical section. Reset on success and on the immediate 402/429 flips.
+    generic_failures: AtomicU32,
+    down_after: u32,
+    /// The transient-outage retry base; the gap is `base · 2^attempt`, capped at 1h.
+    base: Duration,
+    /// Wakes the out-of-energy poller on entering [`VendorState::OutOfEnergy`].
+    oe_signal: tokio::sync::Notify,
+}
+
+impl Vendor {
+    fn new(down_after: u32, base: Duration) -> Self {
         Self {
-            down: AtomicBool::new(false),
-            consecutive_failures: AtomicU32::new(0),
+            state: std::sync::Mutex::new(VendorState::Up),
+            generic_failures: AtomicU32::new(0),
             down_after,
+            base,
+            oe_signal: tokio::sync::Notify::new(),
         }
     }
 
     fn is_down(&self) -> bool {
-        self.down.load(Ordering::Relaxed)
+        !matches!(*self.state.lock().unwrap(), VendorState::Up)
     }
 
-    /// Record a terminal turn failure. Returns `true` if this call flipped the
-    /// state Up→Down (the caller emits the canned "holding your mail" line).
-    /// Returns `false` for failures that don't cross the threshold or that land
-    /// while already Down (probe failures).
-    fn record_failure(&self) -> bool {
-        let n = self.consecutive_failures.fetch_add(1, Ordering::Relaxed) + 1;
-        if n >= self.down_after {
-            !self.down.swap(true, Ordering::Relaxed)
-        } else {
-            false
+    /// The retry gap for the given attempt: `base · 2^attempt`, capped at 1h.
+    fn backoff(&self, attempt: u32) -> Duration {
+        let base = self.base.as_secs().max(1);
+        let secs = base.saturating_mul(1u64 << attempt.min(20));
+        Duration::from_secs(secs.min(BACKOFF_CAP.as_secs()))
+    }
+
+    /// The scene loop's scheduling read: drive now (Go), retry at a deadline
+    /// (Retry), or hold mail without a model call (Hold, out of energy).
+    fn scene_gate(&self) -> SceneGate {
+        match *self.state.lock().unwrap() {
+            VendorState::Up => SceneGate::Go,
+            VendorState::Backoff { try_at, .. } => SceneGate::Retry { at: try_at },
+            // A cheap recheck (not the poll cadence): the shared poller owns the
+            // `/energy` call; the scene only needs to notice the resulting flip Up.
+            VendorState::OutOfEnergy { .. } => SceneGate::Hold { at: Instant::now() + OE_POLL_FLOOR },
         }
     }
 
-    /// Record a successful turn. Returns `true` if this call flipped the state
-    /// Down→Up. Always resets the failure counter.
-    fn record_success(&self) -> bool {
-        self.consecutive_failures.store(0, Ordering::Relaxed);
-        self.down.swap(false, Ordering::Relaxed)
+    /// Terminal 402. Flip to out-of-energy immediately (a 402 is definite, not a
+    /// blip), pacing the balance poll from `resets_at`, and wake the poller. Returns
+    /// `true` on the flip *into* out-of-energy so the caller announces it once.
+    fn note_out_of_energy(&self, resets_at: Option<Instant>) -> bool {
+        let mut st = self.state.lock().unwrap();
+        self.generic_failures.store(0, Ordering::Relaxed);
+        let entering = !matches!(*st, VendorState::OutOfEnergy { .. });
+        if entering {
+            *st = VendorState::OutOfEnergy { poll_at: oe_next_poll(resets_at), resets_at };
+        }
+        drop(st);
+        if entering {
+            self.oe_signal.notify_one();
+        }
+        entering
     }
 
-    /// Force the Down state immediately — for a *definite* outage like
-    /// out-of-energy (a 402), which shouldn't wait out `down_after` flaky retries.
-    /// Returns `true` on the Up→Down flip (so the caller emits the notice once).
-    fn force_down(&self) -> bool {
-        self.consecutive_failures.store(self.down_after, Ordering::Relaxed);
-        !self.down.swap(true, Ordering::Relaxed)
+    /// Terminal 429/529. Silent transient backoff — grow the gap if already backing
+    /// off, else start at the base. A 402 in effect is the stronger state and stands.
+    fn note_rate_limited(&self) {
+        let mut st = self.state.lock().unwrap();
+        self.generic_failures.store(0, Ordering::Relaxed);
+        if matches!(*st, VendorState::OutOfEnergy { .. }) {
+            return;
+        }
+        let attempt = match *st {
+            VendorState::Backoff { attempt, .. } => attempt.saturating_add(1),
+            _ => 0,
+        };
+        *st = VendorState::Backoff { try_at: Instant::now() + self.backoff(attempt), attempt, silent: true };
+    }
+
+    /// Terminal generic outage. Absorb one blip via `down_after`, then flip to an
+    /// *informed* backoff. Returns `true` exactly on that flip (announce once);
+    /// `false` while still absorbing, already backing off, or out of energy.
+    fn note_unreachable(&self) -> bool {
+        let mut st = self.state.lock().unwrap();
+        match *st {
+            // A 402's poll-based recovery is stronger; leave it (and its schedule).
+            VendorState::OutOfEnergy { .. } => false,
+            // Already backing off — a failed retry just grows the gap.
+            VendorState::Backoff { attempt, silent, .. } => {
+                let a = attempt.saturating_add(1);
+                *st = VendorState::Backoff { try_at: Instant::now() + self.backoff(a), attempt: a, silent };
+                false
+            }
+            VendorState::Up => {
+                let n = self.generic_failures.fetch_add(1, Ordering::Relaxed) + 1;
+                if n >= self.down_after {
+                    *st = VendorState::Backoff { try_at: Instant::now() + self.backoff(0), attempt: 0, silent: false };
+                    true
+                } else {
+                    false
+                }
+            }
+        }
+    }
+
+    /// A turn (or retry) succeeded. Flip Up and reset the blip counter. Returns
+    /// `true` if this ended an outage (so the caller logs the recovery).
+    fn note_success(&self) -> bool {
+        let mut st = self.state.lock().unwrap();
+        self.generic_failures.store(0, Ordering::Relaxed);
+        let was_down = !matches!(*st, VendorState::Up);
+        *st = VendorState::Up;
+        was_down
+    }
+
+    /// The next balance-poll instant while out of energy, or `None` once recovered
+    /// (the poller then parks until re-signalled).
+    fn oe_poll_at(&self) -> Option<Instant> {
+        match *self.state.lock().unwrap() {
+            VendorState::OutOfEnergy { poll_at, .. } => Some(poll_at),
+            _ => None,
+        }
+    }
+
+    /// Re-pace the balance poll after a check that found the account still empty.
+    /// No-op if the vendor recovered concurrently.
+    fn oe_reschedule(&self, resets_at: Option<Instant>) {
+        let mut st = self.state.lock().unwrap();
+        if let VendorState::OutOfEnergy { poll_at, resets_at: slot } = &mut *st {
+            *slot = resets_at;
+            *poll_at = oe_next_poll(resets_at);
+        }
     }
 }
 
-/// Whether a terminal turn error is the gateway reporting "out of energy" — an
-/// HTTP 402 Payment Required. We key on the standard status code, not a
-/// vendor-specific error slug, so any conforming gateway trips it and hi-agent
-/// stays ignorant of who the gateway is.
-///
-/// Caveat on where the 402 comes from: the LLM turn runs through the ACP adapter,
-/// which does *not* hand us a numeric HTTP status. It translates the upstream
-/// failure into a JSON-RPC `internalError` (code -32603) whose `message` is the
-/// `claude` CLI's free-text result; the HTTP status survives only as text inside
-/// that message. So we scan the flattened error for a `402` status token rather
-/// than reading a field. A miss just degrades to the generic vendor-down message
-/// — input is still stashed and caught up either way.
-fn is_out_of_energy(err: &anyhow::Error) -> bool {
-    has_status_token(&format!("{err:#}"), 402)
+/// The next out-of-energy balance poll: half the time until the predicted reset,
+/// floored at [`OE_POLL_FLOOR`]. Unknown/past reset → poll at the floor.
+fn oe_next_poll(resets_at: Option<Instant>) -> Instant {
+    let now = Instant::now();
+    let half = match resets_at {
+        Some(r) if r > now => (r - now) / 2,
+        _ => OE_POLL_FLOOR,
+    };
+    now + half.max(OE_POLL_FLOOR)
+}
+
+/// Parse the broker's RFC3339 `resets_at` into a monotonic [`Instant`], or `None`
+/// if blank/unparseable/already past — bridging wall-clock (chrono) to the
+/// monotonic clock the poll scheduler runs on.
+fn resets_at_instant(resets_at: &str) -> Option<Instant> {
+    let reset = chrono::DateTime::parse_from_rfc3339(resets_at.trim()).ok()?;
+    let gap = reset.with_timezone(&chrono::Utc) - chrono::Utc::now();
+    gap.to_std().ok().map(|d| Instant::now() + d)
+}
+
+/// A short human phrase for when the balance refills ("大约 3 小时后", "约 20 分钟后"),
+/// or a vague fallback when the reset time is unknown.
+fn humanize_until_reset(resets_at: &str) -> String {
+    let Ok(reset) = chrono::DateTime::parse_from_rfc3339(resets_at.trim()) else {
+        return "过一会儿".to_string();
+    };
+    let mins = (reset.with_timezone(&chrono::Utc) - chrono::Utc::now()).num_minutes();
+    if mins <= 1 {
+        "很快就".to_string()
+    } else if mins < 60 {
+        format!("约 {mins} 分钟后")
+    } else {
+        let hours = (mins as f64 / 60.0).round() as i64;
+        format!("大约 {hours} 小时后")
+    }
 }
 
 /// Find `status` as a standalone status token in `text` — the digits bounded by
@@ -277,99 +449,120 @@ fn has_status_token(text: &str, status: u16) -> bool {
 }
 
 #[cfg(test)]
-mod vendor_health_tests {
+mod vendor_tests {
     use super::*;
 
-    fn fresh() -> VendorHealth {
-        VendorHealth::new(2)
+    fn fresh() -> Vendor {
+        Vendor::new(2, Duration::from_secs(30))
     }
 
     #[test]
-    fn force_down_flips_immediately_and_once() {
-        let h = fresh();
-        assert!(h.force_down(), "Up -> Down flips on first force");
-        assert!(h.is_down());
-        assert!(!h.force_down(), "already Down -> no second flip");
-        assert!(h.record_success(), "Down -> Up on success");
-        assert!(!h.is_down());
-    }
-
-    #[test]
-    fn detects_out_of_energy() {
-        // A 402 status token in the ACP-translated error → out of energy, whatever
-        // body the gateway attaches (we no longer read the vendor slug).
-        assert!(super::is_out_of_energy(&anyhow::anyhow!(
-            "session/prompt failed: API Error: 402 {{\"error\":\"quota\"}}"
-        )));
-        // The historical songguo shape still trips it (the 402 is what matters).
-        assert!(super::is_out_of_energy(&anyhow::anyhow!(
-            "session/prompt failed: 402 Payment Required songguo_budget_exceeded"
-        )));
-        // Generic outage — no 402.
-        assert!(!super::is_out_of_energy(&anyhow::anyhow!("connection reset by peer")));
+    fn classify_by_status_token() {
+        use Outage::*;
+        // A 402 anywhere in the ACP-translated error → out of energy, whatever body
+        // the gateway attaches (we key on the status code, not a vendor slug).
+        assert_eq!(
+            classify_outage(&anyhow::anyhow!("session/prompt failed: API Error: 402 {{\"error\":\"quota\"}}")),
+            OutOfEnergy
+        );
+        // The historical songguo shape still reads as out of energy.
+        assert_eq!(
+            classify_outage(&anyhow::anyhow!("402 Payment Required songguo_budget_exceeded")),
+            OutOfEnergy
+        );
+        // 429 (throttle) and 529 (overload) are both transient rate limits.
+        assert_eq!(classify_outage(&anyhow::anyhow!("API Error: 429 too many requests")), RateLimited);
+        assert_eq!(classify_outage(&anyhow::anyhow!("API Error: 529 overloaded")), RateLimited);
+        // No status code → generic outage.
+        assert_eq!(classify_outage(&anyhow::anyhow!("connection reset by peer")), Unreachable);
         // A longer number that merely contains "402" must not trip it.
-        assert!(!super::is_out_of_energy(&anyhow::anyhow!(
-            "session/prompt failed: request id 1140228 timed out"
-        )));
+        assert_eq!(classify_outage(&anyhow::anyhow!("request id 1140228 timed out")), Unreachable);
     }
 
     #[test]
     fn starts_up() {
-        let h = fresh();
-        assert!(!h.is_down());
+        assert!(!fresh().is_down());
     }
 
     #[test]
-    fn first_failure_does_not_flip_at_threshold_two() {
-        let h = fresh();
-        assert!(!h.record_failure());
-        assert!(!h.is_down());
+    fn out_of_energy_flips_immediately_and_announces_once() {
+        let v = fresh();
+        assert!(v.note_out_of_energy(None), "402 flips Up -> OutOfEnergy and announces");
+        assert!(v.is_down());
+        assert!(!v.note_out_of_energy(None), "already out of energy -> no second announce");
+        // Out of energy holds mail without a model retry — recovery is the poller.
+        assert!(matches!(v.scene_gate(), SceneGate::Hold { .. }));
+        assert!(v.note_success(), "a refill ends the outage");
+        assert!(!v.is_down());
     }
 
     #[test]
-    fn second_consecutive_failure_flips_down() {
-        let h = fresh();
-        h.record_failure();
-        assert!(h.record_failure(), "the failure that crosses the threshold must report the flip");
-        assert!(h.is_down());
+    fn rate_limited_is_silent_and_retries() {
+        let v = fresh();
+        v.note_rate_limited(); // silent: no announce return value at all
+        assert!(v.is_down());
+        assert!(matches!(v.scene_gate(), SceneGate::Retry { .. }), "429 backs off and retries");
+        assert!(v.note_success());
+        assert!(!v.is_down());
     }
 
     #[test]
-    fn success_resets_the_counter() {
-        let h = fresh();
-        h.record_failure();
-        h.record_success();
-        // Counter reset: one failure after a success must not flip.
-        assert!(!h.record_failure());
-        assert!(!h.is_down());
+    fn generic_outage_absorbs_a_blip_then_informs_once() {
+        let v = fresh();
+        assert!(!v.note_unreachable(), "first generic failure is absorbed (down_after = 2)");
+        assert!(!v.is_down(), "still reachable after one blip");
+        assert!(v.note_unreachable(), "the second flips to an informed backoff, announced once");
+        assert!(v.is_down());
+        assert!(matches!(v.scene_gate(), SceneGate::Retry { .. }));
+        assert!(!v.note_unreachable(), "a failed retry grows the backoff without re-announcing");
     }
 
     #[test]
-    fn success_after_down_flips_up() {
-        let h = fresh();
-        h.record_failure();
-        h.record_failure();
-        assert!(h.is_down());
-        assert!(h.record_success(), "the success that ends an outage must report the recovery");
-        assert!(!h.is_down());
+    fn success_resets_the_blip_counter() {
+        let v = fresh();
+        v.note_unreachable(); // one blip, still up
+        v.note_success(); // resets the counter
+        assert!(!v.note_unreachable(), "one blip after a reset must not flip");
+        assert!(!v.is_down());
     }
 
     #[test]
-    fn failure_while_already_down_does_not_re_flip() {
-        let h = fresh();
-        h.record_failure();
-        h.record_failure();
-        assert!(h.is_down());
-        // A probe failure landing while already Down must not re-report a flip.
-        assert!(!h.record_failure());
-        assert!(h.is_down());
+    fn threshold_one_flips_on_first_generic_failure() {
+        let v = Vendor::new(1, Duration::from_secs(30));
+        assert!(v.note_unreachable());
+        assert!(v.is_down());
     }
 
     #[test]
-    fn threshold_one_flips_on_first_failure() {
-        let h = VendorHealth::new(1);
-        assert!(h.record_failure());
-        assert!(h.is_down());
+    fn backoff_grows_and_caps_at_one_hour() {
+        let v = fresh(); // base 30s
+        assert_eq!(v.backoff(0), Duration::from_secs(30));
+        assert_eq!(v.backoff(1), Duration::from_secs(60));
+        assert_eq!(v.backoff(2), Duration::from_secs(120));
+        assert_eq!(v.backoff(100), BACKOFF_CAP, "never exceeds the 1h cap");
+    }
+
+    #[test]
+    fn out_of_energy_poll_is_half_the_wait_floored_at_ten_seconds() {
+        let now = Instant::now();
+        // A reset an hour out → poll at ~half the gap.
+        let gap = oe_next_poll(Some(now + Duration::from_secs(3600))).saturating_duration_since(now);
+        assert!(gap >= Duration::from_secs(1790) && gap <= Duration::from_secs(1810), "~half of 1h");
+        // Imminent / unknown / past reset → floored at 10s (never faster).
+        for reset in [Some(now + Duration::from_secs(4)), None, Some(now - Duration::from_secs(60))] {
+            assert!(oe_next_poll(reset).saturating_duration_since(now) >= OE_POLL_FLOOR);
+        }
+    }
+
+    #[test]
+    fn out_of_energy_outranks_a_concurrent_backoff() {
+        let v = fresh();
+        v.note_out_of_energy(None);
+        // A 429/generic landing while out of energy must not downgrade the state.
+        v.note_rate_limited();
+        assert!(matches!(v.scene_gate(), SceneGate::Hold { .. }));
+        assert!(!v.note_unreachable());
+        assert!(matches!(v.scene_gate(), SceneGate::Hold { .. }));
     }
 }
 
@@ -620,10 +813,10 @@ struct ReactorInner {
     /// sequencer stamps each turn's voice span; `run_turn` drains the inferred
     /// "what went unheard" note into the next prompt. See [`interrupts`].
     interrupts: InterruptRegistry,
-    /// Shared, process-wide LLM-vendor reachability flag. Read by every scene
-    /// loop to decide whether to hold mail or drive a turn; written by
-    /// `run_turn`'s terminal-failure / success paths. See [`VendorHealth`].
-    vendor_health: Arc<VendorHealth>,
+    /// Shared, process-wide LLM-vendor reachability + recovery policy. Read by every
+    /// scene loop (via [`Vendor::scene_gate`]) to decide whether and when to drive a
+    /// turn; written by `run_turn`'s terminal-failure / success paths. See [`Vendor`].
+    vendor: Arc<Vendor>,
     /// Scene→live-subscriber counts, shared with the HTTP front. Rendered into
     /// each turn as one human-model presence sentence, so the mind knows which
     /// channels actually reach the person right now.
@@ -681,7 +874,7 @@ pub fn start(
             views_dir,
             turn_seq: AtomicU64::new(0),
             scenes: Mutex::new(HashMap::new()),
-            vendor_health: Arc::new(VendorHealth::new(vendor_down_after())),
+            vendor: Arc::new(Vendor::new(vendor_down_after(), backoff_base())),
             last_signal_at: std::sync::Mutex::new(Instant::now()),
             reflect_wake: tokio::sync::Notify::new(),
         }),
@@ -730,7 +923,56 @@ pub fn start(
         consolidated_reflection_loop(reflect_reactor).await;
     });
 
+    // Out-of-energy poller: while any scene has flipped the vendor out of energy
+    // (402), poll the balance on an adaptive cadence and flip back Up the moment it
+    // refills. Parks (no polling, no model calls) whenever the vendor is reachable —
+    // one task for the whole process, so N scenes don't each hammer `/energy`.
+    let energy_reactor = reactor.clone();
+    tokio::spawn(async move {
+        out_of_energy_poller(energy_reactor).await;
+    });
+
     reactor
+}
+
+/// The single out-of-energy poller. While any scene has flipped the vendor to
+/// [`VendorState::OutOfEnergy`], re-fetch the balance at `max(time-to-reset / 2,
+/// 10s)` and flip the vendor back Up the moment it refills; then the scene loops'
+/// held mail drains on their next pass. Parks on [`Vendor::oe_signal`] while the
+/// vendor is reachable, so an account that's in credit costs nothing.
+async fn out_of_energy_poller(reactor: Reactor) {
+    let data_dir = reactor.inner.memory.data_dir().to_path_buf();
+    loop {
+        // Park until a scene reports out of energy (or act on a pending schedule).
+        let poll_at = match reactor.inner.vendor.oe_poll_at() {
+            Some(at) => at,
+            None => {
+                reactor.inner.vendor.oe_signal.notified().await;
+                continue;
+            }
+        };
+        let now = Instant::now();
+        if poll_at > now {
+            tokio::time::sleep(poll_at - now).await;
+        }
+        // A concurrent success may have cleared the outage while we slept.
+        if reactor.inner.vendor.oe_poll_at().is_none() {
+            continue;
+        }
+        match crate::foundation::broker::poll_energy_now(&data_dir).await {
+            Some(en) if en.remaining > 0 => {
+                if reactor.inner.vendor.note_success() {
+                    tracing::info!(remaining = en.remaining, "energy refilled; resuming turns");
+                }
+            }
+            Some(en) => {
+                tracing::info!(remaining = en.remaining, resets_at = %en.resets_at, "still out of energy; re-pacing poll");
+                reactor.inner.vendor.oe_reschedule(resets_at_instant(&en.resets_at));
+            }
+            // Poll failed (offline / no token / BYOK). Retry at the floor cadence.
+            None => reactor.inner.vendor.oe_reschedule(None),
+        }
+    }
 }
 
 /// The single consolidated reflection loop: one "sleep" pass over all
@@ -1037,52 +1279,42 @@ async fn per_scene_loop(
     let mut pulsed_once = false;
 
     // Pending turn-driving items, hoisted out of the main loop so the batch
-    // survives across iterations while in vendor-down mode — a failed probe
-    // must not drop the mail it was attempting to deliver. Cleared on a
-    // successful turn (the mail went out) and on a normal-path failure (the
-    // apology was emitted; re-attempting would re-apologize). Retained on a
-    // probe failure so the next probe retries the same mail plus any new arrivals.
+    // survives across iterations while the vendor is down — a failed retry must not
+    // drop the mail it was attempting to deliver, and out-of-energy mail waits here
+    // for the refill. Cleared on a successful turn (the mail went out) and on a
+    // reachable-but-failed blip (the apology was emitted); held while down.
     let mut batch: Vec<LoopInput> = Vec::new();
     // Worker reports pulled off `inbound` while a prior turn was reorganizing
     // (cancelling to re-prompt with new human input). They don't drive a reorg
     // themselves — fix-forward, like before — so they're held here and folded into
     // `batch` after the turn returns.
     let mut carryover: Vec<LoopInput> = Vec::new();
-    // Next recovery-probe deadline while in vendor-down mode. `None` whenever
-    // the vendor is Up (re-armed on the next Down observation) or right after a
-    // probe fires (re-armed on the next iteration).
-    let mut next_probe: Option<Instant> = None;
-    let probe_interval = vendor_probe_interval();
 
     loop {
-        // Wait for a turn-driving reason: a new signal, a fired alarm, a due
-        // host pulse, a worker question, or — while the vendor is Down — a
-        // recovery probe. Tool control commands (delegate/alarm) are pure
-        // side-effects applied without a turn; only a worker `ask` becomes a
-        // turn-driving item. The soonest of the mind's alarms, the host pulse,
-        // and (while Down) the probe wakes the loop.
+        // Wait for a turn-driving reason: a new signal, a fired alarm, a due host
+        // pulse, a worker question, or — while the vendor is down — a backoff retry
+        // (429/generic) or a recheck that notices an out-of-energy refill. Tool
+        // control commands (delegate/alarm) are pure side-effects applied without a
+        // turn; only a worker `ask` becomes a turn-driving item.
         'wait: loop {
+            let gate = reactor.inner.vendor.scene_gate();
             // A batch pre-seeded by carryover (a worker report pulled off the queue
-            // while a prior turn reorganized) needs no fresh signal to act on —
-            // drive it now while Up. While Down the probe cadence still governs, so
-            // fall through to the timer logic below.
-            if !batch.is_empty() && !reactor.inner.vendor_health.is_down() {
+            // while a prior turn reorganized) needs no fresh signal to act on — drive
+            // it now while reachable. While down, fall through to the timer logic.
+            if !batch.is_empty() && matches!(gate, SceneGate::Go) {
                 break 'wait;
             }
-            let down = reactor.inner.vendor_health.is_down();
-            // While Down, suppress pulses — they call the model and would just fail.
-            // The probe cadence replaces the pulse as the turn-driving timer.
+            let down = !matches!(gate, SceneGate::Go);
+            // While down, suppress pulses — they call the model and would just fail.
             let pulse_at = if down { None } else { pulse_every.map(|d| last_activity + d) };
-            // While Down, arm the recovery probe. Lazy-init on first Down
-            // observation so the first probe is a full interval after the
-            // outage begins, not at loop start; cleared on Up.
-            let probe_at = if down {
-                Some(*next_probe.get_or_insert(Instant::now() + probe_interval))
-            } else {
-                next_probe = None;
-                None
+            // While down, the recovery timer: a backoff retry deadline (429/generic),
+            // or a cheap recheck to notice an out-of-energy refill (the shared poller
+            // owns the actual `/energy` call). Up → no such timer.
+            let recover_at = match gate {
+                SceneGate::Go => None,
+                SceneGate::Retry { at } | SceneGate::Hold { at } => Some(at),
             };
-            let deadline = [alarms.next_deadline(), pulse_at, probe_at]
+            let deadline = [alarms.next_deadline(), pulse_at, recover_at]
                 .into_iter()
                 .flatten()
                 .min();
@@ -1129,9 +1361,9 @@ async fn per_scene_loop(
                 Woke::Timer => {
                     let now = Instant::now();
                     if down {
-                        // Alarms still fire and queue while Down — the mind asked
-                        // to be woken, and the note isn't lost — but they don't
-                        // alone drive a turn; the probe does.
+                        // Alarms still fire and queue while down — the mind asked to
+                        // be woken, and the note isn't lost — but they don't alone
+                        // drive a turn; a backoff retry does.
                         for fired in alarms.take_due(now) {
                             reactor
                                 .inner
@@ -1140,22 +1372,16 @@ async fn per_scene_loop(
                                 .await;
                             batch.push(LoopInput::Alarm(fired));
                         }
-                        // Recovery probe: attempt catch-up only if mail is
-                        // pending. An idle outage wakes here, finds the mailbox
-                        // empty, and goes back to sleep — no vendor call spent.
-                        if let Some(at) = probe_at
+                        // Only a transient backoff drives a model retry, and only with
+                        // mail to deliver. Out of energy holds instead — the shared
+                        // poller flips us back Up and the top of 'wait then drains the
+                        // mail without a doomed model call.
+                        if let SceneGate::Retry { at } = gate
                             && at <= now
                             && !batch.is_empty()
                         {
-                            next_probe = None;
-                            tracing::info!(scene = %scene, mail = batch.len(), "vendor-down probe firing");
+                            tracing::info!(scene = %scene, mail = batch.len(), "backoff retry firing");
                             break 'wait;
-                        }
-                        // Probe fired with no mail, or another (already-consumed)
-                        // timer woke us — re-arm so the next probe is a full
-                        // interval out, not stacked behind the missed one.
-                        if probe_at.is_some_and(|at| at <= now) {
-                            next_probe = None;
                         }
                         continue 'wait;
                     }
@@ -1199,11 +1425,11 @@ async fn per_scene_loop(
             continue;
         }
 
-        let was_down = reactor.inner.vendor_health.is_down();
+        let was_down = reactor.inner.vendor.is_down();
 
         // Commit-after-quiet: wait for things to settle before replying. Skipped
-        // while Down — a probe should attempt catch-up ASAP rather than wait for
-        // more mail to settle (the probe cadence already coalesces arrivals).
+        // while down — a backoff retry should attempt catch-up ASAP rather than wait
+        // for more mail to settle (the retry cadence already coalesces arrivals).
         if !was_down {
             let closed = loop {
                 while let Ok(extra) = inbound.try_recv() {
@@ -1224,13 +1450,13 @@ async fn per_scene_loop(
         // Forget any workers that have finished, so the registry doesn't grow.
         workers.reap();
 
-        // Probe turns don't apologize — the user already heard the "holding your
-        // mail" line when the reactor went Down. Normal turns do.
+        // Retry turns don't apologize — the user already heard the "holding your
+        // mail" line when the vendor first went down. Normal turns do.
         let apologize = !was_down;
         match run_turn(&reactor, &scene, &batch, &mut reactor_session, &mut seeded, &mut budget, &mut workers, &beats, apologize, &mut inbound, &mut carryover).await {
             Ok(()) => {
                 // The turn delivered the mail; clear the backlog. (If this was a
-                // probe, run_turn already flipped the vendor Up via record_success.)
+                // retry, run_turn already flipped the vendor Up via note_success.)
                 batch.clear();
                 // Between turns: if the live session has grown past budget, hot-swap
                 // it now. The human is consuming the reply just delivered, so the
@@ -1297,15 +1523,14 @@ async fn per_scene_loop(
                 seeded = false;
                 budget.reset();
                 reactor.inner.observatory.set_budget(&scene, 0).await;
-                if was_down {
-                    // Probe failed: the vendor is still Down. Keep the mail for
-                    // the next probe — the session is already discarded above,
-                    // and the next probe cold-opens a fresh one and re-seeds.
-                    tracing::info!(scene = %scene, mail = batch.len(), "probe failed; holding mail");
+                // Key on the vendor state run_turn just wrote, not the pre-turn one:
+                // a turn that hit a 402/429 (even the first, from Up) left the vendor
+                // down, so hold the mail — out of energy drains it on refill; a
+                // backoff drives it at the next retry deadline. Only a still-reachable
+                // blip (already apologized inside run_turn) drops it.
+                if reactor.inner.vendor.is_down() {
+                    tracing::info!(scene = %scene, mail = batch.len(), "vendor down; holding mail for recovery");
                 } else {
-                    // Normal failure: the apology (or the Down-flip "holding your
-                    // mail" line) was emitted inside run_turn. Drop the batch so
-                    // it isn't re-attempted on the next turn.
                     batch.clear();
                 }
             }
@@ -1671,6 +1896,14 @@ async fn run_turn(
                     // Discard the possibly-wedged session so the next attempt
                     // restarts from cold and rebuilds context from the snapshot.
                     discard_reactor_session(reactor, scene, reactor_session, seeded, budget).await;
+                    // A 402/429 is definite for this turn: retrying on a fresh session
+                    // within a few hundred ms cannot succeed (the budget won't refill;
+                    // the throttle won't lift). Surface it now and let the terminal
+                    // handler below pick the recovery policy (poll energy / back off),
+                    // instead of burning MAX_ATTEMPTS respawns against a doomed gateway.
+                    if matches!(classify_outage(&err), Outage::OutOfEnergy | Outage::RateLimited) {
+                        break Err(err);
+                    }
                     if attempt >= MAX_ATTEMPTS {
                         break Err(err);
                     }
@@ -1705,37 +1938,52 @@ async fn run_turn(
         // re-ask — so it touches neither.
         match &drive {
             Ok(DriveOutcome::Completed(_)) => {
-                let recovered = reactor.inner.vendor_health.record_success();
-                if recovered {
+                if reactor.inner.vendor.note_success() {
                     tracing::info!(scene = %scene, "vendor recovered; resuming normal turns");
                 }
             }
-            Err(err) => {
-                // Out-of-energy (gateway 402) is a *definite* outage: flip to the
-                // mailbox immediately rather than waiting out `down_after`, and
-                // nudge toward sub/byok. Either way the existing down/probe path
-                // stashes input and catches up when it recovers (energy resets).
-                let out_of_energy = is_out_of_energy(err);
-                let flipped = if out_of_energy {
-                    reactor.inner.vendor_health.force_down()
-                } else {
-                    reactor.inner.vendor_health.record_failure()
-                };
-                if flipped {
-                    let line = if out_of_energy {
-                        "能量用完了。我先把你说的记下来，等能量恢复就接着处理。想现在就继续的话，点菜单栏的 hi 图标就能订阅，或换用自己的 API key。".to_string()
-                    } else {
-                        "我暂时连不上模型，先攒着你的消息，等恢复了一起处理。".to_string()
-                    };
-                    let _ = beats.send(sequencer::Beat::Say(line)).await;
-                } else if apologize && !out_of_energy {
-                    let _ = beats
-                        .send(sequencer::Beat::Say(format!(
-                            "抱歉，我这边出了点问题，没能完成这次回应。({err})"
-                        )))
-                        .await;
+            Err(err) => match classify_outage(err) {
+                Outage::OutOfEnergy => {
+                    // Definite: flip to out-of-energy immediately and announce once,
+                    // pointing at the reset time and the upgrade page. No more model
+                    // calls until the shared poller sees the balance refill — the
+                    // held mail then drains. The reset time comes from the cached
+                    // balance the broker keeps fresh; a 402 body carries none.
+                    let resets_at = crate::foundation::credentials::Credentials::load(reactor.inner.memory.data_dir())
+                        .energy
+                        .map(|e| e.resets_at)
+                        .unwrap_or_default();
+                    if reactor.inner.vendor.note_out_of_energy(resets_at_instant(&resets_at)) {
+                        let when = humanize_until_reset(&resets_at);
+                        let line = format!(
+                            "能量用完了，{when}恢复。想现在就继续，可以到 https://hi.xiaoyuanzhu.com/account 升级套餐。我先把你说的记下来，等能量恢复就接着处理。"
+                        );
+                        let _ = beats.send(sequencer::Beat::Say(line)).await;
+                    }
                 }
-            }
+                Outage::RateLimited => {
+                    // Transient throttle: back off and retry, silently — a rate limit
+                    // that resolves itself isn't worth interrupting the user over.
+                    reactor.inner.vendor.note_rate_limited();
+                }
+                Outage::Unreachable => {
+                    // Generic outage: absorb a blip, then tell the user once we're
+                    // holding their mail; retry on the growing backoff until it clears.
+                    if reactor.inner.vendor.note_unreachable() {
+                        let _ = beats
+                            .send(sequencer::Beat::Say(
+                                "我暂时连不上模型，先攒着你的消息，等恢复了一起处理。".to_string(),
+                            ))
+                            .await;
+                    } else if apologize {
+                        let _ = beats
+                            .send(sequencer::Beat::Say(format!(
+                                "抱歉，我这边出了点问题，没能完成这次回应。({err})"
+                            )))
+                            .await;
+                    }
+                }
+            },
             Ok(DriveOutcome::Reorganized { .. }) => {}
         }
 

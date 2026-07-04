@@ -107,6 +107,11 @@ pub struct SessionRun {
     /// Cached response once `pending` resolves. Held so `wait()` can return
     /// it after `next_update()` has drained the stream.
     response: Option<PromptResponse>,
+    /// The real error the prompt task resolved with, if it failed instead of
+    /// producing a response. Captured here rather than dropped so `wait()` can
+    /// surface the true cause — a gateway 402/429, a transport reset — to the
+    /// reactor's classifier, instead of a generic "no response" placeholder.
+    error: Option<anyhow::Error>,
     /// Text chunks observed so far. Buffered so `wait()` can return a
     /// completed assembly without forcing the caller to also pull updates.
     text_buf: String,
@@ -168,9 +173,11 @@ impl SessionRun {
                     }
                     Ok(Err(e)) => {
                         tracing::warn!(error = %e, "prompt resolved with error");
+                        self.error = Some(e);
                     }
                     Err(join_err) => {
                         tracing::warn!(error = %join_err, "prompt task panicked");
+                        self.error = Some(anyhow!("prompt task panicked: {join_err}"));
                     }
                 }
                 // Drain anything that landed in the buffer while we raced.
@@ -206,10 +213,19 @@ impl SessionRun {
             *slot = Some(rx);
         }
 
-        let response = self
-            .response
-            .take()
-            .ok_or_else(|| anyhow!("prompt finished without a response"))?;
+        // Return the response when the prompt produced one. Otherwise surface the
+        // real failure we captured (a 402/429/transport error) so the reactor can
+        // classify it; the generic placeholder is only the last resort when the
+        // stream closed before the task resolved with anything at all.
+        let response = match self.response.take() {
+            Some(r) => r,
+            None => {
+                return Err(self
+                    .error
+                    .take()
+                    .unwrap_or_else(|| anyhow!("prompt finished without a response")));
+            }
+        };
 
         Ok(PromptResult {
             stop_reason: response.stop_reason,
@@ -291,6 +307,7 @@ impl AcpSession {
             rx: Some(rx),
             pending: Some(pending),
             response: None,
+            error: None,
             text_buf: String::new(),
         })
     }

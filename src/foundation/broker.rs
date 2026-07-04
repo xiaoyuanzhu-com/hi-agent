@@ -389,27 +389,37 @@ pub async fn refresh(data_dir: &Path, bearer: Option<&str>) {
     }
 }
 
-/// Lightweight energy poll: re-fetch the balance with the cached access token and
-/// update the store. Best-effort — a failure leaves the last value in place.
-async fn poll_energy(data_dir: &Path) {
+/// Lightweight energy poll that hands back the fresh balance: re-fetch with the
+/// cached access token, persist it, and return it. `None` in BYOK, when no token
+/// is cached yet, or when the fetch fails (the last cached value is left in
+/// place). The reactor's out-of-energy poller uses the returned `remaining` to
+/// detect a refill and resume, so this must return the value, not just store it.
+pub async fn poll_energy_now(data_dir: &Path) -> Option<Energy> {
     let mut store = Credentials::load(data_dir);
     if store.mode == Mode::Byok {
-        return;
+        return None;
     }
-    let Some(tokens) = store.tokens.clone() else {
-        return;
-    };
+    let tokens = store.tokens.clone()?;
     match fetch_energy(&tokens.access_token).await {
         Ok(en) => {
-            store.energy = Some(en);
+            store.energy = Some(en.clone());
             if let Err(e) = store.save(data_dir) {
                 tracing::debug!(error = %e, "failed to persist energy poll");
             }
             // Keeps the Settings page's "last checked" fresh between full refreshes.
             record_status(data_dir, true, "");
+            Some(en)
         }
-        Err(e) => tracing::debug!(error = %e, "energy poll failed; keeping last value"),
+        Err(e) => {
+            tracing::debug!(error = %e, "energy poll failed; keeping last value");
+            None
+        }
     }
+}
+
+/// Fire-and-forget energy poll for the periodic refresh loop.
+async fn poll_energy(data_dir: &Path) {
+    let _ = poll_energy_now(data_dir).await;
 }
 
 /// Spawn a detached loop that keeps managed credentials fresh while running: the
