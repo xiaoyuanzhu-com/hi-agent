@@ -324,9 +324,6 @@ impl Vendor {
         drop(st);
         if entering {
             self.oe_signal.notify_one();
-            // Mirror the flip to the process-wide flag the `/api/account/energy`
-            // handler reads, so the web app raises the out-of-energy hint at once.
-            crate::foundation::energy_state::set(true);
         }
         entering
     }
@@ -379,13 +376,6 @@ impl Vendor {
         self.generic_failures.store(0, Ordering::Relaxed);
         let was_down = !matches!(*st, VendorState::Up);
         *st = VendorState::Up;
-        drop(st);
-        // Energy is flowing again (this covers both recovery paths — a turn that
-        // completes and the balance poller's refill both land here). Drop the flag
-        // so the web app takes the out-of-energy hint down.
-        if was_down {
-            crate::foundation::energy_state::set(false);
-        }
         was_down
     }
 
@@ -1587,11 +1577,13 @@ async fn warm_up(reactor: &Reactor, scene: &Scene, reactor_session: &mut Option<
                 Ok(Some(run)) => {
                     if let Err(err) = run.wait().await {
                         tracing::warn!(scene = %scene, error = %err, "reactor warm-up prompt failed");
+                        note_warmup_outage(reactor, &err);
                     }
                 }
                 Ok(None) => {}
                 Err(err) => {
                     tracing::warn!(scene = %scene, error = %err, "reactor warm-up prompt failed");
+                    note_warmup_outage(reactor, &err);
                 }
             }
             *reactor_session = Some(session);
@@ -1600,6 +1592,23 @@ async fn warm_up(reactor: &Reactor, scene: &Scene, reactor_session: &mut Option<
         Err(err) => {
             tracing::warn!(scene = %scene, error = %err, "scene warm-up failed; first turn will cold-start");
         }
+    }
+}
+
+/// A warm-up prompt failed. Warm-up is best-effort, so transient/generic failures
+/// are left alone (the first real turn re-tries and classifies them). But a *definite*
+/// out-of-energy (402) is worth acting on now: flip the vendor so the scene holds its
+/// mail instead of hammering, the shared poller starts watching for the refill, and —
+/// the point here — the web app raises the out-of-energy hint at boot, without waiting
+/// for the user's first turn to trip the same 402.
+fn note_warmup_outage(reactor: &Reactor, err: &anyhow::Error) {
+    if matches!(classify_outage(err), Outage::OutOfEnergy) {
+        let resets_at = crate::foundation::credentials::Credentials::load(reactor.inner.memory.data_dir())
+            .energy
+            .map(|e| e.resets_at)
+            .unwrap_or_default();
+        reactor.inner.vendor.note_out_of_energy(resets_at_instant(&resets_at));
+        crate::foundation::energy_state::note_402(reactor.inner.memory.data_dir());
     }
 }
 
@@ -1954,17 +1963,17 @@ async fn run_turn(
             }
             Err(err) => match classify_outage(err) {
                 Outage::OutOfEnergy => {
-                    // Definite: flip to out-of-energy immediately. That flip also
-                    // raises the process-wide flag the web app polls, so it shows the
-                    // out-of-energy hint (above the controls) — no spoken nudge. No
-                    // more model calls until the shared poller sees the balance refill;
-                    // the held mail then drains. `resets_at` paces the balance poll and
-                    // feeds the hint's reset line (a 402 body carries none).
+                    // Definite: flip to out-of-energy immediately. That flip holds the
+                    // scene's mail and wakes the balance poller; `note_402` raises the
+                    // web app's out-of-energy hint at once (managed mode only). No more
+                    // model calls until the poller sees the balance refill. `resets_at`
+                    // paces the balance poll and feeds the hint (a 402 body carries none).
                     let resets_at = crate::foundation::credentials::Credentials::load(reactor.inner.memory.data_dir())
                         .energy
                         .map(|e| e.resets_at)
                         .unwrap_or_default();
                     reactor.inner.vendor.note_out_of_energy(resets_at_instant(&resets_at));
+                    crate::foundation::energy_state::note_402(reactor.inner.memory.data_dir());
                 }
                 Outage::RateLimited => {
                     // Transient throttle: back off and retry, silently — a rate limit

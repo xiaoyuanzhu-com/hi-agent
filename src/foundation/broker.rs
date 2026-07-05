@@ -379,6 +379,9 @@ pub async fn refresh(data_dir: &Path, bearer: Option<&str>) {
     match fetch_energy(&tokens.access_token).await {
         Ok(en) => {
             tracing::info!(tier = %en.tier, remaining = en.remaining, total = en.total, "energy refreshed");
+            // Ground truth: raise / clear the out-of-energy hint from the balance. At
+            // startup this catches an account that's already empty before any 402.
+            crate::foundation::energy_state::reconcile(en.remaining, en.total);
             store.energy = Some(en);
         }
         Err(e) => tracing::warn!(error = %e, "energy fetch failed; keeping cached"),
@@ -408,6 +411,9 @@ pub async fn poll_energy_now(data_dir: &Path) -> Option<Energy> {
     let tokens = store.tokens.clone()?;
     match fetch_energy(&tokens.access_token).await {
         Ok(en) => {
+            // Ground truth: raise the hint when empty, clear it on refill. This is the
+            // 60s periodic poll and the out-of-energy poller's own recovery check.
+            crate::foundation::energy_state::reconcile(en.remaining, en.total);
             store.energy = Some(en.clone());
             if let Err(e) = store.save(data_dir) {
                 tracing::debug!(error = %e, "failed to persist energy poll");

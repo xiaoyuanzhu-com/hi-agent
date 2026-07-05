@@ -618,7 +618,16 @@ pub async fn ingest_pcm_stream(
     // Closing the audio side lets the STT session flush its last utterance.
     drop(audio_tx);
     match tokio::time::timeout(Duration::from_secs(5), stt_task).await {
-        Ok(Ok(Err(err))) => tracing::warn!(scene = %scene, error = %err, "audio ingest STT ended"),
+        Ok(Ok(Err(err))) => {
+            // A 402 here means the managed account is out of energy (STT draws the
+            // same budget) — raise the out-of-energy hint now, without waiting for the
+            // next balance poll. No-op in BYOK / for non-402 STT failures.
+            let text = err.to_string();
+            if text.contains("402") {
+                crate::foundation::energy_state::note_402(&state.data_dir);
+            }
+            tracing::warn!(scene = %scene, error = %err, "audio ingest STT ended");
+        }
         Err(_) => tracing::warn!(scene = %scene, "audio ingest STT did not finalize in time"),
         _ => {}
     }
