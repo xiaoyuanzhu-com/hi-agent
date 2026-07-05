@@ -75,6 +75,10 @@ struct TokenDto {
 struct ModelDto {
     #[serde(default)]
     model: String,
+    /// Optional cheaper/faster companion for the background "haiku" slot. Empty →
+    /// the client reuses `model` for that slot. Only meaningful on the LLM task.
+    #[serde(default)]
+    small: String,
     #[serde(default)]
     quality: i64,
     // Parsed for round-trip + a future weighted policy; selection uses quality today.
@@ -118,16 +122,20 @@ fn origin_of(url: &str) -> String {
 
 /// Reduce one task's `wire → endpoint` map to (wire, full url, api_key, model):
 /// the single wire (one per task today; lexically-first for determinism) and the
-/// highest-`quality` model. Callers keep the full URL or reduce it to its origin.
-fn pick_wire(wires: &std::collections::HashMap<String, WireDto>) -> Option<(String, String, String, Option<String>)> {
+/// highest-`quality` model, plus that model's optional `small` companion. Callers
+/// keep the full URL or reduce it to its origin.
+fn pick_wire(
+    wires: &std::collections::HashMap<String, WireDto>,
+) -> Option<(String, String, String, Option<String>, Option<String>)> {
     let (wire, w) = wires.iter().min_by(|a, b| a.0.cmp(b.0))?;
-    let model = w
-        .models
-        .iter()
-        .max_by_key(|m| m.quality)
+    let best = w.models.iter().max_by_key(|m| m.quality);
+    let model = best
         .map(|m| m.model.trim().to_string())
         .filter(|s| !s.is_empty());
-    Some((wire.clone(), w.url.trim().to_string(), w.api_key.clone(), model))
+    let small = best
+        .map(|m| m.small.trim().to_string())
+        .filter(|s| !s.is_empty());
+    Some((wire.clone(), w.url.trim().to_string(), w.api_key.clone(), model, small))
 }
 
 /// Collapse the broker menu into the internal per-slot [`Managed`], selecting the
@@ -139,18 +147,28 @@ fn pick_wire(wires: &std::collections::HashMap<String, WireDto>) -> Option<(Stri
 /// `/v1/messages` itself, so the LLM slot takes just the **origin**. Every slot
 /// keeps `wire` empty, so each capability uses its single default adapter.
 fn managed_from(c: &ConfigsDto) -> Managed {
-    fn resolve(c: &ConfigsDto, task: &str, full: bool) -> Option<(String, String, Option<String>)> {
-        c.get(task)
-            .and_then(|w| pick_wire(w))
-            .map(|(_wire, url, api_key, model)| (if full { url } else { origin_of(&url) }, api_key, model))
+    fn resolve(
+        c: &ConfigsDto,
+        task: &str,
+        full: bool,
+    ) -> Option<(String, String, Option<String>, Option<String>)> {
+        c.get(task).and_then(|w| pick_wire(w)).map(|(_wire, url, api_key, model, small)| {
+            (if full { url } else { origin_of(&url) }, api_key, model, small)
+        })
     }
     let vendor = |task: &str| -> VendorKey {
         resolve(c, task, true)
-            .map(|(base_url, api_key, model)| VendorKey { wire: String::new(), base_url, api_key, model })
+            .map(|(base_url, api_key, model, _small)| VendorKey { wire: String::new(), base_url, api_key, model })
             .unwrap_or_default()
     };
     let llm = resolve(c, "text-generation", false)
-        .map(|(base_url, api_key, model)| LlmCredentials { wire: String::new(), base_url, api_key, model })
+        .map(|(base_url, api_key, model, small)| LlmCredentials {
+            wire: String::new(),
+            base_url,
+            api_key,
+            model,
+            small,
+        })
         .unwrap_or_default();
     Managed {
         llm,

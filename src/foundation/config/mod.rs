@@ -132,6 +132,9 @@ fn with_context_window(model: &str) -> String {
 pub struct AgentConfig {
     pub upstream_base_url: String,
     pub model: Option<String>,
+    /// Companion model for the background "haiku" slot (`ANTHROPIC_DEFAULT_HAIKU_MODEL`);
+    /// `None` → reuse `model`.
+    pub small: Option<String>,
     pub effort: Option<String>,
     pub permission_mode: Option<String>,
     pub upstream_key: String,
@@ -144,6 +147,7 @@ impl std::fmt::Debug for AgentConfig {
         f.debug_struct("AgentConfig")
             .field("upstream_base_url", &self.upstream_base_url)
             .field("model", &self.model)
+            .field("small", &self.small)
             .field("effort", &self.effort)
             .field("permission_mode", &self.permission_mode)
             .field("upstream_key", &"<redacted>")
@@ -163,9 +167,11 @@ impl AgentConfig {
         let store = crate::foundation::credentials::Credentials::load(data_dir);
         let llm = store.effective().map(|e| e.llm.clone()).unwrap_or_default();
         let model = llm.model.map(|m| m.trim().to_string()).filter(|m| !m.is_empty());
+        let small = llm.small.map(|m| m.trim().to_string()).filter(|m| !m.is_empty());
         use crate::foundation::credentials::get_setting;
         Self::new(
             model,
+            small,
             get_setting(data_dir, KEY_EFFORT),
             get_setting(data_dir, KEY_PERMISSION_MODE),
             llm.base_url,
@@ -184,6 +190,7 @@ impl AgentConfig {
     /// **unconfigured** state — BYOK before the user has pasted a key).
     pub fn new(
         model: Option<String>,
+        small: Option<String>,
         effort: Option<String>,
         permission_mode: Option<String>,
         upstream_base_url: String,
@@ -197,6 +204,7 @@ impl AgentConfig {
         Self {
             upstream_base_url,
             model,
+            small,
             effort,
             permission_mode,
             upstream_key,
@@ -252,6 +260,15 @@ impl AgentConfig {
         if let Some(model) = &self.model {
             env.push(("ANTHROPIC_MODEL".to_string(), with_context_window(model)));
         }
+        // The background "haiku" slot: the broker-supplied `small` companion when
+        // present, otherwise the main model (so the fast slot never falls back to the
+        // CLI's built-in Anthropic haiku through our gateway). Same `[1m]` handling.
+        if let Some(haiku) = self.small.as_ref().or(self.model.as_ref()) {
+            env.push((
+                "ANTHROPIC_DEFAULT_HAIKU_MODEL".to_string(),
+                with_context_window(haiku),
+            ));
+        }
         env
     }
 
@@ -305,6 +322,7 @@ mod tests {
     fn takes_all_parts_from_args() {
         let cfg = AgentConfig::new(
             Some("claude-opus-4-8".to_string()),
+            None,
             Some("high".to_string()),
             Some("acceptEdits".to_string()),
             "https://upstream.example/v1".to_string(),
@@ -320,13 +338,14 @@ mod tests {
     #[test]
     fn empty_base_url_falls_back_to_default() {
         let cfg =
-            AgentConfig::new(None, None, None, "".to_string(), "k".to_string());
+            AgentConfig::new(None, None, None, None, "".to_string(), "k".to_string());
         assert_eq!(cfg.upstream_base_url, DEFAULT_AI_API_BASE);
     }
 
     #[test]
     fn debug_redacts_the_upstream_key() {
         let cfg = AgentConfig::new(
+            None,
             None,
             None,
             None,
@@ -340,15 +359,15 @@ mod tests {
 
     #[test]
     fn empty_key_means_unconfigured() {
-        let cfg = AgentConfig::new(None, None, None, "https://x/v1".to_string(), "".to_string());
+        let cfg = AgentConfig::new(None, None, None, None, "https://x/v1".to_string(), "".to_string());
         assert!(!cfg.is_configured());
-        let cfg = AgentConfig::new(None, None, None, "https://x/v1".to_string(), "k".to_string());
+        let cfg = AgentConfig::new(None, None, None, None, "https://x/v1".to_string(), "k".to_string());
         assert!(cfg.is_configured());
     }
 
     #[test]
     fn unset_optionals_default_to_none() {
-        let cfg = AgentConfig::new(None, None, None, "https://x/v1".to_string(), "k".to_string());
+        let cfg = AgentConfig::new(None, None, None, None, "https://x/v1".to_string(), "k".to_string());
         assert!(cfg.model.is_none());
         assert!(cfg.effort.is_none());
         assert!(cfg.permission_mode.is_none());
@@ -358,6 +377,7 @@ mod tests {
     fn renders_settings_json_with_set_fields() {
         let dir = tempfile::tempdir().unwrap();
         let cfg = AgentConfig::new(
+            None,
             None,
             Some("high".to_string()),
             Some("acceptEdits".to_string()),
@@ -375,7 +395,7 @@ mod tests {
     fn omits_unset_fields() {
         let dir = tempfile::tempdir().unwrap();
         let cfg =
-            AgentConfig::new(None, None, None, "https://x/v1".to_string(), "k".to_string());
+            AgentConfig::new(None, None, None, None, "https://x/v1".to_string(), "k".to_string());
         cfg.render_settings_json(dir.path()).unwrap();
         let v: serde_json::Value =
             serde_json::from_str(&std::fs::read_to_string(dir.path().join("settings.json")).unwrap())
@@ -388,6 +408,7 @@ mod tests {
     fn child_env_sets_static_vars() {
         let cfg = AgentConfig::new(
             Some("claude-opus-4-8".to_string()),
+            None,
             None,
             None,
             "https://x/v1".to_string(),
@@ -417,6 +438,7 @@ mod tests {
             Some("claude-opus-4-8".to_string()),
             None,
             None,
+            None,
             "https://x/v1".to_string(),
             "k".to_string(),
         );
@@ -428,13 +450,33 @@ mod tests {
         assert!(!map.contains_key("ANTHROPIC_API_KEY"));
         // A known 1M model is tagged so the CLI requests the larger window.
         assert_eq!(map["ANTHROPIC_MODEL"], "claude-opus-4-8[1m]");
+        // With no `small`, the background haiku slot mirrors the main model.
+        assert_eq!(map["ANTHROPIC_DEFAULT_HAIKU_MODEL"], "claude-opus-4-8[1m]");
+    }
+
+    #[test]
+    fn auth_child_env_uses_small_for_the_haiku_slot() {
+        let cfg = AgentConfig::new(
+            Some("claude-opus-4-8".to_string()),
+            Some("claude-haiku-4-5-20251001".to_string()),
+            None,
+            None,
+            "https://x/v1".to_string(),
+            "k".to_string(),
+        );
+        let map: std::collections::HashMap<_, _> = cfg.auth_child_env().into_iter().collect();
+        assert_eq!(map["ANTHROPIC_MODEL"], "claude-opus-4-8[1m]");
+        // The companion drives the haiku slot; it isn't a 1M id, so it's untagged.
+        assert_eq!(map["ANTHROPIC_DEFAULT_HAIKU_MODEL"], "claude-haiku-4-5-20251001");
     }
 
     #[test]
     fn auth_child_env_omits_model_when_unset() {
-        let cfg = AgentConfig::new(None, None, None, "https://x/v1".to_string(), "k".to_string());
+        let cfg = AgentConfig::new(None, None, None, None, "https://x/v1".to_string(), "k".to_string());
         let map: std::collections::HashMap<_, _> = cfg.auth_child_env().into_iter().collect();
         assert!(!map.contains_key("ANTHROPIC_MODEL"));
+        // No model and no small → the haiku slot is left to the CLI default too.
+        assert!(!map.contains_key("ANTHROPIC_DEFAULT_HAIKU_MODEL"));
     }
 
     #[test]

@@ -138,6 +138,10 @@ pub struct LlmCredentials {
     /// Model override (`ANTHROPIC_MODEL`); `None` → the adapter's default.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub model: Option<String>,
+    /// Companion model for the background "haiku" slot (`ANTHROPIC_DEFAULT_HAIKU_MODEL`);
+    /// `None` → reuse `model`. Only the managed (broker) path sets this today.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub small: Option<String>,
 }
 
 impl LlmCredentials {
@@ -289,6 +293,7 @@ impl std::fmt::Debug for LlmCredentials {
             .field("base_url", &self.base_url)
             .field("api_key", &redact(&self.api_key))
             .field("model", &self.model)
+            .field("small", &self.small)
             .finish()
     }
 }
@@ -361,6 +366,7 @@ mod db {
             base_url TEXT NOT NULL DEFAULT '',
             api_key  TEXT NOT NULL DEFAULT '',
             model    TEXT,
+            small    TEXT,
             PRIMARY KEY (mode, feature)
         );
         CREATE TABLE IF NOT EXISTS account (
@@ -409,6 +415,9 @@ mod db {
     fn migrate(conn: &Connection) -> anyhow::Result<()> {
         if !column_exists(conn, "credential", "wire")? {
             conn.execute_batch("ALTER TABLE credential ADD COLUMN wire TEXT NOT NULL DEFAULT ''")?;
+        }
+        if !column_exists(conn, "credential", "small")? {
+            conn.execute_batch("ALTER TABLE credential ADD COLUMN small TEXT")?;
         }
         Ok(())
     }
@@ -526,31 +535,37 @@ mod db {
         Ok(map)
     }
 
-    /// The `(wire, base_url, api_key, model)` tuple for one `(mode, feature)`, or
-    /// `None` when no row exists.
+    /// The `(wire, base_url, api_key, model, small)` tuple for one `(mode, feature)`,
+    /// or `None` when no row exists. `small` is only meaningful for the llm feature.
     fn read_row(
         conn: &Connection,
         mode: Mode,
         feature: &str,
-    ) -> anyhow::Result<Option<(String, String, String, Option<String>)>> {
+    ) -> anyhow::Result<Option<(String, String, String, Option<String>, Option<String>)>> {
         Ok(conn
             .query_row(
-                "SELECT wire, base_url, api_key, model FROM credential WHERE mode = ?1 AND feature = ?2",
+                "SELECT wire, base_url, api_key, model, small FROM credential WHERE mode = ?1 AND feature = ?2",
                 params![mode_str(mode), feature],
-                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?)),
             )
             .optional()?)
     }
 
     fn read_vendor(conn: &Connection, mode: Mode, feature: &str) -> anyhow::Result<VendorKey> {
         Ok(read_row(conn, mode, feature)?
-            .map(|(wire, base_url, api_key, model)| VendorKey { wire, base_url, api_key, model })
+            .map(|(wire, base_url, api_key, model, _small)| VendorKey { wire, base_url, api_key, model })
             .unwrap_or_default())
     }
 
     fn read_llm(conn: &Connection, mode: Mode, feature: &str) -> anyhow::Result<LlmCredentials> {
         Ok(read_row(conn, mode, feature)?
-            .map(|(wire, base_url, api_key, model)| LlmCredentials { wire, base_url, api_key, model })
+            .map(|(wire, base_url, api_key, model, small)| LlmCredentials {
+                wire,
+                base_url,
+                api_key,
+                model,
+                small,
+            })
             .unwrap_or_default())
     }
 
@@ -576,13 +591,23 @@ mod db {
     }
 
     fn write_vendor(conn: &Connection, mode: Mode, feature: &str, vk: &VendorKey) -> anyhow::Result<()> {
-        write_row(conn, mode, feature, &vk.wire, &vk.base_url, &vk.api_key, vk.model.as_deref())
+        write_row(conn, mode, feature, &vk.wire, &vk.base_url, &vk.api_key, vk.model.as_deref(), None)
     }
 
     fn write_llm(conn: &Connection, mode: Mode, feature: &str, llm: &LlmCredentials) -> anyhow::Result<()> {
-        write_row(conn, mode, feature, &llm.wire, &llm.base_url, &llm.api_key, llm.model.as_deref())
+        write_row(
+            conn,
+            mode,
+            feature,
+            &llm.wire,
+            &llm.base_url,
+            &llm.api_key,
+            llm.model.as_deref(),
+            llm.small.as_deref(),
+        )
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn write_row(
         conn: &Connection,
         mode: Mode,
@@ -591,13 +616,14 @@ mod db {
         base_url: &str,
         api_key: &str,
         model: Option<&str>,
+        small: Option<&str>,
     ) -> anyhow::Result<()> {
         conn.execute(
-            "INSERT INTO credential (mode, feature, wire, base_url, api_key, model) VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+            "INSERT INTO credential (mode, feature, wire, base_url, api_key, model, small) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
              ON CONFLICT(mode, feature) DO UPDATE SET
                  wire = excluded.wire, base_url = excluded.base_url,
-                 api_key = excluded.api_key, model = excluded.model",
-            params![mode_str(mode), feature, wire, base_url, api_key, model],
+                 api_key = excluded.api_key, model = excluded.model, small = excluded.small",
+            params![mode_str(mode), feature, wire, base_url, api_key, model, small],
         )?;
         Ok(())
     }
