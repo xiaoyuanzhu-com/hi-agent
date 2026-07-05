@@ -121,6 +121,15 @@ impl AgentLayer {
         );
 
         let SessionOpts { system_prompt, cwd } = opts;
+        // Never let a session root at the process cwd. `session/new` requires a cwd,
+        // and an unset one falls through to `std::env::current_dir()` (acp/process.rs)
+        // — which for a Finder-launched `.app` is `/` and in dev is often `~`. The
+        // agent (Claude Code) reads its project tree on startup, so rooting it there
+        // walks into `~/Pictures`, `~/Music`, `~/Documents`, … and fires a burst of
+        // TCC "wants to access your Photos/Music/…" prompts at first launch. Default
+        // instead to the data dir (under Application Support — not a TCC-gated
+        // location), the agent's own world. Workers still override with `views_dir`.
+        let cwd = cwd.or_else(|| Some(self.inner.data_dir.clone()));
 
         let spawn = &self.inner.spawn;
         // Merge the current upstream credential onto the static env at spawn time,
@@ -128,7 +137,7 @@ impl AgentLayer {
         // re-mint, Settings edit, mode switch) — never a stale boot-time snapshot.
         let mut env = spawn.env.clone();
         env.extend(AgentConfig::resolve(&self.inner.data_dir).auth_child_env());
-        tracing::info!(scene = %scene, role = role.as_str(), "spawning ACP subprocess for session");
+        tracing::info!(scene = %scene, role = role.as_str(), cwd = ?cwd, "spawning ACP subprocess for session");
         let (process, rx) = AcpProcess::spawn(
             spawn.program.clone(),
             spawn.args.clone(),

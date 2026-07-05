@@ -57,7 +57,8 @@ use objc2_app_kit::{
 use objc2_foundation::{MainThreadMarker, NSData, NSSize, NSString};
 use tokio::sync::Notify;
 
-use crate::foundation::credentials::{Credentials, Mode};
+use crate::foundation::config::{self, KEY_GESTURES};
+use crate::foundation::credentials::{get_setting, set_setting, Credentials, Mode};
 
 /// State the menu actions close over: where the credential store lives (for the
 /// Account submenu) and the trigger that asks the server to drain. Held as the target
@@ -114,6 +115,29 @@ define_class!(
         #[unsafe(method(useByok:))]
         fn use_byok(&self, _sender: Option<&AnyObject>) {
             self.set_mode(Mode::Byok);
+        }
+
+        /// "Attention gestures" → toggle the right-⌘ gesture master switch
+        /// ([`KEY_GESTURES`]). Off by default: arming the global key event tap forces
+        /// the macOS "Input Monitoring" grant, so we don't want it at boot. Enabling it
+        /// here and restarting arms the tap — and *that's* when macOS asks. Persisted
+        /// best-effort, applies on the next restart (like the account mode); the
+        /// checkmark flips immediately so the new intent is visible.
+        #[unsafe(method(toggleGestures:))]
+        fn toggle_gestures(&self, sender: Option<&AnyObject>) {
+            let data_dir = &self.ivars().data_dir;
+            let next = !config::flag_on(get_setting(data_dir, KEY_GESTURES));
+            if let Err(e) = set_setting(data_dir, KEY_GESTURES, if next { "on" } else { "off" }) {
+                tracing::error!(error = %e, "tray: failed to toggle attention gestures");
+                return;
+            }
+            if let Some(item) = sender {
+                let v = if next { NSControlStateValueOn } else { NSControlStateValueOff };
+                // SAFETY: main-thread AppKit call; `sender` is the NSMenuItem clicked.
+                unsafe {
+                    let _: () = msg_send![item, setState: v];
+                }
+            }
         }
 
         /// A per-feature "…" row under "Your own keys" → open that feature's key
@@ -856,6 +880,19 @@ pub fn run(url: String, data_dir: PathBuf, shutdown: Arc<Notify>) -> anyhow::Res
         let account_parent = make("Account", None, 0);
         account_parent.setSubmenu(Some(&*account_menu));
         menu.addItem(&account_parent);
+
+        // Attention gestures — the right-⌘ tap (glance / listen / show-me). Off by
+        // default so a fresh install doesn't trigger the macOS Input Monitoring prompt
+        // at boot; the checkmark reflects the stored setting and toggling flips it
+        // (arming/disarming the tap takes effect on the next restart).
+        let gestures_on = config::flag_on(get_setting(&data_dir, KEY_GESTURES));
+        let gestures_item = make("Attention gestures", Some(sel!(toggleGestures:)), 40);
+        gestures_item.setState(if gestures_on {
+            NSControlStateValueOn
+        } else {
+            NSControlStateValueOff
+        });
+        menu.addItem(&gestures_item);
 
         menu.addItem(&NSMenuItem::separatorItem(mtm));
 

@@ -320,7 +320,18 @@ async fn run_with_shutdown(config: Config, shutdown: Arc<Notify>) -> anyhow::Res
     // a screenshot of the current screen as a file (macOS only, best-effort — needs
     // the Accessibility + Screen Recording grants, else it stays inert). One
     // desktop, one person showing one agent, so it lands in a single fixed scene.
-    body::gesture::install(seams.state, crate::types::Scene("desktop".to_string()));
+    //
+    // Off unless the user has opted in (the tray's "Attention gestures" item): the
+    // global key event tap forces the macOS "Input Monitoring" grant the moment it's
+    // created, and we don't want that prompt out of the box. Enabling the setting and
+    // restarting arms it — and that's when the grant is requested.
+    if foundation::config::flag_on(foundation::config::tunables::get(
+        foundation::config::KEY_GESTURES,
+    )) {
+        body::gesture::install(seams.state, crate::types::Scene("desktop".to_string()));
+    } else {
+        tracing::info!("attention gestures off (enable in the tray menu to arm them)");
+    }
 
     let addr = ("0.0.0.0", config.port);
     let listener = TcpListener::bind(addr).await?;

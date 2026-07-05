@@ -39,6 +39,22 @@ pub const KEY_VENDOR_DOWN_AFTER: &str = "vendor_down_after";
 /// `off`/`0`/unset/unparseable → the 30s default.
 pub const KEY_VENDOR_PROBE: &str = "vendor_probe";
 
+/// Master switch for the right-⌘ attention gestures (the global key event tap).
+/// Off unless explicitly enabled, because arming the tap forces the macOS
+/// "Input Monitoring" grant at boot — we don't want that prompt out of the box.
+/// `on`/`true`/`1`/`yes` (case-insensitive) enable it; anything else (incl. unset)
+/// leaves gestures disarmed. Toggled from the tray's "Attention gestures" item.
+pub const KEY_GESTURES: &str = "gestures";
+
+/// Interpret a stored on/off flag (e.g. [`KEY_GESTURES`]): `on`/`true`/`1`/`yes`
+/// (case-insensitive, trimmed) → `true`; unset or anything else → `false`.
+pub fn flag_on(value: Option<String>) -> bool {
+    matches!(
+        value.as_deref().map(|v| v.trim().to_ascii_lowercase()).as_deref(),
+        Some("on" | "true" | "1" | "yes")
+    )
+}
+
 /// Env var (set on the cognition subprocess) carrying hi-agent's own HTTP base
 /// URL, so sessions can read input channels and write the overlay over the same
 /// wire the browser uses. See [`AgentConfig::child_env`]. Infra, not user config.
