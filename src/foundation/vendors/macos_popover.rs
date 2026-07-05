@@ -76,7 +76,7 @@ define_class!(
             _configuration: &WKWebViewConfiguration,
             navigation_action: &WKNavigationAction,
             _window_features: &WKWindowFeatures,
-        ) -> Option<Retained<WKWebView>> {
+        ) -> *mut WKWebView {
             if let Some(url) = unsafe { navigation_action.request().URL() } {
                 if let Some(s) = unsafe { url.absoluteString() } {
                     if let Err(e) = std::process::Command::new("open").arg(s.to_string()).spawn() {
@@ -84,7 +84,8 @@ define_class!(
                     }
                 }
             }
-            None
+            // nil — do not create an in-app child web view (the URL went to the browser).
+            std::ptr::null_mut()
         }
     }
 );
