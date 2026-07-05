@@ -162,7 +162,7 @@ define_class!(
             _window_features: &WKWindowFeatures,
         ) -> *mut WKWebView {
             if let Some(url) = unsafe { navigation_action.request().URL() } {
-                if let Some(s) = unsafe { url.absoluteString() } {
+                if let Some(s) = url.absoluteString() {
                     if let Err(e) = std::process::Command::new("open").arg(s.to_string()).spawn() {
                         tracing::error!(error = %e, "face window: failed to open external url");
                     }
