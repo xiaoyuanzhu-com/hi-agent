@@ -6,12 +6,19 @@
 # models, and static ffmpeg all live under Contents/Resources — so it launches and
 # runs fully offline, with nothing to install. Apple Silicon macOS only.
 #
-# Signing:
+# Signing (read from the shell env, else from .env, else defaults):
 #   CODESIGN_IDENTITY  Developer ID Application identity, or "-" for ad-hoc
 #                      (default). Ad-hoc is fine for local testing; a distributable
 #                      (notarizable) build needs a real Developer ID.
 #   NOTARY_PROFILE     A `notarytool` keychain profile name. When set together with
 #                      a real CODESIGN_IDENTITY, the .dmg is notarized + stapled.
+#
+#   These two live in .env (gitignored) on the build host so the identity name and
+#   notary profile stay out of committed scripts — the certificate private key and
+#   notary credentials themselves stay in the macOS keychain, never on disk. With
+#   both set, `make dmg` produces a properly Apple-signed + notarized image ready
+#   to hand to other users; with neither, it falls back to an ad-hoc local build.
+#
 #   SKIP_BUILD=1       Reuse an existing ./target/release/hi-agent (skip `make build`).
 #   REUSE_RESOURCES=DIR  Copy an already-provisioned Resources tree (with
 #                      runtime/.complete) instead of downloading again.
@@ -29,7 +36,27 @@ if [ "$(uname -s)" != "Darwin" ] || [ "$(uname -m)" != "arm64" ]; then
   exit 1
 fi
 
-IDENTITY="${CODESIGN_IDENTITY:--}"          # default ad-hoc
+# Pull the signing selectors from .env when not already set in the shell env, so
+# `make dmg` signs + notarizes by default on a host whose .env carries them. An
+# explicit env var still wins. We read only these two keys (not `source .env`) so
+# unrelated secrets in .env aren't pulled in or shell-evaluated.
+ENV_FILE="$ROOT/.env"
+env_get() {  # env_get KEY -> value from .env with one layer of quotes stripped
+  [ -f "$ENV_FILE" ] || return 0
+  local line
+  line="$(grep -E "^[[:space:]]*$1=" "$ENV_FILE" | tail -n1)" || return 0
+  [ -n "$line" ] || return 0
+  line="${line#*=}"
+  case "$line" in
+    \"*\") line="${line#\"}"; line="${line%\"}" ;;
+    \'*\') line="${line#\'}"; line="${line%\'}" ;;
+  esac
+  printf '%s' "$line"
+}
+
+IDENTITY="${CODESIGN_IDENTITY:-$(env_get CODESIGN_IDENTITY)}"
+IDENTITY="${IDENTITY:--}"                    # default ad-hoc
+NOTARY_PROFILE="${NOTARY_PROFILE:-$(env_get NOTARY_PROFILE)}"
 ENT="$ROOT/scripts/hi-agent.entitlements"
 VERSION="$(awk -F'"' '/^version *=/ {print $2; exit}' Cargo.toml)"
 
