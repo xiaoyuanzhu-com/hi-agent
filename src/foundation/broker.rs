@@ -296,11 +296,11 @@ pub async fn subscribe_url(data_dir: &Path, prefer_path: Option<&str>) -> anyhow
         anyhow::bail!("broker returned an empty web ticket");
     }
     // The caller's preferred landing page wins (the hint wants `/account`); else the
-    // broker's suggested path, else the pricing page. The ticket is a login handoff,
+    // broker's suggested path, else the account page. The ticket is a login handoff,
     // valid for any page on the domain, so overriding the path is safe.
     let prefer = prefer_path.map(|p| p.trim()).filter(|p| !p.is_empty());
     let broker_path = dto.path.trim();
-    let path = prefer.unwrap_or(if broker_path.is_empty() { "/pricing" } else { broker_path });
+    let path = prefer.unwrap_or(if broker_path.is_empty() { "/account" } else { broker_path });
     Ok(format!("{}{}?ticket={}", base_url(), path, dto.ticket.trim()))
 }
 

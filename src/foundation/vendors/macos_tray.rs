@@ -127,9 +127,10 @@ define_class!(
             crate::foundation::vendors::macos_account::configure_feature(mtm, &self.ivars().data_dir, feature);
         }
 
-        /// "小圆猪 ▸ Subscribe…" → open the pricing page in the browser, signed in as
-        /// this device account. The broker round-trip (mint a one-time ticket) runs
-        /// off the main thread; the resulting URL is handed to `open`.
+        /// "小圆猪 ▸ Subscribe…" → open the account page in the browser, signed in as
+        /// this device account (it shows the current plan/energy and links on to
+        /// pricing). The broker round-trip (mint a one-time ticket) runs off the
+        /// main thread; the resulting URL is handed to `open`.
         #[unsafe(method(subscribe:))]
         fn subscribe(&self, _sender: Option<&AnyObject>) {
             let data_dir = self.ivars().data_dir.clone();
@@ -141,7 +142,7 @@ define_class!(
                         return;
                     }
                 };
-                match rt.block_on(crate::foundation::broker::subscribe_url(&data_dir, None)) {
+                match rt.block_on(crate::foundation::broker::subscribe_url(&data_dir, Some("/account"))) {
                     Ok(url) => {
                         if let Err(e) = std::process::Command::new("open").arg(&url).spawn() {
                             tracing::error!(error = %e, "tray: failed to open subscribe url");
