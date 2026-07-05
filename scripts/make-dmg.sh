@@ -163,18 +163,26 @@ build_plain_dmg() {
 build_styled_dmg() {
   local VOL="Hi Agent" W=660 H=400 TITLEBAR=23 ICON=112
   local STAGE="$OUT/dmgroot" RW="$OUT/rw.dmg" MNT="/Volumes/$VOL"
+  fail() { echo "styled: $1 failed" >&2; }   # name the step so a fallback isn't a mystery
   rm -rf "$STAGE" "$RW" "$DMG"; mkdir -p "$STAGE/.background"
-  cp -R "$APP" "$STAGE/" || return 1
-  ln -s /Applications "$STAGE/Applications" || return 1
+  cp -R "$APP" "$STAGE/" || { fail "cp app"; return 1; }
+  ln -s /Applications "$STAGE/Applications" || { fail "ln Applications"; return 1; }
   # Multi-resolution TIFF so Finder stays crisp on Retina and non-Retina.
   tiffutil -cathidpicheck "$BG_DIR/background.png" "$BG_DIR/background@2x.png" \
     -out "$STAGE/.background/background.tiff" >/dev/null 2>&1 \
-    || cp "$BG_DIR/background@2x.png" "$STAGE/.background/background.tiff" || return 1
+    || cp "$BG_DIR/background@2x.png" "$STAGE/.background/background.tiff" \
+    || { fail "background tiff"; return 1; }
 
-  hdiutil create -volname "$VOL" -srcfolder "$STAGE" -fs HFS+ -format UDRW -ov "$RW" >/dev/null || return 1
-  hdiutil attach "$RW" -mountpoint "$MNT" -nobrowse -noverify -noautoopen >/dev/null || return 1
+  hdiutil create -volname "$VOL" -srcfolder "$STAGE" -fs HFS+ -format UDRW -ov "$RW" >/dev/null \
+    || { fail "hdiutil create"; return 1; }
+  # Detach any stale mount of the same volume from a prior interrupted run,
+  # else attach lands on a different mountpoint ("Hi Agent 1") and the osascript,
+  # which addresses the disk by volume name, styles the wrong window.
+  hdiutil detach "$MNT" -force >/dev/null 2>&1 || true
+  hdiutil attach "$RW" -mountpoint "$MNT" -nobrowse -noverify -noautoopen >/dev/null \
+    || { fail "hdiutil attach"; return 1; }
 
-  osascript - "$VOL" "$APPNAME" "$W" "$H" "$TITLEBAR" "$ICON" <<'APPLESCRIPT' || { hdiutil detach "$MNT" >/dev/null 2>&1 || true; return 1; }
+  osascript - "$VOL" "$APPNAME" "$W" "$H" "$TITLEBAR" "$ICON" <<'APPLESCRIPT' || { fail "osascript (Finder Automation permission?)"; hdiutil detach "$MNT" -force >/dev/null 2>&1 || true; return 1; }
 on run argv
   set {volName, appName} to {item 1 of argv, item 2 of argv}
   set {w, h, tb, iconSize} to {item 3 of argv as integer, item 4 of argv as integer, item 5 of argv as integer, item 6 of argv as integer}
@@ -203,20 +211,33 @@ end run
 APPLESCRIPT
 
   sync
+  # Detaching is what actually frees the RW image. If it stays attached, the
+  # convert below hits EAGAIN forever no matter how many times we retry — so
+  # escalate to a forced detach and confirm the volume is gone before moving on.
   local tries=0
   until hdiutil detach "$MNT" >/dev/null 2>&1; do
     tries=$((tries + 1))
     [ "$tries" -ge 5 ] && { hdiutil detach "$MNT" -force >/dev/null 2>&1 || true; break; }
     sleep 1
   done
-  # Even after detach returns, the kernel can hold the RW image's backing store
-  # for a moment; converting into it immediately then fails with EAGAIN
-  # ("Resource temporarily unavailable"). Retry with a short backoff so a
-  # transient busy state doesn't drop us to the plain (unstyled) image.
+  tries=0
+  while [ -d "$MNT" ] && [ "$tries" -lt 5 ]; do   # still mounted → keep forcing
+    hdiutil detach "$MNT" -force >/dev/null 2>&1 || true
+    tries=$((tries + 1)); sleep 1
+  done
+  [ -d "$MNT" ] && { fail "hdiutil detach (volume still mounted)"; return 1; }
+
+  # Even after detach returns the kernel can briefly hold the backing store, so
+  # a convert issued immediately still fails with EAGAIN ("Resource temporarily
+  # unavailable"). Retry with backoff; on the last attempt let the error through
+  # so a genuine failure is diagnosable rather than a silent fallback.
   tries=0
   until hdiutil convert "$RW" -format UDZO -imagekey zlib-level=9 -ov -o "$DMG" >/dev/null 2>&1; do
     tries=$((tries + 1))
-    [ "$tries" -ge 5 ] && return 1
+    if [ "$tries" -ge 6 ]; then
+      hdiutil convert "$RW" -format UDZO -imagekey zlib-level=9 -ov -o "$DMG" >/dev/null || true
+      fail "hdiutil convert"; return 1
+    fi
     sleep 2
   done
   rm -f "$RW"; rm -rf "$STAGE"
