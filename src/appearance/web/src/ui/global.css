@@ -692,9 +692,12 @@ button {
 }
 
 /* Same colour as the hi.xiaoyuanzhu.com subscribe buttons: solid logo red,
-   white text, a soft shadow, hover to ~primary/90. No gradient. */
+   white text, a soft shadow, hover to ~primary/90. No gradient. It's an <a>
+   (opens the signed-in link in the same click), so kill the underline. */
 .hi-oe-btn {
   flex: none;
+  display: inline-flex;
+  align-items: center;
   padding: 7px 18px;
   border-radius: 999px;
   border: none;
@@ -703,6 +706,7 @@ button {
   font-weight: 700;
   letter-spacing: -0.01em;
   color: #fff;
+  text-decoration: none;
   background: #fd605e;
   box-shadow: 0 1px 2px var(--shadow);
   cursor: pointer;
@@ -717,12 +721,6 @@ button {
 
 .hi-oe-btn:active {
   transform: scale(0.97);
-}
-
-.hi-oe-btn:disabled {
-  opacity: 0.7;
-  cursor: default;
-  transform: none;
 }
 
 @media (max-width: 640px) {

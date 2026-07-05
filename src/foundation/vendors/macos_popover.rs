@@ -26,8 +26,8 @@ use objc2::{DefinedClass, MainThreadOnly, define_class, msg_send, sel};
 use objc2_app_kit::{NSApplication, NSPopover, NSPopoverBehavior, NSStatusBarButton, NSViewController};
 use objc2_foundation::{MainThreadMarker, NSPoint, NSRect, NSSize, NSString, NSURL, NSURLRequest};
 use objc2_web_kit::{
-    WKFrameInfo, WKMediaCaptureType, WKPermissionDecision, WKSecurityOrigin, WKUIDelegate, WKWebView,
-    WKWebViewConfiguration,
+    WKFrameInfo, WKMediaCaptureType, WKNavigationAction, WKPermissionDecision, WKSecurityOrigin,
+    WKUIDelegate, WKWebView, WKWebViewConfiguration, WKWindowFeatures,
 };
 
 /// The popover's content size in points — a compact column for the face.
@@ -64,6 +64,27 @@ define_class!(
             decision_handler: &block2::DynBlock<dyn Fn(WKPermissionDecision)>,
         ) {
             decision_handler.call((WKPermissionDecision::Grant,));
+        }
+
+        /// `window.open(...)` from the page (e.g. the out-of-energy card's 升级 link to
+        /// the signed-in `/account`). A `WKWebView` makes no new view for this by default,
+        /// so nothing opens; hand the URL to the system browser (`open`) and return nil.
+        #[unsafe(method(webView:createWebViewWithConfiguration:forNavigationAction:windowFeatures:))]
+        fn create_web_view(
+            &self,
+            _web_view: &WKWebView,
+            _configuration: &WKWebViewConfiguration,
+            navigation_action: &WKNavigationAction,
+            _window_features: &WKWindowFeatures,
+        ) -> Option<Retained<WKWebView>> {
+            if let Some(url) = unsafe { navigation_action.request().URL() } {
+                if let Some(s) = unsafe { url.absoluteString() } {
+                    if let Err(e) = std::process::Command::new("open").arg(s.to_string()).spawn() {
+                        tracing::error!(error = %e, "popover: failed to open external url");
+                    }
+                }
+            }
+            None
         }
     }
 );

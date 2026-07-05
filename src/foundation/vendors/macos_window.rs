@@ -61,8 +61,8 @@ use objc2_foundation::{
     NSUserDefaults,
 };
 use objc2_web_kit::{
-    WKFrameInfo, WKMediaCaptureType, WKPermissionDecision, WKSecurityOrigin, WKUIDelegate,
-    WKWebView, WKWebViewConfiguration,
+    WKFrameInfo, WKMediaCaptureType, WKNavigationAction, WKPermissionDecision, WKSecurityOrigin,
+    WKUIDelegate, WKWebView, WKWebViewConfiguration, WKWindowFeatures,
 };
 
 /// The window's initial content size in points — a roomy desktop column for the face.
@@ -146,6 +146,29 @@ define_class!(
             decision_handler: &block2::DynBlock<dyn Fn(WKPermissionDecision)>,
         ) {
             decision_handler.call((WKPermissionDecision::Grant,));
+        }
+
+        /// The page called `window.open(...)` — e.g. the out-of-energy card's 升级 button
+        /// opening the signed-in `/account` URL. A `WKWebView` returns no new view for
+        /// this by default (so nothing happens, the bug the user saw); we don't want an
+        /// in-app popup anyway. Hand the URL to the system browser (`open`, like the tray's
+        /// Subscribe) and return nil so no child web view is created.
+        #[unsafe(method(webView:createWebViewWithConfiguration:forNavigationAction:windowFeatures:))]
+        fn create_web_view(
+            &self,
+            _web_view: &WKWebView,
+            _configuration: &WKWebViewConfiguration,
+            navigation_action: &WKNavigationAction,
+            _window_features: &WKWindowFeatures,
+        ) -> Option<Retained<WKWebView>> {
+            if let Some(url) = unsafe { navigation_action.request().URL() } {
+                if let Some(s) = unsafe { url.absoluteString() } {
+                    if let Err(e) = std::process::Command::new("open").arg(s.to_string()).spawn() {
+                        tracing::error!(error = %e, "face window: failed to open external url");
+                    }
+                }
+            }
+            None
         }
     }
 );
