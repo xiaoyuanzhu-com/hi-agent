@@ -209,7 +209,16 @@ APPLESCRIPT
     [ "$tries" -ge 5 ] && { hdiutil detach "$MNT" -force >/dev/null 2>&1 || true; break; }
     sleep 1
   done
-  hdiutil convert "$RW" -format UDZO -imagekey zlib-level=9 -o "$DMG" >/dev/null || return 1
+  # Even after detach returns, the kernel can hold the RW image's backing store
+  # for a moment; converting into it immediately then fails with EAGAIN
+  # ("Resource temporarily unavailable"). Retry with a short backoff so a
+  # transient busy state doesn't drop us to the plain (unstyled) image.
+  tries=0
+  until hdiutil convert "$RW" -format UDZO -imagekey zlib-level=9 -ov -o "$DMG" >/dev/null 2>&1; do
+    tries=$((tries + 1))
+    [ "$tries" -ge 5 ] && return 1
+    sleep 2
+  done
   rm -f "$RW"; rm -rf "$STAGE"
 }
 
