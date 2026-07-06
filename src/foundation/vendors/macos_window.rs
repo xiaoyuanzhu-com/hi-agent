@@ -46,6 +46,7 @@
 //! App Transport Security, so a bundled `.app` needs an `NSAllowsLocalNetworking`
 //! exception for the `http://127.0.0.1` page.
 
+use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
 
 use objc2::rc::Retained;
@@ -64,6 +65,9 @@ use objc2_web_kit::{
     WKFrameInfo, WKMediaCaptureType, WKNavigationAction, WKPermissionDecision, WKSecurityOrigin,
     WKUIDelegate, WKWebView, WKWebViewConfiguration, WKWindowFeatures,
 };
+
+use crate::foundation::config::KEY_THEME;
+use crate::foundation::credentials::get_setting;
 
 /// The window's initial content size in points — a roomy desktop column for the face.
 const WINDOW_W: f64 = 1000.0;
@@ -84,16 +88,27 @@ const TRAFFIC_LIGHT_W: f64 = 78.0;
 // as one surface with the web content below it.
 // ---------------------------------------------------------------------------
 
-/// Whether the OS is in dark mode. The face themes via `prefers-color-scheme`
-/// (i.e. the OS appearance), so reading the same signal here keeps the native
-/// bar in step with the web content. Reads the global `AppleInterfaceStyle`
-/// default — `"Dark"` in dark mode, absent in light; we set no per-window
-/// appearance, so this is the effective appearance for our window too.
+/// Whether the OS is in dark mode. Reads the global `AppleInterfaceStyle` default —
+/// `"Dark"` in dark mode, absent in light. Used only for the `system` theme (follow the
+/// OS); a forced Light/Dark theme is decided by [`resolved_is_dark`] before this is
+/// consulted.
 fn os_is_dark() -> bool {
     let defaults = NSUserDefaults::standardUserDefaults();
     defaults
         .stringForKey(&NSString::from_str("AppleInterfaceStyle"))
         .is_some_and(|s| s.to_string().eq_ignore_ascii_case("dark"))
+}
+
+/// Whether the face's paper/ink bar should paint dark right now, honoring the user's
+/// theme choice ([`KEY_THEME`]): a forced `dark`/`light` wins; `system` / unset follows
+/// the OS ([`os_is_dark`]). Kept in step with [`super::macos_settings::apply_app_theme`],
+/// which forces the matching `NSApp.appearance` so the web content re-themes the same way.
+fn resolved_is_dark(data_dir: &Path) -> bool {
+    match get_setting(data_dir, KEY_THEME).as_deref().map(str::trim) {
+        Some("dark") => true,
+        Some("light") => false,
+        _ => os_is_dark(),
+    }
 }
 
 /// An sRGB colour (opaque) — matches how the web tokens are authored (hex/sRGB).
@@ -110,8 +125,8 @@ fn srgb(r: f64, g: f64, b: f64) -> Retained<NSColor> {
 /// `#ffffff`, dark espresso `#2b2720`). The title uses `--fg` (light ink `#3a352c`, dark
 /// ivory `#e8dfce`). Called at install and again on each open so a light/dark switch
 /// since the last open is picked up.
-fn apply_face_theme(window: &NSWindow, label: &NSTextField) {
-    let (bg, fg) = if os_is_dark() {
+fn apply_face_theme(window: &NSWindow, label: &NSTextField, data_dir: &Path) {
+    let (bg, fg) = if resolved_is_dark(data_dir) {
         (srgb(0.169, 0.153, 0.125), srgb(0.910, 0.875, 0.808))
     } else {
         (srgb(1.0, 1.0, 1.0), srgb(0.227, 0.208, 0.173))
@@ -266,6 +281,9 @@ struct Ivars {
     request: Retained<NSURLRequest>,
     /// The centered title label — kept so the bar theme can be re-applied on reopen.
     label: Retained<NSTextField>,
+    /// Where the config store lives, so the bar theme can consult the current theme
+    /// setting ([`resolved_is_dark`]) on each reopen.
+    data_dir: PathBuf,
 }
 
 define_class!(
@@ -322,9 +340,9 @@ impl Host {
         let mtm = MainThreadMarker::new().expect("window host runs on the main thread");
         let iv = self.ivars();
         let app = NSApplication::sharedApplication(mtm);
-        // Re-match the bar to the OS appearance in case dark/light toggled since the
-        // last open (the window is reused, not rebuilt).
-        apply_face_theme(&iv.window, &iv.label);
+        // Re-match the bar to the current theme in case dark/light (or the setting)
+        // toggled since the last open (the window is reused, not rebuilt).
+        apply_face_theme(&iv.window, &iv.label, &iv.data_dir);
         // SAFETY: main-thread AppKit calls. `activateIgnoringOtherApps:` is the pre-Sonoma
         // activation call but still works; the window then becomes key so its web view's
         // input can take keystrokes despite the Accessory activation policy.
@@ -382,7 +400,7 @@ static HOST: OnceLock<HostPtr> = OnceLock::new();
 /// Build the borderless window hosting a `WKWebView` on the face. Best-effort and
 /// called once from the tray's main-thread setup; the web view loads `url` (the face
 /// base, `http://127.0.0.1:{port}/`) and the window stays hidden until [`open`].
-pub fn install(mtm: MainThreadMarker, url: &str) {
+pub fn install(mtm: MainThreadMarker, url: &str, data_dir: PathBuf) {
     // SAFETY: standard AppKit/WebKit setup on the main thread (guaranteed by `mtm`).
     // Every object is kept alive past `install` by leaking it below, so none is used
     // after free; they live for the process, like the tray's items.
@@ -459,9 +477,9 @@ pub fn install(mtm: MainThreadMarker, url: &str) {
             NSAutoresizingMaskOptions::ViewWidthSizable | NSAutoresizingMaskOptions::ViewMinYMargin,
         );
 
-        // Paint the bar + title to the face's theme (paper/ink, following the OS
-        // light/dark appearance) so the native chrome matches the web content.
-        apply_face_theme(&window, &label);
+        // Paint the bar + title to the face's theme (paper/ink, following the resolved
+        // theme setting) so the native chrome matches the web content.
+        apply_face_theme(&window, &label, &data_dir);
 
         // Transparent drag strip across the top `BAR_H`, pinned to the top edge and
         // stretching horizontally — restores window dragging over the region the web view
@@ -488,7 +506,7 @@ pub fn install(mtm: MainThreadMarker, url: &str) {
 
         // The host owns the window, web view, request, and title label for the process
         // lifetime (the ivars keep them alive; the host itself is leaked below).
-        let host = Host::alloc(mtm).set_ivars(Ivars { window, webview, request, label });
+        let host = Host::alloc(mtm).set_ivars(Ivars { window, webview, request, label, data_dir });
         let host: Retained<Host> = msg_send![super(host), init];
         // The host doubles as the window's delegate so it learns when the close button
         // dismisses the (reused) window and can tell the face to release its capture.

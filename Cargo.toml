@@ -112,6 +112,8 @@ objc2-foundation = { version = "0.3", features = [
     # Popover (`crate::vendors::macos_popover`): build the WKWebView's request.
     "NSURL",
     "NSURLRequest",
+    # Settings window (`crate::vendors::macos_settings`): select the sidebar's first row.
+    "NSIndexSet",
 ] }
 objc2-app-kit = { version = "0.3", features = [
     "NSApplication",
@@ -141,6 +143,17 @@ objc2-app-kit = { version = "0.3", features = [
     # hidden in favour of a centered NSTextField label sitting in the title-bar strip,
     # tinted by the window's NSColor background (the themeable bar color).
     "NSColor",
+    # Settings window (`crate::vendors::macos_settings`): a classic left-list / right-detail
+    # preferences window. The sidebar is a source-list NSTableView in an NSScrollView; the
+    # detail panes swap NSViews; General uses NSPopUpButtons (theme/language) + a checkbox,
+    # Account uses an NSTabView, and the theme picker forces the app-wide NSAppearance.
+    "NSTableView",
+    "NSTableColumn",
+    "NSScrollView",
+    "NSTabView",
+    "NSTabViewItem",
+    "NSPopUpButton",
+    "NSAppearance",
 ] }
 # WebKit for the face popover (`crate::vendors::macos_popover`): a WKWebView renders the
 # face inside the NSPopover, with a WKUIDelegate that auto-grants mic/camera (the

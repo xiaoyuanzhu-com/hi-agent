@@ -133,7 +133,7 @@ pub fn load_soul(data_dir: &Path) -> String {
     let commitments = commitments_path(&base);
     let hot = crate::mind::memory::layout::hot_path(&base);
     let proactivity = crate::mind::memory::layout::proactivity_path(&base);
-    format!(
+    let mut seed = format!(
         "You're warm, honest, and kind-hearted — easy company. You like being \
 useful, and when there's a hand to lend you're glad to lend it.\n\n\
 You speak only through the `say` tool; anything you type as text is never heard.\n\n\
@@ -162,7 +162,21 @@ then nothing's proven — lean quiet.",
         commitments.display(),
         hot.display(),
         proactivity.display(),
-    )
+    );
+    // A soft language preference, if the person set one in Settings ▸ General ▸
+    // Language. `system` / unset yields no line, so the agent simply follows the
+    // person's lead (the default). A real choice appends one guidance line — the
+    // agent still switches if the person clearly writes in another language.
+    if let Some(lang) = crate::foundation::config::language_name(
+        crate::foundation::credentials::get_setting(&base, crate::foundation::config::KEY_LANGUAGE)
+            .as_deref(),
+    ) {
+        seed.push_str(&format!(
+            "\n\nSpeak with the person in {lang} by default, unless they clearly \
+write to you in another language — then follow their lead."
+        ));
+    }
+    seed
 }
 
 #[cfg(test)]
@@ -202,6 +216,20 @@ mod soul_tests {
         // The per-install authored identity is referenced as well.
         let self_md = self_path(dir.path());
         assert!(seed.contains(&self_md.display().to_string()));
+    }
+
+    #[test]
+    fn seed_carries_a_language_line_only_when_a_real_language_is_chosen() {
+        use crate::foundation::credentials::set_setting;
+        let dir = tempfile::tempdir().unwrap();
+        // No setting → the agent follows the person; no language sentence.
+        assert!(!load_soul(dir.path()).contains("Speak with the person in"));
+        // `system` is explicit "follow the person" → still no sentence.
+        set_setting(dir.path(), crate::foundation::config::KEY_LANGUAGE, "system").unwrap();
+        assert!(!load_soul(dir.path()).contains("Speak with the person in"));
+        // A real language → one guidance sentence naming the endonym.
+        set_setting(dir.path(), crate::foundation::config::KEY_LANGUAGE, "zh-Hans").unwrap();
+        assert!(load_soul(dir.path()).contains("Speak with the person in 简体中文"));
     }
 
     #[test]

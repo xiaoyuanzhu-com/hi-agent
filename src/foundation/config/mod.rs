@@ -43,8 +43,48 @@ pub const KEY_VENDOR_PROBE: &str = "vendor_probe";
 /// Off unless explicitly enabled, because arming the tap forces the macOS
 /// "Input Monitoring" grant at boot — we don't want that prompt out of the box.
 /// `on`/`true`/`1`/`yes` (case-insensitive) enable it; anything else (incl. unset)
-/// leaves gestures disarmed. Toggled from the tray's "Attention gestures" item.
+/// leaves gestures disarmed. Toggled from Settings ▸ General ▸ Attention gestures.
 pub const KEY_GESTURES: &str = "gestures";
+
+/// Interface appearance: `system` (follow the OS — the default when unset),
+/// `light`, or `dark`. Applied on macOS by forcing `NSApp.appearance`, which drives
+/// both the native chrome and the face web view's `prefers-color-scheme` together.
+/// Set from Settings ▸ General ▸ Theme.
+pub const KEY_THEME: &str = "theme";
+
+/// The language the agent should speak/write in with the user: `system` (follow the
+/// person's lead — the default when unset), or a language code from [`LANGUAGES`]
+/// (e.g. `en`, `zh-Hans`). Surfaced to the mind as one soft-guidance line in the
+/// system-prompt seed (see `crate::identity::load_soul`); applies on restart, like
+/// the other cognition tunables. Set from Settings ▸ General ▸ Language.
+pub const KEY_LANGUAGE: &str = "language";
+
+/// The theme options offered in Settings, as `(stored value, menu label)`. `system`
+/// is first (the default). Shared by the picker and the applier so they can't drift.
+pub const THEMES: &[(&str, &str)] = &[("system", "System"), ("light", "Light"), ("dark", "Dark")];
+
+/// The language options offered in Settings, as `(stored value, menu label)`.
+/// `system` (follow the person's lead) is first and is the default. The rest are
+/// BCP-47-ish codes paired with their endonym; extend the list to add a language.
+pub const LANGUAGES: &[(&str, &str)] = &[
+    ("system", "System (follow the person)"),
+    ("en", "English"),
+    ("zh-Hans", "简体中文"),
+];
+
+/// The human name of a real language choice (for the seed line), or `None` for
+/// `system` / unset / an unknown code — in which case the agent is given no language
+/// instruction and simply follows the person. Matches on [`LANGUAGES`].
+pub fn language_name(value: Option<&str>) -> Option<&'static str> {
+    let code = value.map(str::trim).filter(|c| !c.is_empty())?;
+    if code.eq_ignore_ascii_case("system") {
+        return None;
+    }
+    LANGUAGES
+        .iter()
+        .find(|(c, _)| c.eq_ignore_ascii_case(code))
+        .map(|(_, label)| *label)
+}
 
 /// Interpret a stored on/off flag (e.g. [`KEY_GESTURES`]): `on`/`true`/`1`/`yes`
 /// (case-insensitive, trimmed) → `true`; unset or anything else → `false`.
@@ -317,6 +357,27 @@ impl AgentConfig {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn language_name_maps_only_real_languages() {
+        // A real code returns its endonym for the seed line.
+        assert_eq!(language_name(Some("en")), Some("English"));
+        assert_eq!(language_name(Some("zh-Hans")), Some("简体中文"));
+        // Case-insensitive on the code.
+        assert_eq!(language_name(Some("ZH-HANS")), Some("简体中文"));
+        // `system`, unset, blank, and unknown all mean "no instruction — follow the person".
+        assert_eq!(language_name(Some("system")), None);
+        assert_eq!(language_name(None), None);
+        assert_eq!(language_name(Some("  ")), None);
+        assert_eq!(language_name(Some("kling-on")), None);
+    }
+
+    #[test]
+    fn theme_and_language_options_lead_with_system() {
+        // `system` is the default and must be the first option in each picker.
+        assert_eq!(THEMES.first().map(|(v, _)| *v), Some("system"));
+        assert_eq!(LANGUAGES.first().map(|(v, _)| *v), Some("system"));
+    }
 
     #[test]
     fn takes_all_parts_from_args() {

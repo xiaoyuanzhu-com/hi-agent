@@ -30,6 +30,8 @@ pub mod macos_popover;
 #[cfg(target_os = "macos")]
 pub mod macos_screencast;
 #[cfg(target_os = "macos")]
+pub mod macos_settings;
+#[cfg(target_os = "macos")]
 pub mod macos_tray;
 #[cfg(target_os = "macos")]
 pub mod macos_window;
