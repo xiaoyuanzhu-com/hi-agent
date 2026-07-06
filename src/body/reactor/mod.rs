@@ -175,9 +175,17 @@ const DEFAULT_VENDOR_PROBE: Duration = Duration::from_secs(30);
 const DEFAULT_VENDOR_DOWN_AFTER: u32 = 2;
 /// A transient-outage retry never waits longer than this — the 1h ceiling.
 const BACKOFF_CAP: Duration = Duration::from_secs(3600);
-/// While out of energy, poll the balance no faster than this — the floor on
-/// `max(time-to-reset / 2, …)`.
+/// The scene loop's cheap out-of-energy recheck cadence — how often a held scene wakes
+/// to notice the shared poller flipped the vendor back Up. (The poller itself, below,
+/// runs on [`OE_POLL_OPEN`]/[`OE_POLL_CLOSED`].)
 const OE_POLL_FLOOR: Duration = Duration::from_secs(10);
+/// Out-of-energy balance-poll cadence while the face window is on screen: tight, because
+/// the user is looking and may have just topped up — recovery should feel immediate.
+const OE_POLL_OPEN: Duration = Duration::from_secs(5);
+/// …and while the window is shut: nobody is watching, so poll rarely. The closed→open
+/// edge ([`crate::foundation::window_state::opened`]) forces an immediate check the
+/// moment the window returns, so this only bounds the fully-background case.
+const OE_POLL_CLOSED: Duration = Duration::from_secs(3600);
 
 /// The base transient-outage retry gap. `vendor_probe` in alarm-delay grammar;
 /// `off`/`0`/unset/unparseable → default. (Kept under the historical config key.)
@@ -312,14 +320,15 @@ impl Vendor {
     }
 
     /// Terminal 402. Flip to out-of-energy immediately (a 402 is definite, not a
-    /// blip), pacing the balance poll from `resets_at`, and wake the poller. Returns
-    /// `true` on the flip *into* out-of-energy so the caller announces it once.
+    /// blip), kick the balance poll, and wake the poller; `resets_at` is kept only for
+    /// the refill-time display. Returns `true` on the flip *into* out-of-energy so the
+    /// caller announces it once.
     fn note_out_of_energy(&self, resets_at: Option<Instant>) -> bool {
         let mut st = self.state.lock().unwrap();
         self.generic_failures.store(0, Ordering::Relaxed);
         let entering = !matches!(*st, VendorState::OutOfEnergy { .. });
         if entering {
-            *st = VendorState::OutOfEnergy { poll_at: oe_next_poll(resets_at), resets_at };
+            *st = VendorState::OutOfEnergy { poll_at: oe_next_poll(), resets_at };
         }
         drop(st);
         if entering {
@@ -389,25 +398,30 @@ impl Vendor {
     }
 
     /// Re-pace the balance poll after a check that found the account still empty.
-    /// No-op if the vendor recovered concurrently.
+    /// No-op if the vendor recovered concurrently. `resets_at` is stored only for the
+    /// refill-time display; the poll cadence comes from the window state.
     fn oe_reschedule(&self, resets_at: Option<Instant>) {
         let mut st = self.state.lock().unwrap();
         if let VendorState::OutOfEnergy { poll_at, resets_at: slot } = &mut *st {
             *slot = resets_at;
-            *poll_at = oe_next_poll(resets_at);
+            *poll_at = oe_next_poll();
         }
     }
 }
 
-/// The next out-of-energy balance poll: half the time until the predicted reset,
-/// floored at [`OE_POLL_FLOOR`]. Unknown/past reset → poll at the floor.
-fn oe_next_poll(resets_at: Option<Instant>) -> Instant {
-    let now = Instant::now();
-    let half = match resets_at {
-        Some(r) if r > now => (r - now) / 2,
-        _ => OE_POLL_FLOOR,
+/// The next out-of-energy balance poll: [`OE_POLL_OPEN`] while the face window is on
+/// screen, [`OE_POLL_CLOSED`] while it's shut. This replaces the old pace-from-reset
+/// math — an out-of-band top-up (the user paying) is exactly what the predicted reset
+/// can't foresee, so we poll on a fixed cadence and let the fetched balance be the
+/// ground truth. The closed→open edge additionally cuts the current sleep short (see
+/// the poller), so reopening the window re-checks immediately regardless of this.
+fn oe_next_poll() -> Instant {
+    let gap = if crate::foundation::window_state::is_open() {
+        OE_POLL_OPEN
+    } else {
+        OE_POLL_CLOSED
     };
-    now + half.max(OE_POLL_FLOOR)
+    Instant::now() + gap
 }
 
 /// Parse the broker's RFC3339 `resets_at` into a monotonic [`Instant`], or `None`
@@ -543,15 +557,19 @@ mod vendor_tests {
     }
 
     #[test]
-    fn out_of_energy_poll_is_half_the_wait_floored_at_ten_seconds() {
+    fn out_of_energy_poll_tracks_the_window() {
+        use crate::foundation::window_state;
         let now = Instant::now();
-        // A reset an hour out → poll at ~half the gap.
-        let gap = oe_next_poll(Some(now + Duration::from_secs(3600))).saturating_duration_since(now);
-        assert!(gap >= Duration::from_secs(1790) && gap <= Duration::from_secs(1810), "~half of 1h");
-        // Imminent / unknown / past reset → floored at 10s (never faster).
-        for reset in [Some(now + Duration::from_secs(4)), None, Some(now - Duration::from_secs(60))] {
-            assert!(oe_next_poll(reset).saturating_duration_since(now) >= OE_POLL_FLOOR);
-        }
+        // Window shut → poll rarely (the background cadence, so an idle machine nobody
+        // is watching doesn't hammer the broker).
+        window_state::set_open(false);
+        let closed = oe_next_poll().saturating_duration_since(now);
+        assert!(closed >= OE_POLL_CLOSED - Duration::from_secs(1), "hidden → slow");
+        // Window on screen → poll tight, so a fresh top-up is noticed within seconds.
+        window_state::set_open(true);
+        let open = oe_next_poll().saturating_duration_since(now);
+        assert!(open <= OE_POLL_OPEN + Duration::from_secs(1), "on screen → fast");
+        window_state::set_open(false);
     }
 
     #[test]
@@ -936,10 +954,13 @@ pub fn start(
 }
 
 /// The single out-of-energy poller. While any scene has flipped the vendor to
-/// [`VendorState::OutOfEnergy`], re-fetch the balance at `max(time-to-reset / 2,
-/// 10s)` and flip the vendor back Up the moment it refills; then the scene loops'
-/// held mail drains on their next pass. Parks on [`Vendor::oe_signal`] while the
-/// vendor is reachable, so an account that's in credit costs nothing.
+/// [`VendorState::OutOfEnergy`], re-fetch the balance on the window-gated cadence
+/// ([`OE_POLL_OPEN`] on screen / [`OE_POLL_CLOSED`] hidden) and flip the vendor back Up
+/// the moment it refills; then the scene loops' held mail drains on their next pass.
+/// The face window coming to the front cuts the current wait short and re-checks at
+/// once (a payment made while it was hidden shouldn't wait out the schedule). Parks on
+/// [`Vendor::oe_signal`] while the vendor is reachable, so an account in credit costs
+/// nothing.
 async fn out_of_energy_poller(reactor: Reactor) {
     let data_dir = reactor.inner.memory.data_dir().to_path_buf();
     loop {
@@ -953,7 +974,14 @@ async fn out_of_energy_poller(reactor: Reactor) {
         };
         let now = Instant::now();
         if poll_at > now {
-            tokio::time::sleep(poll_at - now).await;
+            // Wait for the scheduled poll — but cut it short if the face window comes to
+            // the front, since the user may have just paid on the web and wants to keep
+            // going now. That edge polls immediately, then the loop resumes the (now
+            // "open") cadence.
+            tokio::select! {
+                _ = tokio::time::sleep(poll_at - now) => {}
+                _ = crate::foundation::window_state::opened().notified() => {}
+            }
         }
         // A concurrent success may have cleared the outage while we slept.
         if reactor.inner.vendor.oe_poll_at().is_none() {

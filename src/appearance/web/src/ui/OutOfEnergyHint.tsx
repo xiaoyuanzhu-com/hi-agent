@@ -1,5 +1,7 @@
 import { useEffect, useState } from "react";
 
+import { onNativeLifecycle } from "../lib/nativeBridge";
+
 interface EnergyStatus {
   out_of_energy: boolean;
   resets_in?: string;
@@ -30,25 +32,51 @@ export function OutOfEnergyHint() {
   const [resetsIn, setResetsIn] = useState("");
   const [href, setHref] = useState(FALLBACK_URL);
 
+  // Poll the account's energy standing every 5s — but only while the face window is on
+  // screen. The native shell dispatches foreground/background as the window opens and
+  // closes, and the WebView keeps running while hidden, so a naive interval would keep
+  // polling behind a shut window (the native poller already covers that, rarely). A
+  // foreground transition re-polls at once: the user may have just returned from paying.
+  // Sequential (poll → wait 5s), so a slow fetch never overlaps the next tick.
   useEffect(() => {
     let alive = true;
-    const poll = async () => {
+    let visible = true;
+    let timer: number | undefined;
+    const schedule = () => {
+      if (alive && visible) timer = window.setTimeout(run, 5000);
+    };
+    const run = async () => {
+      timer = undefined;
       try {
         const r = await fetch("/api/account/energy");
-        if (!r.ok) return;
-        const d: EnergyStatus = await r.json();
-        if (!alive) return;
-        setOut(!!d.out_of_energy);
-        setResetsIn(d.resets_in ?? "");
+        if (r.ok) {
+          const d: EnergyStatus = await r.json();
+          if (alive) {
+            setOut(!!d.out_of_energy);
+            setResetsIn(d.resets_in ?? "");
+          }
+        }
       } catch {
         /* transient — try again on the next tick */
       }
+      schedule();
     };
-    poll();
-    const id = window.setInterval(poll, 15000);
+    run();
+    const off = onNativeLifecycle((phase) => {
+      const nowVisible = phase === "foreground";
+      if (nowVisible === visible) return;
+      visible = nowVisible;
+      if (visible) {
+        if (timer === undefined) run(); // came back to the front — re-check immediately
+      } else if (timer !== undefined) {
+        window.clearTimeout(timer); // hidden — stop until we're foregrounded again
+        timer = undefined;
+      }
+    });
     return () => {
       alive = false;
-      window.clearInterval(id);
+      if (timer !== undefined) window.clearTimeout(timer);
+      off();
     };
   }, []);
 

@@ -328,6 +328,7 @@ define_class!(
         /// on the next open, where the face restores whatever the user last had on.
         #[unsafe(method(windowWillClose:))]
         fn window_will_close(&self, _notification: &NSNotification) {
+            crate::foundation::window_state::set_open(false);
             self.emit_lifecycle("background");
         }
     }
@@ -364,6 +365,9 @@ impl Host {
         // when the window was last closed. Best-effort and idempotent — on the very first
         // open the page is still loading and no one is listening yet, which is fine (the
         // face does its own honest restore at startup); it matters on every reopen after.
+        // The window is on screen now: tighten the out-of-energy balance poll to seconds
+        // and wake it if it's mid-wait (the user may have just paid while it was hidden).
+        crate::foundation::window_state::set_open(true);
         self.emit_lifecycle("foreground");
     }
 
