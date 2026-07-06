@@ -37,12 +37,12 @@ use std::sync::OnceLock;
 
 use objc2::rc::Retained;
 use objc2::runtime::{AnyObject, NSObject, NSObjectProtocol, ProtocolObject, Sel};
-use objc2::{define_class, msg_send, sel, ClassType, DefinedClass, MainThreadOnly};
+use objc2::{define_class, msg_send, sel, AnyThread, ClassType, DefinedClass, MainThreadOnly};
 use objc2_app_kit::{
     NSApplication, NSAppearance, NSAppearanceNameAqua, NSAppearanceNameDarkAqua, NSBackingStoreType,
-    NSButton, NSControlStateValueOff, NSControlStateValueOn, NSPopUpButton, NSScrollView,
-    NSTableColumn, NSTableView, NSTableViewDataSource, NSTableViewDelegate,
-    NSTableViewSelectionHighlightStyle, NSTabView, NSTabViewItem, NSTextField, NSView, NSWindow,
+    NSButton, NSControlStateValueOff, NSControlStateValueOn, NSControlTextEditingDelegate,
+    NSPopUpButton, NSScrollView, NSTableColumn, NSTableView, NSTableViewDataSource,
+    NSTableViewDelegate, NSTableViewStyle, NSTabView, NSTabViewItem, NSTextField, NSView, NSWindow,
     NSWindowStyleMask,
 };
 use objc2_foundation::{
@@ -162,6 +162,10 @@ define_class!(
 
     unsafe impl NSObjectProtocol for Host {}
 
+    // `NSTableViewDelegate` inherits `NSControlTextEditingDelegate` (all optional
+    // methods); declare the empty conformance so the delegate impl below satisfies it.
+    unsafe impl NSControlTextEditingDelegate for Host {}
+
     // --- sidebar table: 3 static rows of section names (cell-based) ---
     unsafe impl NSTableViewDataSource for Host {
         #[unsafe(method(numberOfRowsInTableView:))]
@@ -169,7 +173,11 @@ define_class!(
             SECTIONS.len() as isize
         }
 
-        #[unsafe(method(tableView:objectValueForTableColumn:row:))]
+        // `method_id` (not `method`): the return is an object, so objc2 applies the
+        // selector's retain semantics (`objectValue…` = no family = +0 autoreleased) and
+        // lets the impl hand back an owned `Retained` — a plain `method` only permits
+        // scalar (`Encode`) returns.
+        #[unsafe(method_id(tableView:objectValueForTableColumn:row:))]
         fn object_value(
             &self,
             _table: &NSTableView,
@@ -475,7 +483,7 @@ fn popup(mtm: MainThreadMarker, list: &[(&str, &str)], frame: NSRect) -> Retaine
 }
 
 /// A standard push button (no target yet — wired after the host exists).
-fn push_button(mtm: MainThreadMarker, title: &str, frame: NSRect) -> Retained<NSButton> {
+fn push_button(_mtm: MainThreadMarker, title: &str, frame: NSRect) -> Retained<NSButton> {
     // SAFETY: main-thread AppKit construction; nil target/action set later.
     unsafe {
         let b: Retained<NSButton> = msg_send![
@@ -490,7 +498,7 @@ fn push_button(mtm: MainThreadMarker, title: &str, frame: NSRect) -> Retained<NS
 }
 
 /// A checkbox (no target yet).
-fn checkbox(mtm: MainThreadMarker, title: &str, frame: NSRect) -> Retained<NSButton> {
+fn checkbox(_mtm: MainThreadMarker, title: &str, frame: NSRect) -> Retained<NSButton> {
     // SAFETY: main-thread AppKit construction; nil target/action set later.
     unsafe {
         let b: Retained<NSButton> = msg_send![
@@ -562,7 +570,7 @@ pub fn install(mtm: MainThreadMarker, data_dir: PathBuf) {
         column.setWidth(SIDEBAR_W - 8.0);
         table.addTableColumn(&column);
         table.setHeaderView(None);
-        table.setSelectionHighlightStyle(NSTableViewSelectionHighlightStyle::SourceList);
+        table.setStyle(NSTableViewStyle::SourceList);
         let _: () = msg_send![&*scroll, setDocumentView: &*table];
         scroll.setHasVerticalScroller(true);
 
@@ -764,12 +772,12 @@ fn build_account(
 
     // SAFETY: main-thread AppKit; add both tabs.
     unsafe {
-        let t1: Retained<NSTabViewItem> = msg_send![NSTabViewItem::alloc(mtm), initWithIdentifier: core::ptr::null_mut::<AnyObject>()];
+        let t1: Retained<NSTabViewItem> = msg_send![NSTabViewItem::alloc(), initWithIdentifier: core::ptr::null_mut::<AnyObject>()];
         t1.setLabel(&NSString::from_str("小圆猪"));
         let _: () = msg_send![&*t1, setView: &*xyz];
         tabs.addTabViewItem(&t1);
         std::mem::forget(t1);
-        let t2: Retained<NSTabViewItem> = msg_send![NSTabViewItem::alloc(mtm), initWithIdentifier: core::ptr::null_mut::<AnyObject>()];
+        let t2: Retained<NSTabViewItem> = msg_send![NSTabViewItem::alloc(), initWithIdentifier: core::ptr::null_mut::<AnyObject>()];
         t2.setLabel(&NSString::from_str("Your own keys"));
         let _: () = msg_send![&*t2, setView: &*byok];
         tabs.addTabViewItem(&t2);
