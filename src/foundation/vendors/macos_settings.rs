@@ -490,7 +490,7 @@ fn push_button(_mtm: MainThreadMarker, title: &str, frame: NSRect) -> Retained<N
             NSButton::class(),
             buttonWithTitle: &*NSString::from_str(title),
             target: core::ptr::null_mut::<AnyObject>(),
-            action: core::ptr::null_mut::<AnyObject>(),
+            action: None::<Sel>,
         ];
         b.setFrame(frame);
         b
@@ -505,7 +505,7 @@ fn checkbox(_mtm: MainThreadMarker, title: &str, frame: NSRect) -> Retained<NSBu
             NSButton::class(),
             checkboxWithTitle: &*NSString::from_str(title),
             target: core::ptr::null_mut::<AnyObject>(),
-            action: core::ptr::null_mut::<AnyObject>(),
+            action: None::<Sel>,
         ];
         b.setFrame(frame);
         b
