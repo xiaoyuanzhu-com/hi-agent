@@ -8,7 +8,7 @@ use std::sync::atomic::AtomicU64;
 use axum::Router;
 use axum::extract::DefaultBodyLimit;
 use axum::http::StatusCode;
-use axum::routing::{get, post};
+use axum::routing::{get, post, put};
 use bytes::Bytes;
 use chrono::{DateTime, Utc};
 use tokio::sync::{broadcast, mpsc};
@@ -32,6 +32,7 @@ pub mod mcp;
 pub mod observe;
 pub mod reflex;
 pub mod sessions;
+pub mod settings;
 pub mod stubs;
 pub mod text;
 pub mod text_bus;
@@ -520,6 +521,15 @@ pub fn build(
         // like every route here; the out-of-energy card calls both.
         .route("/api/account/energy", get(account::get_energy))
         .route("/api/account/subscribe", get(account::get_subscribe))
+        // The config/energy/mode boundary the Settings UI (native or web) drives as a
+        // thin client of the engine — loopback-gated + secret-safe. Reintroduces the
+        // HTTP config surface the tray refactor removed. See settings.rs and
+        // docs/core-shell-config-api.md.
+        .route("/api/settings", get(settings::get_settings))
+        .route("/api/settings/appearance", put(settings::put_appearance))
+        .route("/api/settings/mode", put(settings::put_mode))
+        .route("/api/settings/credentials/{feature}", put(settings::put_feature))
+        .route("/api/account/energy/refresh", post(settings::post_energy_refresh))
         // Web→device account link: `start` opens the browser to the site with a
         // loopback callback + CSRF nonce; the site hands a device-ticket back to
         // `callback`, which redeems it at the broker to adopt the signed-in account.
