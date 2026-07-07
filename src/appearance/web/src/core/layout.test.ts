@@ -20,14 +20,14 @@ describe("floorLayout", () => {
     expect(cap.hidden).toBe(false);
   });
 
-  it("(b) no views, camera on → camera fills, captions tuck bottom-left", () => {
+  it("(b) no views, camera on → camera fills, captions dock bottom-center", () => {
     const { demote, placements } = floorLayout([captions(), camera()]);
     expect(demote).toBe(0);
     const cam = placements.get(CAMERA_ID)!;
     expect(cam.region).toBe("fill");
     expect(cam.pip).toBe(false);
     const cap = placements.get(CAPTIONS_ID)!;
-    expect(cap.region).toBe("bottom_left");
+    expect(cap.region).toBe("bottom");
     expect(cap.docked).toBe(true);
   });
 
@@ -60,12 +60,12 @@ describe("floorLayout", () => {
     expect(placements.get(CAPTIONS_ID)!.hidden).toBe(true);
   });
 
-  it("places a declared view at its region/size and pushes captions to the free edge", () => {
+  it("places a declared view at its region/size; captions still dock bottom-center", () => {
     const { placements } = floorLayout([view("v1", { region: "left", size: "wide" }), captions()]);
     const v = placements.get("v1")!;
     expect(v.region).toBe("left");
     expect(v.size).toBe("wide");
-    // A left-leading view leaves the right edge freest for the words.
-    expect(placements.get(CAPTIONS_ID)!.region).toBe("right");
+    // The words no longer follow the view to a free edge — one fixed bottom dock.
+    expect(placements.get(CAPTIONS_ID)!.region).toBe("bottom");
   });
 });

@@ -8,7 +8,7 @@ import { AudioStreamer } from "../lib/audioStreamer";
 import { VideoStreamer } from "../lib/videoStreamer";
 import { PresenceStiller } from "../lib/presenceStiller";
 import { VoicePlayer } from "../lib/voicePlayer";
-import { SentenceBuffer } from "../lib/sentences";
+import { SentenceBuffer, breakLongSentence } from "../lib/sentences";
 import { getScene } from "../lib/scene";
 import { onNativeLifecycle } from "../lib/nativeBridge";
 import type { PresenceState } from "../ui/Presence";
@@ -271,11 +271,15 @@ export function useAgentSession(): AgentSession {
   }, []);
 
   // Queue freshly-arrived reply sentences. An idle pacer reveals the first at
-  // once, then paces the rest itself.
+  // once, then paces the rest itself. Long sentences are broken into breath-group
+  // clauses first, so one over-long line never parks as a wall of caption text —
+  // the parts reveal in turn, keeping the same total cadence (see breakLongSentence).
   const enqueueAgent = useCallback(
     (list: string[]) => {
       if (list.length === 0) return;
-      pendingAgentRef.current.push(...list);
+      const chunks = list.flatMap((s) => breakLongSentence(s));
+      if (chunks.length === 0) return;
+      pendingAgentRef.current.push(...chunks);
       if (paceTimerRef.current === null) pumpAgent();
     },
     [pumpAgent],

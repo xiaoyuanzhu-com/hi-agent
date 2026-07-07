@@ -51,34 +51,6 @@ export interface Layout {
   placements: Map<string, Placement>;
 }
 
-/** The edge a view at `region` leaves freest for the caption pills — so the words
- * sit clear of the content rather than on top of it. A centered or full-bleed view
- * leaves the bottom; an edge view leaves the opposite edge. */
-function captionComplement(viewRegion: Region): Region {
-  switch (viewRegion) {
-    case "top":
-      return "bottom";
-    case "bottom":
-      return "top";
-    case "left":
-      return "right";
-    case "right":
-      return "left";
-    case "top_left":
-      return "bottom_right";
-    case "top_right":
-      return "bottom_left";
-    case "bottom_left":
-      return "top_right";
-    case "bottom_right":
-      return "top_left";
-    case "center":
-    case "fill":
-    default:
-      return "bottom";
-  }
-}
-
 /**
  * Place every participant. Reproduces the host's prior hand-written placement
  * exactly when no view declares geometry (the no-regression contract, locked by
@@ -123,29 +95,23 @@ export function floorLayout(participants: Participant[]): Layout {
     });
   }
 
-  // The words dock as pills whenever something fills the stage behind them — a
-  // view, or the camera-as-backdrop. Over a view the topmost one drives them: it
-  // may render them itself (host stands down) or push them to the edge it leaves
-  // freest. Alone, they are the lead and sit centered.
+  // The words dock as a single bottom-center strip whenever something fills the
+  // stage behind them — a view, or the camera-as-backdrop. They no longer follow
+  // the view to a free edge: one fixed dock in the bottom bar, sat between the
+  // camera pip (left) and the controls (right) so they never cover the content.
+  // The topmost view may still render the words itself, in which case the host
+  // stands down. Alone (nothing on the stage), the words are the lead and centre.
   if (captions) {
     const docked = overlaid || cameraFill;
-    let region: Region = "center";
     let hidden = false;
     if (overlaid) {
       const top = views[views.length - 1];
-      if (top?.geometry?.owns_captions) {
-        hidden = true;
-      } else {
-        region = captionComplement(top?.geometry?.region ?? "center");
-      }
-    } else if (cameraFill) {
-      // Tuck into the lower-left, clear of a centered face.
-      region = "bottom_left";
+      if (top?.geometry?.owns_captions) hidden = true;
     }
     placements.set(captions.id, {
       id: captions.id,
       kind: "captions",
-      region,
+      region: docked ? "bottom" : "center",
       size: "auto",
       hidden,
       pip: false,

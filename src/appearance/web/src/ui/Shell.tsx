@@ -71,8 +71,11 @@ export function Shell() {
         <div
           className={captionsDocked ? "hi-stage hi-stage--captions" : "hi-stage"}
           data-region={captionsDocked ? captions.region : undefined}
+          // Tells the dock to pull its left edge past the camera pip (bottom-left)
+          // so the bottom bar's three zones — pip · captions · controls — never overlap.
+          data-camera={captionsDocked && camera?.pip ? "pip" : undefined}
         >
-          <SpeechText items={captionsDocked ? sentences.slice(-3) : sentences} />
+          <SpeechText items={captionsDocked ? sentences.slice(-1) : sentences} />
         </div>
       )}
 

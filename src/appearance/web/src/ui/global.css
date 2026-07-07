@@ -356,16 +356,30 @@ button {
 
 /* --- Captions over a view ---------------------------------------------
    While something fills the stage (an agent view at z-index 50, or the camera
-   backdrop), the words dock as pills and rise above it — a dark scrim keeps them
-   legible over whatever is behind (the white text-shadow only works on light
-   ground). The dock side is the `region` the floor (`floorLayout`) placed the
-   words in — the edge the leading view leaves freest. A view that renders the
-   words itself hides this layer entirely (handled in the host, not here). */
-.hi-stage--captions {
+   backdrop), the words dock as a pill in the bottom bar and rise above it — a
+   dark scrim keeps them legible over whatever is behind. One fixed dock: centred
+   in the bottom band, held clear of the controls cluster (right) and the camera
+   pip (left) by the side gutters below, so the words never sit on the content or
+   the corner widgets. A view that renders the words itself hides this layer
+   entirely (handled in the host, not here). */
+.hi-stage.hi-stage--captions {
   top: auto;
-  bottom: calc(env(safe-area-inset-bottom, 0px) + 68px);
-  transform: translateX(-50%);
+  bottom: calc(env(safe-area-inset-bottom, 0px) + 74px);
+  /* Centre band between the two bottom-corner zones: controls (~250px) on the
+     right, always; the camera pip on the left only when it's up (see below). */
+  left: max(272px, env(safe-area-inset-left, 0px) + 24px);
+  right: max(272px, env(safe-area-inset-right, 0px) + 24px);
+  width: auto;
+  transform: none;
+  text-align: center;
   z-index: 60;
+}
+
+/* When the camera pip holds the lower-left corner, push the dock's left edge past
+   it (the pip is clamp(180px, 24vw, 520px) wide from the left margin) so pip ·
+   captions · controls stay three non-overlapping zones. */
+.hi-stage.hi-stage--captions[data-camera="pip"] {
+  left: clamp(220px, calc(24vw + 44px), 584px);
 }
 
 .hi-stage--captions .hi-speech {
@@ -373,14 +387,23 @@ button {
 }
 
 .hi-stage--captions .hi-sentence {
-  padding: 7px 16px;
+  padding: 8px 18px;
   border-radius: 14px;
   background: var(--caption-bg);
   backdrop-filter: blur(10px);
   -webkit-backdrop-filter: blur(10px);
   color: var(--caption-fg);
   text-shadow: none;
-  font-size: clamp(15px, 2vw, 38px);
+  /* One current line — sized to read comfortably on a desktop and still legible
+     across a room on a TV, without dominating the view it sits under. */
+  font-size: clamp(16px, 1.7vw, 30px);
+  line-height: 1.4;
+  /* Backstop: a clause with no soft break (a URL, a code token) can't tower over
+     the view — cap it at three lines. The voice carries the full content. */
+  display: -webkit-box;
+  -webkit-box-orient: vertical;
+  -webkit-line-clamp: 3;
+  overflow: hidden;
 }
 
 .hi-stage--captions .hi-sentence--prev {
@@ -390,56 +413,6 @@ button {
 
 .hi-stage--captions .hi-sentence--user {
   color: var(--caption-user);
-}
-
-/* Caption dock side follows the region the floor placed the words in — the edge
-   the leading view leaves freest, or the lower-left over a bare camera. The
-   default (bottom-center) is the base rule above; these place the others. */
-.hi-stage--captions[data-region="top"],
-.hi-stage--captions[data-region="top_left"],
-.hi-stage--captions[data-region="top_right"] {
-  top: calc(env(safe-area-inset-top, 0px) + 32px);
-  bottom: auto;
-}
-
-/* Left / right and their corners become a narrow column at the edge; the vertical
-   anchor stays the base bottom unless a top_* region lifted it above. */
-.hi-stage--captions[data-region="left"],
-.hi-stage--captions[data-region="top_left"],
-.hi-stage--captions[data-region="bottom_left"],
-.hi-stage--captions[data-region="right"],
-.hi-stage--captions[data-region="top_right"],
-.hi-stage--captions[data-region="bottom_right"] {
-  width: min(420px, 38vw);
-  transform: none;
-}
-
-.hi-stage--captions[data-region="left"],
-.hi-stage--captions[data-region="top_left"],
-.hi-stage--captions[data-region="bottom_left"] {
-  left: max(28px, env(safe-area-inset-left, 0px) + 16px);
-  right: auto;
-  text-align: left;
-}
-
-.hi-stage--captions[data-region="left"] .hi-speech,
-.hi-stage--captions[data-region="top_left"] .hi-speech,
-.hi-stage--captions[data-region="bottom_left"] .hi-speech {
-  align-items: flex-start;
-}
-
-.hi-stage--captions[data-region="right"],
-.hi-stage--captions[data-region="top_right"],
-.hi-stage--captions[data-region="bottom_right"] {
-  left: auto;
-  right: max(28px, env(safe-area-inset-right, 0px) + 16px);
-  text-align: right;
-}
-
-.hi-stage--captions[data-region="right"] .hi-speech,
-.hi-stage--captions[data-region="top_right"] .hi-speech,
-.hi-stage--captions[data-region="bottom_right"] .hi-speech {
-  align-items: flex-end;
 }
 
 /* --- View stage (host frame around an agent view) --------------------
@@ -459,10 +432,12 @@ button {
   /* The empty margins fall through to the room behind — only the surface itself
      takes pointer events (set below). */
   pointer-events: none;
-  /* Base safe-area: clear the bottom corner widgets (pip / controls / kbd). */
+  /* Base safe-area: clear the bottom bar — camera pip / controls / keyboard, and
+     the caption dock, which now always sits bottom-centre regardless of the view's
+     own region. */
   padding: calc(env(safe-area-inset-top, 0px) + 28px)
     max(24px, env(safe-area-inset-right, 0px) + 16px)
-    calc(env(safe-area-inset-bottom, 0px) + 104px)
+    calc(env(safe-area-inset-bottom, 0px) + 140px)
     max(24px, env(safe-area-inset-left, 0px) + 16px);
 }
 
@@ -475,27 +450,6 @@ button {
 .hi-view-frame[data-region="top_right"] { align-items: flex-start; justify-content: flex-end; }
 .hi-view-frame[data-region="bottom_left"] { align-items: flex-end; justify-content: flex-start; }
 .hi-view-frame[data-region="bottom_right"] { align-items: flex-end; justify-content: flex-end; }
-
-/* Reserve the strip the captions dock into — the complement of the view's region
-   (matches floorLayout's captionComplement): center/top → captions bottom;
-   bottom → captions top; left → captions right; right → captions left. */
-.hi-view-frame[data-region="center"],
-.hi-view-frame[data-region="top"],
-.hi-view-frame[data-region="top_left"],
-.hi-view-frame[data-region="top_right"] {
-  padding-bottom: calc(env(safe-area-inset-bottom, 0px) + 140px);
-}
-.hi-view-frame[data-region="bottom"],
-.hi-view-frame[data-region="bottom_left"],
-.hi-view-frame[data-region="bottom_right"] {
-  padding-top: calc(env(safe-area-inset-top, 0px) + 116px);
-}
-.hi-view-frame[data-region="left"] {
-  padding-right: min(440px, 42vw);
-}
-.hi-view-frame[data-region="right"] {
-  padding-left: min(440px, 42vw);
-}
 
 .hi-view-surface {
   pointer-events: auto;
@@ -728,6 +682,14 @@ button {
     right: max(12px, env(safe-area-inset-right));
     bottom: calc(max(12px, env(safe-area-inset-bottom)) + 44px);
     width: min(248px, calc(100vw - 24px));
+  }
+  /* Too narrow for a three-zone bar: the caption becomes a near-full-width strip
+     sitting just above the control row instead of between the corner widgets. */
+  .hi-stage.hi-stage--captions,
+  .hi-stage.hi-stage--captions[data-camera="pip"] {
+    left: 14px;
+    right: 14px;
+    bottom: calc(env(safe-area-inset-bottom, 0px) + 66px);
   }
 }
 
