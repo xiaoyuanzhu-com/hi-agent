@@ -442,7 +442,12 @@ pub async fn claim_device(data_dir: &Path, ticket: &str) -> anyhow::Result<Claim
     Ok(ClaimOutcome::Adopted { email })
 }
 
-
+/// Persist the last broker-sync outcome to `app_settings` (best-effort — a failed
+/// write just leaves the UI showing a slightly stale state). On success the stored
+/// error is cleared; on failure its text is kept so the Settings page can surface
+/// *why* the account is unavailable rather than spinning on "connecting".
+fn record_status(data_dir: &Path, ok: bool, error: &str) {
+    use crate::foundation::credentials::set_setting;
     let now = chrono::Utc::now().to_rfc3339();
     let _ = set_setting(data_dir, KEY_BROKER_STATE, if ok { "ok" } else { "error" });
     let _ = set_setting(data_dir, KEY_BROKER_ERROR, if ok { "" } else { error });

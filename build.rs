@@ -75,6 +75,14 @@ fn build_swift_settings() {
     // et al.; hand the linker the OS Swift lib dir so it can resolve them.
     println!("cargo:rustc-link-search=native=/usr/lib/swift");
     println!("cargo:rustc-link-arg=-L/usr/lib/swift");
+    // Most OS Swift dylibs are linked by absolute path, but the back-deployment
+    // concurrency runtime is referenced as `@rpath/libswift_Concurrency.dylib`
+    // (swiftc emits it that way so it can fall back to a bundled copy on older OSes).
+    // Without an LC_RPATH the loader can't resolve it (`no LC_RPATH's found`), so add
+    // the OS Swift dir as a runpath — the same entry Xcode's default
+    // LD_RUNPATH_SEARCH_PATHS injects; on macOS 12+ the dylib is served from the dyld
+    // shared cache at that path.
+    println!("cargo:rustc-link-arg=-Wl,-rpath,/usr/lib/swift");
 }
 
 struct ManifestVersions {

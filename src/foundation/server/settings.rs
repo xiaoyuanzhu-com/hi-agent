@@ -120,14 +120,14 @@ struct AboutState {
 
 /// Partial appearance write: any field omitted (`None`) is left unchanged.
 #[derive(Deserialize, Default)]
-struct AppearancePatch {
+pub(crate) struct AppearancePatch {
     theme: Option<String>,
     language: Option<String>,
     gestures: Option<bool>,
 }
 
 #[derive(Deserialize)]
-struct ModePatch {
+pub(crate) struct ModePatch {
     mode: Mode,
 }
 
@@ -135,7 +135,7 @@ struct ModePatch {
 /// **blank** value keeps the existing key (so the UI never has to re-enter it, and a
 /// blank field can't wipe it). `base_url`/`model`: `None` keeps, `Some("")` clears.
 #[derive(Deserialize, Default)]
-struct FeaturePatch {
+pub(crate) struct FeaturePatch {
     api_key: Option<String>,
     base_url: Option<String>,
     model: Option<String>,
@@ -155,7 +155,7 @@ pub async fn get_settings(
 }
 
 /// `PUT /api/settings/appearance` — theme / language / gestures (partial).
-pub async fn put_appearance(
+pub(crate) async fn put_appearance(
     State(state): State<Arc<AppState>>,
     ConnectInfo(peer): ConnectInfo<SocketAddr>,
     Json(patch): Json<AppearancePatch>,
@@ -170,7 +170,7 @@ pub async fn put_appearance(
 }
 
 /// `PUT /api/settings/mode` — select the active credential mode.
-pub async fn put_mode(
+pub(crate) async fn put_mode(
     State(state): State<Arc<AppState>>,
     ConnectInfo(peer): ConnectInfo<SocketAddr>,
     Json(patch): Json<ModePatch>,
@@ -185,7 +185,7 @@ pub async fn put_mode(
 }
 
 /// `PUT /api/settings/credentials/{feature}` — set a BYOK key/base_url/model.
-pub async fn put_feature(
+pub(crate) async fn put_feature(
     State(state): State<Arc<AppState>>,
     ConnectInfo(peer): ConnectInfo<SocketAddr>,
     UrlPath(feature): UrlPath<String>,
