@@ -15,7 +15,7 @@ use std::time::Duration;
 use anyhow::Context;
 use serde::Deserialize;
 
-use crate::foundation::credentials::{Credentials, Energy, LlmCredentials, Managed, Mode, Tokens, VendorKey};
+use crate::foundation::credentials::{Credentials, Energy, Identity, LlmCredentials, Managed, Mode, Tokens, VendorKey};
 
 /// Env override for the broker base URL (default [`DEFAULT_BROKER_URL`]).
 const ENV_BROKER_URL: &str = "HI_AGENT_BROKER_URL";
@@ -35,6 +35,12 @@ fn base_url() -> String {
         .map(|s| s.trim().trim_end_matches('/').to_string())
         .filter(|s| !s.is_empty())
         .unwrap_or_else(|| DEFAULT_BROKER_URL.to_string())
+}
+
+/// The broker base URL (env override or default) — public so the account-link
+/// handler can build the site URL it sends the browser to.
+pub fn public_base_url() -> String {
+    base_url()
 }
 
 /// Bounded HTTP client so a slow/unreachable broker can't hang the boot path.
@@ -339,12 +345,104 @@ async fn ensure_tokens(store: &Credentials) -> anyhow::Result<Tokens> {
     bootstrap(&store.device_id).await
 }
 
-/// Persist the last broker-sync outcome to `app_settings` (best-effort — a failed
-/// write just leaves the UI showing a slightly stale state). On success the stored
-/// error is cleared; on failure its text is kept so the Settings page can surface
-/// *why* the account is unavailable rather than spinning on "connecting".
-fn record_status(data_dir: &Path, ok: bool, error: &str) {
-    use crate::foundation::credentials::set_setting;
+/// The signed-in account's identity in a claim response.
+#[derive(Deserialize, Default)]
+struct ClaimIdentityDto {
+    #[serde(default)]
+    email: String,
+    #[serde(default)]
+    name: String,
+    #[serde(default)]
+    tier: String,
+}
+
+/// POST /api/agent/claim success body: fresh account tokens + the adopted identity.
+#[derive(Deserialize, Default)]
+struct ClaimDto {
+    #[serde(default)]
+    access_token: String,
+    #[serde(default)]
+    refresh_token: String,
+    #[serde(default)]
+    expires_in: i64,
+    #[serde(default)]
+    identity: ClaimIdentityDto,
+}
+
+/// A broker error body (`{error, message}`) — read to surface the 409 conflict code.
+#[derive(Deserialize, Default)]
+struct ErrorDto {
+    #[serde(default)]
+    error: String,
+}
+
+/// The result of a web→device claim.
+pub enum ClaimOutcome {
+    /// The device adopted the signed-in account; `email` is who it now is.
+    Adopted { email: String },
+    /// The broker declined to switch automatically — `code` is the machine reason
+    /// (`keep_current` = a recoverable account is signed in here; `chooser_required`
+    /// = both accounts are bound). The caller explains it to the user.
+    Conflict { code: String },
+}
+
+/// Redeem a device-ticket to adopt the account the browser is signed in as (the
+/// web→device link). Authenticates with this device's current access token so the
+/// broker can apply its adoption policy (A = this device, B = the ticket's account);
+/// on success it relinks the device server-side and returns fresh tokens for B,
+/// which we swap into the store along with B's identity, then refresh configs +
+/// energy under the new tokens. A 409 comes back as [`ClaimOutcome::Conflict`] for
+/// the caller to explain rather than an error. Xiaoyuanzhu mode only.
+pub async fn claim_device(data_dir: &Path, ticket: &str) -> anyhow::Result<ClaimOutcome> {
+    let mut store = Credentials::load(data_dir);
+    if store.mode == Mode::Byok {
+        anyhow::bail!("account linking is only available in xiaoyuanzhu mode");
+    }
+    // The claim is authed as the device's current account — make sure we hold a
+    // usable access token (bootstrap on first run), and persist it before the call.
+    let tokens = ensure_tokens(&store).await.context("ensuring a device token before claim")?;
+    store.tokens = Some(tokens.clone());
+    let _ = store.save(data_dir);
+
+    let url = format!("{}/api/agent/claim", base_url());
+    let resp = http()?
+        .post(&url)
+        .bearer_auth(&tokens.access_token)
+        .json(&serde_json::json!({ "ticket": ticket }))
+        .send()
+        .await
+        .with_context(|| format!("calling {url}"))?;
+    let status = resp.status();
+    if status.as_u16() == 409 {
+        let code = resp.json::<ErrorDto>().await.map(|e| e.error).unwrap_or_default();
+        return Ok(ClaimOutcome::Conflict { code });
+    }
+    if !status.is_success() {
+        anyhow::bail!("claim {url} returned {status}: {}", resp.text().await.unwrap_or_default());
+    }
+    let dto: ClaimDto = resp.json().await.context("parsing claim response")?;
+
+    // Swap in the adopted account's tokens + identity.
+    store.tokens = Some(tokens_from(TokenDto {
+        access_token: dto.access_token,
+        refresh_token: dto.refresh_token,
+        expires_in: dto.expires_in,
+    }));
+    let email = dto.identity.email.clone();
+    store.identity = if email.trim().is_empty() {
+        None
+    } else {
+        Some(Identity { email: email.clone(), name: dto.identity.name, tier: dto.identity.tier })
+    };
+    store.save(data_dir).context("saving claimed account")?;
+
+    // Pull the adopted account's configs + energy under its new tokens. `refresh`
+    // reloads the store (keeping the identity we just wrote) and persists again.
+    refresh(data_dir, None).await;
+    Ok(ClaimOutcome::Adopted { email })
+}
+
+
     let now = chrono::Utc::now().to_rfc3339();
     let _ = set_setting(data_dir, KEY_BROKER_STATE, if ok { "ok" } else { "error" });
     let _ = set_setting(data_dir, KEY_BROKER_ERROR, if ok { "" } else { error });

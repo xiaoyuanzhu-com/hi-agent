@@ -21,6 +21,11 @@ use serde::{Deserialize, Serialize};
 /// File under the data dir holding the credential store (SQLite).
 const FILE: &str = "config.db";
 
+/// `app_settings` key recording the port the local HTTP server bound this run, so
+/// the native Settings "Sign in" button and the account-link handlers can build the
+/// loopback callback URL. Written at startup; not a secret.
+pub const KEY_SERVER_PORT: &str = "server_port";
+
 /// Absolute path to the credential store for `data_dir`.
 pub fn path(data_dir: &Path) -> PathBuf {
     data_dir.join(FILE)
@@ -108,6 +113,22 @@ pub struct Credentials {
     /// separate from configs.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub energy: Option<Energy>,
+    /// The signed-in web identity after a device claim (web→device link). `None`
+    /// while anonymous. Display only — the account is keyed by [`Tokens`], not this;
+    /// Settings shows it as "signed in as …".
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub identity: Option<Identity>,
+}
+
+/// The bound web account's display identity, recorded when this device is linked to
+/// it (see `broker::claim_device`). Not a credential — the tokens are the account.
+#[derive(Clone, Default, Serialize, Deserialize, Debug)]
+#[serde(default)]
+pub struct Identity {
+    pub email: String,
+    pub name: String,
+    /// The account tier at claim time (e.g. `standard`/`pro`/`max`). Advisory label.
+    pub tier: String,
 }
 
 /// Broker-issued account tokens. The access token is a short-lived bearer for
@@ -470,7 +491,34 @@ mod db {
             managed: read_managed(conn)?,
             tokens,
             energy,
+            identity: read_identity(conn)?,
         })
+    }
+
+    /// The bound identity, from its `app_settings` scalars. `None` unless an email
+    /// is stored (an anonymous device account leaves them blank).
+    fn read_identity(conn: &Connection) -> anyhow::Result<Option<Identity>> {
+        let email = get_setting(conn, "identity_email")?.unwrap_or_default();
+        if email.trim().is_empty() {
+            return Ok(None);
+        }
+        Ok(Some(Identity {
+            email,
+            name: get_setting(conn, "identity_name")?.unwrap_or_default(),
+            tier: get_setting(conn, "identity_tier")?.unwrap_or_default(),
+        }))
+    }
+
+    /// Persist (or clear) the bound identity scalars.
+    fn write_identity(conn: &Connection, id: Option<&Identity>) -> anyhow::Result<()> {
+        let (email, name, tier) = match id {
+            Some(i) => (i.email.as_str(), i.name.as_str(), i.tier.as_str()),
+            None => ("", "", ""),
+        };
+        set_setting(conn, "identity_email", email)?;
+        set_setting(conn, "identity_name", name)?;
+        set_setting(conn, "identity_tier", tier)?;
+        Ok(())
     }
 
     /// Write every field of `c` — the BYOK flat fields, the managed bundle (when
@@ -493,6 +541,7 @@ mod db {
             write_vendor(conn, Mode::Xiaoyuanzhu, "video", &m.video)?;
         }
         write_account(conn, c)?;
+        write_identity(conn, c.identity.as_ref())?;
         Ok(())
     }
 
@@ -777,6 +826,11 @@ mod tests {
                 ..Default::default()
             }),
             energy: Some(Energy { remaining: 70, total: 100, resets_at: "x".into(), tier: "free".into() }),
+            identity: Some(Identity {
+                email: "iloahz@example.com".into(),
+                name: "Li".into(),
+                tier: "standard".into(),
+            }),
             ..Default::default()
         };
         c.save(dir.path()).unwrap();
@@ -785,6 +839,8 @@ mod tests {
         assert_eq!(back.tokens.as_ref().unwrap().access_token, "acc");
         assert_eq!(back.managed.as_ref().unwrap().llm.base_url, "https://songguo.xiaoyuanzhu.com");
         assert_eq!(back.energy.as_ref().unwrap().remaining, 70);
+        assert_eq!(back.identity.as_ref().unwrap().email, "iloahz@example.com");
+        assert_eq!(back.identity.as_ref().unwrap().tier, "standard");
     }
 
     #[test]

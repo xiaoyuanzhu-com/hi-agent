@@ -520,6 +520,12 @@ pub fn build(
         // like every route here; the out-of-energy card calls both.
         .route("/api/account/energy", get(account::get_energy))
         .route("/api/account/subscribe", get(account::get_subscribe))
+        // Web→device account link: `start` opens the browser to the site with a
+        // loopback callback + CSRF nonce; the site hands a device-ticket back to
+        // `callback`, which redeems it at the broker to adopt the signed-in account.
+        // Loopback-only (the callback's peer must be 127.0.0.1). See account.rs.
+        .route("/account/link/start", get(account::get_link_start))
+        .route("/account/link/callback", get(account::get_link_callback))
         // A scene's channels, observed live as one merged presence stream — the
         // channel inspector's window onto every in/out channel of one scene.
         .route("/api/scenes/{scene}/channels", get(channels::get_scene_channels))

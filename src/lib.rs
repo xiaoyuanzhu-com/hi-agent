@@ -337,16 +337,29 @@ async fn run_with_shutdown(config: Config, shutdown: Arc<Notify>) -> anyhow::Res
     let listener = TcpListener::bind(addr).await?;
     tracing::info!("hi-agent listening on http://0.0.0.0:{}", config.port);
 
+    // Record the bound port so the native Settings "Sign in" button and the
+    // account-link handlers can build the loopback callback URL (not a secret).
+    let _ = foundation::credentials::set_setting(
+        &config.data_dir,
+        foundation::credentials::KEY_SERVER_PORT,
+        &config.port.to_string(),
+    );
+
     // Serve until SIGINT/SIGTERM or the tray's Quit. `with_graceful_shutdown`
     // stops accepting new connections and lets in-flight requests finish. We run
     // it in a task so we can also watch the same trigger ourselves and *bound* the
     // drain: the SSE and long-poll endpoints hold a connection open indefinitely,
     // so an unbounded graceful wait would never return.
+    // `into_make_service_with_connect_info` exposes the peer address so the
+    // account-link callback can enforce loopback-only (see server::account).
     let server_shutdown = shutdown.clone();
     let mut server = tokio::spawn(async move {
-        axum::serve(listener, router)
-            .with_graceful_shutdown(shutdown_requested(server_shutdown))
-            .await
+        axum::serve(
+            listener,
+            router.into_make_service_with_connect_info::<std::net::SocketAddr>(),
+        )
+        .with_graceful_shutdown(shutdown_requested(server_shutdown))
+        .await
     });
 
     tokio::select! {

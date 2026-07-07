@@ -50,7 +50,7 @@ use objc2_foundation::{
 };
 
 use crate::foundation::config::{self, KEY_GESTURES, KEY_LANGUAGE, KEY_THEME, LANGUAGES, THEMES};
-use crate::foundation::credentials::{get_setting, set_setting, Credentials, Mode};
+use crate::foundation::credentials::{get_setting, set_setting, Credentials, Mode, KEY_SERVER_PORT};
 use super::macos_account::{configure_feature, Feature};
 
 // ---------------------------------------------------------------------------
@@ -147,6 +147,8 @@ struct Ivars {
     plan_label: Retained<NSTextField>,
     energy_label: Retained<NSTextField>,
     resets_label: Retained<NSTextField>,
+    /// "Signed in as …" / "Not signed in" — the bound web identity, if any.
+    signin_label: Retained<NSTextField>,
     use_xyz: Retained<NSButton>,
     // Account · BYOK.
     use_byok: Retained<NSButton>,
@@ -272,6 +274,26 @@ define_class!(
             });
         }
 
+        /// "Sign in / 关联账号" → open the browser to link this device to the owner's
+        /// web account. Points at the local `/account/link/start`, which mints the CSRF
+        /// nonce and redirects to the site; the round-trip lands a device-ticket back on
+        /// the loopback callback. Falls back to the plain web account page if the server
+        /// port isn't known yet.
+        #[unsafe(method(signIn:))]
+        fn sign_in(&self, _sender: Option<&AnyObject>) {
+            let data_dir = &self.ivars().data_dir;
+            let port = get_setting(data_dir, KEY_SERVER_PORT)
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty());
+            match port {
+                Some(port) => open_url(&format!("http://127.0.0.1:{port}/account/link/start")),
+                None => {
+                    tracing::warn!("settings: server port unknown; opening the web account page");
+                    open_url("https://hi.xiaoyuanzhu.com/account");
+                }
+            }
+        }
+
         /// A BYOK feature's Edit… button → open its key dialog (the sender's tag names the
         /// feature), then refresh the account tab's status rows.
         #[unsafe(method(editFeature:))]
@@ -383,6 +405,14 @@ impl Host {
         set_label(&iv.plan_label, &plan);
         set_label(&iv.energy_label, &energy);
         set_label(&iv.resets_label, &resets);
+
+        // The bound web identity, if the device has been linked (web→device claim).
+        let signed_in = match &creds.identity {
+            Some(id) if !id.email.trim().is_empty() => format!("Signed in as {}", id.email),
+            Some(id) if !id.name.trim().is_empty() => format!("Signed in as {}", id.name),
+            _ => "Not signed in".to_string(),
+        };
+        set_label(&iv.signin_label, &signed_in);
 
         let xyz_active = creds.mode == Mode::Xiaoyuanzhu;
         set_use_button(&iv.use_xyz, "Use 小圆猪", xyz_active);
@@ -580,7 +610,7 @@ pub fn install(mtm: MainThreadMarker, data_dir: PathBuf) {
             NSRect::new(NSPoint::new(SIDEBAR_W, 0.0), NSSize::new(DETAIL_W, WIN_H)),
         );
         let (general, theme_popup, lang_popup, gestures_check) = build_general(mtm);
-        let (account, plan_label, energy_label, resets_label, use_xyz, manage, use_byok, byok_status, edit_buttons) =
+        let (account, plan_label, energy_label, resets_label, signin_label, use_xyz, manage, sign_in, use_byok, byok_status, edit_buttons) =
             build_account(mtm);
         let (about, visit) = build_about(mtm);
 
@@ -607,6 +637,7 @@ pub fn install(mtm: MainThreadMarker, data_dir: PathBuf) {
             plan_label,
             energy_label,
             resets_label,
+            signin_label,
             use_xyz: use_xyz.clone(),
             use_byok: use_byok.clone(),
             byok_status,
@@ -627,8 +658,10 @@ pub fn install(mtm: MainThreadMarker, data_dir: PathBuf) {
         wire(&use_xyz, &host, sel!(useXiaoyuanzhu:));
         wire(&use_byok, &host, sel!(useByok:));
         wire(&manage, &host, sel!(manageAccount:));
+        wire(&sign_in, &host, sel!(signIn:));
         wire(&visit, &host, sel!(visitWebsite:));
         std::mem::forget(manage);
+        std::mem::forget(sign_in);
         std::mem::forget(visit);
         for (btn, tag) in edit_buttons {
             btn.setTag(tag);
@@ -715,6 +748,8 @@ fn build_account(
     Retained<NSTextField>,
     Retained<NSTextField>,
     Retained<NSTextField>,
+    Retained<NSTextField>,
+    Retained<NSButton>,
     Retained<NSButton>,
     Retained<NSButton>,
     Retained<NSButton>,
@@ -743,13 +778,17 @@ fn build_account(
     let plan_label = label(mtm, "Plan: —", NSRect::new(NSPoint::new(MARGIN, row_y(inner_h, 0.0)), NSSize::new(lw, ROW_H)));
     let energy_label = label(mtm, "Energy: —", NSRect::new(NSPoint::new(MARGIN, row_y(inner_h, 1.0)), NSSize::new(lw, ROW_H)));
     let resets_label = label(mtm, "Resets: —", NSRect::new(NSPoint::new(MARGIN, row_y(inner_h, 2.0)), NSSize::new(lw, ROW_H)));
+    let signin_label = label(mtm, "Not signed in", NSRect::new(NSPoint::new(MARGIN, row_y(inner_h, 3.0)), NSSize::new(lw, ROW_H)));
     xyz.addSubview(&plan_label);
     xyz.addSubview(&energy_label);
     xyz.addSubview(&resets_label);
+    xyz.addSubview(&signin_label);
     let use_xyz = push_button(mtm, "Use 小圆猪", NSRect::new(NSPoint::new(MARGIN, row_y(inner_h, 4.0)), NSSize::new(180.0, ROW_H + 4.0)));
     let manage = push_button(mtm, "Manage on the web…", NSRect::new(NSPoint::new(MARGIN + 190.0, row_y(inner_h, 4.0)), NSSize::new(190.0, ROW_H + 4.0)));
+    let sign_in = push_button(mtm, "Sign in / 关联账号", NSRect::new(NSPoint::new(MARGIN, row_y(inner_h, 5.0)), NSSize::new(200.0, ROW_H + 4.0)));
     xyz.addSubview(&use_xyz);
     xyz.addSubview(&manage);
+    xyz.addSubview(&sign_in);
 
     // --- BYOK tab: a status row + Edit button per feature, plus "Use my own keys" ---
     let byok = NSView::initWithFrame(
@@ -790,7 +829,7 @@ fn build_account(
         .try_into()
         .unwrap_or_else(|_| panic!("FEATURES has exactly 6 entries"));
 
-    (pane, plan_label, energy_label, resets_label, use_xyz, manage, use_byok, status_arr, edit_buttons)
+    (pane, plan_label, energy_label, resets_label, signin_label, use_xyz, manage, sign_in, use_byok, status_arr, edit_buttons)
 }
 
 /// About: name, version, blurb, and a website link. Returns the pane and the "Visit"
