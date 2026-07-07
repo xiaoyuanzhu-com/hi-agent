@@ -94,7 +94,7 @@ The engine's outbound API grows from config CRUD into a **bidirectional perceive
 
 ### Sequencing — two phases, don't flip ownership first
 
-- **Phase 1 — Settings in hosted SwiftUI, Rust still owns the process.** Host a SwiftUI Settings window (via `NSHostingView` in a Rust-created window) talking to the loopback config/energy/mode API. Needs no OS grants, touches none of the hard-won tray/hotkey/capture code — proves the core↔UI API boundary at near-zero risk. **Define that config/energy/mode API boundary cleanly first, then build the client.**
+- **Phase 1 — Settings in hosted SwiftUI, Rust still owns the process.** Host a SwiftUI Settings window (via `NSHostingView` in a Rust-created window) talking to the loopback config/energy/mode API. Needs no OS grants, touches none of the hard-won tray/hotkey/capture code — proves the core↔UI API boundary at near-zero risk. **Define that config/energy/mode API boundary cleanly first, then build the client** — the spec is [docs/core-shell-config-api.md](docs/core-shell-config-api.md).
 - **Phase 2 — flip ownership.** Swift owns `NSApplication`; Rust demoted to sidecar; port app-shell primitives + capability mechanisms to Swift; stand up the streaming perceive/act API. This is the big, GUI-wall-bound phase — do it last.
 
 **Boundary rule going forward:** a capability's *mechanism* (OS touch) belongs in the shell; its *policy* (cross-platform logic) belongs in the engine. A new surface is API-client-native only if it's presentational. When unsure which bucket something falls in, that's a consequential fork — ask.
