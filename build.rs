@@ -12,6 +12,69 @@ fn main() {
     println!("cargo:rustc-env=HI_AGENT_NODE_VERSION={}", manifest.node_version);
     println!("cargo:rustc-env=HI_AGENT_ADAPTER_VERSION={}", manifest.adapter_version);
     println!("cargo:rustc-env=HI_AGENT_CLAUDE_VERSION={}", manifest.claude_version);
+
+    // macOS only: compile + link the native SwiftUI Settings window (the Phase-1 shell
+    // client of the config API — see src/foundation/vendors/macos_swift_settings.rs).
+    // Gated on the target OS so the Linux/Docker and Windows builds never invoke swiftc.
+    if std::env::var("CARGO_CFG_TARGET_OS").as_deref() == Ok("macos") {
+        build_swift_settings();
+    }
+}
+
+/// Compile `swift/HiSettings.swift` into a static lib and emit the link directives that
+/// pull it (plus AppKit/SwiftUI/Foundation and the OS Swift runtime) into the binary.
+///
+/// UNBUILT-caveat: written without a macOS toolchain to test against. The static Swift
+/// link is the most likely fix-forward point — if the linker can't resolve the Swift
+/// runtime symbols, options are (a) add the toolchain's lib path from
+/// `swiftc -print-target-info`, or (b) switch to a dynamic library + an @rpath and
+/// bundle the dylib. SwiftUI itself is an OS framework (never statically linked).
+fn build_swift_settings() {
+    let swift = "src/foundation/vendors/swift/HiSettings.swift";
+    println!("cargo:rerun-if-changed={swift}");
+
+    let out_dir = std::env::var("OUT_DIR").expect("OUT_DIR set by cargo");
+    let lib = format!("{out_dir}/libHiSettings.a");
+
+    // Resolve the macOS SDK so swiftc links against the right frameworks.
+    let sdk = std::process::Command::new("xcrun")
+        .args(["--sdk", "macosx", "--show-sdk-path"])
+        .output()
+        .expect("xcrun --show-sdk-path (is the Xcode command-line toolchain installed?)");
+    let sdk_path = String::from_utf8_lossy(&sdk.stdout).trim().to_string();
+
+    // Emit a static archive of the module. `-parse-as-library` keeps top-level items
+    // (the @_cdecl entry) from being treated as `main`.
+    let status = std::process::Command::new("xcrun")
+        .args([
+            "--sdk",
+            "macosx",
+            "swiftc",
+            "-O",
+            "-parse-as-library",
+            "-static",
+            "-emit-library",
+            "-module-name",
+            "HiSettings",
+            "-sdk",
+            &sdk_path,
+            "-o",
+            &lib,
+            swift,
+        ])
+        .status()
+        .expect("run swiftc");
+    assert!(status.success(), "swiftc failed to build HiSettings.swift");
+
+    println!("cargo:rustc-link-search=native={out_dir}");
+    println!("cargo:rustc-link-lib=static=HiSettings");
+    println!("cargo:rustc-link-lib=framework=AppKit");
+    println!("cargo:rustc-link-lib=framework=SwiftUI");
+    println!("cargo:rustc-link-lib=framework=Foundation");
+    // Swift-in-the-OS runtime: the static archive carries autolink hints for swiftCore
+    // et al.; hand the linker the OS Swift lib dir so it can resolve them.
+    println!("cargo:rustc-link-search=native=/usr/lib/swift");
+    println!("cargo:rustc-link-arg=-L/usr/lib/swift");
 }
 
 struct ManifestVersions {

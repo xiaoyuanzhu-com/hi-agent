@@ -95,11 +95,12 @@ define_class!(
             self.ivars().shutdown.notify_waiters();
         }
 
-        /// "Settings…" → open the native preferences window (General / Account / About;
-        /// see [`super::macos_settings`]). Idempotent — reopening brings it forward.
+        /// "Settings…" → open the native SwiftUI preferences window (General / Account /
+        /// About; see [`super::macos_swift_settings`]). A client of the engine's local
+        /// config API. Idempotent — reopening brings it forward.
         #[unsafe(method(openSettings:))]
         fn open_settings(&self, _sender: Option<&AnyObject>) {
-            super::macos_settings::open();
+            super::macos_swift_settings::open();
         }
 
     }
@@ -593,10 +594,11 @@ pub fn run(url: String, data_dir: PathBuf, shutdown: Arc<Notify>) -> anyhow::Res
             // The face window is button-independent (it's not anchored to the tray), so
             // it's installed unconditionally; the single right-⌘ tap still opens the
             // menu-bar popover, so that's installed too (anchored to the button). The
-            // settings window is installed here too, hidden until "Settings…" opens it.
+            // SwiftUI settings window is built lazily on first "Settings…"; here we just
+            // hand its bridge the data dir so it can resolve the server port.
             crate::foundation::vendors::macos_window::install(mtm, &window_url, data_dir.clone());
             crate::foundation::vendors::macos_popover::install(mtm, button.clone(), &window_url);
-            crate::foundation::vendors::macos_settings::install(mtm, data_dir.clone());
+            crate::foundation::vendors::macos_swift_settings::init(data_dir.clone());
 
             let click = TrayClick::new(mtm, status_item.clone(), button.clone(), menu.clone());
             button.setTarget(Some(&click));

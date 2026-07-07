@@ -93,5 +93,6 @@ New handlers live alongside `server/account.rs` (e.g. `server/settings.rs`), reg
 
 1. Lock this contract (types + routes + gating helper).
 2. Add the loopback-gated `GET /api/settings` + the three writes + `POST /api/account/energy/refresh`; unit-test against a temp `--data-dir`.
-3. Point the **web** Settings SPA at the new API (proves the contract with the existing client before any Swift).
-4. Build the SwiftUI Settings window as an `NSHostingView` client of the same API; keep the objc2 window as fallback until it's at parity.
+3. Build the **native SwiftUI** Settings window as a client of this API (`swift/HiSettings.swift`), compiled + linked by `build.rs` on macOS, opened from the tray via the `hi_settings_open` FFI entry. Settings goes straight to native — the point of the native-presentational decision — not through a web page.
+4. Retire the objc2 preferences window once the SwiftUI one is at parity (keep `apply_app_theme`; the SwiftUI window applies theme live via `NSApp.appearance` too).
+
