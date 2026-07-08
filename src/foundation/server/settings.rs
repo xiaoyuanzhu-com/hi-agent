@@ -17,14 +17,14 @@ use std::net::SocketAddr;
 use std::path::Path;
 use std::sync::Arc;
 
+use axum::Json;
 use axum::extract::{ConnectInfo, Path as UrlPath, State};
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
-use axum::Json;
 use serde::{Deserialize, Serialize};
 
 use crate::foundation::config::{
-    self, KEY_GESTURES, KEY_LANGUAGE, KEY_THEME, LANGUAGES, THEMES,
+    self, KEY_GESTURES, KEY_LANGUAGE, KEY_THEME, LANGUAGES, LLM_WIRES, THEMES,
 };
 use crate::foundation::credentials::{self, Credentials, Energy, Mode};
 use crate::foundation::energy_state;
@@ -106,6 +106,8 @@ struct EnergySnapshot {
 struct FeatureStatus {
     feature: String,
     configured: bool,
+    wire: Option<String>,
+    wires: Vec<Choice>,
     base_url: Option<String>,
     model: Option<String>,
 }
@@ -136,6 +138,7 @@ pub(crate) struct ModePatch {
 /// blank field can't wipe it). `base_url`/`model`: `None` keeps, `Some("")` clears.
 #[derive(Deserialize, Default)]
 pub(crate) struct FeaturePatch {
+    wire: Option<String>,
     api_key: Option<String>,
     base_url: Option<String>,
     model: Option<String>,
@@ -279,20 +282,30 @@ fn appearance_state(data_dir: &Path) -> AppearanceState {
     AppearanceState {
         // Theme applies live (the shell re-applies NSAppearance on change); language
         // and gestures are boot-time decisions, so they apply on restart.
-        theme: ChoiceSetting { value: theme, options: choices(THEMES), applies: "live" },
+        theme: ChoiceSetting {
+            value: theme,
+            options: choices(THEMES),
+            applies: "live",
+        },
         language: ChoiceSetting {
             value: language,
             options: choices(LANGUAGES),
             applies: "restart",
         },
-        gestures: FlagSetting { value: gestures, applies: "restart" },
+        gestures: FlagSetting {
+            value: gestures,
+            applies: "restart",
+        },
     }
 }
 
 fn choices(pairs: &[(&str, &str)]) -> Vec<Choice> {
     pairs
         .iter()
-        .map(|(v, l)| Choice { value: (*v).to_string(), label: (*l).to_string() })
+        .map(|(v, l)| Choice {
+            value: (*v).to_string(),
+            label: (*l).to_string(),
+        })
         .collect()
 }
 
@@ -303,7 +316,11 @@ fn identity_state(creds: &Credentials) -> IdentityState {
             name: non_empty(&id.name),
             email: non_empty(&id.email),
         },
-        None => IdentityState { signed_in: false, name: None, email: None },
+        None => IdentityState {
+            signed_in: false,
+            name: None,
+            email: None,
+        },
     }
 }
 
@@ -328,18 +345,54 @@ fn energy_snapshot(e: Energy) -> EnergySnapshot {
 
 /// A feature's BYOK status without the key. `None` for an unknown feature key.
 fn feature_status(creds: &Credentials, feature: &str) -> Option<FeatureStatus> {
-    let (base_url, api_key, model) = match feature {
-        "llm" => (&creds.llm.base_url, &creds.llm.api_key, &creds.llm.model),
-        "stt" => (&creds.stt.base_url, &creds.stt.api_key, &creds.stt.model),
-        "tts" => (&creds.tts.base_url, &creds.tts.api_key, &creds.tts.model),
-        "vision" => (&creds.vision.base_url, &creds.vision.api_key, &creds.vision.model),
-        "image" => (&creds.image.base_url, &creds.image.api_key, &creds.image.model),
-        "video" => (&creds.video.base_url, &creds.video.api_key, &creds.video.model),
+    let (wire, base_url, api_key, model) = match feature {
+        "llm" => (
+            &creds.llm.wire,
+            &creds.llm.base_url,
+            &creds.llm.api_key,
+            &creds.llm.model,
+        ),
+        "stt" => (
+            &creds.stt.wire,
+            &creds.stt.base_url,
+            &creds.stt.api_key,
+            &creds.stt.model,
+        ),
+        "tts" => (
+            &creds.tts.wire,
+            &creds.tts.base_url,
+            &creds.tts.api_key,
+            &creds.tts.model,
+        ),
+        "vision" => (
+            &creds.vision.wire,
+            &creds.vision.base_url,
+            &creds.vision.api_key,
+            &creds.vision.model,
+        ),
+        "image" => (
+            &creds.image.wire,
+            &creds.image.base_url,
+            &creds.image.api_key,
+            &creds.image.model,
+        ),
+        "video" => (
+            &creds.video.wire,
+            &creds.video.base_url,
+            &creds.video.api_key,
+            &creds.video.model,
+        ),
         _ => return None,
     };
     Some(FeatureStatus {
         feature: feature.to_string(),
         configured: !api_key.trim().is_empty(),
+        wire: non_empty(wire),
+        wires: if feature == "llm" {
+            choices(LLM_WIRES)
+        } else {
+            Vec::new()
+        },
         base_url: non_empty(base_url),
         model: model.as_deref().and_then(non_empty),
     })
@@ -371,24 +424,52 @@ fn set_feature(
 ) -> anyhow::Result<FeatureStatus> {
     let mut creds = Credentials::load(data_dir);
     {
-        // llm and VendorKey differ in extra fields but share (base_url, api_key, model).
-        let (base_url, api_key, model): (&mut String, &mut String, &mut Option<String>) =
-            match feature {
-                "llm" => (&mut creds.llm.base_url, &mut creds.llm.api_key, &mut creds.llm.model),
-                "stt" => (&mut creds.stt.base_url, &mut creds.stt.api_key, &mut creds.stt.model),
-                "tts" => (&mut creds.tts.base_url, &mut creds.tts.api_key, &mut creds.tts.model),
-                "vision" => {
-                    (&mut creds.vision.base_url, &mut creds.vision.api_key, &mut creds.vision.model)
-                }
-                "image" => {
-                    (&mut creds.image.base_url, &mut creds.image.api_key, &mut creds.image.model)
-                }
-                "video" => {
-                    (&mut creds.video.base_url, &mut creds.video.api_key, &mut creds.video.model)
-                }
-                _ => anyhow::bail!("unknown feature: {feature}"),
-            };
-        write_key_fields(base_url, api_key, model, patch);
+        // llm and VendorKey differ in extra fields but share (wire, base_url, api_key, model).
+        let (wire, base_url, api_key, model): (
+            &mut String,
+            &mut String,
+            &mut String,
+            &mut Option<String>,
+        ) = match feature {
+            "llm" => (
+                &mut creds.llm.wire,
+                &mut creds.llm.base_url,
+                &mut creds.llm.api_key,
+                &mut creds.llm.model,
+            ),
+            "stt" => (
+                &mut creds.stt.wire,
+                &mut creds.stt.base_url,
+                &mut creds.stt.api_key,
+                &mut creds.stt.model,
+            ),
+            "tts" => (
+                &mut creds.tts.wire,
+                &mut creds.tts.base_url,
+                &mut creds.tts.api_key,
+                &mut creds.tts.model,
+            ),
+            "vision" => (
+                &mut creds.vision.wire,
+                &mut creds.vision.base_url,
+                &mut creds.vision.api_key,
+                &mut creds.vision.model,
+            ),
+            "image" => (
+                &mut creds.image.wire,
+                &mut creds.image.base_url,
+                &mut creds.image.api_key,
+                &mut creds.image.model,
+            ),
+            "video" => (
+                &mut creds.video.wire,
+                &mut creds.video.base_url,
+                &mut creds.video.api_key,
+                &mut creds.video.model,
+            ),
+            _ => anyhow::bail!("unknown feature: {feature}"),
+        };
+        write_key_fields(wire, base_url, api_key, model, patch);
     }
     creds.save(data_dir)?;
     feature_status(&creds, feature).ok_or_else(|| anyhow::anyhow!("unknown feature: {feature}"))
@@ -397,11 +478,15 @@ fn set_feature(
 /// Apply a [`FeaturePatch`] in place: a non-empty `api_key` replaces (blank keeps);
 /// `base_url`/`model` set when present (`Some("")` clears), keep when absent.
 fn write_key_fields(
+    wire: &mut String,
     base_url: &mut String,
     api_key: &mut String,
     model: &mut Option<String>,
     patch: &FeaturePatch,
 ) {
+    if let Some(w) = &patch.wire {
+        *wire = w.trim().to_string();
+    }
     if let Some(k) = patch.api_key.as_deref() {
         let k = k.trim();
         if !k.is_empty() {
@@ -413,7 +498,11 @@ fn write_key_fields(
     }
     if let Some(m) = &patch.model {
         let m = m.trim();
-        *model = if m.is_empty() { None } else { Some(m.to_string()) };
+        *model = if m.is_empty() {
+            None
+        } else {
+            Some(m.to_string())
+        };
     }
 }
 
@@ -482,24 +571,58 @@ mod tests {
         assert_eq!(status.model.as_deref(), Some("gpt-x"));
         // The projected DTO carries no key field at all — serialize and confirm.
         let json = serde_json::to_string(&status).unwrap();
-        assert!(!json.contains("sk-secret"), "status must not leak the api_key");
+        assert!(
+            !json.contains("sk-secret"),
+            "status must not leak the api_key"
+        );
         assert!(!json.contains("api_key"));
     }
 
     #[test]
     fn blank_key_keeps_existing() {
         let dir = tempfile::tempdir().unwrap();
-        set_feature(dir.path(), "stt", &FeaturePatch { api_key: Some("sk-1".into()), ..Default::default() })
-            .unwrap();
+        set_feature(
+            dir.path(),
+            "stt",
+            &FeaturePatch {
+                api_key: Some("sk-1".into()),
+                ..Default::default()
+            },
+        )
+        .unwrap();
         // A blank key must not wipe the stored one; base_url still updates.
         let status = set_feature(
             dir.path(),
             "stt",
-            &FeaturePatch { api_key: Some("   ".into()), base_url: Some("https://b".into()), ..Default::default() },
+            &FeaturePatch {
+                api_key: Some("   ".into()),
+                base_url: Some("https://b".into()),
+                ..Default::default()
+            },
         )
         .unwrap();
         assert!(status.configured, "blank key should keep the existing key");
         assert_eq!(status.base_url.as_deref(), Some("https://b"));
+    }
+
+    #[test]
+    fn llm_wire_write_persists() {
+        let dir = tempfile::tempdir().unwrap();
+        let status = set_feature(
+            dir.path(),
+            "llm",
+            &FeaturePatch {
+                wire: Some("codex".into()),
+                api_key: Some("sk-1".into()),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(status.wire.as_deref(), Some("codex"));
+        assert_eq!(status.wires.len(), 2);
+
+        let stored = Credentials::load(dir.path());
+        assert_eq!(stored.llm.wire_opt(), Some("codex"));
     }
 
     #[test]

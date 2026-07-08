@@ -147,13 +147,21 @@ struct AccountState: Decodable {
 }
 struct IdentityState: Decodable { var signedIn: Bool; var name: String?; var email: String? }
 struct EnergySnapshot: Decodable { var tier: String; var remaining: Int; var total: Int; var resetsAt: String; var outOfEnergy: Bool }
-struct FeatureStatus: Decodable, Identifiable { var feature: String; var configured: Bool; var baseUrl: String?; var model: String?; var id: String { feature } }
+struct FeatureStatus: Decodable, Identifiable {
+    var feature: String
+    var configured: Bool
+    var wire: String?
+    var wires: [Choice]
+    var baseUrl: String?
+    var model: String?
+    var id: String { feature }
+}
 struct AboutState: Decodable { var version: String; var website: String }
 
 struct AppearancePatch: Encodable { var theme: String?; var language: String?; var gestures: Bool? }
 struct ModePatch: Encodable { var mode: String }
 struct ModeEcho: Decodable { var mode: String }
-struct FeaturePatch: Encodable { var apiKey: String?; var baseUrl: String?; var model: String? }
+struct FeaturePatch: Encodable { var wire: String?; var apiKey: String?; var baseUrl: String?; var model: String? }
 struct EnergyEcho: Decodable { var energy: EnergySnapshot? }
 
 let featureLabels: [String: String] = [
@@ -211,6 +219,9 @@ final class SettingsModel: ObservableObject {
             let next = try await api.putFeature(feature, patch)
             if let i = snap?.account.features.firstIndex(where: { $0.feature == feature }) {
                 snap?.account.features[i] = next
+            }
+            if feature == "llm", patch.wire != nil {
+                restartHint = true
             }
         } catch { self.error = "\(error)" }
     }
@@ -490,6 +501,7 @@ struct FeatureEditor: View {
     @Binding var isPresented: Bool
 
     @State private var apiKey = ""
+    @State private var wire = "claude"
     @State private var baseUrl = ""
     @State private var modelName = ""
     @State private var saving = false
@@ -497,6 +509,12 @@ struct FeatureEditor: View {
     var body: some View {
         VStack(alignment: .leading, spacing: 12) {
             Text(featureLabels[status.feature] ?? status.feature).font(.headline)
+            if status.feature == "llm", !status.wires.isEmpty {
+                Picker("Agent", selection: $wire) {
+                    ForEach(status.wires, id: \.value) { Text($0.label).tag($0.value) }
+                }
+                .pickerStyle(.menu)
+            }
             SecureField(status.configured ? "•••••• (leave blank to keep)" : "API key", text: $apiKey)
             TextField("Base URL (optional)", text: $baseUrl)
             TextField("Model (optional)", text: $modelName)
@@ -509,6 +527,7 @@ struct FeatureEditor: View {
                         // Blank api_key → nil so the engine keeps the stored key.
                         let key = apiKey.trimmingCharacters(in: .whitespaces)
                         await model.saveFeature(status.feature, FeaturePatch(
+                            wire: status.feature == "llm" ? wire : nil,
                             apiKey: key.isEmpty ? nil : key,
                             baseUrl: baseUrl, model: modelName))
                         saving = false
@@ -522,6 +541,7 @@ struct FeatureEditor: View {
         .padding(20)
         .frame(width: 380)
         .onAppear {
+            wire = status.wire ?? "claude"
             baseUrl = status.baseUrl ?? ""
             modelName = status.model ?? ""
         }

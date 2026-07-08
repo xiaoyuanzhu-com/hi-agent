@@ -12,6 +12,33 @@ use anyhow::Context;
 /// Default upstream base URL when the stored LLM base URL is empty.
 pub const DEFAULT_AI_API_BASE: &str = "https://api.anthropic.com";
 
+/// The ACP-backed coding agent used for cognition.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum LlmWire {
+    #[default]
+    Claude,
+    Codex,
+}
+
+impl LlmWire {
+    pub fn from_opt(value: Option<&str>) -> Self {
+        match value.map(str::trim).map(str::to_ascii_lowercase).as_deref() {
+            Some("codex") => Self::Codex,
+            _ => Self::Claude,
+        }
+    }
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Claude => "claude",
+            Self::Codex => "codex",
+        }
+    }
+}
+
+/// The LLM wire options offered in Settings.
+pub const LLM_WIRES: &[(&str, &str)] = &[("claude", "Claude Code"), ("codex", "Codex")];
+
 // Keys under which the cognition tunables live in the config store's `app_settings`
 // table. Shared by the readers (reactor, `resolve`) and the settings handler so the
 // names can't drift. Each is optional; an absent key → the built-in default.
@@ -90,7 +117,10 @@ pub fn language_name(value: Option<&str>) -> Option<&'static str> {
 /// (case-insensitive, trimmed) → `true`; unset or anything else → `false`.
 pub fn flag_on(value: Option<String>) -> bool {
     matches!(
-        value.as_deref().map(|v| v.trim().to_ascii_lowercase()).as_deref(),
+        value
+            .as_deref()
+            .map(|v| v.trim().to_ascii_lowercase())
+            .as_deref(),
         Some("on" | "true" | "1" | "yes")
     )
 }
@@ -170,6 +200,7 @@ fn with_context_window(model: &str) -> String {
 /// (loaded from `.env` in dev); the upstream credential never lives in git.
 #[derive(Clone)]
 pub struct AgentConfig {
+    pub wire: LlmWire,
     pub upstream_base_url: String,
     pub model: Option<String>,
     /// Companion model for the background "haiku" slot (`ANTHROPIC_DEFAULT_HAIKU_MODEL`);
@@ -186,6 +217,7 @@ impl std::fmt::Debug for AgentConfig {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("AgentConfig")
             .field("upstream_base_url", &self.upstream_base_url)
+            .field("wire", &self.wire)
             .field("model", &self.model)
             .field("small", &self.small)
             .field("effort", &self.effort)
@@ -206,10 +238,18 @@ impl AgentConfig {
     pub fn resolve(data_dir: &Path) -> Self {
         let store = crate::foundation::credentials::Credentials::load(data_dir);
         let llm = store.effective().map(|e| e.llm.clone()).unwrap_or_default();
-        let model = llm.model.map(|m| m.trim().to_string()).filter(|m| !m.is_empty());
-        let small = llm.small.map(|m| m.trim().to_string()).filter(|m| !m.is_empty());
+        let wire = LlmWire::from_opt(llm.wire_opt());
+        let model = llm
+            .model
+            .map(|m| m.trim().to_string())
+            .filter(|m| !m.is_empty());
+        let small = llm
+            .small
+            .map(|m| m.trim().to_string())
+            .filter(|m| !m.is_empty());
         use crate::foundation::credentials::get_setting;
         Self::new(
+            wire,
             model,
             small,
             get_setting(data_dir, KEY_EFFORT),
@@ -229,6 +269,7 @@ impl AgentConfig {
     /// [`DEFAULT_AI_API_BASE`] when unset; an empty key is allowed (the
     /// **unconfigured** state — BYOK before the user has pasted a key).
     pub fn new(
+        wire: LlmWire,
         model: Option<String>,
         small: Option<String>,
         effort: Option<String>,
@@ -242,6 +283,7 @@ impl AgentConfig {
             upstream_base_url
         };
         Self {
+            wire,
             upstream_base_url,
             model,
             small,
@@ -290,26 +332,78 @@ impl AgentConfig {
     /// pointing at Anthropic's *native* endpoint (which wants `x-api-key`) would
     /// need this revisited — today every path goes through a Bearer gateway.
     pub fn auth_child_env(&self) -> Vec<(String, String)> {
-        let mut env = vec![
-            (
-                "ANTHROPIC_BASE_URL".to_string(),
-                self.upstream_base_url.clone(),
-            ),
-            ("ANTHROPIC_AUTH_TOKEN".to_string(), self.upstream_key.clone()),
-        ];
-        if let Some(model) = &self.model {
-            env.push(("ANTHROPIC_MODEL".to_string(), with_context_window(model)));
+        match self.wire {
+            LlmWire::Claude => {
+                let mut env = vec![
+                    (
+                        "ANTHROPIC_BASE_URL".to_string(),
+                        self.upstream_base_url.clone(),
+                    ),
+                    (
+                        "ANTHROPIC_AUTH_TOKEN".to_string(),
+                        self.upstream_key.clone(),
+                    ),
+                ];
+                if let Some(model) = &self.model {
+                    env.push(("ANTHROPIC_MODEL".to_string(), with_context_window(model)));
+                }
+                // The background "haiku" slot: the broker-supplied `small` companion when
+                // present, otherwise the main model (so the fast slot never falls back to the
+                // CLI's built-in Anthropic haiku through our gateway). Same `[1m]` handling.
+                if let Some(haiku) = self.small.as_ref().or(self.model.as_ref()) {
+                    env.push((
+                        "ANTHROPIC_DEFAULT_HAIKU_MODEL".to_string(),
+                        with_context_window(haiku),
+                    ));
+                }
+                env
+            }
+            LlmWire::Codex => {
+                let mut env = Vec::new();
+                if !self.upstream_key.trim().is_empty() {
+                    env.push(("CODEX_API_KEY".to_string(), self.upstream_key.clone()));
+                    env.push((
+                        "DEFAULT_AUTH_REQUEST".to_string(),
+                        serde_json::json!({
+                            "methodId": "api-key",
+                            "_meta": { "api-key": { "apiKey": self.upstream_key } }
+                        })
+                        .to_string(),
+                    ));
+                }
+
+                let mut codex = serde_json::Map::new();
+                if let Some(model) = &self.model {
+                    codex.insert("model".into(), serde_json::json!(model));
+                }
+                let base = self.upstream_base_url.trim();
+                if !base.is_empty() && base != DEFAULT_AI_API_BASE {
+                    codex.insert(
+                        "model_provider".into(),
+                        serde_json::json!("hi-agent-gateway"),
+                    );
+                    codex.insert(
+                        "model_providers".into(),
+                        serde_json::json!({
+                            "hi-agent-gateway": {
+                                "name": "hi-agent gateway",
+                                "base_url": base,
+                                "env_key": "CODEX_API_KEY",
+                                "wire_api": "responses"
+                            }
+                        }),
+                    );
+                    env.push(("MODEL_PROVIDER".to_string(), "hi-agent-gateway".to_string()));
+                }
+                if !codex.is_empty() {
+                    env.push((
+                        "CODEX_CONFIG".to_string(),
+                        serde_json::Value::Object(codex).to_string(),
+                    ));
+                }
+                env
+            }
         }
-        // The background "haiku" slot: the broker-supplied `small` companion when
-        // present, otherwise the main model (so the fast slot never falls back to the
-        // CLI's built-in Anthropic haiku through our gateway). Same `[1m]` handling.
-        if let Some(haiku) = self.small.as_ref().or(self.model.as_ref()) {
-            env.push((
-                "ANTHROPIC_DEFAULT_HAIKU_MODEL".to_string(),
-                with_context_window(haiku),
-            ));
-        }
-        env
     }
 
     /// Build the **static** env var pairs for the ACP child process — everything
@@ -320,29 +414,39 @@ impl AgentConfig {
     ///
     /// `server_port` is hi-agent's own HTTP port (handed to the child as
     /// `HI_AGENT_BASE_URL` so a session can reach the channels); `config_dir` is the
-    /// managed `CLAUDE_CONFIG_DIR`; `node_bin_dir` is the directory containing the
-    /// resolved `node`; `claude_bin` is the resolved claude executable.
+    /// managed Claude config dir when the Claude wire is selected; `node_bin_dir`
+    /// is the directory containing the resolved `node`; `agent_bin` is the resolved
+    /// Claude or Codex executable.
     pub fn child_env(
         &self,
         server_port: u16,
         config_dir: &Path,
         node_bin_dir: &Path,
-        claude_bin: &Path,
+        agent_bin: &Path,
     ) -> Vec<(String, String)> {
-        let mut env = vec![
-            (
-                ENV_SERVER_BASE_URL.to_string(),
-                format!("http://127.0.0.1:{server_port}"),
-            ),
-            (
-                "CLAUDE_CONFIG_DIR".to_string(),
-                config_dir.to_string_lossy().into_owned(),
-            ),
-            (
-                "CLAUDE_CODE_EXECUTABLE".to_string(),
-                claude_bin.to_string_lossy().into_owned(),
-            ),
-        ];
+        let mut env = vec![(
+            ENV_SERVER_BASE_URL.to_string(),
+            format!("http://127.0.0.1:{server_port}"),
+        )];
+        match self.wire {
+            LlmWire::Claude => {
+                env.push((
+                    "CLAUDE_CONFIG_DIR".to_string(),
+                    config_dir.to_string_lossy().into_owned(),
+                ));
+                env.push((
+                    "CLAUDE_CODE_EXECUTABLE".to_string(),
+                    agent_bin.to_string_lossy().into_owned(),
+                ));
+            }
+            LlmWire::Codex => {
+                env.push((
+                    "CODEX_PATH".to_string(),
+                    agent_bin.to_string_lossy().into_owned(),
+                ));
+                env.push(("NO_BROWSER".to_string(), "1".to_string()));
+            }
+        }
         // Prepend the resolved node dir to PATH so the adapter resolves `node`.
         let sep = if cfg!(windows) { ';' } else { ':' };
         let existing = std::env::var("PATH").unwrap_or_default();
@@ -382,6 +486,7 @@ mod tests {
     #[test]
     fn takes_all_parts_from_args() {
         let cfg = AgentConfig::new(
+            LlmWire::Claude,
             Some("claude-opus-4-8".to_string()),
             None,
             Some("high".to_string()),
@@ -398,14 +503,22 @@ mod tests {
 
     #[test]
     fn empty_base_url_falls_back_to_default() {
-        let cfg =
-            AgentConfig::new(None, None, None, None, "".to_string(), "k".to_string());
+        let cfg = AgentConfig::new(
+            LlmWire::Claude,
+            None,
+            None,
+            None,
+            None,
+            "".to_string(),
+            "k".to_string(),
+        );
         assert_eq!(cfg.upstream_base_url, DEFAULT_AI_API_BASE);
     }
 
     #[test]
     fn debug_redacts_the_upstream_key() {
         let cfg = AgentConfig::new(
+            LlmWire::Claude,
             None,
             None,
             None,
@@ -414,21 +527,48 @@ mod tests {
             "super-secret-key".to_string(),
         );
         let rendered = format!("{cfg:?}");
-        assert!(!rendered.contains("super-secret-key"), "key leaked: {rendered}");
+        assert!(
+            !rendered.contains("super-secret-key"),
+            "key leaked: {rendered}"
+        );
         assert!(rendered.contains("<redacted>"));
     }
 
     #[test]
     fn empty_key_means_unconfigured() {
-        let cfg = AgentConfig::new(None, None, None, None, "https://x/v1".to_string(), "".to_string());
+        let cfg = AgentConfig::new(
+            LlmWire::Claude,
+            None,
+            None,
+            None,
+            None,
+            "https://x/v1".to_string(),
+            "".to_string(),
+        );
         assert!(!cfg.is_configured());
-        let cfg = AgentConfig::new(None, None, None, None, "https://x/v1".to_string(), "k".to_string());
+        let cfg = AgentConfig::new(
+            LlmWire::Claude,
+            None,
+            None,
+            None,
+            None,
+            "https://x/v1".to_string(),
+            "k".to_string(),
+        );
         assert!(cfg.is_configured());
     }
 
     #[test]
     fn unset_optionals_default_to_none() {
-        let cfg = AgentConfig::new(None, None, None, None, "https://x/v1".to_string(), "k".to_string());
+        let cfg = AgentConfig::new(
+            LlmWire::Claude,
+            None,
+            None,
+            None,
+            None,
+            "https://x/v1".to_string(),
+            "k".to_string(),
+        );
         assert!(cfg.model.is_none());
         assert!(cfg.effort.is_none());
         assert!(cfg.permission_mode.is_none());
@@ -438,6 +578,7 @@ mod tests {
     fn renders_settings_json_with_set_fields() {
         let dir = tempfile::tempdir().unwrap();
         let cfg = AgentConfig::new(
+            LlmWire::Claude,
             None,
             None,
             Some("high".to_string()),
@@ -455,12 +596,20 @@ mod tests {
     #[test]
     fn omits_unset_fields() {
         let dir = tempfile::tempdir().unwrap();
-        let cfg =
-            AgentConfig::new(None, None, None, None, "https://x/v1".to_string(), "k".to_string());
+        let cfg = AgentConfig::new(
+            LlmWire::Claude,
+            None,
+            None,
+            None,
+            None,
+            "https://x/v1".to_string(),
+            "k".to_string(),
+        );
         cfg.render_settings_json(dir.path()).unwrap();
-        let v: serde_json::Value =
-            serde_json::from_str(&std::fs::read_to_string(dir.path().join("settings.json")).unwrap())
-                .unwrap();
+        let v: serde_json::Value = serde_json::from_str(
+            &std::fs::read_to_string(dir.path().join("settings.json")).unwrap(),
+        )
+        .unwrap();
         assert!(v.get("effortLevel").is_none());
         assert!(v.get("permissions").is_none());
     }
@@ -468,6 +617,7 @@ mod tests {
     #[test]
     fn child_env_sets_static_vars() {
         let cfg = AgentConfig::new(
+            LlmWire::Claude,
             Some("claude-opus-4-8".to_string()),
             None,
             None,
@@ -496,6 +646,7 @@ mod tests {
     #[test]
     fn auth_child_env_carries_the_upstream_credential() {
         let cfg = AgentConfig::new(
+            LlmWire::Claude,
             Some("claude-opus-4-8".to_string()),
             None,
             None,
@@ -518,6 +669,7 @@ mod tests {
     #[test]
     fn auth_child_env_uses_small_for_the_haiku_slot() {
         let cfg = AgentConfig::new(
+            LlmWire::Claude,
             Some("claude-opus-4-8".to_string()),
             Some("claude-haiku-4-5-20251001".to_string()),
             None,
@@ -528,12 +680,23 @@ mod tests {
         let map: std::collections::HashMap<_, _> = cfg.auth_child_env().into_iter().collect();
         assert_eq!(map["ANTHROPIC_MODEL"], "claude-opus-4-8[1m]");
         // The companion drives the haiku slot; it isn't a 1M id, so it's untagged.
-        assert_eq!(map["ANTHROPIC_DEFAULT_HAIKU_MODEL"], "claude-haiku-4-5-20251001");
+        assert_eq!(
+            map["ANTHROPIC_DEFAULT_HAIKU_MODEL"],
+            "claude-haiku-4-5-20251001"
+        );
     }
 
     #[test]
     fn auth_child_env_omits_model_when_unset() {
-        let cfg = AgentConfig::new(None, None, None, None, "https://x/v1".to_string(), "k".to_string());
+        let cfg = AgentConfig::new(
+            LlmWire::Claude,
+            None,
+            None,
+            None,
+            None,
+            "https://x/v1".to_string(),
+            "k".to_string(),
+        );
         let map: std::collections::HashMap<_, _> = cfg.auth_child_env().into_iter().collect();
         assert!(!map.contains_key("ANTHROPIC_MODEL"));
         // No model and no small → the haiku slot is left to the CLI default too.
@@ -541,17 +704,55 @@ mod tests {
     }
 
     #[test]
+    fn codex_auth_env_carries_key_model_and_gateway_config() {
+        let cfg = AgentConfig::new(
+            LlmWire::Codex,
+            Some("gpt-5-codex".to_string()),
+            None,
+            None,
+            None,
+            "https://gateway.example/v1".to_string(),
+            "sk-codex".to_string(),
+        );
+        let map: std::collections::HashMap<_, _> = cfg.auth_child_env().into_iter().collect();
+        assert_eq!(map["CODEX_API_KEY"], "sk-codex");
+        assert!(!map.contains_key("ANTHROPIC_AUTH_TOKEN"));
+        assert_eq!(map["MODEL_PROVIDER"], "hi-agent-gateway");
+
+        let config: serde_json::Value = serde_json::from_str(&map["CODEX_CONFIG"]).unwrap();
+        assert_eq!(config["model"], "gpt-5-codex");
+        assert_eq!(config["model_provider"], "hi-agent-gateway");
+        assert_eq!(
+            config["model_providers"]["hi-agent-gateway"]["base_url"],
+            "https://gateway.example/v1"
+        );
+
+        let auth: serde_json::Value = serde_json::from_str(&map["DEFAULT_AUTH_REQUEST"]).unwrap();
+        assert_eq!(auth["methodId"], "api-key");
+        assert_eq!(auth["_meta"]["api-key"]["apiKey"], "sk-codex");
+    }
+
+    #[test]
     fn context_window_tags_only_known_1m_models() {
         // Known 1M ids get the suffix (Anthropic and non-Anthropic alike).
-        assert_eq!(with_context_window("claude-opus-4-8"), "claude-opus-4-8[1m]");
-        assert_eq!(with_context_window("deepseek-v4-pro"), "deepseek-v4-pro[1m]");
+        assert_eq!(
+            with_context_window("claude-opus-4-8"),
+            "claude-opus-4-8[1m]"
+        );
+        assert_eq!(
+            with_context_window("deepseek-v4-pro"),
+            "deepseek-v4-pro[1m]"
+        );
         assert_eq!(with_context_window("glm-5.2"), "glm-5.2[1m]");
         // Unlisted / BYOK / custom ids pass through untouched (tagging one would
         // break an endpoint that can't serve 1M).
         assert_eq!(with_context_window("claude-haiku-4-5"), "claude-haiku-4-5");
         assert_eq!(with_context_window("gpt-4o"), "gpt-4o");
         // Idempotent: an already-tagged id is not doubled.
-        assert_eq!(with_context_window("claude-opus-4-8[1m]"), "claude-opus-4-8[1m]");
+        assert_eq!(
+            with_context_window("claude-opus-4-8[1m]"),
+            "claude-opus-4-8[1m]"
+        );
     }
 
     #[test]
@@ -565,19 +766,26 @@ mod tests {
 
         let mut store = Credentials {
             mode: Mode::Byok,
-            llm: LlmCredentials { api_key: "key-A".into(), ..Default::default() },
+            llm: LlmCredentials {
+                api_key: "key-A".into(),
+                ..Default::default()
+            },
             ..Default::default()
         };
         store.save(dir.path()).unwrap();
-        let a: std::collections::HashMap<_, _> =
-            AgentConfig::resolve(dir.path()).auth_child_env().into_iter().collect();
+        let a: std::collections::HashMap<_, _> = AgentConfig::resolve(dir.path())
+            .auth_child_env()
+            .into_iter()
+            .collect();
         assert_eq!(a["ANTHROPIC_AUTH_TOKEN"], "key-A");
 
         // Rotate the stored key; a fresh resolve must carry the new one.
         store.llm.api_key = "key-B".into();
         store.save(dir.path()).unwrap();
-        let b: std::collections::HashMap<_, _> =
-            AgentConfig::resolve(dir.path()).auth_child_env().into_iter().collect();
+        let b: std::collections::HashMap<_, _> = AgentConfig::resolve(dir.path())
+            .auth_child_env()
+            .into_iter()
+            .collect();
         assert_eq!(b["ANTHROPIC_AUTH_TOKEN"], "key-B");
     }
 }

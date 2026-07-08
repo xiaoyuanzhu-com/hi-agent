@@ -36,25 +36,34 @@ use std::time::Duration;
 use anyhow::{Context, anyhow, bail};
 use tokio::process::Command;
 
+use crate::foundation::config::LlmWire;
+
 /// Pinned Node version (no leading `v`), stamped from `src/runtime/manifest.toml`.
 const NODE_VERSION: &str = env!("HI_AGENT_NODE_VERSION");
 
 /// The committed pin files, embedded so `npm ci` reproduces the exact tree
 /// without needing the repo on disk. Tiny (text), unlike the runtime itself.
-const PACKAGE_JSON: &str =
-    include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/src/runtime/package.json"));
-const PACKAGE_LOCK: &str =
-    include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/src/runtime/package-lock.json"));
+const PACKAGE_JSON: &str = include_str!(concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/src/runtime/package.json"
+));
+const PACKAGE_LOCK: &str = include_str!(concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/src/runtime/package-lock.json"
+));
 
-/// Path of the adapter entry relative to the install dir, after `npm ci`.
-const ADAPTER_REL: &str = "adapter/node_modules/@agentclientprotocol/claude-agent-acp/dist/index.js";
+/// Path of each adapter entry relative to the install dir, after `npm ci`.
+const CLAUDE_ADAPTER_REL: &str =
+    "adapter/node_modules/@agentclientprotocol/claude-agent-acp/dist/index.js";
+const CODEX_ADAPTER_REL: &str = "adapter/node_modules/@agentclientprotocol/codex-acp/dist/index.js";
 
 /// Absolute paths to the resolved runtime components.
 #[derive(Debug, Clone)]
 pub struct ResolvedRuntime {
+    pub wire: LlmWire,
     pub node_bin: PathBuf,
     pub adapter_entry: PathBuf,
-    pub claude_bin: PathBuf,
+    pub agent_bin: PathBuf,
     /// Where these came from — `"system"` (found on `PATH`) or `"managed"`
     /// (downloaded/installed into the cache). For logging only.
     pub origin: &'static str,
@@ -69,7 +78,7 @@ impl ResolvedRuntime {
 
 /// Resolve the runtime: prefer one bundled inside a packaged `.app`, else the
 /// system tools if all are present, else install on first run and reuse after.
-pub async fn ensure() -> anyhow::Result<ResolvedRuntime> {
+pub async fn ensure(wire: LlmWire) -> anyhow::Result<ResolvedRuntime> {
     // A shipped `.app` carries a complete managed runtime under its Resources;
     // use it so the packaged app runs with no download and is unaffected by
     // whatever node/claude happen to be on the user's PATH. Absent (dev/Docker/
@@ -78,13 +87,13 @@ pub async fn ensure() -> anyhow::Result<ResolvedRuntime> {
         let rt = res.join("runtime");
         if rt.join(".complete").exists() {
             tracing::debug!(path = %rt.display(), "using bundled runtime");
-            return resolve_bundled(&rt);
+            return resolve_bundled(&rt, wire);
         }
     }
 
     // Prefer what the system already offers — no download when the user has
     // node + the ACP adapter + claude on PATH.
-    if let Some(system) = resolve_system() {
+    if let Some(system) = resolve_system(wire) {
         return Ok(system);
     }
 
@@ -95,9 +104,9 @@ pub async fn ensure() -> anyhow::Result<ResolvedRuntime> {
     // was built from *these* pins — a changed lockfile lands on a different path.
     let runtime = if target.join(".complete").exists() {
         tracing::debug!(path = %target.display(), "runtime already installed");
-        resolve(&target)?
+        resolve(&target, wire)?
     } else {
-        install(&target).await?
+        install(&target, wire).await?
     };
 
     // Now that a current runtime is ready, prune installs left by older pins so
@@ -285,10 +294,7 @@ fn runtime_dir() -> anyhow::Result<PathBuf> {
     }
     let dirs = directories::ProjectDirs::from("dev", "human-interface", "hi-agent")
         .ok_or_else(|| anyhow!("cannot determine OS cache dir"))?;
-    Ok(dirs
-        .cache_dir()
-        .join("runtime")
-        .join(runtime_fingerprint()))
+    Ok(dirs.cache_dir().join("runtime").join(runtime_fingerprint()))
 }
 
 /// A short, stable fingerprint of everything that determines the installed tree:
@@ -325,13 +331,16 @@ pub async fn provision_into(dir: &Path) -> anyhow::Result<()> {
     if cache.join(".complete").exists() {
         tracing::debug!(path = %cache.display(), "reusing cached runtime for the bundle");
     } else {
-        install(&cache).await?;
+        install(&cache, LlmWire::Claude).await?;
     }
     copy_tree(&cache, dir)
         .await
         .with_context(|| format!("copying the cached runtime into {}", dir.display()))?;
     if !dir.join(".complete").exists() {
-        bail!("runtime copied to {} but its .complete marker is missing", dir.display());
+        bail!(
+            "runtime copied to {} but its .complete marker is missing",
+            dir.display()
+        );
     }
     Ok(())
 }
@@ -363,7 +372,7 @@ async fn copy_tree(src: &Path, dst: &Path) -> anyhow::Result<()> {
 /// Install the pinned Node + adapter into `target`. Builds in a sibling temp dir
 /// and atomically renames into place, so concurrent or interrupted starts never
 /// observe a half-installed runtime.
-async fn install(target: &Path) -> anyhow::Result<ResolvedRuntime> {
+async fn install(target: &Path, wire: LlmWire) -> anyhow::Result<ResolvedRuntime> {
     let parent = target
         .parent()
         .ok_or_else(|| anyhow!("runtime dir {} has no parent", target.display()))?;
@@ -378,17 +387,21 @@ async fn install(target: &Path) -> anyhow::Result<ResolvedRuntime> {
         .with_context(|| format!("creating {}", tmp.display()))?;
 
     // 1. Node — download + extract into <tmp>/node.
-    let node_bin = fetch_node(&tmp).await.context("installing the Node runtime")?;
+    let node_bin = fetch_node(&tmp)
+        .await
+        .context("installing the Node runtime")?;
     // 2. Adapter + claude — npm ci against the committed lockfile into <tmp>/adapter.
-    npm_ci(&node_bin, &tmp).await.context("installing the ACP adapter")?;
+    npm_ci(&node_bin, &tmp)
+        .await
+        .context("installing the ACP adapter")?;
 
     // Fail loudly if the install didn't produce the paths we expect, before we
     // publish anything (a corrupt cache dir is worse than a clear error).
-    let staged = resolve(&tmp)?;
+    let staged = resolve(&tmp, wire)?;
     for (label, p) in [
         ("node", &staged.node_bin),
         ("adapter", &staged.adapter_entry),
-        ("claude", &staged.claude_bin),
+        (wire.as_str(), &staged.agent_bin),
     ] {
         if !p.exists() {
             bail!(
@@ -419,24 +432,43 @@ async fn install(target: &Path) -> anyhow::Result<ResolvedRuntime> {
     }
 
     hint("runtime ready.");
-    resolve(target)
+    resolve(target, wire)
 }
 
 /// Build absolute paths from an installed (or reused) target dir.
-fn resolve(target: &Path) -> anyhow::Result<ResolvedRuntime> {
-    // The `claude` CLI ships as a native binary inside a platform-specific
-    // package `@anthropic-ai/claude-agent-sdk-<os>-<arch>` (an optional dep of
-    // the SDK; npm installs only the one matching this host). Its <os>-<arch>
-    // suffix is exactly the Node target mapping; on Windows the binary is
-    // `claude.exe`.
+fn resolve(target: &Path, wire: LlmWire) -> anyhow::Result<ResolvedRuntime> {
     let (os, arch) = node_target()?;
-    let exe = if cfg!(target_os = "windows") { ".exe" } else { "" };
-    let claude_rel =
-        format!("adapter/node_modules/@anthropic-ai/claude-agent-sdk-{os}-{arch}/claude{exe}");
+    let exe = if cfg!(target_os = "windows") {
+        ".exe"
+    } else {
+        ""
+    };
+    let (adapter_rel, agent_rel) = match wire {
+        LlmWire::Claude => {
+            // The `claude` CLI ships as a native binary inside a platform-specific
+            // package `@anthropic-ai/claude-agent-sdk-<os>-<arch>` (an optional dep of
+            // the SDK; npm installs only the one matching this host).
+            let rel = format!(
+                "adapter/node_modules/@anthropic-ai/claude-agent-sdk-{os}-{arch}/claude{exe}"
+            );
+            (CLAUDE_ADAPTER_REL, rel)
+        }
+        LlmWire::Codex => {
+            // The Codex ACP adapter carries `@openai/codex`; its JS bin delegates to
+            // the platform-native optional package installed for this host.
+            let rel = if cfg!(target_os = "windows") {
+                "adapter/node_modules/@openai/codex/bin/codex.js".to_string()
+            } else {
+                "adapter/node_modules/.bin/codex".to_string()
+            };
+            (CODEX_ADAPTER_REL, rel)
+        }
+    };
     Ok(ResolvedRuntime {
+        wire,
         node_bin: node_bin_in(&target.join("node")),
-        adapter_entry: target.join(ADAPTER_REL),
-        claude_bin: target.join(claude_rel),
+        adapter_entry: target.join(adapter_rel),
+        agent_bin: target.join(agent_rel),
         origin: "managed",
     })
 }
@@ -444,8 +476,8 @@ fn resolve(target: &Path) -> anyhow::Result<ResolvedRuntime> {
 /// Same as [`resolve`] but stamped `origin = "bundled"` — the layout of a
 /// provisioned `.app` runtime is identical to a managed-cache one (it was built
 /// by the same [`install`]), so only the origin label differs (for logging).
-fn resolve_bundled(target: &Path) -> anyhow::Result<ResolvedRuntime> {
-    let mut r = resolve(target)?;
+fn resolve_bundled(target: &Path, wire: LlmWire) -> anyhow::Result<ResolvedRuntime> {
+    let mut r = resolve(target, wire)?;
     r.origin = "bundled";
     Ok(r)
 }
@@ -472,7 +504,11 @@ async fn fetch_url_bytes(client: &reqwest::Client, url: &str) -> anyhow::Result<
 /// auto-detects the `.zip` Node ships there).
 async fn fetch_node(dir: &Path) -> anyhow::Result<PathBuf> {
     let (os, arch) = node_target()?;
-    let ext = if cfg!(target_os = "windows") { "zip" } else { "tar.gz" };
+    let ext = if cfg!(target_os = "windows") {
+        "zip"
+    } else {
+        "tar.gz"
+    };
     let stem = format!("node-v{NODE_VERSION}-{}-{arch}", node_dist_os(os));
     let url = format!("https://nodejs.org/dist/v{NODE_VERSION}/{stem}.{ext}");
 
@@ -481,7 +517,9 @@ async fn fetch_node(dir: &Path) -> anyhow::Result<PathBuf> {
         .await
         .with_context(|| format!("creating {}", node_dir.display()))?;
 
-    hint(&format!("first run — downloading Node {NODE_VERSION} (~30 MB)…"));
+    hint(&format!(
+        "first run — downloading Node {NODE_VERSION} (~30 MB)…"
+    ));
     tracing::debug!(%url, "downloading Node");
     let client = crate::net::http_client();
     let bytes = crate::net::with_retries("node", || fetch_url_bytes(&client, url.as_str())).await?;
@@ -510,7 +548,10 @@ async fn fetch_node(dir: &Path) -> anyhow::Result<PathBuf> {
 
     let node_bin = node_bin_in(&node_dir);
     if !is_executable(&node_bin) {
-        bail!("Node extracted but `{}` is missing or not executable", node_bin.display());
+        bail!(
+            "Node extracted but `{}` is missing or not executable",
+            node_bin.display()
+        );
     }
     Ok(node_bin)
 }
@@ -559,7 +600,10 @@ fn npm_cli_for(node_bin: &Path) -> Option<PathBuf> {
     let cli = if cfg!(target_os = "windows") {
         node_bin.parent()?.join("node_modules/npm/bin/npm-cli.js")
     } else {
-        node_bin.parent()?.parent()?.join("lib/node_modules/npm/bin/npm-cli.js")
+        node_bin
+            .parent()?
+            .parent()?
+            .join("lib/node_modules/npm/bin/npm-cli.js")
     };
     cli.exists().then_some(cli)
 }
@@ -666,26 +710,25 @@ fn is_executable(p: &Path) -> bool {
 /// returns `None` if any is missing, so we never pair a system tool with a
 /// managed one. The adapter bin is a JS entry (it has a `node` shebang), so we
 /// keep running it as `node <entry>` exactly like the managed adapter.
-fn resolve_system() -> Option<ResolvedRuntime> {
+fn resolve_system(wire: LlmWire) -> Option<ResolvedRuntime> {
     let node_bin = find_on_path("node")?;
-    let adapter_entry = find_on_path("claude-agent-acp")?;
-    // Resolve `claude` deliberately rather than by raw PATH order: GUI launchers
-    // (cmux, some IDEs) prepend their own `claude` *shim* to PATH that only
-    // authenticates inside that app's sandbox — running it standalone yields
-    // "Please run /login". `resolve_claude_bin` skips those. If it finds nothing
-    // usable we return None, dropping to the managed runtime (a real bundled
-    // claude) rather than pairing the system tools with a broken claude.
-    let claude_bin = resolve_claude_bin()?;
+    let (adapter_name, agent_bin) = match wire {
+        LlmWire::Claude => ("claude-agent-acp", resolve_claude_bin()?),
+        LlmWire::Codex => ("codex-acp", resolve_codex_bin()?),
+    };
+    let adapter_entry = find_on_path(adapter_name)?;
     tracing::debug!(
+        wire = wire.as_str(),
         node = %node_bin.display(),
         adapter = %adapter_entry.display(),
-        claude = %claude_bin.display(),
+        agent = %agent_bin.display(),
         "using system runtime from PATH",
     );
     Some(ResolvedRuntime {
+        wire,
         node_bin,
         adapter_entry,
-        claude_bin,
+        agent_bin,
         origin: "system",
     })
 }
@@ -765,6 +808,24 @@ fn resolve_claude_bin() -> Option<PathBuf> {
     None
 }
 
+/// Locate a Codex CLI for `CODEX_PATH`. The system `codex-acp` package can run its
+/// own bundled `@openai/codex`, so this is best-effort; if absent the adapter still
+/// starts without `CODEX_PATH`.
+fn resolve_codex_bin() -> Option<PathBuf> {
+    if let Some(raw) = std::env::var_os("HI_AGENT_CODEX_BIN") {
+        let p = PathBuf::from(raw);
+        if is_executable(&p) {
+            return Some(p);
+        }
+        tracing::warn!(path = %p.display(), "HI_AGENT_CODEX_BIN is not executable; ignoring");
+    }
+    find_on_path("codex").or_else(|| {
+        canonical_codex_paths()
+            .into_iter()
+            .find(|p| is_executable(p))
+    })
+}
+
 /// Standard places the official installer / package managers put `claude`.
 fn canonical_claude_paths() -> Vec<PathBuf> {
     let mut out = Vec::new();
@@ -773,6 +834,17 @@ fn canonical_claude_paths() -> Vec<PathBuf> {
     }
     out.push(PathBuf::from("/opt/homebrew/bin/claude"));
     out.push(PathBuf::from("/usr/local/bin/claude"));
+    out
+}
+
+/// Standard places the official installer / package managers put `codex`.
+fn canonical_codex_paths() -> Vec<PathBuf> {
+    let mut out = Vec::new();
+    if let Some(home) = std::env::var_os("HOME") {
+        out.push(PathBuf::from(&home).join(".local/bin/codex"));
+    }
+    out.push(PathBuf::from("/opt/homebrew/bin/codex"));
+    out.push(PathBuf::from("/usr/local/bin/codex"));
     out
 }
 
@@ -823,29 +895,46 @@ mod tests {
 
     #[test]
     fn resolve_builds_expected_paths() {
-        let r = resolve(Path::new("/cache/runtimeX")).unwrap();
+        let r = resolve(Path::new("/cache/runtimeX"), LlmWire::Claude).unwrap();
         assert!(r.adapter_entry.ends_with("claude-agent-acp/dist/index.js"));
         assert!(
-            r.claude_bin
+            r.agent_bin
                 .to_string_lossy()
                 .contains("@anthropic-ai/claude-agent-sdk-"),
             "claude path should point at a platform package: {}",
-            r.claude_bin.display()
+            r.agent_bin.display()
         );
         assert_eq!(r.origin, "managed");
+        assert_eq!(r.wire, LlmWire::Claude);
 
         #[cfg(not(target_os = "windows"))]
         {
             assert_eq!(r.node_bin, Path::new("/cache/runtimeX/node/bin/node"));
-            assert!(r.claude_bin.ends_with("claude"));
+            assert!(r.agent_bin.ends_with("claude"));
             assert_eq!(r.node_bin_dir(), Path::new("/cache/runtimeX/node/bin"));
         }
         #[cfg(target_os = "windows")]
         {
             assert!(r.node_bin.ends_with("node/node.exe"));
-            assert!(r.claude_bin.ends_with("claude.exe"));
+            assert!(r.agent_bin.ends_with("claude.exe"));
             assert!(r.node_bin_dir().ends_with("runtimeX/node"));
         }
+    }
+
+    #[test]
+    fn resolve_builds_codex_paths() {
+        let r = resolve(Path::new("/cache/runtimeX"), LlmWire::Codex).unwrap();
+        assert!(r.adapter_entry.ends_with("codex-acp/dist/index.js"));
+        assert_eq!(r.origin, "managed");
+        assert_eq!(r.wire, LlmWire::Codex);
+
+        #[cfg(not(target_os = "windows"))]
+        assert!(r.agent_bin.ends_with("adapter/node_modules/.bin/codex"));
+        #[cfg(target_os = "windows")]
+        assert!(
+            r.agent_bin
+                .ends_with("adapter/node_modules/@openai/codex/bin/codex.js")
+        );
     }
 
     #[test]
@@ -853,7 +942,9 @@ mod tests {
         assert!(is_app_bundle_path(Path::new(
             "/Applications/cmux.app/Contents/Resources/bin/claude"
         )));
-        assert!(!is_app_bundle_path(Path::new("/Users/me/.local/bin/claude")));
+        assert!(!is_app_bundle_path(Path::new(
+            "/Users/me/.local/bin/claude"
+        )));
         assert!(!is_app_bundle_path(Path::new("/opt/homebrew/bin/claude")));
     }
 
@@ -864,7 +955,10 @@ mod tests {
             node_modules_ancestor(entry),
             Some(PathBuf::from("/r/adapter/node_modules"))
         );
-        assert_eq!(node_modules_ancestor(Path::new("/usr/local/bin/tool")), None);
+        assert_eq!(
+            node_modules_ancestor(Path::new("/usr/local/bin/tool")),
+            None
+        );
     }
 
     #[test]

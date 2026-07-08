@@ -18,7 +18,6 @@ pub mod net;
 pub mod runtime;
 pub mod types;
 
-
 #[derive(Debug, Clone)]
 pub struct Config {
     pub port: u16,
@@ -68,8 +67,8 @@ async fn run_with_shutdown(config: Config, shutdown: Arc<Notify>) -> anyhow::Res
     // `.../hi-agent/data/prompts/core.md`, not `.../hi-agent/./data/prompts/core.md`.
     // Every downstream consumer (load_soul, prompts_dir, views_dir, …) inherits this.
     let mut config = config;
-    config.data_dir = normalize_dir(&config.data_dir)
-        .context("resolving cwd to absolutize data dir")?;
+    config.data_dir =
+        normalize_dir(&config.data_dir).context("resolving cwd to absolutize data dir")?;
     tracing::debug!(?config, "starting hi-agent");
 
     // Snapshot the cognition tunables (pulse, reflection cadence, compact ceiling,
@@ -107,7 +106,9 @@ async fn run_with_shutdown(config: Config, shutdown: Arc<Notify>) -> anyhow::Res
         if d.is_absolute() {
             d
         } else {
-            std::env::current_dir().context("resolving cwd to absolutize prompts dir")?.join(d)
+            std::env::current_dir()
+                .context("resolving cwd to absolutize prompts dir")?
+                .join(d)
         }
     };
 
@@ -120,7 +121,9 @@ async fn run_with_shutdown(config: Config, shutdown: Arc<Notify>) -> anyhow::Res
         if d.is_absolute() {
             d
         } else {
-            std::env::current_dir().context("resolving cwd to absolutize views dir")?.join(d)
+            std::env::current_dir()
+                .context("resolving cwd to absolutize views dir")?
+                .join(d)
         }
     };
     std::fs::create_dir_all(&views_dir).context("creating views dir")?;
@@ -182,8 +185,9 @@ async fn run_with_shutdown(config: Config, shutdown: Arc<Notify>) -> anyhow::Res
     // Build the owner sign-in state (None when OIDC is unconfigured — sign-in
     // unavailable, free tier only). Fallible: it generates/reads the cookie key
     // under <data_dir>/auth/, so a bad key file surfaces here, not mid-request.
-    let auth_state = foundation::auth::AuthState::from_config(config.auth.clone(), &config.data_dir)
-        .context("initializing owner sign-in")?;
+    let auth_state =
+        foundation::auth::AuthState::from_config(config.auth.clone(), &config.data_dir)
+            .context("initializing owner sign-in")?;
 
     let (router, seams) = foundation::server::build(
         memory.clone(),
@@ -197,13 +201,16 @@ async fn run_with_shutdown(config: Config, shutdown: Arc<Notify>) -> anyhow::Res
     );
 
     // Resolve the runtime: prefer system tools on PATH, else install on first run.
-    let runtime = runtime::ensure().await?;
-    tracing::info!(origin = runtime.origin, "runtime resolved");
+    let runtime = runtime::ensure(config.agent.wire).await?;
+    tracing::info!(
+        origin = runtime.origin,
+        wire = runtime.wire.as_str(),
+        "runtime resolved"
+    );
 
-    // Render the managed settings.json into a hi-agent-owned config dir.
-    // Absolutize it: it's handed to the child as `CLAUDE_CONFIG_DIR`, and the
-    // child may run with a different cwd than us — a relative path would make
-    // claude read a *different* dir than the one we seed the approval into.
+    // Render the managed settings.json into a hi-agent-owned config dir. Claude
+    // reads it via `CLAUDE_CONFIG_DIR`; Codex ignores it. Absolutize it because
+    // child processes may run with a different cwd than us.
     let claude_config_dir = {
         let dir = config.data_dir.join("claude-config");
         if dir.is_absolute() {
@@ -231,15 +238,18 @@ async fn run_with_shutdown(config: Config, shutdown: Arc<Notify>) -> anyhow::Res
         config.port,
         &claude_config_dir,
         runtime.node_bin_dir(),
-        &runtime.claude_bin,
+        &runtime.agent_bin,
     );
     // The view-builder sub-agent opens <prompts>/appearance.md and aesthetic.md as
     // files; hand it the absolute dir the same way workers already get
     // HI_AGENT_BASE_URL.
-    child_env.push(("HI_AGENT_PROMPTS_DIR".to_string(), prompts_dir.display().to_string()));
+    child_env.push((
+        "HI_AGENT_PROMPTS_DIR".to_string(),
+        prompts_dir.display().to_string(),
+    ));
     // Diagnostic: surface exactly what differs between launchers (terminal vs.
-    // cmux etc.) — cwd, the resolved runtime binaries, the config dir claude
-    // will read, and the upstream key's fingerprint. The upstream credential vars
+    // cmux etc.) — cwd, the resolved runtime binaries, the adapter config dir,
+    // and the upstream key's fingerprint. The upstream credential vars
     // are no longer frozen into `child_env` (they're re-resolved per session
     // spawn), so read them from a fresh `auth_child_env` for this snapshot.
     {
@@ -258,11 +268,13 @@ async fn run_with_shutdown(config: Config, shutdown: Arc<Notify>) -> anyhow::Res
             config_dir = %claude_config_dir.display(),
             config_dir_abs = ?std::fs::canonicalize(&claude_config_dir).ok(),
             runtime_origin = runtime.origin,
-            claude_bin = %runtime.claude_bin.display(),
+            agent_wire = runtime.wire.as_str(),
+            agent_bin = %runtime.agent_bin.display(),
             node_bin = %runtime.node_bin.display(),
             anthropic_base_url = get_in(&auth_env, "ANTHROPIC_BASE_URL"),
             claude_config_dir_env = get("CLAUDE_CONFIG_DIR"),
             claude_code_executable = get("CLAUDE_CODE_EXECUTABLE"),
+            codex_path = get("CODEX_PATH"),
             auth_token_fp = fp,
             path_head = child_env.iter().find(|(n,_)| n == "PATH").map(|(_,v)| v.split(':').next().unwrap_or("")).unwrap_or(""),
             "child auth/runtime env resolved"
@@ -289,7 +301,6 @@ async fn run_with_shutdown(config: Config, shutdown: Arc<Notify>) -> anyhow::Res
     // termination we still need to reap every subprocess it spawned. The clone
     // shares the same process registry.
     let agent_for_shutdown = agent.clone();
-
 
     let soul = identity::load_soul(&config.data_dir);
     // The reactor compiles view source to ESM via esbuild; modules land under
@@ -384,7 +395,10 @@ async fn run_with_shutdown(config: Config, shutdown: Arc<Notify>) -> anyhow::Res
 
     // Reap every ACP subprocess (one `node` + `claude` per live session) so none
     // are orphaned. Bounded so a stuck child can't hang exit.
-    if tokio::time::timeout(SHUTDOWN_GRACE, agent_for_shutdown.shutdown()).await.is_err() {
+    if tokio::time::timeout(SHUTDOWN_GRACE, agent_for_shutdown.shutdown())
+        .await
+        .is_err()
+    {
         tracing::warn!("ACP subprocess reaping timed out");
     }
 
@@ -507,7 +521,7 @@ async fn shutdown_signal() {
 
     #[cfg(unix)]
     let terminate = async {
-        use tokio::signal::unix::{signal, SignalKind};
+        use tokio::signal::unix::{SignalKind, signal};
         match signal(SignalKind::terminate()) {
             Ok(mut stream) => {
                 stream.recv().await;

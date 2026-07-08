@@ -5,6 +5,7 @@
 //! ~30 MB of Node and runs `npm ci`). The fast, network-free checks for path
 //! resolution / target mapping live as unit tests in `src/runtime/mod.rs`.
 
+use hi_agent::foundation::config::LlmWire;
 use hi_agent::runtime;
 
 #[tokio::test]
@@ -21,14 +22,30 @@ async fn installs_then_reuses() {
         std::env::set_var("HI_AGENT_RUNTIME_DIR", cache.path());
     }
 
-    let r1 = runtime::ensure().await.expect("first-run install should succeed");
-    assert!(r1.node_bin.exists(), "node missing: {}", r1.node_bin.display());
-    assert!(r1.adapter_entry.exists(), "adapter missing: {}", r1.adapter_entry.display());
-    assert!(r1.claude_bin.exists(), "claude missing: {}", r1.claude_bin.display());
+    let r1 = runtime::ensure(LlmWire::Claude)
+        .await
+        .expect("first-run install should succeed");
+    assert!(
+        r1.node_bin.exists(),
+        "node missing: {}",
+        r1.node_bin.display()
+    );
+    assert!(
+        r1.adapter_entry.exists(),
+        "adapter missing: {}",
+        r1.adapter_entry.display()
+    );
+    assert!(
+        r1.agent_bin.exists(),
+        "claude missing: {}",
+        r1.agent_bin.display()
+    );
 
     // Second call reuses the install (`.complete` marker present).
-    let r2 = runtime::ensure().await.expect("reuse should succeed");
+    let r2 = runtime::ensure(LlmWire::Claude)
+        .await
+        .expect("reuse should succeed");
     assert_eq!(r1.node_bin, r2.node_bin);
     assert_eq!(r1.adapter_entry, r2.adapter_entry);
-    assert_eq!(r1.claude_bin, r2.claude_bin);
+    assert_eq!(r1.agent_bin, r2.agent_bin);
 }
