@@ -36,8 +36,9 @@ impl LlmWire {
     }
 }
 
-/// The LLM wire options offered in Settings.
-pub const LLM_WIRES: &[(&str, &str)] = &[("claude", "Claude Code"), ("codex", "Codex")];
+/// The LLM wire options offered in Settings. Codex remains an internal managed
+/// wire selected by the broker response, but is not exposed as a client toggle.
+pub const LLM_WIRES: &[(&str, &str)] = &[("claude", "Claude Code")];
 
 // Keys under which the cognition tunables live in the config store's `app_settings`
 // table. Shared by the readers (reactor, `resolve`) and the settings handler so the

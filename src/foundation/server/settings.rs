@@ -619,7 +619,8 @@ mod tests {
         )
         .unwrap();
         assert_eq!(status.wire.as_deref(), Some("codex"));
-        assert_eq!(status.wires.len(), 2);
+        assert_eq!(status.wires.len(), 1);
+        assert_eq!(status.wires[0].value, "claude");
 
         let stored = Credentials::load(dir.path());
         assert_eq!(stored.llm.wire_opt(), Some("codex"));

@@ -15,6 +15,7 @@ use std::time::Duration;
 use anyhow::Context;
 use serde::Deserialize;
 
+use crate::foundation::config::LlmWire;
 use crate::foundation::credentials::{Credentials, Energy, Identity, LlmCredentials, Managed, Mode, Tokens, VendorKey};
 
 /// Env override for the broker base URL (default [`DEFAULT_BROKER_URL`]).
@@ -127,13 +128,20 @@ fn origin_of(url: &str) -> String {
 }
 
 /// Reduce one task's `wire → endpoint` map to (wire, full url, api_key, model):
-/// the single wire (one per task today; lexically-first for determinism) and the
-/// highest-`quality` model, plus that model's optional `small` companion. Callers
-/// keep the full URL or reduce it to its origin.
+/// the selected wire (or lexically-first for deterministic default behavior) and
+/// the highest-`quality` model, plus that model's optional `small` companion.
+///
+/// Broker URLs are always full protocol endpoints. Callers keep that endpoint or
+/// strip/rebase it per local adapter requirements.
 fn pick_wire(
     wires: &std::collections::HashMap<String, WireDto>,
+    desired_wire: Option<&str>,
 ) -> Option<(String, String, String, Option<String>, Option<String>)> {
-    let (wire, w) = wires.iter().min_by(|a, b| a.0.cmp(b.0))?;
+    let (wire, w) = if let Some(desired) = desired_wire {
+        wires.get_key_value(desired)?
+    } else {
+        wires.iter().min_by(|a, b| a.0.cmp(b.0))?
+    };
     let best = w.models.iter().max_by_key(|m| m.quality);
     let model = best
         .map(|m| m.model.trim().to_string())
@@ -144,21 +152,56 @@ fn pick_wire(
     Some((wire.clone(), w.url.trim().to_string(), w.api_key.clone(), model, small))
 }
 
+fn broker_llm_wire(wire: LlmWire) -> &'static str {
+    match wire {
+        LlmWire::Claude => "anthropic-messages",
+        LlmWire::Codex => "openai-responses",
+    }
+}
+
+fn openai_responses_base(url: &str) -> String {
+    let u = url.trim().trim_end_matches('/');
+    u.strip_suffix("/responses").unwrap_or(u).to_string()
+}
+
+fn llm_base_url(wire: LlmWire, endpoint: &str) -> String {
+    match wire {
+        // Claude Code wants ANTHROPIC_BASE_URL; the CLI appends /v1/messages.
+        LlmWire::Claude => origin_of(endpoint),
+        // Codex wants an OpenAI provider base; the adapter's wire_api = responses
+        // appends /responses. Preserve the broker's /v1 prefix and strip only the
+        // endpoint leaf from the full /v1/responses URL.
+        LlmWire::Codex => openai_responses_base(endpoint),
+    }
+}
+
+fn pick_llm_wire(c: &ConfigsDto) -> Option<(LlmWire, String, String, Option<String>, Option<String>)> {
+    let wires = c.get("text-generation")?;
+    // Broker controls the agent by choosing which wires it returns. If multiple
+    // are available, prefer Claude Code for today's default behavior; otherwise
+    // use the available Codex wire. The client does not send a preference.
+    if let Some((_wire, url, api_key, model, small)) = pick_wire(wires, Some(broker_llm_wire(LlmWire::Claude))) {
+        return Some((LlmWire::Claude, url, api_key, model, small));
+    }
+    if let Some((_wire, url, api_key, model, small)) = pick_wire(wires, Some(broker_llm_wire(LlmWire::Codex))) {
+        return Some((LlmWire::Codex, url, api_key, model, small));
+    }
+    None
+}
+
 /// Collapse the broker menu into the internal per-slot [`Managed`], selecting the
 /// best-quality model per task.
 ///
-/// Our code uses the broker's **full URL** verbatim for every capability — that's
-/// the single source of truth for each endpoint. The one exception is the LLM: its
-/// URL is handed to the Claude CLI via `ANTHROPIC_BASE_URL`, and the CLI appends
-/// `/v1/messages` itself, so the LLM slot takes just the **origin**. Every slot
-/// keeps `wire` empty, so each capability uses its single default adapter.
+/// Our code treats the broker's **full endpoint URL** as the source of truth. Most
+/// capabilities use it verbatim. LLM adapters strip only what their child CLI
+/// expects: Claude Code keeps the origin, while Codex keeps the OpenAI /v1 base.
 fn managed_from(c: &ConfigsDto) -> Managed {
     fn resolve(
         c: &ConfigsDto,
         task: &str,
         full: bool,
     ) -> Option<(String, String, Option<String>, Option<String>)> {
-        c.get(task).and_then(|w| pick_wire(w)).map(|(_wire, url, api_key, model, small)| {
+        c.get(task).and_then(|w| pick_wire(w, None)).map(|(_wire, url, api_key, model, small)| {
             (if full { url } else { origin_of(&url) }, api_key, model, small)
         })
     }
@@ -167,10 +210,10 @@ fn managed_from(c: &ConfigsDto) -> Managed {
             .map(|(base_url, api_key, model, _small)| VendorKey { wire: String::new(), base_url, api_key, model })
             .unwrap_or_default()
     };
-    let llm = resolve(c, "text-generation", false)
-        .map(|(base_url, api_key, model, small)| LlmCredentials {
-            wire: String::new(),
-            base_url,
+    let llm = pick_llm_wire(c)
+        .map(|(wire, endpoint, api_key, model, small)| LlmCredentials {
+            wire: wire.as_str().to_string(),
+            base_url: llm_base_url(wire, &endpoint),
             api_key,
             model,
             small,
@@ -573,4 +616,87 @@ pub fn spawn_refresh_loop(data_dir: std::path::PathBuf) {
             }
         }
     });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn text_generation_configs() -> ConfigsDto {
+        serde_json::from_value(serde_json::json!({
+            "text-generation": {
+                "anthropic-messages": {
+                    "url": "https://songguo.example/v1/messages",
+                    "api_key": "tok",
+                    "models": [{
+                        "model": "claude-opus-4-8",
+                        "small": "claude-haiku-4-5-20251001",
+                        "quality": 95
+                    }]
+                },
+                "openai-responses": {
+                    "url": "https://songguo.example/v1/responses",
+                    "api_key": "tok",
+                    "models": [
+                        { "model": "gpt-5.5", "quality": 96 },
+                        { "model": "gpt-5.4-mini", "quality": 78 }
+                    ]
+                }
+            }
+        }))
+        .unwrap()
+    }
+
+    #[test]
+    fn managed_from_uses_codex_when_that_is_the_available_wire() {
+        let configs: ConfigsDto = serde_json::from_value(serde_json::json!({
+            "text-generation": {
+                "openai-responses": {
+                    "url": "https://songguo.example/v1/responses",
+                    "api_key": "tok",
+                    "models": [
+                        { "model": "gpt-5.5", "quality": 96 },
+                        { "model": "gpt-5.4-mini", "quality": 78 }
+                    ]
+                }
+            }
+        }))
+        .unwrap();
+
+        let managed = managed_from(&configs);
+        assert_eq!(managed.llm.wire, "codex");
+        assert_eq!(managed.llm.base_url, "https://songguo.example/v1");
+        assert_eq!(managed.llm.api_key, "tok");
+        assert_eq!(managed.llm.model.as_deref(), Some("gpt-5.5"));
+        assert_eq!(managed.llm.small, None);
+    }
+
+    #[test]
+    fn managed_from_prefers_claude_when_multiple_wires_are_available() {
+        let managed = managed_from(&text_generation_configs());
+        assert_eq!(managed.llm.wire, "claude");
+        assert_eq!(managed.llm.base_url, "https://songguo.example");
+        assert_eq!(managed.llm.api_key, "tok");
+        assert_eq!(managed.llm.model.as_deref(), Some("claude-opus-4-8"));
+        assert_eq!(managed.llm.small.as_deref(), Some("claude-haiku-4-5-20251001"));
+    }
+
+    #[test]
+    fn managed_from_uses_claude_for_older_brokers() {
+        let configs: ConfigsDto = serde_json::from_value(serde_json::json!({
+            "text-generation": {
+                "anthropic-messages": {
+                    "url": "https://songguo.example/v1/messages",
+                    "api_key": "tok",
+                    "models": [{ "model": "claude-opus-4-8", "quality": 95 }]
+                }
+            }
+        }))
+        .unwrap();
+
+        let managed = managed_from(&configs);
+        assert_eq!(managed.llm.wire, "claude");
+        assert_eq!(managed.llm.base_url, "https://songguo.example");
+        assert_eq!(managed.llm.model.as_deref(), Some("claude-opus-4-8"));
+    }
 }
