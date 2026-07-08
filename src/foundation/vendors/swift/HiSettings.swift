@@ -48,7 +48,7 @@ final class SettingsWindowController {
         let window = NSWindow(contentViewController: hosting)
         window.title = "Settings"
         window.styleMask = [.titled, .closable, .miniaturizable]
-        window.setContentSize(NSSize(width: 640, height: 460))
+        window.setContentSize(NSSize(width: 780, height: 520))
         window.isReleasedWhenClosed = false
         window.center()
         window.makeKeyAndOrderFront(nil)
@@ -234,22 +234,54 @@ final class SettingsModel: ObservableObject {
 
 // MARK: - Views
 
+enum SettingsPane: String, CaseIterable, Identifiable {
+    case general
+    case account
+    case about
+
+    var id: String { rawValue }
+
+    var title: String {
+        switch self {
+        case .general: return "General"
+        case .account: return "Account"
+        case .about: return "About"
+        }
+    }
+
+    var symbol: String {
+        switch self {
+        case .general: return "gearshape"
+        case .account: return "person.crop.circle"
+        case .about: return "info.circle"
+        }
+    }
+}
+
 struct SettingsRootView: View {
     @StateObject private var model: SettingsModel
+    @State private var selectedPane: SettingsPane = .general
     init(api: SettingsAPI) { _model = StateObject(wrappedValue: SettingsModel(api: api)) }
 
     var body: some View {
         Group {
             if let snap = model.snap {
-                TabView {
-                    GeneralTab(model: model, appearance: snap.appearance)
-                        .tabItem { Label("General", systemImage: "gearshape") }
-                    AccountTab(model: model, account: snap.account)
-                        .tabItem { Label("Account", systemImage: "person.crop.circle") }
-                    AboutTab(about: snap.about)
-                        .tabItem { Label("About", systemImage: "info.circle") }
+                HStack(spacing: 0) {
+                    SettingsSidebar(selection: $selectedPane)
+                    Divider()
+                    SettingsDetailPane(title: selectedPane.title) {
+                        switch selectedPane {
+                        case .general:
+                            GeneralTab(model: model, appearance: snap.appearance)
+                        case .account:
+                            AccountTab(model: model, account: snap.account)
+                        case .about:
+                            AboutTab(about: snap.about)
+                        }
+                    }
                 }
-                .frame(width: 620, height: 440)
+                .frame(width: 780, height: 520)
+                .background(Color(NSColor.windowBackgroundColor))
             } else if let error = model.error {
                 Text("Couldn’t load settings: \(error)").padding()
             } else {
@@ -257,6 +289,75 @@ struct SettingsRootView: View {
             }
         }
         .task { await model.load() }
+    }
+}
+
+struct SettingsSidebar: View {
+    @Binding var selection: SettingsPane
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 6) {
+            Text("Settings")
+                .font(.title3)
+                .fontWeight(.semibold)
+                .padding(.horizontal, 14)
+                .padding(.top, 18)
+                .padding(.bottom, 8)
+
+            ForEach(SettingsPane.allCases) { pane in
+                Button {
+                    selection = pane
+                } label: {
+                    HStack(spacing: 10) {
+                        Image(systemName: pane.symbol)
+                            .frame(width: 18)
+                        Text(pane.title)
+                            .lineLimit(1)
+                        Spacer()
+                    }
+                    .padding(.horizontal, 12)
+                    .padding(.vertical, 7)
+                    .contentShape(Rectangle())
+                    .background(
+                        RoundedRectangle(cornerRadius: 7)
+                            .fill(selection == pane ? Color.accentColor.opacity(0.18) : Color.clear)
+                    )
+                }
+                .buttonStyle(.plain)
+                .foregroundColor(selection == pane ? .primary : .secondary)
+                .padding(.horizontal, 8)
+            }
+
+            Spacer()
+        }
+        .frame(width: 190)
+        .background(Color(NSColor.controlBackgroundColor))
+    }
+}
+
+struct SettingsDetailPane<Content: View>: View {
+    let title: String
+    let content: Content
+
+    init(title: String, @ViewBuilder content: () -> Content) {
+        self.title = title
+        self.content = content()
+    }
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 0) {
+            Text(title)
+                .font(.title2)
+                .fontWeight(.semibold)
+                .padding(.horizontal, 28)
+                .padding(.top, 24)
+                .padding(.bottom, 16)
+            Divider()
+            content
+                .padding(28)
+                .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
+        }
+        .frame(maxWidth: .infinity, maxHeight: .infinity)
     }
 }
 
@@ -284,7 +385,6 @@ struct GeneralTab: View {
                     .font(.footnote).foregroundColor(.secondary)
             }
         }
-        .padding()
     }
 }
 
@@ -310,7 +410,6 @@ struct AccountTab: View {
                 }
             }
         }
-        .padding()
     }
 }
 
@@ -432,12 +531,12 @@ struct FeatureEditor: View {
 struct AboutTab: View {
     let about: AboutState
     var body: some View {
-        VStack(spacing: 8) {
+        VStack(alignment: .leading, spacing: 8) {
             Text("Hi Agent").font(.title2).bold()
             Text("Version \(about.version)").foregroundColor(.secondary)
             Link(about.website.replacingOccurrences(of: "https://", with: ""),
                  destination: URL(string: about.website)!)
         }
-        .padding(40)
+        .frame(maxWidth: .infinity, alignment: .leading)
     }
 }

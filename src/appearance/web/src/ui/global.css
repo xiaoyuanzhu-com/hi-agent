@@ -228,6 +228,83 @@ button {
   isolation: isolate;
 }
 
+/* --- Whole-face file handoff ----------------------------------------- */
+.hi-file-drop {
+  position: fixed;
+  inset: 0;
+  z-index: 80;
+  display: grid;
+  place-items: center;
+  padding: 24px;
+  pointer-events: none;
+  background: color-mix(in srgb, var(--bg-0) 70%, transparent);
+  backdrop-filter: blur(8px);
+  -webkit-backdrop-filter: blur(8px);
+  animation: hi-file-drop-in 160ms var(--ease);
+}
+
+.hi-file-drop::before {
+  content: "";
+  position: absolute;
+  inset: 18px;
+  border: 2px dashed var(--accent-line);
+  border-radius: 28px;
+  background: var(--accent-wash);
+}
+
+.hi-file-drop-box {
+  position: relative;
+  display: inline-flex;
+  align-items: center;
+  gap: 12px;
+  min-height: 52px;
+  max-width: min(420px, calc(100vw - 64px));
+  padding: 12px 18px;
+  border-radius: 999px;
+  border: 1px solid var(--surface-border);
+  background: var(--surface-strong);
+  color: var(--fg);
+  box-shadow: 0 18px 60px var(--shadow-strong);
+}
+
+.hi-file-drop-icon {
+  display: grid;
+  place-items: center;
+  flex: none;
+  width: 28px;
+  height: 28px;
+  border-radius: 50%;
+  background: var(--accent);
+  color: var(--bg-0);
+  font-size: 18px;
+  font-weight: 700;
+  line-height: 1;
+}
+
+.hi-file-drop-text {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-size: 15px;
+  font-weight: 700;
+  color: var(--fg);
+}
+
+.hi-file-drop[data-state="error"]::before {
+  border-color: rgba(253, 96, 94, 0.55);
+  background: rgba(253, 96, 94, 0.08);
+}
+
+.hi-file-drop[data-state="error"] .hi-file-drop-icon {
+  background: #fd605e;
+}
+
+@keyframes hi-file-drop-in {
+  from { opacity: 0; }
+  to { opacity: 1; }
+}
+
 /* --- Presence (themed background) ------------------------------------
    The paper itself: a soft warm gradient from the theme tokens, with a single
    very faint state-glow breathing into it (colour set by data-state below). No
@@ -877,4 +954,3 @@ button {
     height: 32px;
   }
 }
-
