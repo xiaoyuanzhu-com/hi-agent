@@ -4,6 +4,8 @@ interface KeyboardFallbackProps {
   onSend: (text: string) => void;
   /** Whether the text channel is on (input line shown). Persisted by the hook. */
   open: boolean;
+  /** Text pasted while the channel is open but focus is outside the input. */
+  pastedText?: { id: number; text: string } | null;
   /** Turn the channel on — e.g. the user started typing while it was off. */
   onOpen: () => void;
   /** Turn the channel off — e.g. Esc. */
@@ -17,9 +19,10 @@ interface KeyboardFallbackProps {
  * seeds the first character, so a keyboard user never has to reach for a button.
  * Independent of the audio channels: usable with the mic on, off, or unavailable.
  */
-export function KeyboardFallback({ onSend, open, onOpen, onClose }: KeyboardFallbackProps) {
+export function KeyboardFallback({ onSend, open, pastedText, onOpen, onClose }: KeyboardFallbackProps) {
   const [text, setText] = useState("");
   const inputRef = useRef<HTMLInputElement | null>(null);
+  const lastPasteIdRef = useRef(0);
 
   // Start-typing-to-open: a single printable key turns the channel on and seeds
   // the line. Only active while the channel is off.
@@ -39,6 +42,13 @@ export function KeyboardFallback({ onSend, open, onOpen, onClose }: KeyboardFall
   useEffect(() => {
     if (open) inputRef.current?.focus();
   }, [open]);
+
+  useEffect(() => {
+    if (!open || !pastedText || pastedText.id === lastPasteIdRef.current) return;
+    lastPasteIdRef.current = pastedText.id;
+    setText((prev) => prev + pastedText.text);
+    inputRef.current?.focus();
+  }, [open, pastedText]);
 
   const submit = () => {
     const trimmed = text.trim();
