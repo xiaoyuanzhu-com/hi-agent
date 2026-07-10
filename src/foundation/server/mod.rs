@@ -22,6 +22,7 @@ use crate::types::{Channel, Scene, Signal, ViewEnvelope};
 
 pub mod account;
 pub mod acp;
+pub mod attention;
 pub mod audio;
 pub mod binder;
 pub mod channels;
@@ -491,6 +492,9 @@ pub fn build(
         // changes — real-time "who's here", no remote call. A no-op without the
         // face capability.
         .route("/api/in/vision/presence", post(vision::post_presence))
+        // The attention lane: the web face reports its own window coming forward
+        // (visibility/focus) — the "they're checking on you" signal for presence.
+        .route("/api/in/attention", post(attention::post_attention))
         // The file channel — handing the agent a file (handed artifact, not a
         // sense). Drag-drop posts to /api/in/file; the phone handoff mints a
         // token (/api/handoff), serves an uploader at /up/<token>, receives at

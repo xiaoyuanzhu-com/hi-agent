@@ -77,6 +77,10 @@ pub async fn post_text(
         tracing::error!(error = %err, "journal append failed; accepting signal anyway");
     }
 
+    // A human message is engagement — refresh presence and start the owed-reply
+    // clock (covers both typed text and transcribed voice, which lands here too).
+    state.presence.note_activity(&scene);
+
     // Echo to scene observers (live, no buffer) before dispatching inward, so a
     // typed line shows on every client just like recognized speech does.
     state.echo_input(&scene, Channel::Text, &signal.body, true);

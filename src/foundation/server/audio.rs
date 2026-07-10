@@ -374,6 +374,10 @@ async fn stream_audio_in(
     stream: Option<String>,
     mut socket: axum::extract::ws::WebSocket,
 ) {
+    // Hold a mic-reach guard for the life of the socket: the mic is open for the
+    // whole voice session, so this doubles as the "voice conversation active"
+    // posture signal for presence. Dropped when the stream ends below.
+    let _mic = state.presence.connect_mic(&scene);
     // The WS is just one source of PCM frames. Forward its binary frames into the
     // shared ingest; when the socket closes the sender drops, the ingest sees the
     // stream end, and it finalizes. A browser mic carries no source tag.

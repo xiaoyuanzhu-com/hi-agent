@@ -1486,6 +1486,9 @@ async fn per_scene_loop(
                 // The turn delivered the mail; clear the backlog. (If this was a
                 // retry, run_turn already flipped the vendor Up via note_success.)
                 batch.clear();
+                // A reply landed — stop the presence owed-reply clock (no-op if
+                // nothing was owed, e.g. a pulse turn).
+                reactor.inner.presence.note_delivered(&scene);
                 // Between turns: if the live session has grown past budget, hot-swap
                 // it now. The human is consuming the reply just delivered, so the
                 // summarize-and-reopen happens in that natural gap — invisible, never

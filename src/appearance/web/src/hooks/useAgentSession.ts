@@ -2,6 +2,7 @@ import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { subscribeOutText } from "../channels/out/text";
 import { subscribeAudioTurns } from "../channels/out/audio";
 import { postInText, subscribeInText } from "../channels/in/text";
+import { reportAttention } from "../channels/in/attention";
 import { AudioBus } from "../lib/audioBus";
 import { ActivityMeter } from "../lib/activityMeter";
 import { AudioStreamer } from "../lib/audioStreamer";
@@ -356,6 +357,35 @@ export function useAgentSession(): AgentSession {
       clearAgentQueue();
     };
   }, [woken, scene, enqueueAgent, clearAgentQueue]);
+
+  // ---- Attention reporter (window came forward) --------------------------
+  // Tell the backend when our own window becomes visible or regains focus — the
+  // "they're checking on you" signal for presence. First-party only: we report
+  // our window's own visibility, never anything about other apps. Report once on
+  // mount (the page being up is itself an activation) and on each visible/focus
+  // transition, coalesced so a rapid focus+visible pair sends one beat.
+  useEffect(() => {
+    const ctrl = new AbortController();
+    let last = 0;
+    const beat = () => {
+      if (document.visibilityState !== "visible") return;
+      const now = Date.now();
+      if (now - last < 1000) return; // coalesce focus+visibilitychange bursts
+      last = now;
+      void reportAttention({ scene, signal: ctrl.signal });
+    };
+    beat(); // mount = an activation
+    const onVisible = () => {
+      if (document.visibilityState === "visible") beat();
+    };
+    document.addEventListener("visibilitychange", onVisible);
+    window.addEventListener("focus", beat);
+    return () => {
+      ctrl.abort();
+      document.removeEventListener("visibilitychange", onVisible);
+      window.removeEventListener("focus", beat);
+    };
+  }, [scene]);
 
   // ---- GET /out/audio subscription loop (TTS playback) -------------------
   // Pure render: each response is one turn's continuous audio. Stream its body
