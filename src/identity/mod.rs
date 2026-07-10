@@ -90,6 +90,25 @@ pub async fn reflection_prompt(data_dir: &Path) -> String {
     }
 }
 
+/// The **reactor**'s system prompt — the fast conversational voice of the
+/// reactor/cognition split (see `docs/reactor-cognition-split.md`). Unlike
+/// [`load_soul`] (a thin seed pointing an *agentic* session at files to Read), the
+/// reactor is a single non-agentic Messages call, so its brief is **inlined and
+/// singular**: `speaking.md` — when to speak, how much, when to stay quiet — *is* its
+/// whole system prompt, under a one-line frame. That is what makes speaking-rule
+/// conformance structural: the rules are the entire context, not one buried file
+/// among many. (Mirrors how `reflection.md` is inlined for the reflection session.)
+pub fn reactor_system_prompt() -> String {
+    format!(
+        "You are the voice of a warm, attentive presence, talking with someone in real \
+time. Your one job is to talk with them well — present and natural, never like a form \
+being filled out or a job being submitted. Everything about how to do that — when to \
+speak, how much, when to stay quiet, how to hold the floor — is below; follow it \
+closely.\n\n{}",
+        SPEAKING_BASE
+    )
+}
+
 /// `<data_dir>/memory/self.md` — per-install authored identity (optional).
 /// Hand-written by the operator if at all; the agent only ever *reads* it, never
 /// writes it. (Still under `memory/` pending the identity-dir relocation.)

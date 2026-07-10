@@ -57,6 +57,7 @@ mod interrupts;
 pub mod outbound;
 mod sequencer;
 mod tools;
+mod voice;
 mod workers;
 
 pub use interrupts::InterruptRegistry;
@@ -1827,6 +1828,162 @@ async fn drive_racing_inbound(
 /// the new signals; the snapshot is the durable backstop, not per-turn context to
 /// re-send. `seeded` decouples "snapshot delivered" from "session open", since
 /// warm-up opens a session without seeding it.
+/// A split-mode turn: the fast **reactor** voice. One direct Anthropic Messages call
+/// (`speaking.md` as the system prompt, the assembled turn context as the user
+/// message) produces the spoken words, fed straight to the sequencer — no ACP
+/// session, no tools, no agentic loop. This is the fast, speaking-rule-conformant
+/// conversational voice of the reactor/cognition split.
+///
+/// **Phase 1 caveat:** cognition — the agentic thinker that does real work and
+/// delegates to workers — is not yet wired into this path, so a split-mode turn
+/// currently answers *conversationally only*. Routing cognition's async intents back
+/// through this voice is the next step (see `docs/reactor-cognition-split.md`); the
+/// mode is env-gated and default off precisely because of that.
+///
+/// Mirrors [`run_turn`]'s reorganization/barge-in shape: a human burst arriving
+/// mid-call drops the in-flight request (dropping the future cancels the HTTP call)
+/// and re-asks with their words folded in; a worker report spills to `carryover`.
+async fn run_reactor_turn(
+    reactor: &Reactor,
+    scene: &Scene,
+    batch: &[LoopInput],
+    beats: &mpsc::Sender<sequencer::Beat>,
+    inbound: &mut mpsc::Receiver<LoopInput>,
+    carryover: &mut Vec<LoopInput>,
+) -> anyhow::Result<()> {
+    // Resolve the fast-voice wire up front: an unconfigured or non-Claude wire can't
+    // speak, and failing before any turn bracket opens keeps the sequencer clean.
+    let system = crate::identity::reactor_system_prompt();
+    let agent_cfg =
+        crate::foundation::config::AgentConfig::resolve(reactor.inner.memory.data_dir());
+    let msg_cfg = voice::config_from(&agent_cfg)?;
+
+    let presence_note = format!("## Presence\n{}", reactor.inner.presence.render(scene));
+    let interrupted = reactor
+        .inner
+        .interrupts
+        .take_pending(scene)
+        .await
+        .map(|i| interrupts::render_interruption(&i))
+        .unwrap_or_default();
+
+    // Accumulated across reorganizations: the human words seen so far, and what we had
+    // already spoken before being reorganized (empty here — a reactor reorg cancels
+    // the call before it speaks).
+    let mut new_signals_body = render_batch(batch);
+    let mut spoken_so_far = String::new();
+
+    // One pass's race outcome between the Messages call and new inbound.
+    enum Step {
+        Spoke,
+        Reorganize(Vec<Signal>),
+        Failed(anyhow::Error),
+    }
+
+    loop {
+        let turn_id = reactor.inner.turn_seq.fetch_add(1, Ordering::Relaxed);
+        let new_signals = format!("## New signals\n{new_signals_body}");
+        let reorg_note = if spoken_so_far.trim().is_empty() {
+            String::new()
+        } else {
+            interrupts::render_reorg(spoken_so_far.trim())
+        };
+
+        // The reactor always reads the recent conversation (the memory snapshot), so
+        // its voice reconciles with what was already said rather than repeating it.
+        let snap = build_for_scene(&reactor.inner.memory, scene).await?;
+        let context = join_sections(&[
+            &snap.render_for_prompt(),
+            &presence_note,
+            &interrupted,
+            &reorg_note,
+            &new_signals,
+        ]);
+
+        let _ = beats.send(sequencer::Beat::TurnStart { turn: turn_id }).await;
+
+        // Race the Messages call against new inbound. Box::pin so the same call stays
+        // alive across worker reports (they only spill to carryover); break on
+        // completion, error, or a human burst. Boxing makes the future Unpin, so it
+        // can be re-polled in the select and awaited directly.
+        let mut speak_fut = Box::pin(voice::speak(&msg_cfg, &system, &context));
+        let step = loop {
+            tokio::select! {
+                res = &mut speak_fut => break match res {
+                    Ok(text) => {
+                        if !text.trim().is_empty() {
+                            let _ = beats.send(sequencer::Beat::Say(text)).await;
+                        }
+                        Step::Spoke
+                    }
+                    Err(e) => Step::Failed(e),
+                },
+                item = inbound.recv() => match item {
+                    // Inbound closed (shutdown): stop racing and just finish the reply.
+                    None => break match (&mut speak_fut).await {
+                        Ok(text) => {
+                            if !text.trim().is_empty() {
+                                let _ = beats.send(sequencer::Beat::Say(text)).await;
+                            }
+                            Step::Spoke
+                        }
+                        Err(e) => Step::Failed(e),
+                    },
+                    // They spoke while we were composing — reorganize. Settle the rest
+                    // of the burst; workers spill to carryover.
+                    Some(LoopInput::Human(sig)) => {
+                        let mut burst = vec![sig];
+                        loop {
+                            match timeout(RESPONSE_SETTLE, inbound.recv()).await {
+                                Ok(Some(LoopInput::Human(s))) => burst.push(s),
+                                Ok(Some(other)) => carryover.push(other),
+                                Ok(None) => break,
+                                Err(_) => break,
+                            }
+                        }
+                        break Step::Reorganize(burst);
+                    }
+                    // A worker report folds into the next turn; keep composing.
+                    Some(other) => carryover.push(other),
+                },
+            }
+        };
+
+        // On a terminal outage, tell the user once we're holding their mail — sent
+        // inside the bracket so the line actually plays.
+        if let Step::Failed(err) = &step {
+            tracing::warn!(scene = %scene, error = %err, "reactor voice failed");
+            if reactor.inner.vendor.note_unreachable() {
+                let _ = beats
+                    .send(sequencer::Beat::Say(
+                        "我暂时连不上模型，先攒着你的消息，等恢复了一起处理。".to_string(),
+                    ))
+                    .await;
+            }
+        }
+
+        // Close this pass's bracket and capture what was spoken.
+        let (done_tx, done_rx) = oneshot::channel();
+        let _ = beats.send(sequencer::Beat::TurnEnd { done: done_tx }).await;
+        let reply = done_rx.await.unwrap_or_default();
+        reactor.inner.interrupts.end_turn(scene, turn_id, &reply).await;
+
+        match step {
+            Step::Spoke => {
+                let _ = reactor.inner.vendor.note_success();
+                return Ok(());
+            }
+            Step::Failed(err) => return Err(err),
+            Step::Reorganize(burst) => {
+                // The call was cancelled before it spoke, so there's no stale tail;
+                // fold the burst in and re-ask.
+                spoken_so_far.push_str(&reply);
+                new_signals_body.push_str(&render_human_signals(&burst));
+            }
+        }
+    }
+}
+
 async fn run_turn(
     reactor: &Reactor,
     scene: &Scene,
@@ -1849,6 +2006,13 @@ async fn run_turn(
     inbound: &mut mpsc::Receiver<LoopInput>,
     carryover: &mut Vec<LoopInput>,
 ) -> anyhow::Result<()> {
+    // Split mode (prototype, env-gated): the fast reactor voice handles the turn — one
+    // direct Messages call, no ACP session or tools. Default off, so the agentic path
+    // below is unchanged. See docs/reactor-cognition-split.md.
+    if voice::split_enabled() {
+        return run_reactor_turn(reactor, scene, batch, beats, inbound, carryover).await;
+    }
+
     // Computed once, shared by every reorganization pass.
     let worker_status = workers.render_status().await;
     let presence_note =
