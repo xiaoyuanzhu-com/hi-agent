@@ -1412,7 +1412,15 @@ async fn per_scene_loop(
     // is still delivered by the first real turn (which sees an open, system-prompted
     // but unseeded session). Best-effort; on failure the first turn cold-opens as
     // before.
-    warm_up(&reactor, &scene, &mut reactor_session).await;
+    //
+    // Split mode's voice is a direct Messages call, so the reactor ACP session is
+    // never driven — skip warming it. That warm is a subprocess spawn *plus* a full
+    // LLM warm turn, `.await`ed here before the loop reads any input; in split mode it
+    // is pure waste that also stalls the first real turn behind it. Cognition warms
+    // lazily on its first turn instead. See docs/reactor-cognition-split.md.
+    if !voice::split_enabled() {
+        warm_up(&reactor, &scene, &mut reactor_session).await;
+    }
 
     // Pulse bookkeeping: the host's recurring self-attention timer. `last_activity`
     // resets on every turn, so pulses only fire into genuine quiet; the first pulse
