@@ -682,9 +682,9 @@ mod reflection_schedule_tests {
     }
 }
 
-/// How far back a scene's raw memory may date and still be re-warmed at startup.
-/// Re-warm gives recently-active scenes a live loop again so their pulses can
-/// fire — a standing commitment must not need a client connection to be checked.
+/// How far back a scene's raw memory may date and still count as "recently active"
+/// for the consolidated reflection pass. (Re-warming at startup uses the tighter
+/// [`REWARM_MAX_IDLE`] gate instead — see [`scenes_to_rewarm`].)
 const REWARM_WINDOW: Duration = Duration::from_secs(7 * 24 * 3600);
 
 const SCENE_QUEUE_CAPACITY: usize = 64;
@@ -930,14 +930,18 @@ pub fn start(
         tracing::warn!("reactor warm channel closed; warm-up loop exiting");
     });
 
-    // Re-warm recently-active scenes, so a standing commitment has a live loop —
-    // and therefore pulses — without waiting for a client to connect. Bounded by
-    // [`REWARM_WINDOW`]; a long-idle scene stays cold. Boot is not a special
-    // case: this merely stands the loops up, and each one's first pulse carries
-    // the "host process started Xm ago" fact like any other.
+    // Re-warm scenes with a genuinely fresh, still-live conversation, so their loop
+    // (and pulse) is up without waiting for a client to reconnect. Deliberately
+    // conservative — see [`scenes_to_rewarm`]: each warm spawns a subprocess and an
+    // LLM call, so warming a crowd at boot hurts startup UX and competes for our own
+    // LLM rate limit right when the user wants to interact. Boot is not a special
+    // case: this merely stands the loops up, and each one's first pulse carries the
+    // "host process started Xm ago" fact like any other. Standing/scheduled work
+    // (cron, serving) does not depend on this — it lives on the heartbeat, so a scene
+    // going cold never drops a duty.
     let rewarm_reactor = reactor.clone();
     tokio::spawn(async move {
-        for scene in recent_scenes(rewarm_reactor.inner.memory.data_dir(), REWARM_WINDOW) {
+        for scene in scenes_to_rewarm(rewarm_reactor.inner.memory.data_dir()) {
             tracing::info!(scene = %scene, "re-warming recently-active scene");
             rewarm_reactor.ensure_scene(scene).await;
         }
@@ -1087,10 +1091,20 @@ async fn consolidated_reflection_loop(reactor: Reactor) {
     }
 }
 
-/// Scenes whose raw memory saw activity within `window`: the directories under
-/// `<data_dir>/memory/raw/` with a recently-modified day folder. Errors read as
-/// "no scenes" — re-warm is best-effort.
-fn recent_scenes(data_dir: &std::path::Path, window: Duration) -> Vec<Scene> {
+/// Scenes whose raw memory saw activity within `window`, each paired with the
+/// newest modification time seen across its day folders (its last signal). The
+/// directories are under `<data_dir>/memory/raw/`; errors read as "no scenes" —
+/// re-warm is best-effort.
+///
+/// The mtime already ignores idle pulses: a pulse that concludes "nothing to do"
+/// emits nothing and so writes nothing under `raw/`, so the newest mtime marks the
+/// last *real* signal (an inbound utterance or an emitted reply), never a bare
+/// self-attention tick. That is what lets the re-warm gate treat mtime as "last
+/// input" without a separate journal scan.
+fn scenes_with_activity(
+    data_dir: &std::path::Path,
+    window: Duration,
+) -> Vec<(Scene, std::time::SystemTime)> {
     let raw = data_dir.join("memory").join("raw");
     let Some(cutoff) = std::time::SystemTime::now().checked_sub(window) else {
         return Vec::new();
@@ -1104,21 +1118,99 @@ fn recent_scenes(data_dir: &std::path::Path, window: Duration) -> Vec<Scene> {
         if !path.is_dir() {
             continue;
         }
-        let recent = std::fs::read_dir(&path)
-            .map(|days| {
-                days.flatten().any(|d| {
-                    d.metadata()
-                        .and_then(|m| m.modified())
-                        .map(|t| t >= cutoff)
-                        .unwrap_or(false)
-                })
-            })
-            .unwrap_or(false);
-        if recent && let Some(name) = path.file_name().and_then(|n| n.to_str()) {
-            scenes.push(Scene(name.to_owned()));
+        // Newest day-folder mtime under this scene — the time of its last signal.
+        let newest = std::fs::read_dir(&path).ok().and_then(|days| {
+            days.flatten()
+                .filter_map(|d| d.metadata().and_then(|m| m.modified()).ok())
+                .max()
+        });
+        if let Some(newest) = newest
+            && newest >= cutoff
+            && let Some(name) = path.file_name().and_then(|n| n.to_str())
+        {
+            scenes.push((Scene(name.to_owned()), newest));
         }
     }
     scenes
+}
+
+/// Scenes whose raw memory saw activity within `window`. Thin projection of
+/// [`scenes_with_activity`] for callers that only need the ids (the consolidated
+/// reflection pass).
+fn recent_scenes(data_dir: &std::path::Path, window: Duration) -> Vec<Scene> {
+    scenes_with_activity(data_dir, window)
+        .into_iter()
+        .map(|(scene, _)| scene)
+        .collect()
+}
+
+/// A scene whose last input is older than this is not re-warmed at startup: it has
+/// gone quiet, and standing work no longer lives in a per-scene loop (cron/serving
+/// run on the heartbeat), so there is nothing to keep alive by warming it.
+const REWARM_MAX_IDLE: Duration = Duration::from_secs(24 * 3600);
+
+/// Where the re-warm gate persists its per-scene bookkeeping (see
+/// [`scenes_to_rewarm`]). Sits outside `raw/` so writing it never perturbs the
+/// activity mtimes [`scenes_with_activity`] reads.
+fn rewarm_state_path(data_dir: &std::path::Path) -> PathBuf {
+    data_dir.join("memory").join("rewarm.json")
+}
+
+/// Scene id → the unix-seconds mtime of its newest raw signal at the moment we last
+/// re-warmed it. A missing/corrupt file reads as empty: at worst one extra re-warm.
+fn load_rewarm_state(data_dir: &std::path::Path) -> HashMap<String, u64> {
+    std::fs::read(rewarm_state_path(data_dir))
+        .ok()
+        .and_then(|bytes| serde_json::from_slice(&bytes).ok())
+        .unwrap_or_default()
+}
+
+fn save_rewarm_state(data_dir: &std::path::Path, state: &HashMap<String, u64>) {
+    if let Ok(bytes) = serde_json::to_vec_pretty(state) {
+        // Best-effort: a lost write just costs at most one extra re-warm next boot.
+        let _ = std::fs::write(rewarm_state_path(data_dir), bytes);
+    }
+}
+
+/// Which recently-active scenes to re-warm at startup — deliberately conservative.
+///
+/// Warming a scene is expensive: it spawns an ACP subprocess and its first pulse is
+/// an LLM call. Warming many scenes at once slows startup and floods our own LLM
+/// rate limit *exactly* when the user is trying to interact — so we warm only the
+/// scenes that plausibly still have a live conversation, and never re-warm the same
+/// quiet scene twice. A scene is re-warmed only when BOTH hold:
+///   1. its last input is newer than [`REWARM_MAX_IDLE`] (a day quiet → stay cold),
+///      enforced by the `scenes_with_activity` window; and
+///   2. we have not already re-warmed it for that same, unchanged input — so
+///      restarting the host repeatedly within a day doesn't re-warm a quiet scene
+///      each time.
+///
+/// "Input" here is raw-memory activity, which already excludes pulses (an idle
+/// pulse writes nothing — see [`scenes_with_activity`]). Standing/scheduled work
+/// (cron, serving) does NOT rely on re-warming: it belongs to the global heartbeat
+/// session, not a per-scene loop, so letting an idle scene go cold never drops a
+/// duty.
+fn scenes_to_rewarm(data_dir: &std::path::Path) -> Vec<Scene> {
+    let prior = load_rewarm_state(data_dir);
+    let mut warm = Vec::new();
+    // Only scenes carried forward here (all within REWARM_MAX_IDLE) stay in the
+    // map; scenes that have since gone quiet fall out, keeping it bounded.
+    let mut next: HashMap<String, u64> = HashMap::new();
+    for (scene, mtime) in scenes_with_activity(data_dir, REWARM_MAX_IDLE) {
+        let epoch = mtime
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        next.insert(scene.0.clone(), epoch);
+        if prior.get(&scene.0) == Some(&epoch) {
+            // Condition 2: already re-warmed for this exact input, nothing new
+            // since — leave it cold and let a fresh signal wake it on demand.
+            continue;
+        }
+        warm.push(scene);
+    }
+    save_rewarm_state(data_dir, &next);
+    warm
 }
 
 /// Whether a failed prompt is an upstream authentication failure (a 401 from the
