@@ -238,6 +238,11 @@ pub(super) struct WorkerRegistry {
     inbound: mpsc::Sender<LoopInput>,
     workers: HashMap<WorkerId, Worker>,
     next_id: WorkerId,
+    /// The scene's persistent **cognition** worker, if spawned — the agentic thinker
+    /// the reactor hands every human turn to in split mode (the reactor/cognition
+    /// split). Followed up rather than respawned each turn, so it keeps full context.
+    /// `None` until the first turn that needs it. See [`WorkerRegistry::cognize`].
+    cognition: Option<WorkerId>,
 }
 
 impl WorkerRegistry {
@@ -247,6 +252,7 @@ impl WorkerRegistry {
             inbound,
             workers: HashMap::new(),
             next_id: 1,
+            cognition: None,
         }
     }
 
@@ -361,6 +367,22 @@ impl WorkerRegistry {
         }
         tracing::info!(scene = %self.scene, worker = id, "follow-up target gone; spawning fresh worker");
         self.spawn(reactor, task).await
+    }
+
+    /// Ensure the scene's persistent **cognition** worker is working on `task`:
+    /// resume the warm one if it exists (full context, no clobbering), else spawn it.
+    /// The reactor/cognition split calls this each turn that carries a human request,
+    /// so cognition thinks and works continuously off the floor while the reactor
+    /// voices; its output rides back as an ordinary [`WorkerReport`] the reactor
+    /// articulates. [`follow_up`](Self::follow_up) already falls back to a fresh spawn
+    /// if the tracked worker has gone, so the id is re-stored from whatever it returns.
+    pub(super) async fn cognize(&mut self, reactor: &Reactor, task: String) -> anyhow::Result<()> {
+        let id = match self.cognition {
+            Some(id) => self.follow_up(reactor, id, task).await?,
+            None => self.spawn(reactor, task).await?,
+        };
+        self.cognition = Some(id);
+        Ok(())
     }
 
     /// Forget workers whose drive task has finished, so the map doesn't grow.

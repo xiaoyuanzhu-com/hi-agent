@@ -1,8 +1,9 @@
 # reactor / cognition / worker — the tempo split
 
-> **Status: in progress on `feat/reactor-cognition-split`.** The direct-LLM wire is
-> written (unbuilt — no local toolchain, Mac mini down); the reactor-loop rewiring is
-> the remaining work and wants a compiler. This doc is the design contract for it.
+> **Status: phases 1–2 on `origin/main` (`feat/reactor-cognition-split`), UNBUILT.**
+> The fast reactor voice *and* the cognition-as-worker wiring are implemented (blind — no
+> local toolchain, Mac mini down); build + measure + fix-forward. Env-gated
+> (`HI_AGENT_REACTOR_SPLIT`, default off → today's agentic path unchanged). Design contract.
 
 ## The problem
 
@@ -83,33 +84,43 @@ Presence appears **only** as the emission gate ("hold the `say` if the room's em
 cognition never considers it. Turn-taking / floor logic (is it my turn?) stays — that's
 conversation, not presence.
 
-## Built so far
+## Built so far (UNBUILT — build + measure on the Mac mini)
 
 - **`foundation/vendors/anthropic_messages.rs`** — the direct Messages vendor:
-  stateless `Config::new(token, base_url, model)` + `complete(cfg, system, &[Turn])`,
-  non-streaming, Bearer-authed, `/v1/messages` endpoint (host-root aware), unit-tested
-  (request shape, endpoint construction, reply parsing). Registered in `vendors/mod.rs`.
-  **Unbuilt** — verify on the Mac mini.
+  stateless `Config::new` + `complete`, non-streaming, Bearer-authed, `/v1/messages`
+  (host-root aware), unit-tested. Registered in `vendors/mod.rs`.
+- **`identity::reactor_system_prompt()`** — `speaking.md` inlined as the reactor's whole
+  system prompt, under a frame naming it the *voice* and cognition the *hands*.
+- **`body/reactor/voice.rs`** — glue: `config_from` (credential → Messages config, small
+  slot, raw model) + `speak` + the `split_enabled` env gate. (`AgentConfig`'s fields are
+  public, so no accessor was needed.)
+- **`body/reactor/run_reactor_turn`** — the split turn path, branched at `run_turn`'s top:
+  one Messages call → sequencer (`Beat::Say`), mirroring `run_turn`'s reorg/barge-in (a
+  mid-call human burst cancels the request and re-asks). Default off → the agentic path is
+  byte-for-byte unchanged.
+- **Cognition wiring** — `WorkerRegistry::cognize` runs a **persistent cognition worker**
+  (spawn once, follow-up each turn) seeded with the turn's human request; it thinks/works
+  off the floor and reports back as an ordinary `LoopInput::Worker` the reactor voices. So
+  the reactor is the single fast voice; cognition (agentic) does the work in parallel. No
+  MCP/role surgery — a worker is already channel-mute (it reports, never `say`s), and the
+  human-only task render keeps cognition from re-ingesting its own report.
 
-## Remaining (wants a compiler — iterate, don't write blind)
+## Remaining (fix-forward + next)
 
-1. **`AgentConfig` accessor** returning `(upstream_base_url, upstream_key,
-   small.or(model))` for the reactor — the **raw** model id (never the `[1m]`
-   context-window suffix `with_context_window` adds; that's a CLI-ism).
-2. **Reactor turn path**: on a committed turn, assemble the reactor prompt and call the
-   Messages vendor instead of spawning an ACP session; feed the returned text to the
-   sequencer. The delivery seam is already model-agnostic — the sequencer voices any
-   string (canned status lines already do, `reactor/mod.rs`), and the current
-   `SessionUpdate::Text` drop (`reactor/mod.rs:1768`) becomes "consume as speech" on the
-   reactor path.
-3. **Rename** the ACP reactor session → **cognition** (`SessionRole::Reactor` →
-   `Cognition`, `open_session`, observatory `SessionKind`).
-4. **reactor ↔ cognition intent bus** — reuse the §7 worker-intent mechanism; add
-   single-voice reconciliation so a landed intent doesn't contradict an earlier ack.
-5. **Config**: a fast-model key, defaulting to the existing `small` slot
-   (`LlmCredentials.small`, `credentials.rs`).
-6. **Presence** as the emission gate — fold in the 3-axis model already on `main`.
-7. **Streaming** (follow-up): token-stream the Messages reply for fast first word.
+- **Build + measure** (Mac mini): compile, run the spike (split vs. default latency +
+  speaking-rule feel), fix-forward any blind compile errors.
+- **Cognition can't sub-delegate** — the worker role only exposes `ask`, not `delegate`,
+  so cognition does multi-step work inline rather than fanning out to sub-workers. Fine for
+  v1; a role/MCP change restores the 3rd tier.
+- **Rename** `SessionRole::Reactor` → `Cognition` (+ `SessionKind`, MCP `X-HI-Role`
+  routing) — deferred as risky-blind; cosmetic, and split mode doesn't drive the ACP
+  "reactor" session anyway.
+- **Trivial-turn cost** — cognition is handed *every* human turn (even "thanks"); the
+  reactor's reconciliation suppresses double-speak, but a cheap gate (reactor decides, or
+  cognition self-suppresses "nothing to do") would avoid the waste.
+- **Promote the env flag** to a config-store tunable once validated.
+- **Presence** as the emission gate — fold in the 3-axis model already on `main`.
+- **Streaming** — token-stream the Messages reply for fast first word.
 
 ## Open forks
 

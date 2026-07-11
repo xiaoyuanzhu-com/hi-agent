@@ -1753,6 +1753,22 @@ fn render_human_signals(burst: &[Signal]) -> String {
     s
 }
 
+/// Render just the human requests in a batch (skipping worker reports, alarms, and
+/// pulses) — the text handed to cognition as the turn's task. Skipping reports is
+/// what keeps cognition from re-ingesting its own prior output (a feedback loop).
+fn render_human_from_batch(batch: &[LoopInput]) -> String {
+    use crate::mind::memory::snapshot::{Speaker, transcript_line};
+    use std::fmt::Write as _;
+    let mut s = String::new();
+    for input in batch {
+        if let LoopInput::Human(sig) = input {
+            let chan = sig.channel.with_stream(sig.stream.as_deref());
+            let _ = writeln!(s, "{}", transcript_line(Speaker::Them, &chan, &sig.body));
+        }
+    }
+    s
+}
+
 /// Drive one prompt to completion, but race it against new inbound signals so the
 /// mind can reorganize mid-reply like a person. The model's `say`/`show_view` tool
 /// calls reach the sequencer out of band; this only watches the prompt's update
@@ -1864,11 +1880,12 @@ async fn drive_racing_inbound(
 /// session, no tools, no agentic loop. This is the fast, speaking-rule-conformant
 /// conversational voice of the reactor/cognition split.
 ///
-/// **Phase 1 caveat:** cognition — the agentic thinker that does real work and
-/// delegates to workers — is not yet wired into this path, so a split-mode turn
-/// currently answers *conversationally only*. Routing cognition's async intents back
-/// through this voice is the next step (see `docs/reactor-cognition-split.md`); the
-/// mode is env-gated and default off precisely because of that.
+/// Cognition — the agentic thinker/worker — runs in parallel: the turn's human
+/// request is handed to a persistent cognition worker ([`workers::WorkerRegistry::cognize`]),
+/// which thinks and works off the floor and reports back as an ordinary
+/// `LoopInput::Worker` the reactor voices on a later turn. So the reactor stays the
+/// single fast voice while the real work happens elsewhere. Still env-gated (default
+/// off) pending build + measurement.
 ///
 /// Mirrors [`run_turn`]'s reorganization/barge-in shape: a human burst arriving
 /// mid-call drops the in-flight request (dropping the future cancels the HTTP call)
@@ -1877,6 +1894,7 @@ async fn run_reactor_turn(
     reactor: &Reactor,
     scene: &Scene,
     batch: &[LoopInput],
+    workers: &mut workers::WorkerRegistry,
     beats: &mpsc::Sender<sequencer::Beat>,
     inbound: &mut mpsc::Receiver<LoopInput>,
     carryover: &mut Vec<LoopInput>,
@@ -2001,6 +2019,16 @@ async fn run_reactor_turn(
         match step {
             Step::Spoke => {
                 let _ = reactor.inner.vendor.note_success();
+                // Hand the turn's human request to cognition — the agentic thinker —
+                // so it works off the floor while the voice moves on; its report rides
+                // back as a WorkerReport the reactor voices next turn. Spawned once per
+                // scene, then followed up. Nothing to hand off on a pure report/pulse turn.
+                let task = render_human_from_batch(batch);
+                if !task.trim().is_empty() {
+                    if let Err(e) = workers.cognize(reactor, task).await {
+                        tracing::warn!(scene = %scene, error = %e, "cognition spawn/follow-up failed");
+                    }
+                }
                 return Ok(());
             }
             Step::Failed(err) => return Err(err),
@@ -2040,7 +2068,7 @@ async fn run_turn(
     // direct Messages call, no ACP session or tools. Default off, so the agentic path
     // below is unchanged. See docs/reactor-cognition-split.md.
     if voice::split_enabled() {
-        return run_reactor_turn(reactor, scene, batch, beats, inbound, carryover).await;
+        return run_reactor_turn(reactor, scene, batch, workers, beats, inbound, carryover).await;
     }
 
     // Computed once, shared by every reorganization pass.
