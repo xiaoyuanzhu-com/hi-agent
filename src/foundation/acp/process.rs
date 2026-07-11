@@ -160,13 +160,22 @@ impl AcpProcess {
                 acp::LineDirection::Stdin => tracing::trace!(target: "acp::send", "{line}"),
                 acp::LineDirection::Stdout => tracing::trace!(target: "acp::recv", "{line}"),
                 // The ACP adapter logs `Unexpected case: {...}` to stderr (via its
-                // `unreachable` fallback) for any stream message subtype it lacks an
+                // `unreachable` fallback) for any stream message type it lacks an
                 // explicit case for. We capture every adapter stderr line and surface
-                // it as a WARN — but `thinking_tokens` is a benign, informational token
-                // estimate from a newer CLI than the adapter; treating it as "known,
-                // no-op" here keeps the warning channel meaningful for real issues.
+                // it as a WARN — but a newer `claude` CLI than the adapter emits
+                // benign, informational message types the adapter simply hasn't caught
+                // up to (verified absent even in the latest adapter release), so its
+                // `default` arm shouts about them. These carry no ACP-relevant state;
+                // demoting the known ones to `trace` keeps the WARN channel meaningful
+                // for real issues:
+                //   - `thinking_tokens`   — token-estimate updates
+                //   - `command_lifecycle` — command queued/started/completed pings
+                // The real fix is upstream (a no-op `break` case in the adapter's
+                // switch); revisit this list when bumping the pinned adapter.
                 acp::LineDirection::Stderr
-                    if line.contains("Unexpected case") && line.contains("thinking_tokens") =>
+                    if line.contains("Unexpected case")
+                        && (line.contains("thinking_tokens")
+                            || line.contains("command_lifecycle")) =>
                 {
                     tracing::trace!(target: "acp::stderr", "{line}")
                 }
