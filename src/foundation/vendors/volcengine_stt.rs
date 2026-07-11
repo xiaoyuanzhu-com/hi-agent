@@ -225,7 +225,7 @@ async fn transcribe_inner(cfg: &Config, audio: Bytes, mime: &str) -> anyhow::Res
 
     // 1. FULL_CLIENT_REQUEST — JSON config. Request utterances + speaker
     //    clustering when configured so a multi-speaker clip comes back labeled.
-    tx.send(Message::Binary(config_frame(cfg, cfg.speaker_info, cfg.speaker_info)?)).await?;
+    tx.send(Message::binary(config_frame(cfg, cfg.speaker_info, cfg.speaker_info)?)).await?;
 
     // 2. Audio chunks.
     let mut offset = 0;
@@ -233,7 +233,7 @@ async fn transcribe_inner(cfg: &Config, audio: Bytes, mime: &str) -> anyhow::Res
         let end = (offset + PCM_CHUNK_BYTES).min(pcm.len());
         let is_last = end == pcm.len();
         let flags = if is_last { FLAG_LAST_CHUNK } else { 0 };
-        tx.send(Message::Binary(frame(
+        tx.send(Message::binary(frame(
             MSG_TYPE_AUDIO_ONLY,
             flags,
             SER_RAW,
@@ -246,7 +246,7 @@ async fn transcribe_inner(cfg: &Config, audio: Bytes, mime: &str) -> anyhow::Res
     // ends — done as part of the last chunk above if it had data, but if
     // pcm was empty we still need to terminate.
     if pcm.is_empty() {
-        tx.send(Message::Binary(frame(
+        tx.send(Message::binary(frame(
             MSG_TYPE_AUDIO_ONLY,
             FLAG_LAST_CHUNK,
             SER_RAW,
@@ -356,7 +356,7 @@ pub async fn transcribe_streaming(
     // keeps returning low-latency 逐字 partials (the barge-in trigger), while a
     // non-streaming second pass re-recognizes each VAD-cut segment and tags it
     // with `speaker_id`. So diarization here does NOT cost the live partials.
-    tx.send(Message::Binary(config_frame(cfg, true, cfg.speaker_info)?)).await?;
+    tx.send(Message::binary(config_frame(cfg, true, cfg.speaker_info)?)).await?;
 
     // Sender task: stream PCM chunks until the input closes, then mark the
     // last chunk so the upstream finalizes.
@@ -365,7 +365,7 @@ pub async fn transcribe_streaming(
             let mut offset = 0;
             while offset < chunk.len() {
                 let end = (offset + PCM_CHUNK_BYTES).min(chunk.len());
-                tx.send(Message::Binary(frame(
+                tx.send(Message::binary(frame(
                     MSG_TYPE_AUDIO_ONLY,
                     0,
                     SER_RAW,
@@ -375,7 +375,7 @@ pub async fn transcribe_streaming(
                 offset = end;
             }
         }
-        tx.send(Message::Binary(frame(MSG_TYPE_AUDIO_ONLY, FLAG_LAST_CHUNK, SER_RAW, &[])))
+        tx.send(Message::binary(frame(MSG_TYPE_AUDIO_ONLY, FLAG_LAST_CHUNK, SER_RAW, &[])))
             .await?;
         anyhow::Ok(())
     });

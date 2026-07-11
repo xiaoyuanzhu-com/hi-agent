@@ -165,7 +165,7 @@ pub async fn start(cfg: &Config) -> anyhow::Result<TtsStream> {
 
     // Handshake before returning, so `start()` only resolves once the
     // session can accept text and a connect failure surfaces to the caller.
-    tx.send(Message::Binary(frame(
+    tx.send(Message::binary(frame(
         MSG_TYPE_FULL_CLIENT,
         SER_JSON,
         EV_START_CONNECTION,
@@ -182,7 +182,7 @@ pub async fn start(cfg: &Config) -> anyhow::Result<TtsStream> {
             "audio_params": audio_params,
         },
     });
-    tx.send(Message::Binary(frame(
+    tx.send(Message::binary(frame(
         MSG_TYPE_FULL_CLIENT,
         SER_JSON,
         EV_START_SESSION,
@@ -260,7 +260,7 @@ async fn drive_session<Tx, Rx>(
                             match serde_json::to_vec(&task_payload) {
                                 Ok(buf) => {
                                     let f = frame(MSG_TYPE_FULL_CLIENT, SER_JSON, EV_TASK_REQUEST, Some(&session_id), &buf);
-                                    if tx.send(Message::Binary(f)).await.is_err() {
+                                    if tx.send(Message::binary(f)).await.is_err() {
                                         return Flow::Break;
                                     }
                                 }
@@ -272,7 +272,7 @@ async fn drive_session<Tx, Rx>(
                             // End of input — flush and wait for the server to finish.
                             text_done = true;
                             let f = frame(MSG_TYPE_FULL_CLIENT, SER_JSON, EV_FINISH_SESSION, Some(&session_id), b"{}");
-                            let _ = tx.send(Message::Binary(f)).await;
+                            let _ = tx.send(Message::binary(f)).await;
                             Flow::Continue
                         }
                     }
@@ -302,7 +302,7 @@ async fn drive_session<Tx, Rx>(
 
     // Best-effort teardown; ignore failures, the audio is already delivered.
     let _ = tx
-        .send(Message::Binary(frame(
+        .send(Message::binary(frame(
             MSG_TYPE_FULL_CLIENT,
             SER_JSON,
             EV_FINISH_CONNECTION,

@@ -15,7 +15,7 @@
 use std::path::PathBuf;
 use std::sync::Arc;
 
-use agent_client_protocol::schema::{HttpHeader, McpServer, McpServerHttp};
+use agent_client_protocol::schema::v1::{HttpHeader, McpServer, McpServerHttp};
 
 use crate::foundation::acp::{AcpProcess, AcpSession, AcpTap, ProcessRegistry, SessionOpts};
 use crate::foundation::config::{AgentConfig, HEADER_ROLE, HEADER_SCENE, HEADER_WORKER_ID};

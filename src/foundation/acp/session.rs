@@ -3,7 +3,7 @@
 use std::sync::Arc;
 
 use agent_client_protocol as acp;
-use acp::schema::{
+use acp::schema::v1::{
     self as acp_schema, CancelNotification, ContentBlock, PromptRequest, PromptResponse,
     SessionId, StopReason, TextContent,
 };

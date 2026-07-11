@@ -277,8 +277,8 @@ async fn vision_get_streams_camera_video() {
     let (mut ws, _) = tokio_tungstenite::connect_async(ws_url).await.expect("ws connect");
     let init = vec![0x1A, 0x45, 0xDF, 0xA3]; // EBML magic — stands in for the init segment
     let frame = vec![0x42u8, 0x82, 0x88];
-    ws.send(Message::Binary(init.clone())).await.expect("send init");
-    ws.send(Message::Binary(frame.clone())).await.expect("send frame");
+    ws.send(Message::binary(init.clone())).await.expect("send init");
+    ws.send(Message::binary(frame.clone())).await.expect("send frame");
     // Give the frames time to fan out to the GET body before closing the source.
     tokio::time::sleep(Duration::from_millis(80)).await;
     ws.close(None).await.expect("close ws");

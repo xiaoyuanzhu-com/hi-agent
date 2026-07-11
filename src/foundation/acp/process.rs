@@ -20,8 +20,9 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
 use agent_client_protocol as acp;
-use acp::schema::{
-    InitializeRequest, McpServer, NewSessionRequest, ProtocolVersion, RequestPermissionRequest,
+use acp::schema::ProtocolVersion;
+use acp::schema::v1::{
+    InitializeRequest, McpServer, NewSessionRequest, RequestPermissionRequest,
     RequestPermissionResponse, RequestPermissionOutcome, SelectedPermissionOutcome, SessionId,
     SessionNotification,
 };
@@ -346,7 +347,7 @@ fn auto_allow(
     request: RequestPermissionRequest,
     responder: acp::Responder<RequestPermissionResponse>,
 ) {
-    use acp::schema::PermissionOptionKind as K;
+    use acp::schema::v1::PermissionOptionKind as K;
     let pick = request
         .options
         .iter()

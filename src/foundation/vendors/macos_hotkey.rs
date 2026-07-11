@@ -25,7 +25,8 @@ use std::cell::Cell;
 use anyhow::anyhow;
 use core_foundation::runloop::{kCFRunLoopCommonModes, CFRunLoop};
 use core_graphics::event::{
-    CGEventTap, CGEventTapLocation, CGEventTapOptions, CGEventTapPlacement, CGEventType,
+    CallbackResult, CGEventTap, CGEventTapLocation, CGEventTapOptions, CGEventTapPlacement,
+    CGEventType,
 };
 
 use crate::body::capabilities::hotkey::Edge;
@@ -49,7 +50,12 @@ pub fn run(on_edge: impl Fn(Edge) + 'static) -> anyhow::Result<()> {
     let cmd_held = Cell::new(false);
 
     let current = CFRunLoop::get_current();
-    let tap = CGEventTap::new(
+    // SAFETY: core-graphics 0.25's safe `new` requires the callback be `Send +
+    // 'static`, but ours borrows non-Send thread-local state (`cmd_held`, `on_edge`).
+    // `new_unchecked`'s contract is satisfied instead: this tap is installed only on
+    // the current thread's run loop (below) and never handed elsewhere, so the
+    // callback is only ever invoked on this thread.
+    let tap = unsafe { CGEventTap::new_unchecked(
         CGEventTapLocation::HID,
         CGEventTapPlacement::HeadInsertEventTap,
         CGEventTapOptions::ListenOnly,
@@ -72,16 +78,16 @@ pub fn run(on_edge: impl Fn(Edge) + 'static) -> anyhow::Result<()> {
                 _ => {}
             }
             // ListenOnly: the return is ignored; pass the event through untouched.
-            None
+            CallbackResult::Keep
         },
-    )
+    ) }
     .map_err(|()| {
         anyhow!("could not create event tap (Accessibility / Input Monitoring permission?)")
     })?;
 
     unsafe {
         let source = tap
-            .mach_port
+            .mach_port()
             .create_runloop_source(0)
             .map_err(|()| anyhow!("could not create run-loop source for the event tap"))?;
         current.add_source(&source, kCFRunLoopCommonModes);

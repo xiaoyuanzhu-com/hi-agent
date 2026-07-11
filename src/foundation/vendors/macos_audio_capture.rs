@@ -81,26 +81,26 @@ fn build_stream(frame_tx: mpsc::Sender<Bytes>) -> anyhow::Result<cpal::Stream> {
     let supported = device.default_input_config().context("no default input config")?;
     let sample_format = supported.sample_format();
     let config: cpal::StreamConfig = supported.into();
-    let in_rate = config.sample_rate.0 as f64;
+    let in_rate = config.sample_rate as f64;
     let channels = config.channels as usize;
     let mut rs = Resampler::new(in_rate, channels);
     let err_fn = |e| tracing::warn!(error = %e, "mic capture stream error");
 
     let stream = match sample_format {
         SampleFormat::F32 => device.build_input_stream(
-            &config,
+            config.clone(),
             move |data: &[f32], _: &_| rs.push(data, &frame_tx),
             err_fn,
             None,
         )?,
         SampleFormat::I16 => device.build_input_stream(
-            &config,
+            config.clone(),
             move |data: &[i16], _: &_| rs.push(data, &frame_tx),
             err_fn,
             None,
         )?,
         SampleFormat::U16 => device.build_input_stream(
-            &config,
+            config.clone(),
             move |data: &[u16], _: &_| rs.push(data, &frame_tx),
             err_fn,
             None,

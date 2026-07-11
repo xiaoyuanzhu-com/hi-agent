@@ -34,7 +34,7 @@ rust-embed = "8"
 # ACP client. Bumped 0.12 -> 1.x (2026-07); this crossed a major, so the
 # session/notification surface in src/foundation/acp/ likely needs an audit.
 # Kept in lockstep with the node adapters in src/runtime/package.json.
-agent-client-protocol = { version = "1.2", features = ["unstable_session_usage"] }
+agent-client-protocol = { version = "1.2", features = ["unstable_end_turn_token_usage"] }
 
 # Voice capabilities (Step 11): HTTP client for STT/TTS providers and helpers
 # for the audio bytes flowing through them. `bytes` is also re-exported via
@@ -69,12 +69,13 @@ time = "0.3"
 # exactly CAM++'s front-end (16 kHz, 80 mel bins, no dither, per-utterance CMN),
 # so features bit-match training. `image` decodes frames; `nalgebra` solves the
 # 5-point similarity transform that aligns a face crop before EdgeFace.
-# `ndarray` WAS pinned to 0.16 to match knf-rs's return type. Bumped to 0.17 in
-# the 2026-07 sweep while knf-rs stayed 0.3.2 — if knf-rs still returns an
-# ndarray 0.16 `Array`, this reintroduces a two-version-of-ndarray mismatch at
-# the knf-rs boundary (src/**/voiceprint). Watch that seam first if it breaks.
+# `ndarray` is pinned to 0.16 to match knf-rs 0.3.2's return type — the 2026-07
+# sweep's bump to 0.17 reintroduced a two-versions-of-ndarray mismatch at the
+# knf-rs boundary (`compute_fbank` returns an ndarray 0.16 `Array2`), so we hold
+# it here until knf-rs itself moves to 0.17. campplus only touches `.dim()` and
+# `.into_raw_vec_and_offset()`, both of which exist in 0.16.
 ort = "2.0.0-rc.12"
-ndarray = "0.17"
+ndarray = "0.16"
 image = "0.25"
 knf-rs = "0.3.2"
 nalgebra = "0.35"
