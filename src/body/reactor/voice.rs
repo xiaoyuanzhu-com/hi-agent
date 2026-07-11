@@ -17,18 +17,13 @@ use crate::foundation::vendors::anthropic_messages::{self, Turn};
 /// call cannot inherit). Without this the reactor would go mute on such a config.
 const DEFAULT_FAST_MODEL: &str = "claude-haiku-4-5-20251001";
 
-/// Prototype toggle for the reactor split. **Env-gated and default off**, so the
-/// agentic path is byte-for-byte unchanged unless a developer opts in for
-/// measurement (`HI_AGENT_REACTOR_SPLIT=1`). To be promoted to a config-store
-/// tunable once the split is validated on a real box. (An env flag is deliberately
-/// temporary — the project otherwise keeps tunables in the config store.)
+/// Whether the reactor split (the fast, non-agentic direct-Messages voice) is active.
+/// **Split is now the default** — the `HI_AGENT_REACTOR_SPLIT` env flag is retired.
+/// Kept as a single seam (rather than deleting the call sites) so the legacy
+/// ACP-reactor-session path stays compiled and reachable-in-source until it's removed
+/// in a follow-up cleanup; the callers below decide the behaviour off this one bool.
 pub(super) fn split_enabled() -> bool {
-    std::env::var("HI_AGENT_REACTOR_SPLIT")
-        .map(|v| {
-            let v = v.trim();
-            !v.is_empty() && v != "0" && !v.eq_ignore_ascii_case("false")
-        })
-        .unwrap_or(false)
+    true
 }
 
 /// Build the Messages config for the reactor's fast voice from the resolved upstream
