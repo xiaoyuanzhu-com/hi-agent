@@ -22,7 +22,7 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
-thiserror = "1"
+thiserror = "2"
 anyhow = "1"
 clap = { version = "4", features = ["derive"] }
 dotenvy = "0.15"
@@ -31,16 +31,17 @@ chrono = { version = "0.4", features = ["serde"] }
 futures = "0.3"
 async-trait = "0.1"
 rust-embed = "8"
-# ACP client. 0.12 is the line current as of early 2026; this is the published
-# API used in Step 2. If a 0.13 lands with a breaking surface, audit src/acp/.
-agent-client-protocol = { version = "0.12", features = ["unstable_session_usage"] }
+# ACP client. Bumped 0.12 -> 1.x (2026-07); this crossed a major, so the
+# session/notification surface in src/foundation/acp/ likely needs an audit.
+# Kept in lockstep with the node adapters in src/runtime/package.json.
+agent-client-protocol = { version = "1.2", features = ["unstable_session_usage"] }
 
 # Voice capabilities (Step 11): HTTP client for STT/TTS providers and helpers
 # for the audio bytes flowing through them. `bytes` is also re-exported via
 # `Bytes` in axum extractors; keeping it explicit makes the voice traits
 # legible without depending on a particular axum version.
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls", "stream"] }
-tokio-tungstenite = { version = "0.24", default-features = false, features = ["rustls-tls-webpki-roots", "connect"] }
+tokio-tungstenite = { version = "0.29", default-features = false, features = ["rustls-tls-webpki-roots", "connect"] }
 bytes = "1"
 base64 = "0.22"
 
@@ -48,7 +49,7 @@ base64 = "0.22"
 # renderer; default features off to skip the PNG/`image` renderer (we emit SVG).
 qrcode = { version = "0.14", default-features = false, features = ["svg"] }
 
-directories = "5"
+directories = "6"
 
 # Browser login gate (optional; only active with HI_AGENT_AUTH=on). hi-agent is
 # an OIDC relying party to an external IdP — in the intended deployment, the
@@ -58,7 +59,7 @@ directories = "5"
 # cookie; `time` is the `cookie` crate's duration type, named here for max-age.
 # rustls only (no native-tls/openssl), matching the rest of the tree.
 openidconnect = { version = "4", default-features = false, features = ["reqwest", "rustls-tls"] }
-axum-extra = { version = "0.10", features = ["cookie", "cookie-private"] }
+axum-extra = { version = "0.12", features = ["cookie", "cookie-private"] }
 time = "0.3"
 
 # Local ONNX capabilities (voiceprint, face): on-device inference, no network.
@@ -68,12 +69,15 @@ time = "0.3"
 # exactly CAM++'s front-end (16 kHz, 80 mel bins, no dither, per-utterance CMN),
 # so features bit-match training. `image` decodes frames; `nalgebra` solves the
 # 5-point similarity transform that aligns a face crop before EdgeFace.
-# `ndarray` is pinned to 0.16 to match knf-rs's return type (ort uses its own).
+# `ndarray` WAS pinned to 0.16 to match knf-rs's return type. Bumped to 0.17 in
+# the 2026-07 sweep while knf-rs stayed 0.3.2 — if knf-rs still returns an
+# ndarray 0.16 `Array`, this reintroduces a two-version-of-ndarray mismatch at
+# the knf-rs boundary (src/**/voiceprint). Watch that seam first if it breaks.
 ort = "2.0.0-rc.12"
-ndarray = "0.16"
+ndarray = "0.17"
 image = "0.25"
 knf-rs = "0.3.2"
-nalgebra = "0.33"
+nalgebra = "0.35"
 
 # Integrity check for the auto-provisioned ONNX models (see `crate::models`):
 # the recognition models are fetched on first run from third-party mirrors, so
@@ -86,14 +90,14 @@ sha2 = "0.10"
 # source — no system libsqlite3, consistent with the bundled-desktop
 # distribution goal. Only app-managed config lives here; the agent's own data
 # (memory journal, `.env`, claude-config) stays on the filesystem.
-rusqlite = { version = "0.32", features = ["bundled"] }
+rusqlite = { version = "0.40", features = ["bundled"] }
 
 # macOS effector capabilities (input actuation + window capture). `core-graphics`
 # gives CGEvent (synthesize mouse/keyboard input) and CGWindowList (enumerate
 # on-screen windows); `core-foundation` reads the CFDictionary window records.
 # Target-gated so the Linux dev box and the Docker image skip them entirely.
 [target.'cfg(target_os = "macos")'.dependencies]
-core-graphics = "0.24"
+core-graphics = "0.25"
 core-foundation = "0.10"
 # posix_spawn + the private responsibility_spawnattrs_setdisclaim, used by main() to
 # re-exec ourselves as our own TCC "responsible process" under `make dev` (see the
@@ -172,7 +176,7 @@ block2 = "0.6"
 # (`crate::vendors::macos_audio_capture`): opens the default input device and yields
 # the 16 kHz mono 16-bit PCM the audio pipeline expects, so the gesture can listen
 # with no browser page open. Target-gated like the other desktop capabilities.
-cpal = "0.15"
+cpal = "0.18"
 
 [dev-dependencies]
 # tempfile is used by integration tests for throwaway data dirs.

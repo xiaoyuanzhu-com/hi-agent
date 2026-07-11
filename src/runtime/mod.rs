@@ -148,7 +148,7 @@ fn gc_stale_runtimes(current: &Path) {
 /// in `src/runtime/package.json` — the managed adapter install carries the same
 /// one; this is the version we install standalone when the runtime came from the
 /// system PATH (and so has no adapter-adjacent esbuild).
-const ESBUILD_VERSION: &str = "0.28.0";
+const ESBUILD_VERSION: &str = "0.28.1";
 
 /// Resolve an esbuild native binary for the view compiler, guaranteeing one
 /// exists regardless of where the runtime came from. esbuild is *hi-agent's* own

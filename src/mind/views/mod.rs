@@ -161,7 +161,7 @@ mod tests {
             // when the runtime comes from PATH).
             cache
                 .join("view-tool")
-                .join(format!("esbuild-0.28.0-{platform}"))
+                .join(format!("esbuild-0.28.1-{platform}"))
                 .join("node_modules/@esbuild")
                 .join(&platform)
                 .join("bin/esbuild"),
