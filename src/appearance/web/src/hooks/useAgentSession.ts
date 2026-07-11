@@ -498,7 +498,15 @@ export function useAgentSession(): AgentSession {
     const superseded = () => micGenRef.current !== gen;
     try {
       const stream = await navigator.mediaDevices.getUserMedia({
-        audio: { channelCount: 1, echoCancellation: true, noiseSuppression: true },
+        // AEC + noise-suppression are disabled deliberately: WebKit runs both in
+        // the "Graphics and Media" (media) process, and the echo canceller — which
+        // engages whenever capture and playback run together (mic + speaker on) —
+        // pegged a full CPU core there. STT/endpointing is server-side and robust,
+        // so browser NS is redundant. Must be explicit `false`: the platform
+        // default for both is `true`, so omitting them would NOT disable them.
+        // Trade-off: with AEC off the open mic can hear the agent's own TTS and
+        // re-transcribe it — gate mic upload while `voice.isPlaying()` if that bites.
+        audio: { channelCount: 1, echoCancellation: false, noiseSuppression: false },
       });
       if (superseded()) {
         stream.getTracks().forEach((t) => t.stop());
