@@ -1405,6 +1405,11 @@ async fn per_scene_loop(
     // wake — time passing — on top of an incoming signal; see the `select!` below.
     let mut alarms = Alarms::new();
 
+    // Announce the loop and whether split mode is active, so a silent scene is
+    // immediately explained: split=false means the flag never reached the process, so
+    // the ACP reactor session + its warm-up run (and can block the loop) as before.
+    tracing::info!(scene = %scene, split = voice::split_enabled(), "reactor per-scene loop up");
+
     // Warm-up: this loop was just stood up (a scene-presence GET, or the first
     // utterance). Pull the cold-start forward now — spawn the subprocess, open the
     // persistent ACP session, and pre-send the system prompt to warm the backend —
