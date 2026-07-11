@@ -12,6 +12,11 @@
 use crate::foundation::config::{AgentConfig, LlmWire};
 use crate::foundation::vendors::anthropic_messages::{self, Turn};
 
+/// Fallback fast model when the config leaves both the small slot and the main model
+/// unset (i.e. it relies on the ACP adapter's own default, which a *direct* Messages
+/// call cannot inherit). Without this the reactor would go mute on such a config.
+const DEFAULT_FAST_MODEL: &str = "claude-haiku-4-5-20251001";
+
 /// Prototype toggle for the reactor split. **Env-gated and default off**, so the
 /// agentic path is byte-for-byte unchanged unless a developer opts in for
 /// measurement (`HI_AGENT_REACTOR_SPLIT=1`). To be promoted to a config-store
@@ -37,13 +42,15 @@ pub(super) fn config_from(cfg: &AgentConfig) -> anyhow::Result<anthropic_message
             cfg.wire
         );
     }
+    // Prefer the small/fast slot, then the main model; if the config carries neither
+    // (leaving ANTHROPIC_MODEL to the adapter default), fall back to a known fast model
+    // rather than failing — a direct call has no adapter default to inherit.
     let model = cfg
         .small
         .clone()
         .or_else(|| cfg.model.clone())
-        .ok_or_else(|| {
-            anyhow::anyhow!("reactor voice: no model configured (small and model both unset)")
-        })?;
+        .unwrap_or_else(|| DEFAULT_FAST_MODEL.to_string());
+    tracing::info!(model = %model, base = %cfg.upstream_base_url, "reactor voice: resolved wire");
     anthropic_messages::Config::new(&cfg.upstream_key, Some(cfg.upstream_base_url.as_str()), &model)
 }
 

@@ -1996,7 +1996,13 @@ async fn run_reactor_turn(
     let system = crate::identity::reactor_system_prompt();
     let agent_cfg =
         crate::foundation::config::AgentConfig::resolve(reactor.inner.memory.data_dir());
-    let msg_cfg = voice::config_from(&agent_cfg)?;
+    let msg_cfg = match voice::config_from(&agent_cfg) {
+        Ok(c) => c,
+        Err(e) => {
+            tracing::warn!(scene = %scene, error = %e, "reactor voice: cannot configure; turn is mute");
+            return Err(e);
+        }
+    };
 
     let presence_note = format!("## Presence\n{}", reactor.inner.presence.render(scene));
     let interrupted = reactor
@@ -2046,11 +2052,13 @@ async fn run_reactor_turn(
         // alive across worker reports (they only spill to carryover); break on
         // completion, error, or a human burst. Boxing makes the future Unpin, so it
         // can be re-polled in the select and awaited directly.
+        tracing::info!(scene = %scene, ctx_chars = context.chars().count(), "reactor voice: calling model");
         let mut speak_fut = Box::pin(voice::speak(&msg_cfg, &system, &context));
         let step = loop {
             tokio::select! {
                 res = &mut speak_fut => break match res {
                     Ok(text) => {
+                        tracing::info!(scene = %scene, reply_chars = text.chars().count(), "reactor voice: replied");
                         if !text.trim().is_empty() {
                             let _ = beats.send(sequencer::Beat::Say(text)).await;
                         }
@@ -2160,6 +2168,7 @@ async fn run_turn(
     // direct Messages call, no ACP session or tools. Default off, so the agentic path
     // below is unchanged. See docs/reactor-cognition-split.md.
     if voice::split_enabled() {
+        tracing::info!(scene = %scene, inputs = batch.len(), "split mode: reactor voice turn");
         return run_reactor_turn(reactor, scene, batch, workers, beats, inbound, carryover).await;
     }
 
