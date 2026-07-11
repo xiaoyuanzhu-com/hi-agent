@@ -2047,12 +2047,22 @@ async fn run_reactor_turn(
     tracing::info!(scene = %scene, ctx_chars = context.chars().count(), "reactor voice: prompting session");
     let _ = beats.send(sequencer::Beat::TurnStart { turn: turn_id }).await;
 
-    let spoke = match drive_voice(&session, context).await {
-        Ok(text) => {
+    let spoke = match drive_voice(&session, scene, context).await {
+        Ok(Voiced::Text(text)) => {
             tracing::info!(scene = %scene, reply_chars = text.chars().count(), "reactor voice: replied");
             if !text.trim().is_empty() {
                 let _ = beats.send(sequencer::Beat::Say(text)).await;
             }
+            true
+        }
+        Ok(Voiced::ToolAttempt(text)) => {
+            // The voice reached for a tool (it must not). Say whatever it managed first,
+            // then discard the now-wedged session (it holds an orphaned in-flight prompt);
+            // cognition does the actual work. This keeps a tool attempt from stalling.
+            if !text.trim().is_empty() {
+                let _ = beats.send(sequencer::Beat::Say(text)).await;
+            }
+            *reactor_session = None;
             true
         }
         Err(err) => {
@@ -2125,13 +2135,48 @@ async fn open_reactor_voice_session(reactor: &Reactor, scene: &Scene) -> anyhow:
     Ok(session)
 }
 
-/// Prompt the tools-off voice session and return its spoken text. `wait()` drains the
-/// stream, concatenating every `agent_message_chunk` into `PromptResult::text` — the
-/// words to speak. With no tools there is nothing to loop on, so this is one round-trip.
-async fn drive_voice(session: &AcpSession, context: String) -> anyhow::Result<String> {
-    let run = session.prompt(context).await?;
+/// Outcome of driving the tools-off voice session.
+enum Voiced {
+    /// The turn finished cleanly; carries the spoken text.
+    Text(String),
+    /// The model reached for a tool (which the voice must never do). We abandon the turn
+    /// rather than let the tool call stall it, carrying whatever was spoken before the
+    /// call. The caller must **discard** the session — we did not `wait()` it out, so it
+    /// now holds an orphaned in-flight prompt.
+    ToolAttempt(String),
+}
+
+/// Prompt the tools-off voice session and return its spoken text, streaming the updates
+/// **with logging** so a stall names itself. The CLI's built-in tools are still
+/// reachable, so the model *can* emit a `tool_call` despite having no host tools — the
+/// most likely stall — so we log it and bail ([`Voiced::ToolAttempt`]) rather than wait
+/// on it. Otherwise `wait()` parks the session and surfaces any real prompt error.
+async fn drive_voice(session: &AcpSession, scene: &Scene, context: String) -> anyhow::Result<Voiced> {
+    let mut run = session.prompt(context).await?;
+    let mut text = String::new();
+    while let Some(update) = run.next_update().await {
+        match update {
+            SessionUpdate::Text(t) => text.push_str(&t),
+            SessionUpdate::Thought(t) => {
+                tracing::info!(scene = %scene, chars = t.chars().count(), "reactor voice: model is thinking");
+            }
+            SessionUpdate::ToolCall(stub) => {
+                tracing::warn!(scene = %scene, variant = stub.raw_variant, "reactor voice: model invoked a TOOL — abandoning the turn (the voice is tools-off) so it cannot stall");
+                return Ok(Voiced::ToolAttempt(text));
+            }
+            SessionUpdate::Other(what) => {
+                tracing::debug!(scene = %scene, what = %what, "reactor voice: other update");
+            }
+        }
+    }
     let result = run.wait().await?;
-    Ok(result.text)
+    tracing::info!(
+        scene = %scene,
+        stop = ?result.stop_reason,
+        reply_chars = text.chars().count(),
+        "reactor voice: turn complete"
+    );
+    Ok(Voiced::Text(text))
 }
 
 async fn run_turn(
