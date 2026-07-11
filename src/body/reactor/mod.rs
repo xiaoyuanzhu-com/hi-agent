@@ -77,6 +77,7 @@ use tokio::time::{Instant, sleep_until, timeout};
 use crate::foundation::acp::{AcpSession, SessionOpts, SessionUpdate};
 use crate::foundation::agent::{AgentLayer, SessionRole};
 use crate::foundation::config;
+use crate::foundation::shutdown::Shutdown;
 use crate::mind::memory::{Memory, build_for_scene};
 use crate::foundation::observatory::{EventKind, Observatory, SessionKind};
 use crate::types::{Channel, Geometry, JournalEntry, Origin, Scene, Signal, ViewEnvelope, ViewOp};
@@ -859,6 +860,13 @@ struct ReactorInner {
     /// that goes active after a long quiet doesn't wait out the backed-off gap
     /// before its first pass — the loop re-derives its deadline on every notify.
     reflect_wake: tokio::sync::Notify,
+    /// Process-wide shutdown signal, triggered by [`crate::run_with_shutdown`] the
+    /// moment a SIGINT/SIGTERM or the tray's Quit is observed. Read by every scene
+    /// loop, the reflection loop, and the drive retry path so that, once shutdown
+    /// begins, an idle loop winds down promptly and a failed prompt does **not**
+    /// restart an ACP session — the children just received the same signal, and a
+    /// respawn here would race the subprocess reap and could orphan a child.
+    shutdown: Shutdown,
 }
 
 struct SceneHandle {
@@ -878,6 +886,7 @@ pub fn start(
     interrupts: InterruptRegistry,
     presence: crate::body::presence::Presence,
     views_dir: PathBuf,
+    shutdown: Shutdown,
 ) -> Reactor {
     let reactor = Reactor {
         inner: Arc::new(ReactorInner {
@@ -896,6 +905,7 @@ pub fn start(
             vendor: Arc::new(Vendor::new(vendor_down_after(), backoff_base())),
             last_signal_at: std::sync::Mutex::new(Instant::now()),
             reflect_wake: tokio::sync::Notify::new(),
+            shutdown,
         }),
     };
     let dispatch_reactor = reactor.clone();
@@ -1038,10 +1048,22 @@ async fn consolidated_reflection_loop(reactor: Reactor) {
         if at > now {
             // Sleep until due, but wake early if fresh input lands — then re-loop to
             // recompute the deadline (which only actually fires once it's past).
+            // Shutdown ends the loop rather than starting a doomed "sleep" pass.
             tokio::select! {
                 _ = tokio::time::sleep(at.saturating_duration_since(now)) => {}
                 _ = reactor.inner.reflect_wake.notified() => continue,
+                _ = reactor.inner.shutdown.cancelled() => {
+                    tracing::info!("shutdown requested; ending consolidated reflection loop");
+                    return;
+                }
             }
+        }
+
+        // Shutdown may have arrived without the sleep above (deadline already past):
+        // don't open a reflection subprocess into a dying process group.
+        if reactor.inner.shutdown.is_triggered() {
+            tracing::info!("shutdown requested; ending consolidated reflection loop");
+            return;
         }
 
         // Due. Adapt the backoff against the *old* anchor before re-anchoring: fresh
@@ -1198,6 +1220,8 @@ enum Woke {
     Inbound(Option<LoopInput>),
     Control(Option<SceneControl>),
     Timer,
+    /// Process shutdown began while this loop was idle — stop waiting and exit.
+    Shutdown,
 }
 
 /// Why one reorganization pass's prompt drive ended. A pass runs one
@@ -1352,10 +1376,12 @@ async fn per_scene_loop(
                     recvd = inbound.recv() => Woke::Inbound(recvd),
                     ctl = control.recv() => Woke::Control(ctl),
                     _ = sleep_until(deadline) => Woke::Timer,
+                    _ = reactor.inner.shutdown.cancelled() => Woke::Shutdown,
                 },
                 None => tokio::select! {
                     recvd = inbound.recv() => Woke::Inbound(recvd),
                     ctl = control.recv() => Woke::Control(ctl),
+                    _ = reactor.inner.shutdown.cancelled() => Woke::Shutdown,
                 },
             };
             match woke {
@@ -1370,6 +1396,10 @@ async fn per_scene_loop(
                 }
                 Woke::Inbound(None) => {
                     tracing::info!(scene = %scene, "per-scene inbound closed; exiting loop");
+                    return;
+                }
+                Woke::Shutdown => {
+                    tracing::info!(scene = %scene, "shutdown requested; exiting per-scene loop");
                     return;
                 }
                 // The keepalive sender means this is effectively unreachable; treat
@@ -2110,6 +2140,14 @@ async fn run_turn(
                     // Discard the possibly-wedged session so the next attempt
                     // restarts from cold and rebuilds context from the snapshot.
                     discard_reactor_session(reactor, scene, reactor_session, seeded, budget).await;
+                    // Shutdown in progress: the children just took the same SIGINT/
+                    // SIGTERM this failure reflects. Don't respawn — a fresh session
+                    // opened now would race the ACP reap and could orphan a child.
+                    // Surface the failure and let the loop wind down.
+                    if reactor.inner.shutdown.is_triggered() {
+                        tracing::debug!(scene = %scene, "prompt failed during shutdown; not restarting");
+                        break Err(err);
+                    }
                     // A 402/429 is definite for this turn: retrying on a fresh session
                     // within a few hundred ms cannot succeed (the budget won't refill;
                     // the throttle won't lift). Surface it now and let the terminal

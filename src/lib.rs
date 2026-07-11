@@ -311,6 +311,10 @@ async fn run_with_shutdown(config: Config, shutdown: Arc<Notify>) -> anyhow::Res
         .await
         .context("resolving esbuild for the view compiler")?;
     let view_compiler = mind::views::ViewCompiler::new(esbuild_bin, &config.data_dir);
+    // The reactor's shutdown signal: triggered below the moment a signal / Quit is
+    // observed, so its scene loops, reflection, and drive retries wind down instead
+    // of restarting ACP sessions into a process group that's already terminating.
+    let reactor_shutdown = foundation::shutdown::Shutdown::new();
     let _reactor = body::reactor::start(
         memory,
         agent,
@@ -324,6 +328,7 @@ async fn run_with_shutdown(config: Config, shutdown: Arc<Notify>) -> anyhow::Res
         interrupts,
         presence,
         views_dir,
+        reactor_shutdown.clone(),
     );
     tracing::info!("reactor started");
 
@@ -380,6 +385,10 @@ async fn run_with_shutdown(config: Config, shutdown: Arc<Notify>) -> anyhow::Res
             Err(e) => tracing::error!(error = %e, "HTTP server task panicked"),
         },
         _ = shutdown_requested(shutdown.clone()) => {
+            // Quiesce the reactor *first*, before the drain: for the whole drain
+            // window it must not restart a session or open a reflection pass, or a
+            // freshly spawned child would race the ACP reap below and outlive us.
+            reactor_shutdown.trigger();
             tracing::info!(grace = ?SHUTDOWN_GRACE, "shutdown requested; draining in-flight requests");
             match tokio::time::timeout(SHUTDOWN_GRACE, &mut server).await {
                 Ok(Ok(Ok(()))) => tracing::info!("HTTP server drained cleanly"),
@@ -392,6 +401,11 @@ async fn run_with_shutdown(config: Config, shutdown: Arc<Notify>) -> anyhow::Res
             }
         }
     }
+
+    // Also quiesce the reactor if we got here via the server task ending on its own
+    // (an HTTP error, not a signal) — idempotent, and it stops the reactor from
+    // respawning sessions while we reap. No-op on the shutdown path (already fired).
+    reactor_shutdown.trigger();
 
     // Reap every ACP subprocess (one `node` + `claude` per live session) so none
     // are orphaned. Bounded so a stuck child can't hang exit.

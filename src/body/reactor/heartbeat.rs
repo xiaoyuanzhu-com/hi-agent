@@ -206,7 +206,14 @@ struct SceneFrontier {
 /// unconsolidated signal to be worth a session.
 pub(super) async fn consolidate(reactor: &Reactor, scenes: &[Scene]) {
     if let Err(err) = run_consolidation(reactor, scenes).await {
-        tracing::warn!(error = %err, "consolidation failed");
+        // A pass already in flight when shutdown began fails because its child took
+        // the process group's signal — expected, not a fault. Keep it out of the
+        // WARN stream so a real consolidation failure stays visible.
+        if reactor.inner.shutdown.is_triggered() {
+            tracing::debug!(error = %err, "consolidation aborted by shutdown");
+        } else {
+            tracing::warn!(error = %err, "consolidation failed");
+        }
     }
 }
 
