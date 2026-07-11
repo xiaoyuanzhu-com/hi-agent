@@ -327,33 +327,12 @@ button {
   background: radial-gradient(600% 120% at 50% 0%, var(--bg-1), var(--bg-0) 62%);
 }
 
-/* The whisper of colour: three soft pools in the current state's glow hue,
-   breathing slowly. `--glow` cross-fades on state change (@property, above);
-   `--presence` (set inline from `demote`) recedes it when a surface is up. */
-.hi-presence-glow {
-  position: absolute;
-  inset: 0;
-  --glow: var(--glow-idle);
-  background:
-    radial-gradient(52% 55% at 18% 22%, var(--glow), transparent 70%),
-    radial-gradient(55% 55% at 84% 30%, var(--glow), transparent 72%),
-    radial-gradient(60% 60% at 60% 94%, var(--glow), transparent 74%);
-  opacity: var(--presence, 1);
-  transition: --glow 1200ms var(--ease);
-  animation: hi-breathe 9s ease-in-out infinite;
-  will-change: opacity;
-}
-.hi-presence[data-state="idle"] .hi-presence-glow { --glow: var(--glow-idle); }
-.hi-presence[data-state="listening"] .hi-presence-glow { --glow: var(--glow-listening); }
-.hi-presence[data-state="thinking"] .hi-presence-glow { --glow: var(--glow-thinking); }
-.hi-presence[data-state="speaking"] .hi-presence-glow { --glow: var(--glow-speaking); }
-.hi-presence[data-state="offline"] .hi-presence-glow { --glow: var(--glow-offline); }
-.hi-presence[data-state="waking"] .hi-presence-glow { --glow: var(--glow-waking); }
-
-@keyframes hi-breathe {
-  0%, 100% { opacity: calc(var(--presence, 1) * 0.62); }
-  50%      { opacity: calc(var(--presence, 1) * 1); }
-}
+/* The breathing state-glow ("watercolour") was removed: it was the only always-on
+   full-screen animation, and `will-change: opacity` promoted it to a full-viewport
+   backing layer — so the WebKit GPU process ("… Graphics and Media") never idled.
+   The presence is now the static paper gradient above alone. The `--glow-*` tokens
+   and `@property --glow` are left in place so the field can be reinstated by
+   restoring `.hi-presence-glow`. */
 
 /* --- Atmosphere (grain over the paper) -------------------------------- */
 .hi-atmosphere {

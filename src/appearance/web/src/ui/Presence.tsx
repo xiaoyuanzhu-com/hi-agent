@@ -1,5 +1,3 @@
-import type { CSSProperties } from "react";
-
 export type PresenceState =
   | "waking"
   | "idle"
@@ -10,34 +8,22 @@ export type PresenceState =
 
 interface PresenceProps {
   state: PresenceState;
-  /** 0..1 — how much a content overlay is up; the glow recedes as this rises so
-   *  words and cards stay legible. */
+  /** Retained for API compatibility; the static field no longer recedes. */
   demote?: number;
 }
 
 /**
- * The agent's presence — a calm, matte, static skin.
+ * The agent's presence — a calm, matte, fully static skin.
  *
- * The background is the theme's warm paper (a soft gradient) with a single very
- * faint state-glow breathing into it: sage while the human holds the floor,
- * amber while thinking, terracotta while speaking, near-nothing at rest. It is
- * all CSS — the colours come from the `--glow-*` / `--bg-*` theme tokens (see
- * global.css), so re-skinning (or the light/dark swap) is a token change alone.
- * The glow colour cross-fades on state change; `demote` fades it back when a
- * content surface is up.
+ * The background is the theme's warm paper (a soft gradient) and nothing else.
+ * The breathing state-glow ("watercolour") was removed: as the only always-on
+ * full-screen animation (a `will-change: opacity` layer), it kept the WebKit GPU
+ * process busy even at rest. The `state` is still reflected as `data-state` for
+ * any future styling hook, but no longer paints a colour field.
  *
- * (Replaces the earlier WebGL watercolour field — no canvas, no audio, no
- * per-frame loop; honours `prefers-reduced-motion` via the global rule, which
- * simply stops the slow breath and leaves a static glow.)
+ * All CSS — colours come from the `--bg-*` theme tokens (see global.css), so the
+ * light/dark swap is a token change alone. No canvas, no audio, no per-frame loop.
  */
-export function Presence({ state, demote = 0 }: PresenceProps) {
-  const presence = 1 - demote * 0.6;
-  return (
-    <div aria-hidden className="hi-presence" data-state={state}>
-      <div
-        className="hi-presence-glow"
-        style={{ "--presence": presence.toFixed(3) } as CSSProperties}
-      />
-    </div>
-  );
+export function Presence({ state }: PresenceProps) {
+  return <div aria-hidden className="hi-presence" data-state={state} />;
 }
