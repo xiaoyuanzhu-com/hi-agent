@@ -1979,44 +1979,36 @@ async fn drive_racing_inbound(
 /// the new signals; the snapshot is the durable backstop, not per-turn context to
 /// re-send. `seeded` decouples "snapshot delivered" from "session open", since
 /// warm-up opens a session without seeding it.
-/// A split-mode turn: the fast **reactor** voice. One direct Anthropic Messages call
-/// (`speaking.md` as the system prompt, the assembled turn context as the user
-/// message) produces the spoken words, fed straight to the sequencer — no ACP
-/// session, no tools, no agentic loop. This is the fast, speaking-rule-conformant
-/// conversational voice of the reactor/cognition split.
+/// A split-mode turn: the fast **reactor** voice. An ACP session with **tools off**
+/// ([`SessionRole::ReactorVoice`], no `/mcp` attach) carrying `speaking.md` as its
+/// system prompt. With no tools there's nothing to loop on, so the turn is a single
+/// generation; it speaks via the session's plain message text — [`SessionRun::wait`]
+/// concatenates every `agent_message_chunk` into the reply — fed to the sequencer.
+/// Riding the ACP path reuses the CLI's proven gateway integration; the speed comes
+/// from having no tool loop, not from bypassing the adapter.
 ///
-/// Cognition — the agentic thinker/worker — runs in parallel: the turn's human
-/// request is handed to a persistent cognition worker ([`workers::WorkerRegistry::cognize`]),
-/// which thinks and works off the floor and reports back as an ordinary
-/// `LoopInput::Worker` the reactor voices on a later turn. So the reactor stays the
-/// single fast voice while the real work happens elsewhere. Still env-gated (default
-/// off) pending build + measurement.
+/// Cognition — the agentic thinker/worker — runs in parallel: the turn's human request
+/// is handed to a persistent cognition worker ([`workers::WorkerRegistry::cognize`]),
+/// which works off the floor and reports back as an ordinary `LoopInput::Worker` the
+/// reactor voices on a later turn. So the reactor stays the single fast voice.
 ///
-/// Mirrors [`run_turn`]'s reorganization/barge-in shape: a human burst arriving
-/// mid-call drops the in-flight request (dropping the future cancels the HTTP call)
-/// and re-asks with their words folded in; a worker report spills to `carryover`.
+/// v1 keeps it simple — no mid-turn reorganization. A voice turn is one fast
+/// generation, so a human speaking during it just queues and the serial loop folds it
+/// into the next turn.
 async fn run_reactor_turn(
     reactor: &Reactor,
     scene: &Scene,
     batch: &[LoopInput],
     workers: &mut workers::WorkerRegistry,
+    reactor_session: &mut Option<Arc<AcpSession>>,
     beats: &mpsc::Sender<sequencer::Beat>,
-    inbound: &mut mpsc::Receiver<LoopInput>,
-    carryover: &mut Vec<LoopInput>,
 ) -> anyhow::Result<()> {
-    // Resolve the fast-voice wire up front: an unconfigured or non-Claude wire can't
-    // speak, and failing before any turn bracket opens keeps the sequencer clean.
-    let system = crate::identity::reactor_system_prompt();
-    let agent_cfg =
-        crate::foundation::config::AgentConfig::resolve(reactor.inner.memory.data_dir());
-    let msg_cfg = match voice::config_from(&agent_cfg) {
-        Ok(c) => c,
-        Err(e) => {
-            tracing::warn!(scene = %scene, error = %e, "reactor voice: cannot configure; turn is mute");
-            return Err(e);
-        }
-    };
+    let turn_id = reactor.inner.turn_seq.fetch_add(1, Ordering::Relaxed);
 
+    // Assemble the turn context: recent conversation (so the voice reconciles with what
+    // was already said rather than repeating it), live worker status (so it can surface
+    // cognition's progress), presence, any barge-in note, and the new signals.
+    let worker_status = workers.render_status().await;
     let presence_note = format!("## Presence\n{}", reactor.inner.presence.render(scene));
     let interrupted = reactor
         .inner
@@ -2025,95 +2017,48 @@ async fn run_reactor_turn(
         .await
         .map(|i| interrupts::render_interruption(&i))
         .unwrap_or_default();
+    let new_signals = format!("## New signals\n{}", render_batch(batch));
 
-    // Accumulated across reorganizations: the human words seen so far, and what we had
-    // already spoken before being reorganized (empty here — a reactor reorg cancels
-    // the call before it speaks).
-    let mut new_signals_body = render_batch(batch);
-    let mut spoken_so_far = String::new();
+    // Open (or reuse) the persistent tools-off voice session. `speaking.md` is prepended
+    // to its first prompt; the session then remembers prior turns, so only a *fresh*
+    // session is handed the memory snapshot — later turns send just the delta.
+    let (session, fresh) = match reactor_session {
+        Some(s) => (s.clone(), false),
+        None => {
+            let opened = open_reactor_voice_session(reactor, scene).await?;
+            *reactor_session = Some(opened.clone());
+            (opened, true)
+        }
+    };
 
-    // One pass's race outcome between the Messages call and new inbound.
-    enum Step {
-        Spoke,
-        Reorganize(Vec<Signal>),
-        Failed(anyhow::Error),
-    }
-
-    loop {
-        let turn_id = reactor.inner.turn_seq.fetch_add(1, Ordering::Relaxed);
-        let new_signals = format!("## New signals\n{new_signals_body}");
-        let reorg_note = if spoken_so_far.trim().is_empty() {
-            String::new()
-        } else {
-            interrupts::render_reorg(spoken_so_far.trim())
-        };
-
-        // The reactor always reads the recent conversation (the memory snapshot), so
-        // its voice reconciles with what was already said rather than repeating it.
+    let context = if fresh {
         let snap = build_for_scene(&reactor.inner.memory, scene).await?;
-        let context = join_sections(&[
+        join_sections(&[
             &snap.render_for_prompt(),
+            &worker_status,
             &presence_note,
             &interrupted,
-            &reorg_note,
             &new_signals,
-        ]);
+        ])
+    } else {
+        join_sections(&[&worker_status, &presence_note, &interrupted, &new_signals])
+    };
 
-        let _ = beats.send(sequencer::Beat::TurnStart { turn: turn_id }).await;
+    tracing::info!(scene = %scene, ctx_chars = context.chars().count(), "reactor voice: prompting session");
+    let _ = beats.send(sequencer::Beat::TurnStart { turn: turn_id }).await;
 
-        // Race the Messages call against new inbound. Box::pin so the same call stays
-        // alive across worker reports (they only spill to carryover); break on
-        // completion, error, or a human burst. Boxing makes the future Unpin, so it
-        // can be re-polled in the select and awaited directly.
-        tracing::info!(scene = %scene, ctx_chars = context.chars().count(), "reactor voice: calling model");
-        let mut speak_fut = Box::pin(voice::speak(&msg_cfg, &system, &context));
-        let step = loop {
-            tokio::select! {
-                res = &mut speak_fut => break match res {
-                    Ok(text) => {
-                        tracing::info!(scene = %scene, reply_chars = text.chars().count(), "reactor voice: replied");
-                        if !text.trim().is_empty() {
-                            let _ = beats.send(sequencer::Beat::Say(text)).await;
-                        }
-                        Step::Spoke
-                    }
-                    Err(e) => Step::Failed(e),
-                },
-                item = inbound.recv() => match item {
-                    // Inbound closed (shutdown): stop racing and just finish the reply.
-                    None => break match (&mut speak_fut).await {
-                        Ok(text) => {
-                            if !text.trim().is_empty() {
-                                let _ = beats.send(sequencer::Beat::Say(text)).await;
-                            }
-                            Step::Spoke
-                        }
-                        Err(e) => Step::Failed(e),
-                    },
-                    // They spoke while we were composing — reorganize. Settle the rest
-                    // of the burst; workers spill to carryover.
-                    Some(LoopInput::Human(sig)) => {
-                        let mut burst = vec![sig];
-                        loop {
-                            match timeout(RESPONSE_SETTLE, inbound.recv()).await {
-                                Ok(Some(LoopInput::Human(s))) => burst.push(s),
-                                Ok(Some(other)) => carryover.push(other),
-                                Ok(None) => break,
-                                Err(_) => break,
-                            }
-                        }
-                        break Step::Reorganize(burst);
-                    }
-                    // A worker report folds into the next turn; keep composing.
-                    Some(other) => carryover.push(other),
-                },
+    let spoke = match drive_voice(&session, context).await {
+        Ok(text) => {
+            tracing::info!(scene = %scene, reply_chars = text.chars().count(), "reactor voice: replied");
+            if !text.trim().is_empty() {
+                let _ = beats.send(sequencer::Beat::Say(text)).await;
             }
-        };
-
-        // On a terminal outage, tell the user once we're holding their mail — sent
-        // inside the bracket so the line actually plays.
-        if let Step::Failed(err) = &step {
+            true
+        }
+        Err(err) => {
             tracing::warn!(scene = %scene, error = %err, "reactor voice failed");
+            // Drop the possibly-wedged session so the next turn re-opens cold.
+            *reactor_session = None;
             if reactor.inner.vendor.note_unreachable() {
                 let _ = beats
                     .send(sequencer::Beat::Say(
@@ -2121,38 +2066,72 @@ async fn run_reactor_turn(
                     ))
                     .await;
             }
+            false
         }
+    };
 
-        // Close this pass's bracket and capture what was spoken.
-        let (done_tx, done_rx) = oneshot::channel();
-        let _ = beats.send(sequencer::Beat::TurnEnd { done: done_tx }).await;
-        let reply = done_rx.await.unwrap_or_default();
-        reactor.inner.interrupts.end_turn(scene, turn_id, &reply).await;
+    // Close the bracket and record what was spoken (for barge-in resolution).
+    let (done_tx, done_rx) = oneshot::channel();
+    let _ = beats.send(sequencer::Beat::TurnEnd { done: done_tx }).await;
+    let reply = done_rx.await.unwrap_or_default();
+    reactor.inner.interrupts.end_turn(scene, turn_id, &reply).await;
 
-        match step {
-            Step::Spoke => {
-                let _ = reactor.inner.vendor.note_success();
-                // Hand the turn's human request to cognition — the agentic thinker —
-                // so it works off the floor while the voice moves on; its report rides
-                // back as a WorkerReport the reactor voices next turn. Spawned once per
-                // scene, then followed up. Nothing to hand off on a pure report/pulse turn.
-                let task = render_human_from_batch(batch);
-                if !task.trim().is_empty() {
-                    if let Err(e) = workers.cognize(reactor, task).await {
-                        tracing::warn!(scene = %scene, error = %e, "cognition spawn/follow-up failed");
-                    }
-                }
-                return Ok(());
-            }
-            Step::Failed(err) => return Err(err),
-            Step::Reorganize(burst) => {
-                // The call was cancelled before it spoke, so there's no stale tail;
-                // fold the burst in and re-ask.
-                spoken_so_far.push_str(&reply);
-                new_signals_body.push_str(&render_human_signals(&burst));
+    if spoke {
+        let _ = reactor.inner.vendor.note_success();
+        // Hand the turn's human request to cognition — the agentic thinker — so it works
+        // off the floor while the voice moves on; its report rides back as a WorkerReport
+        // the reactor voices on a later turn. Spawned once per scene, then followed up.
+        // Nothing to hand off on a pure report/pulse turn.
+        let task = render_human_from_batch(batch);
+        if !task.trim().is_empty() {
+            if let Err(e) = workers.cognize(reactor, task).await {
+                tracing::warn!(scene = %scene, error = %e, "cognition spawn/follow-up failed");
             }
         }
     }
+    Ok(())
+}
+
+/// Open a fresh **tools-off** reactor voice session for `scene`, carrying `speaking.md`
+/// as its system prompt (prepended to the first prompt). No `/mcp` attach, so the model
+/// has no host tools and the turn is a single generation.
+async fn open_reactor_voice_session(reactor: &Reactor, scene: &Scene) -> anyhow::Result<Arc<AcpSession>> {
+    let session = Arc::new(
+        reactor
+            .inner
+            .agent
+            .session(
+                scene,
+                SessionRole::ReactorVoice,
+                None,
+                SessionOpts {
+                    system_prompt: Some(crate::identity::reactor_system_prompt()),
+                    cwd: None,
+                },
+            )
+            .await?,
+    );
+    reactor
+        .inner
+        .observatory
+        .record(
+            scene,
+            EventKind::SessionOpened {
+                kind: SessionKind::Reactor,
+                id: session.id().0.to_string(),
+            },
+        )
+        .await;
+    Ok(session)
+}
+
+/// Prompt the tools-off voice session and return its spoken text. `wait()` drains the
+/// stream, concatenating every `agent_message_chunk` into `PromptResult::text` — the
+/// words to speak. With no tools there is nothing to loop on, so this is one round-trip.
+async fn drive_voice(session: &AcpSession, context: String) -> anyhow::Result<String> {
+    let run = session.prompt(context).await?;
+    let result = run.wait().await?;
+    Ok(result.text)
 }
 
 async fn run_turn(
@@ -2178,11 +2157,12 @@ async fn run_turn(
     carryover: &mut Vec<LoopInput>,
 ) -> anyhow::Result<()> {
     // Split mode (prototype, env-gated): the fast reactor voice handles the turn — one
-    // direct Messages call, no ACP session or tools. Default off, so the agentic path
-    // below is unchanged. See docs/reactor-cognition-split.md.
+    // tools-off ACP session, single generation. Default is now this path (split is the
+    // direction); the agentic body below is retained but unreachable. See
+    // docs/reactor-cognition-split.md.
     if voice::split_enabled() {
         tracing::info!(scene = %scene, inputs = batch.len(), "split mode: reactor voice turn");
-        return run_reactor_turn(reactor, scene, batch, workers, beats, inbound, carryover).await;
+        return run_reactor_turn(reactor, scene, batch, workers, reactor_session, beats).await;
     }
 
     // Computed once, shared by every reorganization pass.

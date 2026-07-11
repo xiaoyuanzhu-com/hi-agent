@@ -30,6 +30,10 @@ use crate::types::Scene;
 pub enum SessionRole {
     #[default]
     Reactor,
+    /// The fast, **tools-off** reactor voice (reactor/cognition split): a single
+    /// generation with no `/mcp` attach at all, so there is no tool loop. It speaks
+    /// via its plain message text (`agent_message_chunk`), not a `say` tool.
+    ReactorVoice,
     Worker,
     Reflection,
 }
@@ -38,6 +42,7 @@ impl SessionRole {
     fn as_str(self) -> &'static str {
         match self {
             SessionRole::Reactor => "reactor",
+            SessionRole::ReactorVoice => "reactor-voice",
             SessionRole::Worker => "worker",
             SessionRole::Reflection => "reflection",
         }
@@ -108,17 +113,24 @@ impl AgentLayer {
         worker_id: Option<u64>,
         opts: SessionOpts,
     ) -> anyhow::Result<AcpSession> {
-        let mut headers = vec![
-            HttpHeader::new(HEADER_SCENE, scene.0.clone()),
-            HttpHeader::new(HEADER_ROLE, role.as_str()),
-        ];
-        if let Some(id) = worker_id {
-            headers.push(HttpHeader::new(HEADER_WORKER_ID, id.to_string()));
-        }
-        let mcp = McpServer::Http(
-            McpServerHttp::new("hi-agent", format!("{}/mcp", self.inner.server_base_url))
-                .headers(headers),
-        );
+        // The reactor VOICE gets no `/mcp` attach at all — a single tools-free
+        // generation, which is what makes it a fast, loop-free turn. Every other role
+        // attaches hi-agent's tool surface, routed server-side by the X-HI-Role header.
+        let mcp_servers = if matches!(role, SessionRole::ReactorVoice) {
+            Vec::new()
+        } else {
+            let mut headers = vec![
+                HttpHeader::new(HEADER_SCENE, scene.0.clone()),
+                HttpHeader::new(HEADER_ROLE, role.as_str()),
+            ];
+            if let Some(id) = worker_id {
+                headers.push(HttpHeader::new(HEADER_WORKER_ID, id.to_string()));
+            }
+            vec![McpServer::Http(
+                McpServerHttp::new("hi-agent", format!("{}/mcp", self.inner.server_base_url))
+                    .headers(headers),
+            )]
+        };
 
         let SessionOpts { system_prompt, cwd } = opts;
         // Never let a session root at the process cwd. `session/new` requires a cwd,
@@ -148,7 +160,7 @@ impl AgentLayer {
         )
         .await?;
         let id = process
-            .open_session(SessionOpts { system_prompt: None, cwd }, vec![mcp])
+            .open_session(SessionOpts { system_prompt: None, cwd }, mcp_servers)
             .await?;
 
         Ok(AcpSession::new(id, process, rx, system_prompt))
