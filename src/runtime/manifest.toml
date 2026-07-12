@@ -6,7 +6,7 @@
 # The managed install lives at a fixed path (not version-keyed), so bumping a pin
 # does not auto-reinstall — delete the runtime dir to force a fresh install.
 node_version    = "22.14.0"
-adapter_version = "0.36.1"
+adapter_version = "0.58.1"
 # claude_version is resolved by `npm ci` from the lockfile; recorded here for
 # the `--version` stamp only.
 claude_version  = "unknown"

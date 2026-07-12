@@ -407,6 +407,23 @@ impl AgentConfig {
         }
     }
 
+    /// The model the **reactor** (the fast conversational voice) should run: the
+    /// broker's small/fast companion when present, else the main model. A reactor
+    /// turn is a single quick generation, so it takes the light model rather than the
+    /// heavy one `auth_child_env` puts in `ANTHROPIC_MODEL`. Context-window normalized
+    /// like the others. `None` (Codex, or no model configured) → no override; the
+    /// reactor keeps whatever `auth_child_env` set.
+    pub fn reactor_model(&self) -> Option<String> {
+        match self.wire {
+            LlmWire::Claude => self
+                .small
+                .as_ref()
+                .or(self.model.as_ref())
+                .map(|m| with_context_window(m)),
+            LlmWire::Codex => None,
+        }
+    }
+
     /// Build the **static** env var pairs for the ACP child process — everything
     /// fixed for the process lifetime (resolved runtime paths, config dir, the
     /// server URL). The volatile upstream credential vars come from

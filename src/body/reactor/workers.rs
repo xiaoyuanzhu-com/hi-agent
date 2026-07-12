@@ -151,6 +151,17 @@ images) — and `$HI_AGENT_PROMPTS_DIR/aesthetic.md` — the bar a view has to c
 Author to both. Your working directory is the agent's view workshop (`views/`). Report every \
 ref you saved in your summary — that ref is how the agent puts your view on screen.\n\
 \n\
+If the view will take a while to get right, don't leave the person staring at a \
+blank wait. Save a ROUGH first version early — the real layout with whatever content \
+you have so far, or a plain \"pulling this together…\" placeholder — under a stable \
+ref, and report that ref right away so the agent can put something up. Then keep \
+refining the SAME ref in place as the content firms up (overwrite it and report it \
+again each time you meaningfully advance it), ending on the polished version. Keep \
+the ref stable across versions so the agent evolves one view in place rather than \
+stacking copies. Rough-but-early beats perfect-but-late: a half-filled view the \
+person watches fill in reads as progress, not as a defect — like a colleague turning \
+their screen around while they work, not only at the end.\n\
+\n\
 Before you call the work done, look at what you actually made — not whether it ran \
 but whether it is any good. Hold it against the strong examples you pulled up at the \
 start: appealing, or merely functional? If it is dull — a flat highlight reel, a \

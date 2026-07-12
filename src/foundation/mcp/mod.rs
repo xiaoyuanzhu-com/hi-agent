@@ -41,8 +41,10 @@ pub enum McpReply {
     Accepted,
 }
 
-/// The two tool surfaces, selected by the `X-HI-Role` header. A reactor session
-/// drives output and delegation; a worker can only raise a question.
+/// The tool surfaces, selected by the `X-HI-Role` header. The reactor gets only
+/// `show_view` (it speaks via plain message text, not a tool); a worker gets the
+/// work tools but no voice; reflection reads/writes derived memory. The `_` fallback
+/// is the legacy agentic reactor's full toolset, kept for untagged sessions.
 fn tools_for_role(role: Option<&str>) -> Vec<Value> {
     match role {
         Some("worker") => vec![
@@ -239,7 +241,14 @@ fn tools_for_role(role: Option<&str>) -> Vec<Value> {
             ),
             see_tool(),
         ],
-        // Default to the reactor surface (the soul describes these).
+        // The reactor is the fast conversational voice: it speaks via plain message
+        // text (not a `say` tool) and gets exactly one expression tool — `show_view` —
+        // to put a view a worker already built on screen. Nothing else; the heavy work
+        // is delegated to workers in code, not via a tool.
+        Some("reactor") => vec![show_view_tool()],
+        // Fallback for an unheadered/unknown role — the legacy agentic reactor's full
+        // toolset. No live role maps here after the reactor/cognition split, but keep
+        // it so an untagged session still degrades to something usable.
         _ => vec![
             tool(
                 "say",
@@ -252,30 +261,7 @@ fn tools_for_role(role: Option<&str>) -> Vec<Value> {
                     "required": ["text"],
                 }),
             ),
-            tool(
-                "show_view",
-                "Put a view on the screen. Normally you show a view a builder made for you: \
-                 delegate the build, then pass the `ref` it reported back (like `project/view`) here. \
-                 Interleave show_view and say calls in the order you want them experienced (say, \
-                 then show) so each view lands as you speak to it. Reuse an `id` with op=replace \
-                 to evolve a view in place; op=dismiss takes one down. The screen is persistent \
-                 state: whatever you've shown stays up — across page refreshes, other devices in \
-                 the scene, even restarts — until you dismiss or replace it, so never re-show \
-                 something that's already on screen. Re-showing an existing id raises it above \
-                 the other views. For a trivial one-off you may pass raw `source` JSX instead of \
-                 a ref.",
-                json!({
-                    "type": "object",
-                    "properties": {
-                        "op": { "type": "string", "enum": ["show", "replace", "dismiss"], "description": "show mounts; replace swaps the same id in place; dismiss removes it." },
-                        "id": { "type": "string", "description": "A stable name for this on-screen slot, so replace/dismiss can target it. Omit to auto-generate." },
-                        "ref": { "type": "string", "description": "A view ref a builder reported (e.g. `project/view`) — the usual way to show a built view. Omit for dismiss." },
-                        "source": { "type": "string", "description": "Raw JSX (default-exported component) for a trivial inline view, when not using a ref. Omit for dismiss." },
-                        "region": { "type": "string", "enum": ["center", "top", "bottom", "left", "right", "top_left", "top_right", "bottom_left", "bottom_right", "fill"], "description": "Optional: where on the stage to place this view. Omit to use the placement the builder chose — only set it to override, e.g. when arranging several views at once." },
-                    },
-                    "required": ["op"],
-                }),
-            ),
+            show_view_tool(),
             tool(
                 "delegate",
                 "Hand a heavy or long-running task (research, multi-step tool use, writing and \
@@ -388,6 +374,35 @@ fn watch_tool() -> Value {
     )
 }
 
+/// The `show_view` tool — put a view on the screen. The reactor's one expression
+/// tool beyond speech: it shows a view a worker already built (by `ref`), or a
+/// trivial inline one. Shared by the reactor surface and the legacy fallback.
+fn show_view_tool() -> Value {
+    tool(
+        "show_view",
+        "Put a view on the screen. Normally you show a view a builder made for you: \
+         delegate the build, then pass the `ref` it reported back (like `project/view`) here. \
+         Interleave show_view and say calls in the order you want them experienced (say, \
+         then show) so each view lands as you speak to it. Reuse an `id` with op=replace \
+         to evolve a view in place; op=dismiss takes one down. The screen is persistent \
+         state: whatever you've shown stays up — across page refreshes, other devices in \
+         the scene, even restarts — until you dismiss or replace it, so never re-show \
+         something that's already on screen. Re-showing an existing id raises it above \
+         the other views. For a trivial one-off you may pass raw `source` JSX instead of \
+         a ref.",
+        json!({
+            "type": "object",
+            "properties": {
+                "op": { "type": "string", "enum": ["show", "replace", "dismiss"], "description": "show mounts; replace swaps the same id in place; dismiss removes it." },
+                "id": { "type": "string", "description": "A stable name for this on-screen slot, so replace/dismiss can target it. Omit to auto-generate." },
+                "ref": { "type": "string", "description": "A view ref a builder reported (e.g. `project/view`) — the usual way to show a built view. Omit for dismiss." },
+                "source": { "type": "string", "description": "Raw JSX (default-exported component) for a trivial inline view, when not using a ref. Omit for dismiss." },
+                "region": { "type": "string", "enum": ["center", "top", "bottom", "left", "right", "top_left", "top_right", "bottom_left", "bottom_right", "fill"], "description": "Optional: where on the stage to place this view. Omit to use the placement the builder chose — only set it to override, e.g. when arranging several views at once." },
+            },
+            "required": ["op"],
+        }),
+    )
+}
 
 /// Handle one parsed JSON-RPC message. `scene`/`role`/`worker_id` come from the
 /// request headers; `registry` routes tool calls to the owning scene loop.
@@ -431,7 +446,7 @@ pub async fn handle(
             let args = params.get("arguments").cloned().unwrap_or_else(|| json!({}));
             McpReply::Json(result(
                 id,
-                dispatch_tool(registry, data_dir, video_partial, scene.as_ref(), worker_id, name, &args).await,
+                dispatch_tool(registry, data_dir, video_partial, scene.as_ref(), worker_id, role, name, &args).await,
             ))
         }
         // ping is a no-op request the client may send.
@@ -450,12 +465,25 @@ async fn dispatch_tool(
     video_partial: &Mutex<HashMap<Scene, PartialMinute>>,
     scene: Option<&Scene>,
     worker_id: Option<u64>,
+    role: Option<&str>,
     name: &str,
     args: &Value,
 ) -> Value {
     let Some(scene) = scene else {
         return tool_error("missing X-HI-Scene header");
     };
+
+    // Expression tools belong to the reactor alone — it is the single
+    // guideline-carrying voice, so everything the person sees or hears goes through
+    // its `speaking.md` generation. A worker or reflection session must never speak
+    // or take the screen even if its model emits the call (these aren't in its
+    // advertised surface); enforce that structurally here, not just via the tool list.
+    if matches!(name, "say" | "show_view") && role != Some("reactor") {
+        return tool_error(&format!(
+            "`{name}` is reactor-only; role `{}` may not speak or show",
+            role.unwrap_or("<none>")
+        ));
+    }
 
     // Reflection tools are pure derived-memory IO over `data_dir`; they don't touch
     // the scene loop (no sink), so handle them before the sink lookup. The

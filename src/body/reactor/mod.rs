@@ -57,7 +57,6 @@ mod interrupts;
 pub mod outbound;
 mod sequencer;
 mod tools;
-mod voice;
 mod workers;
 
 pub use interrupts::InterruptRegistry;
@@ -1316,19 +1315,6 @@ enum Woke {
     Shutdown,
 }
 
-/// Why one reorganization pass's prompt drive ended. A pass runs one
-/// `session.prompt()`; either it finishes on its own, or new human input lands
-/// mid-flight and we cancel it to re-prompt with that input folded in.
-enum DriveOutcome {
-    /// The prompt ran to completion. Carries the stop-reason string for the log.
-    Completed(Option<String>),
-    /// New human input arrived while the prompt was still in flight. The turn was
-    /// marked for flush and the prompt cancelled; carries the fresh human burst to
-    /// fold into the next pass. `session_ok` is false if the post-cancel drain
-    /// timed out — the session is wedged and must be discarded before re-prompting.
-    Reorganized { burst: Vec<Signal>, session_ok: bool },
-}
-
 /// Apply one tool control command. Delegate and alarm are side-effects that run
 /// without a turn (returns `None`); a worker `ask` becomes a question report the
 /// loop folds into its next turn (returns `Some`). Worker-registry and alarm
@@ -1387,15 +1373,9 @@ async fn per_scene_loop(
     // loop touches it, so a plain local `Option` suffices; the heartbeat swap
     // below replaces it in place, between turns.
     let mut reactor_session: Option<Arc<AcpSession>> = None;
-    // Whether the live session has been seeded with the journal snapshot yet.
-    // Warm-up opens the session without prompting, so it can be `Some` yet
-    // unseeded; the first real turn sends the snapshot and flips this. A hot-swap
-    // bakes the journal tail into the replacement's system prompt, so a swapped
-    // session stays seeded; a session discarded after a turn failure resets this
-    // so the next cold-open re-seeds.
-    let mut seeded = false;
-    // Tracks how much the live session has accumulated, so we know when to
-    // hot-swap it before it rots or overflows.
+    // Retained for the observatory's budget readout; the reactor turn no longer
+    // feeds it, so the hot-swap it gated never fires (the reactor re-opens cold on
+    // failure instead). Left in place until the hot-swap path is fully retired.
     let mut budget = heartbeat::ContextBudget::new();
     // The scene's live working sessions. Heavy/tool-using work the reactor
     // delegates runs here; workers post progress and results back through
@@ -1405,27 +1385,11 @@ async fn per_scene_loop(
     // wake — time passing — on top of an incoming signal; see the `select!` below.
     let mut alarms = Alarms::new();
 
-    // Announce the loop and whether split mode is active, so a silent scene is
-    // immediately explained: split=false means the flag never reached the process, so
-    // the ACP reactor session + its warm-up run (and can block the loop) as before.
-    tracing::info!(scene = %scene, split = voice::split_enabled(), "reactor per-scene loop up");
+    tracing::info!(scene = %scene, "reactor per-scene loop up");
 
-    // Warm-up: this loop was just stood up (a scene-presence GET, or the first
-    // utterance). Pull the cold-start forward now — spawn the subprocess, open the
-    // persistent ACP session, and pre-send the system prompt to warm the backend —
-    // so that work is off the first real turn's critical path. The journal snapshot
-    // is still delivered by the first real turn (which sees an open, system-prompted
-    // but unseeded session). Best-effort; on failure the first turn cold-opens as
-    // before.
-    //
-    // Split mode's voice is a direct Messages call, so the reactor ACP session is
-    // never driven — skip warming it. That warm is a subprocess spawn *plus* a full
-    // LLM warm turn, `.await`ed here before the loop reads any input; in split mode it
-    // is pure waste that also stalls the first real turn behind it. Cognition warms
-    // lazily on its first turn instead. See docs/reactor-cognition-split.md.
-    if !voice::split_enabled() {
-        warm_up(&reactor, &scene, &mut reactor_session).await;
-    }
+    // No warm-up: the reactor session opens lazily on its first turn (a subprocess
+    // spawn + system-prompt prime would only stall that first turn behind it). The
+    // journal snapshot is delivered by that first turn's fresh-session branch.
 
     // Pulse bookkeeping: the host's recurring self-attention timer. `last_activity`
     // resets on every turn, so pulses only fire into genuine quiet; the first pulse
@@ -1442,11 +1406,6 @@ async fn per_scene_loop(
     // for the refill. Cleared on a successful turn (the mail went out) and on a
     // reachable-but-failed blip (the apology was emitted); held while down.
     let mut batch: Vec<LoopInput> = Vec::new();
-    // Worker reports pulled off `inbound` while a prior turn was reorganizing
-    // (cancelling to re-prompt with new human input). They don't drive a reorg
-    // themselves — fix-forward, like before — so they're held here and folded into
-    // `batch` after the turn returns.
-    let mut carryover: Vec<LoopInput> = Vec::new();
 
     loop {
         // Wait for a turn-driving reason: a new signal, a fired alarm, a due host
@@ -1456,9 +1415,9 @@ async fn per_scene_loop(
         // turn; only a worker `ask` becomes a turn-driving item.
         'wait: loop {
             let gate = reactor.inner.vendor.scene_gate();
-            // A batch pre-seeded by carryover (a worker report pulled off the queue
-            // while a prior turn reorganized) needs no fresh signal to act on — drive
-            // it now while reachable. While down, fall through to the timer logic.
+            // Mail already sitting in `batch` (e.g. held while the vendor was down)
+            // needs no fresh signal to act on — drive it now while reachable. While
+            // down, fall through to the timer logic.
             if !batch.is_empty() && matches!(gate, SceneGate::Go) {
                 break 'wait;
             }
@@ -1614,13 +1573,10 @@ async fn per_scene_loop(
         // Forget any workers that have finished, so the registry doesn't grow.
         workers.reap();
 
-        // Retry turns don't apologize — the user already heard the "holding your
-        // mail" line when the vendor first went down. Normal turns do.
-        let apologize = !was_down;
-        match run_turn(&reactor, &scene, &batch, &mut reactor_session, &mut seeded, &mut budget, &mut workers, &beats, apologize, &mut inbound, &mut carryover).await {
+        match run_reactor_turn(&reactor, &scene, &batch, &mut workers, &mut reactor_session, &beats).await {
             Ok(()) => {
                 // The turn delivered the mail; clear the backlog. (If this was a
-                // retry, run_turn already flipped the vendor Up via note_success.)
+                // retry, the turn already flipped the vendor Up via note_success.)
                 batch.clear();
                 // A reply landed — stop the presence owed-reply clock (no-op if
                 // nothing was owed, e.g. a pulse turn).
@@ -1661,7 +1617,6 @@ async fn per_scene_loop(
                                         )
                                         .await;
                                 }
-                                seeded = false;
                                 budget.reset();
                                 reactor.inner.observatory.set_budget(&scene, 0).await;
                             }
@@ -1686,11 +1641,11 @@ async fn per_scene_loop(
                         )
                         .await;
                 }
-                // The fresh session that replaces it must re-ingest the snapshot.
-                seeded = false;
+                // Dropping the session means the next turn cold-opens and its
+                // fresh-session branch re-ingests the journal snapshot.
                 budget.reset();
                 reactor.inner.observatory.set_budget(&scene, 0).await;
-                // Key on the vendor state run_turn just wrote, not the pre-turn one:
+                // Key on the vendor state the turn just wrote, not the pre-turn one:
                 // a turn that hit a 402/429 (even the first, from Up) left the vendor
                 // down, so hold the mail — out of energy drains it on refill; a
                 // backoff drives it at the next retry deadline. Only a still-reachable
@@ -1706,156 +1661,7 @@ async fn per_scene_loop(
         // Any completed turn is activity: the pulse clock restarts, so pulses
         // only ever fire into genuine quiet.
         last_activity = Instant::now();
-
-        // Worker reports pulled off the queue while this turn reorganized fold into
-        // the next batch (fix-forward), just as they would have without reorg. A
-        // non-empty carryover (while Up) skips the wait and drives a turn next pass.
-        batch.append(&mut carryover);
     }
-}
-
-/// One-time scene warm-up, run once before the per-scene loop blocks on its first
-/// input. Opens the scene's persistent reactor session — so the subprocess spawn
-/// and ACP `session/new` are off the first reply's critical path — then pre-sends
-/// the system prompt (the soul plus memory core) on its own, so the backend
-/// processes it and the upstream prompt cache populates before any user input
-/// arrives. The first real turn then runs against an already-warm session and
-/// delivers only the journal snapshot and new signals.
-///
-/// The warm prompt carries no transcript and no signals, so the model has nothing
-/// to act on; any `say`/`show_view` it might still emit is dropped, since the
-/// sequencer ignores beats until the first `TurnStart`. The journal snapshot is
-/// not sent here — the session stays unseeded, so the first real turn delivers it.
-///
-/// Best-effort: any failure is logged and leaves the session open-but-unseeded (or
-/// unopened), so the first real turn proceeds as it did before.
-async fn warm_up(reactor: &Reactor, scene: &Scene, reactor_session: &mut Option<Arc<AcpSession>>) {
-    // Defensive: the prologue runs once on a fresh loop, so the session is always
-    // cold here, but never re-open an already-open session.
-    if reactor_session.is_some() {
-        return;
-    }
-    match open_session(reactor, scene).await {
-        Ok(session) => {
-            // Drive the warm prompt to completion so the session's prompt slot is
-            // parked back for the first real turn. Best-effort: a failed warm just
-            // leaves the session open-but-unseeded, as before.
-            match session.warm().await {
-                Ok(Some(run)) => {
-                    if let Err(err) = run.wait().await {
-                        tracing::warn!(scene = %scene, error = %err, "reactor warm-up prompt failed");
-                        note_warmup_outage(reactor, &err);
-                    }
-                }
-                Ok(None) => {}
-                Err(err) => {
-                    tracing::warn!(scene = %scene, error = %err, "reactor warm-up prompt failed");
-                    note_warmup_outage(reactor, &err);
-                }
-            }
-            *reactor_session = Some(session);
-            tracing::info!(scene = %scene, "reactor session warmed up (system prompt pre-sent)");
-        }
-        Err(err) => {
-            tracing::warn!(scene = %scene, error = %err, "scene warm-up failed; first turn will cold-start");
-        }
-    }
-}
-
-/// A warm-up prompt failed. Warm-up is best-effort, so transient/generic failures
-/// are left alone (the first real turn re-tries and classifies them). But a *definite*
-/// out-of-energy (402) is worth acting on now: flip the vendor so the scene holds its
-/// mail instead of hammering, the shared poller starts watching for the refill, and —
-/// the point here — the web app raises the out-of-energy hint at boot, without waiting
-/// for the user's first turn to trip the same 402.
-fn note_warmup_outage(reactor: &Reactor, err: &anyhow::Error) {
-    if matches!(classify_outage(err), Outage::OutOfEnergy) {
-        let resets_at = crate::foundation::credentials::Credentials::load(reactor.inner.memory.data_dir())
-            .energy
-            .map(|e| e.resets_at)
-            .unwrap_or_default();
-        reactor.inner.vendor.note_out_of_energy(resets_at_instant(&resets_at));
-        crate::foundation::energy_state::note_402(reactor.inner.memory.data_dir());
-    }
-}
-
-/// Open a fresh persistent reactor session for `scene`, carrying the soul as its
-/// system prompt, and record the lifecycle event. The soul references `self.md`,
-/// `commitments.md`, and `hot.md` by path, so the session reads the current duties
-/// and digest rather than a stale copy. The session consumes the system prompt on
-/// its first `prompt()` and never re-sends it. Shared by the warm-up prologue and
-/// the cold path of [`run_turn`].
-async fn open_session(reactor: &Reactor, scene: &Scene) -> anyhow::Result<Arc<AcpSession>> {
-    let system_prompt = reactor.inner.soul.clone();
-    let session = Arc::new(
-        reactor
-            .inner
-            .agent
-            .session(
-                scene,
-                SessionRole::Reactor,
-                None,
-                SessionOpts {
-                    system_prompt: Some(system_prompt),
-                    cwd: None,
-                },
-            )
-            .await?,
-    );
-    reactor
-        .inner
-        .observatory
-        .record(
-            scene,
-            EventKind::SessionOpened {
-                kind: SessionKind::Reactor,
-                id: session.id().0.to_string(),
-            },
-        )
-        .await;
-    Ok(session)
-}
-
-/// Discard the live reactor session after a failed or wedged prompt: record the
-/// close, drop it so the next turn cold-opens, and reset the seed/budget so the
-/// fresh session re-ingests the journal snapshot. Idempotent — a no-op on the
-/// observatory side if the slot is already empty.
-async fn discard_reactor_session(
-    reactor: &Reactor,
-    scene: &Scene,
-    reactor_session: &mut Option<Arc<AcpSession>>,
-    seeded: &mut bool,
-    budget: &mut heartbeat::ContextBudget,
-) {
-    if let Some(dead) = reactor_session.take() {
-        reactor
-            .inner
-            .observatory
-            .record(
-                scene,
-                EventKind::SessionClosed {
-                    kind: SessionKind::Reactor,
-                    id: dead.id().0.to_string(),
-                },
-            )
-            .await;
-    }
-    *seeded = false;
-    budget.reset();
-    reactor.inner.observatory.set_budget(scene, 0).await;
-}
-
-/// Render a burst of human signals (folded in by a reorganization) as transcript
-/// lines — the same shape `render_batch` produces for its `Human` arm.
-fn render_human_signals(burst: &[Signal]) -> String {
-    use crate::mind::memory::snapshot::{Speaker, transcript_line};
-    use std::fmt::Write as _;
-    let mut s = String::new();
-    for sig in burst {
-        let chan = sig.channel.with_stream(sig.stream.as_deref());
-        let _ = writeln!(s, "{}", transcript_line(Speaker::Them, &chan, &sig.body));
-    }
-    s
 }
 
 /// Render just the human requests in a batch (skipping worker reports, alarms, and
@@ -1874,127 +1680,22 @@ fn render_human_from_batch(batch: &[LoopInput]) -> String {
     s
 }
 
-/// Drive one prompt to completion, but race it against new inbound signals so the
-/// mind can reorganize mid-reply like a person. The model's `say`/`show_view` tool
-/// calls reach the sequencer out of band; this only watches the prompt's update
-/// stream and the scene queue.
-///
-/// - A **human** signal arriving mid-flight is the cue to reconsider: we collect
-///   the rest of their burst (a short settle), mark the turn for flush so its stale
-///   tail isn't spoken, cancel the prompt, drain+park the session, and hand the
-///   burst back as [`DriveOutcome::Reorganized`] for the caller to fold into a fresh
-///   pass.
-/// - A **worker** report (the only other thing on `inbound` mid-turn) folds into the
-///   next batch via `carryover`, exactly as fix-forward did before — it doesn't make
-///   the mind reconsider what it's saying.
-/// - Otherwise the prompt runs to completion → [`DriveOutcome::Completed`].
-///
-/// Owns the `SessionRun` end to end (so `wait()`'s by-value consumption stays legal)
-/// and does the `prompt()` itself, so an open failure is a retriable `Err` for the
-/// caller's attempt loop.
-async fn drive_racing_inbound(
-    reactor: &Reactor,
-    scene: &Scene,
-    session: &Arc<AcpSession>,
-    prompt_text: String,
-    inbound: &mut mpsc::Receiver<LoopInput>,
-    carryover: &mut Vec<LoopInput>,
-    turn_id: u64,
-) -> anyhow::Result<DriveOutcome> {
-    // Why the race ended. Kept tiny so the `select!` arms never touch `run` except
-    // through `next_update` — `run` is consumed (via `wait()`) only after the loop,
-    // sidestepping cross-arm borrow friction.
-    enum Ended {
-        Completed,
-        InboundClosed,
-        HumanBurst(Vec<Signal>),
-    }
 
-    let mut run = session.prompt(prompt_text).await?;
-    let ended = loop {
-        tokio::select! {
-            upd = run.next_update() => match upd {
-                Some(SessionUpdate::ToolCall(stub)) => {
-                    tracing::debug!(scene = %scene, variant = stub.raw_variant, "tool call");
-                }
-                Some(SessionUpdate::Text(_)) => {} // narration, not for saying; drop
-                Some(_) => {} // thoughts and unmodelled updates
-                None => break Ended::Completed,
-            },
-            item = inbound.recv() => match item {
-                None => break Ended::InboundClosed,
-                // They spoke while we were still working on this reply — reorganize.
-                Some(LoopInput::Human(sig)) => {
-                    let mut burst = vec![sig];
-                    // Settle the rest of their burst; workers spill to carryover.
-                    loop {
-                        match timeout(RESPONSE_SETTLE, inbound.recv()).await {
-                            Ok(Some(LoopInput::Human(s))) => burst.push(s),
-                            Ok(Some(other)) => carryover.push(other),
-                            Ok(None) => break, // inbound closed mid-settle
-                            Err(_) => break,   // quiet → burst complete
-                        }
-                    }
-                    break Ended::HumanBurst(burst);
-                }
-                // A worker report folds into the next batch (fix-forward), as before.
-                Some(other) => carryover.push(other),
-            },
-        }
-    };
-
-    match ended {
-        Ended::Completed | Ended::InboundClosed => {
-            let result = run.wait().await?;
-            tracing::debug!(scene = %scene, stop = ?result.stop_reason, "turn finished");
-            Ok(DriveOutcome::Completed(Some(format!("{:?}", result.stop_reason))))
-        }
-        Ended::HumanBurst(burst) => {
-            tracing::info!(scene = %scene, turn = turn_id, added = burst.len(), "human spoke mid-reply; reorganizing");
-            // Stop the stale tail so any say/show beats still queued for this turn
-            // are dropped rather than spoken.
-            reactor.inner.interrupts.mark_flush(scene, turn_id).await;
-            // Best-effort cancel to free the model call, but we do NOT wait for it:
-            // this ACP adapter doesn't honour `session/cancel` promptly (observed —
-            // an in-flight prompt never resolved `Cancelled` even after 60s), so
-            // draining to reuse the warm session is not viable. Discard the session
-            // instead (dropping it kills the subprocess and the orphaned call); the
-            // next pass cold-opens a fresh one.
-            let _ = session.cancel().await;
-            Ok(DriveOutcome::Reorganized { burst, session_ok: false })
-        }
-    }
-}
-
-/// One turn: prompt the scene's persistent reactor session (opening it on the
-/// first turn) and bracket it on the scene's output sequencer. Spoken text and
-/// views no longer ride the reply stream — the mind emits them as `say`/`show_view`
-/// tool calls that land on the sequencer out of band — so here we only seed the
-/// prompt, drive it to completion, and report the turn. The sequencer returns the
-/// turn's spoken reply (for the context budget and the turn log).
-///
-/// An unseeded session — never prompted (freshly cold-opened, or warmed by the
-/// prologue) — is seeded with the journal snapshot, since it carries no memory of
-/// prior turns. A seeded session already ingested that history, so it gets only
-/// the new signals; the snapshot is the durable backstop, not per-turn context to
-/// re-send. `seeded` decouples "snapshot delivered" from "session open", since
-/// warm-up opens a session without seeding it.
-/// A split-mode turn: the fast **reactor** voice. An ACP session with **tools off**
-/// ([`SessionRole::ReactorVoice`], no `/mcp` attach) carrying `speaking.md` as its
-/// system prompt. With no tools there's nothing to loop on, so the turn is a single
-/// generation; it speaks via the session's plain message text — [`SessionRun::wait`]
-/// concatenates every `agent_message_chunk` into the reply — fed to the sequencer.
-/// Riding the ACP path reuses the CLI's proven gateway integration; the speed comes
-/// from having no tool loop, not from bypassing the adapter.
+/// A reactor turn: the single fast conversational voice. An ACP session
+/// ([`SessionRole::Reactor`]) on the small model, carrying `speaking.md` as its system
+/// prompt and a minimal `show_view`-only `/mcp` surface. A turn is a single quick
+/// generation: it speaks via the session's plain message text — [`SessionRun::wait`]
+/// concatenates every `agent_message_chunk` into the reply — and may call `show_view`
+/// to put a view a worker already built on screen; both feed the sequencer. The speed
+/// comes from the small model + a single generation, not from bypassing the adapter.
 ///
 /// Cognition — the agentic thinker/worker — runs in parallel: the turn's human request
 /// is handed to a persistent cognition worker ([`workers::WorkerRegistry::cognize`]),
 /// which works off the floor and reports back as an ordinary `LoopInput::Worker` the
 /// reactor voices on a later turn. So the reactor stays the single fast voice.
 ///
-/// v1 keeps it simple — no mid-turn reorganization. A voice turn is one fast
-/// generation, so a human speaking during it just queues and the serial loop folds it
-/// into the next turn.
+/// v1 keeps it simple — no mid-turn reorganization. A turn is one fast generation, so a
+/// human speaking during it just queues and the serial loop folds it into the next turn.
 async fn run_reactor_turn(
     reactor: &Reactor,
     scene: &Scene,
@@ -2019,13 +1720,13 @@ async fn run_reactor_turn(
         .unwrap_or_default();
     let new_signals = format!("## New signals\n{}", render_batch(batch));
 
-    // Open (or reuse) the persistent tools-off voice session. `speaking.md` is prepended
+    // Open (or reuse) the persistent reactor session. `speaking.md` is prepended
     // to its first prompt; the session then remembers prior turns, so only a *fresh*
     // session is handed the memory snapshot — later turns send just the delta.
     let (session, fresh) = match reactor_session {
         Some(s) => (s.clone(), false),
         None => {
-            let opened = open_reactor_voice_session(reactor, scene).await?;
+            let opened = open_reactor_session(reactor, scene).await?;
             *reactor_session = Some(opened.clone());
             (opened, true)
         }
@@ -2044,29 +1745,19 @@ async fn run_reactor_turn(
         join_sections(&[&worker_status, &presence_note, &interrupted, &new_signals])
     };
 
-    tracing::info!(scene = %scene, ctx_chars = context.chars().count(), "reactor voice: prompting session");
+    tracing::info!(scene = %scene, ctx_chars = context.chars().count(), "reactor: prompting session");
     let _ = beats.send(sequencer::Beat::TurnStart { turn: turn_id }).await;
 
     let spoke = match drive_voice(&session, scene, context).await {
-        Ok(Voiced::Text(text)) => {
-            tracing::info!(scene = %scene, reply_chars = text.chars().count(), "reactor voice: replied");
+        Ok(text) => {
+            tracing::info!(scene = %scene, reply_chars = text.chars().count(), "reactor: replied");
             if !text.trim().is_empty() {
                 let _ = beats.send(sequencer::Beat::Say(text)).await;
             }
-            true
-        }
-        Ok(Voiced::ToolAttempt(text)) => {
-            // The voice reached for a tool (it must not). Say whatever it managed first,
-            // then discard the now-wedged session (it holds an orphaned in-flight prompt);
-            // cognition does the actual work. This keeps a tool attempt from stalling.
-            if !text.trim().is_empty() {
-                let _ = beats.send(sequencer::Beat::Say(text)).await;
-            }
-            *reactor_session = None;
             true
         }
         Err(err) => {
-            tracing::warn!(scene = %scene, error = %err, "reactor voice failed");
+            tracing::warn!(scene = %scene, error = %err, "reactor turn failed");
             // Drop the possibly-wedged session so the next turn re-opens cold.
             *reactor_session = None;
             if reactor.inner.vendor.note_unreachable() {
@@ -2102,17 +1793,18 @@ async fn run_reactor_turn(
     Ok(())
 }
 
-/// Open a fresh **tools-off** reactor voice session for `scene`, carrying `speaking.md`
-/// as its system prompt (prepended to the first prompt). No `/mcp` attach, so the model
-/// has no host tools and the turn is a single generation.
-async fn open_reactor_voice_session(reactor: &Reactor, scene: &Scene) -> anyhow::Result<Arc<AcpSession>> {
+/// Open a fresh **reactor** session for `scene`, carrying `speaking.md` as its system
+/// prompt (prepended to the first prompt). It speaks via plain message text and gets a
+/// minimal `show_view`-only `/mcp` surface, so a turn is a single quick generation that
+/// may also put one already-built view on screen.
+async fn open_reactor_session(reactor: &Reactor, scene: &Scene) -> anyhow::Result<Arc<AcpSession>> {
     let session = Arc::new(
         reactor
             .inner
             .agent
             .session(
                 scene,
-                SessionRole::ReactorVoice,
+                SessionRole::Reactor,
                 None,
                 SessionOpts {
                     system_prompt: Some(crate::identity::reactor_system_prompt()),
@@ -2135,38 +1827,26 @@ async fn open_reactor_voice_session(reactor: &Reactor, scene: &Scene) -> anyhow:
     Ok(session)
 }
 
-/// Outcome of driving the tools-off voice session.
-enum Voiced {
-    /// The turn finished cleanly; carries the spoken text.
-    Text(String),
-    /// The model reached for a tool (which the voice must never do). We abandon the turn
-    /// rather than let the tool call stall it, carrying whatever was spoken before the
-    /// call. The caller must **discard** the session — we did not `wait()` it out, so it
-    /// now holds an orphaned in-flight prompt.
-    ToolAttempt(String),
-}
-
-/// Prompt the tools-off voice session and return its spoken text, streaming the updates
-/// **with logging** so a stall names itself. The CLI's built-in tools are still
-/// reachable, so the model *can* emit a `tool_call` despite having no host tools — the
-/// most likely stall — so we log it and bail ([`Voiced::ToolAttempt`]) rather than wait
-/// on it. Otherwise `wait()` parks the session and surfaces any real prompt error.
-async fn drive_voice(session: &AcpSession, scene: &Scene, context: String) -> anyhow::Result<Voiced> {
+/// Prompt the reactor session and return its spoken text (every `agent_message_chunk`
+/// concatenated). Tool calls — the reactor's only tool is `show_view` — are dispatched
+/// server-side through hi-agent's `/mcp` (which emits the `Beat::Show`), so the drive
+/// loop just keeps streaming speech past them, exactly like a worker's loop; `wait()`
+/// then parks the session and surfaces any real prompt error (a gateway 402/429, a
+/// transport reset) to the caller's classifier.
+async fn drive_voice(session: &AcpSession, scene: &Scene, context: String) -> anyhow::Result<String> {
     let mut run = session.prompt(context).await?;
     let mut text = String::new();
     while let Some(update) = run.next_update().await {
         match update {
             SessionUpdate::Text(t) => text.push_str(&t),
             SessionUpdate::Thought(t) => {
-                tracing::info!(scene = %scene, chars = t.chars().count(), "reactor voice: model is thinking");
+                tracing::debug!(scene = %scene, chars = t.chars().count(), "reactor: model is thinking");
             }
-            SessionUpdate::ToolCall(stub) => {
-                tracing::warn!(scene = %scene, variant = stub.raw_variant, "reactor voice: model invoked a TOOL — abandoning the turn (the voice is tools-off) so it cannot stall");
-                return Ok(Voiced::ToolAttempt(text));
-            }
-            SessionUpdate::Other(what) => {
-                tracing::debug!(scene = %scene, what = %what, "reactor voice: other update");
-            }
+            // `show_view` dispatches server-side via `/mcp`; the reactor keeps speaking.
+            // Its surface is `show_view`-only and the dispatch guard blocks any other
+            // expression tool, so there is nothing to intercept here.
+            SessionUpdate::ToolCall(_) => {}
+            SessionUpdate::Other(_) => {}
         }
     }
     let result = run.wait().await?;
@@ -2174,306 +1854,11 @@ async fn drive_voice(session: &AcpSession, scene: &Scene, context: String) -> an
         scene = %scene,
         stop = ?result.stop_reason,
         reply_chars = text.chars().count(),
-        "reactor voice: turn complete"
+        "reactor: turn complete"
     );
-    Ok(Voiced::Text(text))
+    Ok(text)
 }
 
-async fn run_turn(
-    reactor: &Reactor,
-    scene: &Scene,
-    batch: &[LoopInput],
-    reactor_session: &mut Option<Arc<AcpSession>>,
-    seeded: &mut bool,
-    budget: &mut heartbeat::ContextBudget,
-    workers: &mut workers::WorkerRegistry,
-    beats: &mpsc::Sender<sequencer::Beat>,
-    // Whether to emit the canned apology on terminal failure. `true` for normal
-    // turns (driven by a human/worker/alarm/pulse); `false` for probe turns
-    // while in vendor-down mode — those failures are silent, the user already
-    // heard the "holding your mail" line when the reactor went Down.
-    apologize: bool,
-    // The scene inbound queue and a carryover buffer, so a turn can notice human
-    // input arriving while it's still working and reorganize — cancel the
-    // in-flight reply and re-prompt with the new input folded in — instead of
-    // speaking a now-stale reply. Worker reports pulled mid-turn spill to
-    // `carryover`, which the caller folds into the next batch.
-    inbound: &mut mpsc::Receiver<LoopInput>,
-    carryover: &mut Vec<LoopInput>,
-) -> anyhow::Result<()> {
-    // Split mode (prototype, env-gated): the fast reactor voice handles the turn — one
-    // tools-off ACP session, single generation. Default is now this path (split is the
-    // direction); the agentic body below is retained but unreachable. See
-    // docs/reactor-cognition-split.md.
-    if voice::split_enabled() {
-        tracing::info!(scene = %scene, inputs = batch.len(), "split mode: reactor voice turn");
-        return run_reactor_turn(reactor, scene, batch, workers, reactor_session, beats).await;
-    }
-
-    // Computed once, shared by every reorganization pass.
-    let worker_status = workers.render_status().await;
-    let presence_note =
-        format!("## Presence\n{}", reactor.inner.presence.render(scene));
-
-    // If the human barged into a *previous* reply's playback, tell the mind what
-    // went unheard — taken once, ahead of all passes. Facts only; how to fold the
-    // tail forward is core.md's job.
-    let interrupted = reactor
-        .inner
-        .interrupts
-        .take_pending(scene)
-        .await
-        .map(|i| interrupts::render_interruption(&i))
-        .unwrap_or_default();
-
-    // Accumulated across passes: the human's words seen so far (the original batch
-    // plus anything a reorganization folds in), and what we'd already spoken before
-    // being reorganized (empty in the thinking phase — nothing was said yet).
-    let mut new_signals_body = render_batch(batch);
-    let mut spoken_so_far = String::new();
-
-    'reorg: loop {
-        let turn_id = reactor.inner.turn_seq.fetch_add(1, Ordering::Relaxed);
-        let new_signals = format!("## New signals\n{new_signals_body}");
-        let reorg_note = if spoken_so_far.trim().is_empty() {
-            String::new()
-        } else {
-            interrupts::render_reorg(spoken_so_far.trim())
-        };
-        reactor
-            .inner
-            .observatory
-            .record(
-                scene,
-                EventKind::TurnStarted { turn: turn_id, input: preview(&new_signals_body) },
-            )
-            .await;
-
-        // Bracket this pass on the sequencer (it renders say()/show_view() that
-        // arrive out-of-band as tool calls between these two beats). Each pass is
-        // its own turn id and TTS span; the next pass opens a fresh bracket (the
-        // sequencer resets per TurnStart), so an abandoned pass's flushed tail can't
-        // bleed into it. Sent once per pass, before the retry loop, so every attempt
-        // of this pass lives inside one bracket.
-        let _ = beats.send(sequencer::Beat::TurnStart { turn: turn_id }).await;
-
-        // Drive the prompt to completion, retrying a failed attempt on a freshly
-        // restarted ACP session with exponential backoff. The drive races the prompt
-        // against new human input; a mid-flight human burst comes back as
-        // `Reorganized` (not an error) and is handled below, outside the retry loop.
-        const MAX_ATTEMPTS: u32 = 3;
-        let mut attempt: u32 = 0;
-        let mut healed = false;
-        let mut prompt_chars = 0usize;
-        let drive: anyhow::Result<DriveOutcome> = loop {
-            attempt += 1;
-
-            // Build the prompt and acquire the session *inside* the attempt, so a
-            // failure to open (or to build the snapshot) is itself retriable. An
-            // unseeded session — fresh after a discard — re-seeds with the snapshot.
-            let attempt_result: anyhow::Result<DriveOutcome> = async {
-                let prompt_text = if *seeded {
-                    join_sections(&[&worker_status, &presence_note, &interrupted, &reorg_note, &new_signals])
-                } else {
-                    let snap = build_for_scene(&reactor.inner.memory, scene).await?;
-                    join_sections(&[
-                        &snap.render_for_prompt(),
-                        &worker_status,
-                        &presence_note,
-                        &interrupted,
-                        &reorg_note,
-                        &new_signals,
-                    ])
-                };
-                prompt_chars = prompt_text.chars().count();
-
-                let session = match reactor_session {
-                    Some(s) => s.clone(),
-                    None => {
-                        let opened = open_session(reactor, scene).await?;
-                        *reactor_session = Some(opened.clone());
-                        opened
-                    }
-                };
-
-                drive_racing_inbound(reactor, scene, &session, prompt_text, inbound, carryover, turn_id).await
-            }
-            .await;
-
-            match attempt_result {
-                Ok(outcome) => break Ok(outcome),
-                Err(err) => {
-                    tracing::warn!(scene = %scene, attempt, error = %err, "prompt attempt failed");
-                    // Discard the possibly-wedged session so the next attempt
-                    // restarts from cold and rebuilds context from the snapshot.
-                    discard_reactor_session(reactor, scene, reactor_session, seeded, budget).await;
-                    // Shutdown in progress: the children just took the same SIGINT/
-                    // SIGTERM this failure reflects. Don't respawn — a fresh session
-                    // opened now would race the ACP reap and could orphan a child.
-                    // Surface the failure and let the loop wind down.
-                    if reactor.inner.shutdown.is_triggered() {
-                        tracing::debug!(scene = %scene, "prompt failed during shutdown; not restarting");
-                        break Err(err);
-                    }
-                    // A 402/429 is definite for this turn: retrying on a fresh session
-                    // within a few hundred ms cannot succeed (the budget won't refill;
-                    // the throttle won't lift). Surface it now and let the terminal
-                    // handler below pick the recovery policy (poll energy / back off),
-                    // instead of burning MAX_ATTEMPTS respawns against a doomed gateway.
-                    if matches!(classify_outage(&err), Outage::OutOfEnergy | Outage::RateLimited) {
-                        break Err(err);
-                    }
-                    if attempt >= MAX_ATTEMPTS {
-                        break Err(err);
-                    }
-                    // A 401 means the upstream key the child was spawned with is
-                    // stale (broker re-mint / revocation). Re-fetch from the broker
-                    // once per turn so the store holds a fresh key; the next attempt
-                    // spawns a session that re-resolves it (see AgentLayer::session).
-                    // No-op in BYOK, so safe in every mode; a genuinely bad BYOK key
-                    // just exhausts the remaining attempts and surfaces, as before.
-                    if is_auth_error(&err) && !healed {
-                        healed = true;
-                        tracing::info!(scene = %scene, "auth failure; refreshing broker credentials before restart");
-                        crate::foundation::broker::refresh(reactor.inner.memory.data_dir(), None).await;
-                    }
-                    // Exponential backoff before the restart: 250ms, then 500ms.
-                    let backoff = Duration::from_millis(250u64 << (attempt - 1));
-                    tracing::info!(scene = %scene, attempt, ?backoff, "restarting ACP session after backoff");
-                    tokio::time::sleep(backoff).await;
-                }
-            }
-        };
-
-        // A successful drive (completed or reorganized) delivered a prompt, so the
-        // session is now seeded; a reorganized-but-wedged pass resets this when it
-        // discards the session below.
-        if drive.is_ok() {
-            *seeded = true;
-        }
-
-        // Vendor health + apology apply only to terminal outcomes. A reorganization
-        // is neither success nor failure — the vendor answered fine, we chose to
-        // re-ask — so it touches neither.
-        match &drive {
-            Ok(DriveOutcome::Completed(_)) => {
-                if reactor.inner.vendor.note_success() {
-                    tracing::info!(scene = %scene, "vendor recovered; resuming normal turns");
-                }
-            }
-            Err(err) => match classify_outage(err) {
-                Outage::OutOfEnergy => {
-                    // Definite: flip to out-of-energy immediately. That flip holds the
-                    // scene's mail and wakes the balance poller; `note_402` raises the
-                    // web app's out-of-energy hint at once (managed mode only). No more
-                    // model calls until the poller sees the balance refill. `resets_at`
-                    // paces the balance poll and feeds the hint (a 402 body carries none).
-                    let resets_at = crate::foundation::credentials::Credentials::load(reactor.inner.memory.data_dir())
-                        .energy
-                        .map(|e| e.resets_at)
-                        .unwrap_or_default();
-                    reactor.inner.vendor.note_out_of_energy(resets_at_instant(&resets_at));
-                    crate::foundation::energy_state::note_402(reactor.inner.memory.data_dir());
-                }
-                Outage::RateLimited => {
-                    // Transient throttle: back off and retry, silently — a rate limit
-                    // that resolves itself isn't worth interrupting the user over.
-                    reactor.inner.vendor.note_rate_limited();
-                }
-                Outage::Unreachable => {
-                    // Generic outage: absorb a blip, then tell the user once we're
-                    // holding their mail; retry on the growing backoff until it clears.
-                    if reactor.inner.vendor.note_unreachable() {
-                        let _ = beats
-                            .send(sequencer::Beat::Say(
-                                "我暂时连不上模型，先攒着你的消息，等恢复了一起处理。".to_string(),
-                            ))
-                            .await;
-                    } else if apologize {
-                        let _ = beats
-                            .send(sequencer::Beat::Say(format!(
-                                "抱歉，我这边出了点问题，没能完成这次回应。({err})"
-                            )))
-                            .await;
-                    }
-                }
-            },
-            Ok(DriveOutcome::Reorganized { .. }) => {}
-        }
-
-        // Always close this pass's bracket, even on error, so any open audio span
-        // ends and the /thought utterance closes. It hands back what this pass
-        // actually spoke, accumulated from its say() calls.
-        let (done_tx, done_rx) = oneshot::channel();
-        let _ = beats.send(sequencer::Beat::TurnEnd { done: done_tx }).await;
-        let reply = done_rx.await.unwrap_or_default();
-        // Close the pass on the interrupt registry: clears the live marker, caches
-        // the reply for barge-in resolution, back-fills an interrupt that hit it.
-        reactor.inner.interrupts.end_turn(scene, turn_id, &reply).await;
-
-        match drive {
-            Ok(DriveOutcome::Completed(stop_reason)) => {
-                budget.record_turn(prompt_chars, reply.chars().count());
-                reactor
-                    .inner
-                    .observatory
-                    .record(
-                        scene,
-                        EventKind::TurnFinished {
-                            turn: turn_id,
-                            stop_reason,
-                            reply_chars: reply.chars().count(),
-                            reply: preview(&reply),
-                        },
-                    )
-                    .await;
-                reactor.inner.observatory.set_budget(scene, budget.chars()).await;
-                return Ok(());
-            }
-            Ok(DriveOutcome::Reorganized { burst, session_ok }) => {
-                budget.record_turn(prompt_chars, reply.chars().count());
-                reactor
-                    .inner
-                    .observatory
-                    .record(
-                        scene,
-                        EventKind::TurnFinished {
-                            turn: turn_id,
-                            stop_reason: Some("Reorganized".to_string()),
-                            reply_chars: reply.chars().count(),
-                            reply: preview(&reply),
-                        },
-                    )
-                    .await;
-                // Carry what we'd spoken (if anything) into the reorg note, and fold
-                // the new human words into the next pass's signals.
-                if !reply.trim().is_empty() {
-                    if !spoken_so_far.is_empty() {
-                        spoken_so_far.push(' ');
-                    }
-                    spoken_so_far.push_str(reply.trim());
-                }
-                new_signals_body.push_str(&render_human_signals(&burst));
-                // A speaking-phase reorg (the human talked over live playback) also
-                // sets a barge-in note via note_speech; we've folded that fact into
-                // the reorg note already, so drain it to avoid a stale duplicate.
-                let _ = reactor.inner.interrupts.take_pending(scene).await;
-                if !session_ok {
-                    // The cancelled prompt's session is wedged — discard it so the
-                    // next pass cold-opens a fresh one and re-seeds.
-                    discard_reactor_session(reactor, scene, reactor_session, seeded, budget).await;
-                }
-                reactor.inner.observatory.set_budget(scene, budget.chars()).await;
-                continue 'reorg;
-            }
-            Err(err) => {
-                // A pass that failed every attempt propagates, so the caller's error
-                // arm runs (the session is already discarded above).
-                return Err(err);
-            }
-        }
-    }
-}
 
 async fn emit_thought_chunk(reactor: &Reactor, scene: &Scene, text: String) {
     let ts = Utc::now();
@@ -2539,19 +1924,6 @@ fn join_sections(sections: &[&str]) -> String {
         .filter(|s| !s.is_empty())
         .collect::<Vec<_>>()
         .join("\n\n")
-}
-
-/// Cap a message at a sane length for an observatory event. The session log is
-/// a developer view, not a transcript store; a long reply is truncated with an
-/// ellipsis rather than streaming kilobytes through the SSE feed and the ring.
-fn preview(s: &str) -> String {
-    const MAX: usize = 2000;
-    let s = s.trim();
-    if s.chars().count() <= MAX {
-        return s.to_string();
-    }
-    let head: String = s.chars().take(MAX).collect();
-    format!("{head}…")
 }
 
 fn render_batch(batch: &[LoopInput]) -> String {

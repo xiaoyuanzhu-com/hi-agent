@@ -1,9 +1,36 @@
 # reactor / cognition / worker — the tempo split
 
-> **Status: phases 1–2 on `origin/main` (`feat/reactor-cognition-split`), UNBUILT.**
-> The fast reactor voice *and* the cognition-as-worker wiring are implemented (blind — no
-> local toolchain, Mac mini down); build + measure + fix-forward. Env-gated
-> (`HI_AGENT_REACTOR_SPLIT`, default off → today's agentic path unchanged). Design contract.
+> **Status: the split is the default and always on** (`split_enabled()` hardcoded true;
+> the `HI_AGENT_REACTOR_SPLIT` env flag is retired). The `feat/reactor-communicator`
+> change makes the reactor a proper fast **communicator** and fixes the silence the split
+> shipped with — see *Current state* below. The legacy agentic reactor path is dead code
+> pending deletion.
+
+## Current state (reactor-communicator change)
+
+What the split actually is today, correcting the historical design notes further down:
+
+- **The reactor is a tools-light ACP session, not a direct Messages call.** The direct
+  Anthropic Messages path (below) was tried and **reverted** — the hand-rolled request hung
+  on the songguo gateway — so the reactor rides an ACP session, reusing the CLI's proven
+  gateway path. It carries `speaking.md` as its system prompt, speaks via plain message
+  text (`agent_message_chunk`), and gets a **`show_view`-only** `/mcp` surface.
+- **Naming: `SessionRole::ReactorVoice` was collapsed into `Reactor`** (the old agentic
+  `Reactor` role is deleted). Cognition is a persistent `SessionRole::Worker`. This
+  supersedes the deferred `Reactor → Cognition` rename listed under *Remaining*.
+- **Speed came from two real fixes, not from "no tool loop":** (1) the reactor now runs the
+  **small model** (a per-role `ANTHROPIC_MODEL` override), where it had silently inherited
+  the heavy `ANTHROPIC_MODEL`; (2) `resolve_system()` now **rejects a PATH `claude-agent-acp`
+  whose version ≠ the pin**, so a stray global 0.55.x (which hangs every ACP prompt for
+  minutes) can't shadow the pinned adapter. A tools-off single generation on Opus/0.55.x was
+  itself taking minutes — the original "the agentic loop is the latency" claim was wrong.
+- **Views work again.** `show_view` had become unreachable in split mode (tools-off reactor,
+  worker surface without it); the reactor now has it, so it can put a worker-built view on
+  screen. Expression is enforced reactor-only at dispatch (`dispatch_tool` role guard).
+
+Deferred: deleting the dead legacy agentic path (`voice.rs` gate, the legacy `run_turn`
+body, `warm_up`/`open_session`/`discard_reactor_session`/`drive_racing_inbound`/`DriveOutcome`,
+the heartbeat hot-swap); and Stage 2 (progressive, presence-paced interim views).
 
 ## The problem
 
@@ -46,7 +73,13 @@ self isn't fragmented (which `architecture.md` §3 rightly warns against) — on
 tempo is split. Same spectrum the **reflex** tier already established (reflex = no LLM
 → reactor = one fast LLM call → cognition = agentic loop).
 
-## Why a direct call, not ACP-with-tools-disabled
+## Why a direct call, not ACP-with-tools-disabled  *(historical — reverted)*
+
+> This section records the original reasoning for a direct Messages call. It was **tried
+> and reverted**: the direct request hung on the songguo gateway, and the real latency
+> turned out to be the model + a hang-zone adapter, not the ACP envelope. The reactor now
+> rides a tools-light ACP session (see *Current state*). The `speaking.md`-as-system-prompt
+> goal is met via `reactor_system_prompt()` prepended to the session.
 
 We evaluated reusing the ACP session with tools off + explicit prompts. **Rejected** —
 ACP structurally cannot meet the reactor's two goals:
@@ -112,9 +145,9 @@ conversation, not presence.
 - **Cognition can't sub-delegate** — the worker role only exposes `ask`, not `delegate`,
   so cognition does multi-step work inline rather than fanning out to sub-workers. Fine for
   v1; a role/MCP change restores the 3rd tier.
-- **Rename** `SessionRole::Reactor` → `Cognition` (+ `SessionKind`, MCP `X-HI-Role`
-  routing) — deferred as risky-blind; cosmetic, and split mode doesn't drive the ACP
-  "reactor" session anyway.
+- ~~**Rename** `SessionRole::Reactor` → `Cognition`~~ — **superseded.** The
+  reactor-communicator change instead collapsed `ReactorVoice` into `Reactor` and deleted
+  the agentic `Reactor`; cognition is a `Worker`. See *Current state* above.
 - **Trivial-turn cost** — cognition is handed *every* human turn (even "thanks"); the
   reactor's reconciliation suppresses double-speak, but a cheap gate (reactor decides, or
   cognition self-suppresses "nothing to do") would avoid the waste.

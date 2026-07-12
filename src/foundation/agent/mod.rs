@@ -22,18 +22,21 @@ use crate::foundation::config::{AgentConfig, HEADER_ROLE, HEADER_SCENE, HEADER_W
 use crate::types::Scene;
 
 /// Which tool surface a session gets, carried as `X-HI-Role` on its MCP attach so
-/// the `/mcp` server exposes the right tools (see [`crate::foundation::mcp`]). A reactor
-/// session drives output and delegation; a worker can only raise a question; a
-/// reflection session ("sleep") only reads/writes derived memory (episodes,
-/// facets) and has no voice.
+/// the `/mcp` server exposes the right tools (see [`crate::foundation::mcp`]). The
+/// reactor is the single fast conversational voice that owns interaction: it speaks
+/// via plain message text and gets a minimal `show_view`-only surface to put
+/// cognition's artifacts on screen — the heavy work is delegated to workers. A
+/// worker can only raise a question; a reflection session ("sleep") only
+/// reads/writes derived memory (episodes, facets) and has no voice.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum SessionRole {
+    /// The always-present **reactor** — the fast conversational voice. A turn is a
+    /// single quick generation on the small model; it speaks via its plain message
+    /// text (`agent_message_chunk`) and may call only `show_view` to display a view
+    /// a worker already built. Real work is delegated to [`Worker`](Self::Worker)
+    /// sessions (cognition).
     #[default]
     Reactor,
-    /// The fast, **tools-off** reactor voice (reactor/cognition split): a single
-    /// generation with no `/mcp` attach at all, so there is no tool loop. It speaks
-    /// via its plain message text (`agent_message_chunk`), not a `say` tool.
-    ReactorVoice,
     Worker,
     Reflection,
 }
@@ -42,7 +45,6 @@ impl SessionRole {
     fn as_str(self) -> &'static str {
         match self {
             SessionRole::Reactor => "reactor",
-            SessionRole::ReactorVoice => "reactor-voice",
             SessionRole::Worker => "worker",
             SessionRole::Reflection => "reflection",
         }
@@ -113,12 +115,12 @@ impl AgentLayer {
         worker_id: Option<u64>,
         opts: SessionOpts,
     ) -> anyhow::Result<AcpSession> {
-        // The reactor VOICE gets no `/mcp` attach at all — a single tools-free
-        // generation, which is what makes it a fast, loop-free turn. Every other role
-        // attaches hi-agent's tool surface, routed server-side by the X-HI-Role header.
-        let mcp_servers = if matches!(role, SessionRole::ReactorVoice) {
-            Vec::new()
-        } else {
+        // Every role attaches hi-agent's tool surface, routed server-side by the
+        // X-HI-Role header. The reactor's surface is deliberately tiny — `show_view`
+        // only (see [`crate::foundation::mcp::tools_for_role`]) — so a reactor turn
+        // is a single quick generation that speaks via message text and, at most,
+        // puts one already-built view on screen; the loop-heavy work is a worker's.
+        let mcp_servers = {
             let mut headers = vec![
                 HttpHeader::new(HEADER_SCENE, scene.0.clone()),
                 HttpHeader::new(HEADER_ROLE, role.as_str()),
@@ -148,7 +150,18 @@ impl AgentLayer {
         // so this child always carries the freshest key from the store (broker
         // re-mint, Settings edit, mode switch) — never a stale boot-time snapshot.
         let mut env = spawn.env.clone();
-        env.extend(AgentConfig::resolve(&self.inner.data_dir).auth_child_env());
+        let cfg = AgentConfig::resolve(&self.inner.data_dir);
+        env.extend(cfg.auth_child_env());
+        // The reactor is the fast conversational voice — pin it to the small/fast
+        // model rather than the heavy `ANTHROPIC_MODEL` `auth_child_env` sets, so a
+        // turn returns in ~a second. Replace (not append) the entry so there's no
+        // duplicate `ANTHROPIC_MODEL` for the child to disambiguate.
+        if matches!(role, SessionRole::Reactor) {
+            if let Some(model) = cfg.reactor_model() {
+                env.retain(|(k, _)| k.as_str() != "ANTHROPIC_MODEL");
+                env.push(("ANTHROPIC_MODEL".to_string(), model));
+            }
+        }
         tracing::info!(scene = %scene, role = role.as_str(), cwd = ?cwd, "spawning ACP subprocess for session");
         let (process, rx) = AcpProcess::spawn(
             spawn.program.clone(),

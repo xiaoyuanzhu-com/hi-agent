@@ -41,6 +41,12 @@ use crate::foundation::config::LlmWire;
 /// Pinned Node version (no leading `v`), stamped from `src/runtime/manifest.toml`.
 const NODE_VERSION: &str = env!("HI_AGENT_NODE_VERSION");
 
+/// Pinned ACP adapter version, stamped from `src/runtime/manifest.toml` (kept in
+/// sync with `package.json`). Used to reject a *different* `claude-agent-acp` found
+/// on `PATH` — a stray global install (e.g. the 0.55.x hang-zone) silently
+/// overriding the pin is exactly what wedged reactor turns for minutes.
+const ADAPTER_VERSION: &str = env!("HI_AGENT_ADAPTER_VERSION");
+
 /// The committed pin files, embedded so `npm ci` reproduces the exact tree
 /// without needing the repo on disk. Tiny (text), unlike the runtime itself.
 const PACKAGE_JSON: &str = include_str!(concat!(
@@ -717,6 +723,27 @@ fn resolve_system(wire: LlmWire) -> Option<ResolvedRuntime> {
         LlmWire::Codex => ("codex-acp", resolve_codex_bin()?),
     };
     let adapter_entry = find_on_path(adapter_name)?;
+
+    // A `claude-agent-acp` on `PATH` whose version differs from our pin is a trap:
+    // it can be a known-bad release (0.55.x hangs every ACP prompt for minutes) that
+    // silently shadows the managed/bundled adapter. Only Claude ships this pin, so
+    // check it for `LlmWire::Claude`; on a definite mismatch, skip the system runtime
+    // and fall through to the managed install of the pinned version. A version we
+    // can't read is accepted (don't break unusual-but-valid setups).
+    if let LlmWire::Claude = wire {
+        if let Some(found) = adapter_version_on_path(&adapter_entry) {
+            if found != ADAPTER_VERSION {
+                tracing::warn!(
+                    found = %found,
+                    pinned = %ADAPTER_VERSION,
+                    adapter = %adapter_entry.display(),
+                    "ignoring PATH claude-agent-acp: version != pinned; using the managed runtime instead",
+                );
+                return None;
+            }
+        }
+    }
+
     tracing::debug!(
         wire = wire.as_str(),
         node = %node_bin.display(),
@@ -731,6 +758,22 @@ fn resolve_system(wire: LlmWire) -> Option<ResolvedRuntime> {
         agent_bin,
         origin: "system",
     })
+}
+
+/// Best-effort read of the `version` from the `claude-agent-acp` package that a
+/// `PATH` entry resolves to. Follows symlinks (the npm bin is a symlink into the
+/// package's `dist/`), then walks up to the nearest `package.json` — the package
+/// root — and parses its `version`. Returns `None` if anything can't be read, so
+/// the caller treats "unknown" as "don't reject".
+fn adapter_version_on_path(entry: &Path) -> Option<String> {
+    let real = entry.canonicalize().ok()?;
+    let pkg = real
+        .ancestors()
+        .map(|dir| dir.join("package.json"))
+        .find(|p| p.is_file())?;
+    let text = std::fs::read_to_string(&pkg).ok()?;
+    let json: serde_json::Value = serde_json::from_str(&text).ok()?;
+    json.get("version")?.as_str().map(str::to_string)
 }
 
 /// Find an executable named `name` on `PATH`, returning the first match. On
