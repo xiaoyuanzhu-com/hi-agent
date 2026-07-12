@@ -147,6 +147,12 @@ pub async fn start(cfg: &Config) -> anyhow::Result<TtsStream> {
     headers.insert("X-Api-Key", HeaderValue::from_str(&cfg.api_key)?);
     headers.insert("X-Api-Resource-Id", HeaderValue::from_str(&cfg.resource_id)?);
     headers.insert("X-Api-Connect-Id", HeaderValue::from_str(&connect_id)?);
+    // Ask the songguo gateway to decode and return per-character TTS usage so the
+    // call is metered/billed; stripped before forwarding, harmless direct-to-vendor.
+    headers.insert(
+        "X-Control-Require-Usage-Tokens-Return",
+        HeaderValue::from_static("true"),
+    );
 
     let (ws, response) = tokio_tungstenite::connect_async(request)
         .await
