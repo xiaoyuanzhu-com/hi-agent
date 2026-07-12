@@ -176,17 +176,6 @@ const DEFAULT_VENDOR_PROBE: Duration = Duration::from_secs(30);
 const DEFAULT_VENDOR_DOWN_AFTER: u32 = 2;
 /// A transient-outage retry never waits longer than this — the 1h ceiling.
 const BACKOFF_CAP: Duration = Duration::from_secs(3600);
-/// The scene loop's cheap out-of-energy recheck cadence — how often a held scene wakes
-/// to notice the shared poller flipped the vendor back Up. (The poller itself, below,
-/// runs on [`OE_POLL_OPEN`]/[`OE_POLL_CLOSED`].)
-const OE_POLL_FLOOR: Duration = Duration::from_secs(10);
-/// Out-of-energy balance-poll cadence while the face window is on screen: tight, because
-/// the user is looking and may have just topped up — recovery should feel immediate.
-const OE_POLL_OPEN: Duration = Duration::from_secs(5);
-/// …and while the window is shut: nobody is watching, so poll rarely. The closed→open
-/// edge ([`crate::foundation::window_state::opened`]) forces an immediate check the
-/// moment the window returns, so this only bounds the fully-background case.
-const OE_POLL_CLOSED: Duration = Duration::from_secs(3600);
 
 /// The base transient-outage retry gap. `vendor_probe` in alarm-delay grammar;
 /// `off`/`0`/unset/unparseable → default. (Kept under the historical config key.)
@@ -204,38 +193,6 @@ fn vendor_down_after() -> u32 {
         .unwrap_or(DEFAULT_VENDOR_DOWN_AFTER)
 }
 
-/// The classified recovery policy for a terminal turn error — the two states the
-/// user asked for, plus the generic fallback.
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
-enum Outage {
-    /// Gateway 402: the account is out of energy. Retrying model calls is pointless
-    /// — the budget won't refill for a while — so we poll the balance and resume on
-    /// refill (or an upgrade). Announced, with the reset time + upgrade page.
-    OutOfEnergy,
-    /// Gateway 429 / 529: throttled or overloaded. Transient and self-healing —
-    /// back off and retry, silently (the user needn't hear about it).
-    RateLimited,
-    /// Anything else (5xx, transport, timeout, a missing response): a generic
-    /// outage. Informed once (after a blip is absorbed), then retried with backoff.
-    Unreachable,
-}
-
-/// Classify a terminal turn error by the HTTP status token the ACP adapter folds
-/// into its opaque message — the adapter hands us no numeric status, so we scan the
-/// flattened text for a standalone status token (same approach as [`has_status_token`]).
-/// A miss falls through to [`Outage::Unreachable`], the safe generic path: mail is
-/// stashed and retried either way.
-fn classify_outage(err: &anyhow::Error) -> Outage {
-    let s = format!("{err:#}");
-    if has_status_token(&s, 402) {
-        Outage::OutOfEnergy
-    } else if has_status_token(&s, 429) || has_status_token(&s, 529) {
-        Outage::RateLimited
-    } else {
-        Outage::Unreachable
-    }
-}
-
 /// How a scene loop should treat the vendor right now — the read side of [`Vendor`].
 #[derive(Clone, Copy, Debug)]
 enum SceneGate {
@@ -244,19 +201,12 @@ enum SceneGate {
     /// Transient outage (429 / generic): hold mail, and drive a catch-up turn once
     /// `at` (the current backoff deadline) passes. A failed retry grows the gap.
     Retry { at: Instant },
-    /// Out of energy (402): hold mail but do **not** drive a model turn — recovery
-    /// is the shared energy poll, which flips the vendor back Up. `at` is a cheap
-    /// recheck so the loop notices the refill and drains its mail.
-    Hold { at: Instant },
 }
 
 /// The vendor's reachability and, when down, how to recover from it.
 #[derive(Clone, Copy, Debug)]
 enum VendorState {
     Up,
-    /// Out of energy (402). `poll_at` is the next balance check; `resets_at` is the
-    /// broker's predicted refill instant when known (paces the poll).
-    OutOfEnergy { poll_at: Instant, resets_at: Option<Instant> },
     /// Transient backoff (429 / generic). `try_at` is the next retry deadline;
     /// `attempt` grows the gap toward [`BACKOFF_CAP`]; `silent` suppresses the user
     /// notice for a pure rate-limit (429), which the user needn't hear about.
@@ -266,24 +216,20 @@ enum VendorState {
 /// Shared, process-wide view of the upstream LLM vendor and how to recover from an
 /// outage. Every scene loop reads it (via [`Vendor::scene_gate`]) to decide whether
 /// and when to drive a turn; `run_turn`'s terminal path writes it. The vendor is a
-/// shared resource, so one scene detecting an outage steers all of them — and a
-/// single [out-of-energy poller](out_of_energy_poller) owns balance polling so N
-/// scenes don't each hammer `/energy`.
+/// shared resource, so one scene detecting an outage steers all of them.
 ///
-/// The three `note_*` writers return whether the transition warrants a *one-time*
-/// user notice (so the reactor announces "out of energy" / "can't reach the model"
-/// exactly once), mirroring the old flip-once contract.
+/// The `note_*` writers return whether the transition warrants a *one-time* user
+/// notice (so the reactor announces "can't reach the model" exactly once),
+/// mirroring the old flip-once contract.
 struct Vendor {
     state: std::sync::Mutex<VendorState>,
     /// Consecutive *generic* (Unreachable) failures, to absorb a blip before an
     /// informed backoff. Accessed only under `state`'s lock, so effectively part of
-    /// the same critical section. Reset on success and on the immediate 402/429 flips.
+    /// the same critical section. Reset on success.
     generic_failures: AtomicU32,
     down_after: u32,
     /// The transient-outage retry base; the gap is `base · 2^attempt`, capped at 1h.
     base: Duration,
-    /// Wakes the out-of-energy poller on entering [`VendorState::OutOfEnergy`].
-    oe_signal: tokio::sync::Notify,
 }
 
 impl Vendor {
@@ -293,7 +239,6 @@ impl Vendor {
             generic_failures: AtomicU32::new(0),
             down_after,
             base,
-            oe_signal: tokio::sync::Notify::new(),
         }
     }
 
@@ -308,59 +253,20 @@ impl Vendor {
         Duration::from_secs(secs.min(BACKOFF_CAP.as_secs()))
     }
 
-    /// The scene loop's scheduling read: drive now (Go), retry at a deadline
-    /// (Retry), or hold mail without a model call (Hold, out of energy).
+    /// The scene loop's scheduling read: drive now (Go) or retry at a deadline (Retry).
     fn scene_gate(&self) -> SceneGate {
         match *self.state.lock().unwrap() {
             VendorState::Up => SceneGate::Go,
             VendorState::Backoff { try_at, .. } => SceneGate::Retry { at: try_at },
-            // A cheap recheck (not the poll cadence): the shared poller owns the
-            // `/energy` call; the scene only needs to notice the resulting flip Up.
-            VendorState::OutOfEnergy { .. } => SceneGate::Hold { at: Instant::now() + OE_POLL_FLOOR },
         }
-    }
-
-    /// Terminal 402. Flip to out-of-energy immediately (a 402 is definite, not a
-    /// blip), kick the balance poll, and wake the poller; `resets_at` is kept only for
-    /// the refill-time display. Returns `true` on the flip *into* out-of-energy so the
-    /// caller announces it once.
-    fn note_out_of_energy(&self, resets_at: Option<Instant>) -> bool {
-        let mut st = self.state.lock().unwrap();
-        self.generic_failures.store(0, Ordering::Relaxed);
-        let entering = !matches!(*st, VendorState::OutOfEnergy { .. });
-        if entering {
-            *st = VendorState::OutOfEnergy { poll_at: oe_next_poll(), resets_at };
-        }
-        drop(st);
-        if entering {
-            self.oe_signal.notify_one();
-        }
-        entering
-    }
-
-    /// Terminal 429/529. Silent transient backoff — grow the gap if already backing
-    /// off, else start at the base. A 402 in effect is the stronger state and stands.
-    fn note_rate_limited(&self) {
-        let mut st = self.state.lock().unwrap();
-        self.generic_failures.store(0, Ordering::Relaxed);
-        if matches!(*st, VendorState::OutOfEnergy { .. }) {
-            return;
-        }
-        let attempt = match *st {
-            VendorState::Backoff { attempt, .. } => attempt.saturating_add(1),
-            _ => 0,
-        };
-        *st = VendorState::Backoff { try_at: Instant::now() + self.backoff(attempt), attempt, silent: true };
     }
 
     /// Terminal generic outage. Absorb one blip via `down_after`, then flip to an
     /// *informed* backoff. Returns `true` exactly on that flip (announce once);
-    /// `false` while still absorbing, already backing off, or out of energy.
+    /// `false` while still absorbing or already backing off.
     fn note_unreachable(&self) -> bool {
         let mut st = self.state.lock().unwrap();
         match *st {
-            // A 402's poll-based recovery is stronger; leave it (and its schedule).
-            VendorState::OutOfEnergy { .. } => false,
             // Already backing off — a failed retry just grows the gap.
             VendorState::Backoff { attempt, silent, .. } => {
                 let a = attempt.saturating_add(1);
@@ -388,50 +294,6 @@ impl Vendor {
         *st = VendorState::Up;
         was_down
     }
-
-    /// The next balance-poll instant while out of energy, or `None` once recovered
-    /// (the poller then parks until re-signalled).
-    fn oe_poll_at(&self) -> Option<Instant> {
-        match *self.state.lock().unwrap() {
-            VendorState::OutOfEnergy { poll_at, .. } => Some(poll_at),
-            _ => None,
-        }
-    }
-
-    /// Re-pace the balance poll after a check that found the account still empty.
-    /// No-op if the vendor recovered concurrently. `resets_at` is stored only for the
-    /// refill-time display; the poll cadence comes from the window state.
-    fn oe_reschedule(&self, resets_at: Option<Instant>) {
-        let mut st = self.state.lock().unwrap();
-        if let VendorState::OutOfEnergy { poll_at, resets_at: slot } = &mut *st {
-            *slot = resets_at;
-            *poll_at = oe_next_poll();
-        }
-    }
-}
-
-/// The next out-of-energy balance poll: [`OE_POLL_OPEN`] while the face window is on
-/// screen, [`OE_POLL_CLOSED`] while it's shut. This replaces the old pace-from-reset
-/// math — an out-of-band top-up (the user paying) is exactly what the predicted reset
-/// can't foresee, so we poll on a fixed cadence and let the fetched balance be the
-/// ground truth. The closed→open edge additionally cuts the current sleep short (see
-/// the poller), so reopening the window re-checks immediately regardless of this.
-fn oe_next_poll() -> Instant {
-    let gap = if crate::foundation::window_state::is_open() {
-        OE_POLL_OPEN
-    } else {
-        OE_POLL_CLOSED
-    };
-    Instant::now() + gap
-}
-
-/// Parse the broker's RFC3339 `resets_at` into a monotonic [`Instant`], or `None`
-/// if blank/unparseable/already past — bridging wall-clock (chrono) to the
-/// monotonic clock the poll scheduler runs on.
-fn resets_at_instant(resets_at: &str) -> Option<Instant> {
-    let reset = chrono::DateTime::parse_from_rfc3339(resets_at.trim()).ok()?;
-    let gap = reset.with_timezone(&chrono::Utc) - chrono::Utc::now();
-    gap.to_std().ok().map(|d| Instant::now() + d)
 }
 
 /// A short human phrase for when the balance refills ("大约 3 小时后", "约 20 分钟后"),
@@ -451,18 +313,6 @@ pub(crate) fn humanize_until_reset(resets_at: &str) -> String {
     }
 }
 
-/// Find `status` as a standalone status token in `text` — the digits bounded by
-/// non-digits, so "API Error: 402 …" matches but a longer number that merely
-/// contains those digits (a request id, a timestamp) does not.
-fn has_status_token(text: &str, status: u16) -> bool {
-    let needle = status.to_string();
-    text.match_indices(&needle).any(|(i, _)| {
-        let before = text[..i].chars().next_back();
-        let after = text[i + needle.len()..].chars().next();
-        before.is_none_or(|c| !c.is_ascii_digit()) && after.is_none_or(|c| !c.is_ascii_digit())
-    })
-}
-
 #[cfg(test)]
 mod vendor_tests {
     use super::*;
@@ -472,53 +322,8 @@ mod vendor_tests {
     }
 
     #[test]
-    fn classify_by_status_token() {
-        use Outage::*;
-        // A 402 anywhere in the ACP-translated error → out of energy, whatever body
-        // the gateway attaches (we key on the status code, not a vendor slug).
-        assert_eq!(
-            classify_outage(&anyhow::anyhow!("session/prompt failed: API Error: 402 {{\"error\":\"quota\"}}")),
-            OutOfEnergy
-        );
-        // The historical songguo shape still reads as out of energy.
-        assert_eq!(
-            classify_outage(&anyhow::anyhow!("402 Payment Required songguo_budget_exceeded")),
-            OutOfEnergy
-        );
-        // 429 (throttle) and 529 (overload) are both transient rate limits.
-        assert_eq!(classify_outage(&anyhow::anyhow!("API Error: 429 too many requests")), RateLimited);
-        assert_eq!(classify_outage(&anyhow::anyhow!("API Error: 529 overloaded")), RateLimited);
-        // No status code → generic outage.
-        assert_eq!(classify_outage(&anyhow::anyhow!("connection reset by peer")), Unreachable);
-        // A longer number that merely contains "402" must not trip it.
-        assert_eq!(classify_outage(&anyhow::anyhow!("request id 1140228 timed out")), Unreachable);
-    }
-
-    #[test]
     fn starts_up() {
         assert!(!fresh().is_down());
-    }
-
-    #[test]
-    fn out_of_energy_flips_immediately_and_announces_once() {
-        let v = fresh();
-        assert!(v.note_out_of_energy(None), "402 flips Up -> OutOfEnergy and announces");
-        assert!(v.is_down());
-        assert!(!v.note_out_of_energy(None), "already out of energy -> no second announce");
-        // Out of energy holds mail without a model retry — recovery is the poller.
-        assert!(matches!(v.scene_gate(), SceneGate::Hold { .. }));
-        assert!(v.note_success(), "a refill ends the outage");
-        assert!(!v.is_down());
-    }
-
-    #[test]
-    fn rate_limited_is_silent_and_retries() {
-        let v = fresh();
-        v.note_rate_limited(); // silent: no announce return value at all
-        assert!(v.is_down());
-        assert!(matches!(v.scene_gate(), SceneGate::Retry { .. }), "429 backs off and retries");
-        assert!(v.note_success());
-        assert!(!v.is_down());
     }
 
     #[test]
@@ -555,33 +360,6 @@ mod vendor_tests {
         assert_eq!(v.backoff(1), Duration::from_secs(60));
         assert_eq!(v.backoff(2), Duration::from_secs(120));
         assert_eq!(v.backoff(100), BACKOFF_CAP, "never exceeds the 1h cap");
-    }
-
-    #[test]
-    fn out_of_energy_poll_tracks_the_window() {
-        use crate::foundation::window_state;
-        let now = Instant::now();
-        // Window shut → poll rarely (the background cadence, so an idle machine nobody
-        // is watching doesn't hammer the broker).
-        window_state::set_open(false);
-        let closed = oe_next_poll().saturating_duration_since(now);
-        assert!(closed >= OE_POLL_CLOSED - Duration::from_secs(1), "hidden → slow");
-        // Window on screen → poll tight, so a fresh top-up is noticed within seconds.
-        window_state::set_open(true);
-        let open = oe_next_poll().saturating_duration_since(now);
-        assert!(open <= OE_POLL_OPEN + Duration::from_secs(1), "on screen → fast");
-        window_state::set_open(false);
-    }
-
-    #[test]
-    fn out_of_energy_outranks_a_concurrent_backoff() {
-        let v = fresh();
-        v.note_out_of_energy(None);
-        // A 429/generic landing while out of energy must not downgrade the state.
-        v.note_rate_limited();
-        assert!(matches!(v.scene_gate(), SceneGate::Hold { .. }));
-        assert!(!v.note_unreachable());
-        assert!(matches!(v.scene_gate(), SceneGate::Hold { .. }));
     }
 }
 
@@ -627,19 +405,6 @@ mod reflection_schedule_tests {
         // fresh input since then → fire base (60s) after the anchor.
         let at = next_reflection_at(t0, t0 + secs(30), None, Some(secs(60)), secs(60));
         assert_eq!(at, Some(t0 + secs(60)));
-    }
-
-    #[test]
-    fn is_auth_error_matches_the_gateway_401() {
-        // The real shape from a live run: the adapter's `errorKind` is stringified
-        // into the anyhow message. The heal path keys off exactly this.
-        let e = anyhow::anyhow!(
-            "session/prompt failed: Internal error: Failed to authenticate. \
-             API Error: 401 invalid user key: {{ \"errorKind\": \"authentication_failed\" }}"
-        );
-        assert!(is_auth_error(&e));
-        // An ordinary failure must not trigger a broker refresh + restart.
-        assert!(!is_auth_error(&anyhow::anyhow!("session/prompt failed: connection reset")));
     }
 
     #[test]
@@ -955,66 +720,7 @@ pub fn start(
         consolidated_reflection_loop(reflect_reactor).await;
     });
 
-    // Out-of-energy poller: while any scene has flipped the vendor out of energy
-    // (402), poll the balance on an adaptive cadence and flip back Up the moment it
-    // refills. Parks (no polling, no model calls) whenever the vendor is reachable —
-    // one task for the whole process, so N scenes don't each hammer `/energy`.
-    let energy_reactor = reactor.clone();
-    tokio::spawn(async move {
-        out_of_energy_poller(energy_reactor).await;
-    });
-
     reactor
-}
-
-/// The single out-of-energy poller. While any scene has flipped the vendor to
-/// [`VendorState::OutOfEnergy`], re-fetch the balance on the window-gated cadence
-/// ([`OE_POLL_OPEN`] on screen / [`OE_POLL_CLOSED`] hidden) and flip the vendor back Up
-/// the moment it refills; then the scene loops' held mail drains on their next pass.
-/// The face window coming to the front cuts the current wait short and re-checks at
-/// once (a payment made while it was hidden shouldn't wait out the schedule). Parks on
-/// [`Vendor::oe_signal`] while the vendor is reachable, so an account in credit costs
-/// nothing.
-async fn out_of_energy_poller(reactor: Reactor) {
-    let data_dir = reactor.inner.memory.data_dir().to_path_buf();
-    loop {
-        // Park until a scene reports out of energy (or act on a pending schedule).
-        let poll_at = match reactor.inner.vendor.oe_poll_at() {
-            Some(at) => at,
-            None => {
-                reactor.inner.vendor.oe_signal.notified().await;
-                continue;
-            }
-        };
-        let now = Instant::now();
-        if poll_at > now {
-            // Wait for the scheduled poll — but cut it short if the face window comes to
-            // the front, since the user may have just paid on the web and wants to keep
-            // going now. That edge polls immediately, then the loop resumes the (now
-            // "open") cadence.
-            tokio::select! {
-                _ = tokio::time::sleep(poll_at - now) => {}
-                _ = crate::foundation::window_state::opened().notified() => {}
-            }
-        }
-        // A concurrent success may have cleared the outage while we slept.
-        if reactor.inner.vendor.oe_poll_at().is_none() {
-            continue;
-        }
-        match crate::foundation::broker::poll_energy_now(&data_dir).await {
-            Some(en) if en.remaining > 0 => {
-                if reactor.inner.vendor.note_success() {
-                    tracing::info!(remaining = en.remaining, "energy refilled; resuming turns");
-                }
-            }
-            Some(en) => {
-                tracing::info!(remaining = en.remaining, resets_at = %en.resets_at, "still out of energy; re-pacing poll");
-                reactor.inner.vendor.oe_reschedule(resets_at_instant(&en.resets_at));
-            }
-            // Poll failed (offline / no token / BYOK). Retry at the floor cadence.
-            None => reactor.inner.vendor.oe_reschedule(None),
-        }
-    }
 }
 
 /// The single consolidated reflection loop: one "sleep" pass over all
@@ -1212,16 +918,6 @@ fn scenes_to_rewarm(data_dir: &std::path::Path) -> Vec<Scene> {
     warm
 }
 
-/// Whether a failed prompt is an upstream authentication failure (a 401 from the
-/// LLM gateway), which the retry loop heals by refreshing broker credentials. The
-/// ACP adapter reports it as `errorKind: "authentication_failed"`, and that kind is
-/// stringified into the `anyhow` error message today — so we match on it rather than
-/// a typed variant (centralized here to harden later if the acp crate exposes the
-/// structured `data`).
-fn is_auth_error(err: &anyhow::Error) -> bool {
-    err.to_string().contains("authentication_failed")
-}
-
 impl Reactor {
     async fn deliver_to_scene(&self, scene: Scene, signal: Signal) {
         // Mark global activity and poke the consolidated reflection clock, so a scene
@@ -1402,17 +1098,16 @@ async fn per_scene_loop(
 
     // Pending turn-driving items, hoisted out of the main loop so the batch
     // survives across iterations while the vendor is down — a failed retry must not
-    // drop the mail it was attempting to deliver, and out-of-energy mail waits here
-    // for the refill. Cleared on a successful turn (the mail went out) and on a
-    // reachable-but-failed blip (the apology was emitted); held while down.
+    // drop the mail it was attempting to deliver. Cleared on a successful turn (the
+    // mail went out) and on a reachable-but-failed blip (the apology was emitted);
+    // held while down.
     let mut batch: Vec<LoopInput> = Vec::new();
 
     loop {
         // Wait for a turn-driving reason: a new signal, a fired alarm, a due host
         // pulse, a worker question, or — while the vendor is down — a backoff retry
-        // (429/generic) or a recheck that notices an out-of-energy refill. Tool
-        // control commands (delegate/alarm) are pure side-effects applied without a
-        // turn; only a worker `ask` becomes a turn-driving item.
+        // (429/generic). Tool control commands (delegate/alarm) are pure side-effects
+        // applied without a turn; only a worker `ask` becomes a turn-driving item.
         'wait: loop {
             let gate = reactor.inner.vendor.scene_gate();
             // Mail already sitting in `batch` (e.g. held while the vendor was down)
@@ -1424,12 +1119,11 @@ async fn per_scene_loop(
             let down = !matches!(gate, SceneGate::Go);
             // While down, suppress pulses — they call the model and would just fail.
             let pulse_at = if down { None } else { pulse_every.map(|d| last_activity + d) };
-            // While down, the recovery timer: a backoff retry deadline (429/generic),
-            // or a cheap recheck to notice an out-of-energy refill (the shared poller
-            // owns the actual `/energy` call). Up → no such timer.
+            // While down, the recovery timer: the backoff retry deadline (429/generic).
+            // Up → no such timer.
             let recover_at = match gate {
                 SceneGate::Go => None,
-                SceneGate::Retry { at } | SceneGate::Hold { at } => Some(at),
+                SceneGate::Retry { at } => Some(at),
             };
             let deadline = [alarms.next_deadline(), pulse_at, recover_at]
                 .into_iter()
@@ -1646,10 +1340,9 @@ async fn per_scene_loop(
                 budget.reset();
                 reactor.inner.observatory.set_budget(&scene, 0).await;
                 // Key on the vendor state the turn just wrote, not the pre-turn one:
-                // a turn that hit a 402/429 (even the first, from Up) left the vendor
-                // down, so hold the mail — out of energy drains it on refill; a
-                // backoff drives it at the next retry deadline. Only a still-reachable
-                // blip (already apologized inside run_turn) drops it.
+                // a turn that flipped the vendor down holds the mail — a backoff drives
+                // it at the next retry deadline. Only a still-reachable blip (already
+                // apologized inside run_turn) drops it.
                 if reactor.inner.vendor.is_down() {
                     tracing::info!(scene = %scene, mail = batch.len(), "vendor down; holding mail for recovery");
                 } else {

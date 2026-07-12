@@ -64,21 +64,8 @@ impl ContextBudget {
         }
     }
 
-    /// Fold one completed turn's prompt and reply sizes into the running total.
-    pub(super) fn record_turn(&mut self, prompt_chars: usize, reply_chars: usize) {
-        self.chars = self
-            .chars
-            .saturating_add(prompt_chars)
-            .saturating_add(reply_chars);
-    }
-
     pub(super) fn should_swap(&self) -> bool {
         self.chars >= self.limit
-    }
-
-    /// Current accumulated chars, mirrored into the observatory for display.
-    pub(super) fn chars(&self) -> usize {
-        self.chars
     }
 
     /// Reset after a swap (or after the session is discarded on error).

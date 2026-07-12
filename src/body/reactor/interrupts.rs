@@ -201,20 +201,6 @@ pub(super) fn render_interruption(i: &Interruption) -> String {
     }
 }
 
-/// Render a reorganization note for a re-prompt: new human input arrived while the
-/// mind was still mid-reply. Only used when the mind had already spoken something
-/// (the speaking phase); in the thinking phase nothing was said, so the folded
-/// input alone speaks for itself and no note is rendered. Facts only — whether to
-/// continue, pivot, or drop the tail is the soul's judgment (see `speaking.md`).
-pub(super) fn render_reorg(spoken_so_far: &str) -> String {
-    format!(
-        "## Still mid-reply\nYou'd already begun replying and had said: \"{spoken_so_far}\". \
-         They added more before you finished (see New signals) — so your reply isn't done. Fold \
-         it all into one reply: continue from where you left off, don't restart or repeat what \
-         you already said."
-    )
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -327,12 +313,5 @@ mod tests {
         assert!(reg.should_skip(&scene(), 9).await);
         // A later (reorganized) pass with a fresh id is unaffected.
         assert!(!reg.should_skip(&scene(), 10).await);
-    }
-
-    #[test]
-    fn render_reorg_carries_the_spoken_text() {
-        let note = render_reorg("最近你加了 amnesia、transient");
-        assert!(note.contains("最近你加了 amnesia、transient"));
-        assert!(note.contains("Still mid-reply"));
     }
 }
