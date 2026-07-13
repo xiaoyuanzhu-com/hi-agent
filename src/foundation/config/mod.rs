@@ -407,18 +407,27 @@ impl AgentConfig {
         }
     }
 
-    /// The model the **reactor** (the fast conversational voice) should run: the
-    /// broker's small/fast companion when present, else the main model. A reactor
-    /// turn is a single quick generation, so it takes the light model rather than the
-    /// heavy one `auth_child_env` puts in `ANTHROPIC_MODEL`. Context-window normalized
-    /// like the others. `None` (Codex, or no model configured) → no override; the
-    /// reactor keeps whatever `auth_child_env` set.
+    /// The model the **reactor** (the conversational voice) should run: the **main,
+    /// smart** model, same as cognition. The reactor's core skill is judging the edge
+    /// of what it already holds — "can I answer from my prepared context, or must I
+    /// hand this to cognition?" — which is a smart-model job, not a small-model one.
+    /// Its speed comes from a *single tools-off generation* over a bounded prepared
+    /// context (no fetch, no tool loop), not from a lighter model. So it takes `model`,
+    /// falling back to `small` only when no main model is configured. Context-window
+    /// normalized like the others. `None` (Codex, or nothing configured) → no override;
+    /// the reactor keeps whatever `auth_child_env` set.
+    ///
+    /// (Historically this pinned the reactor to the *small* slot — that was from a spell
+    /// when the reactor had accidentally inherited Opus *and* rode a hang-zone adapter,
+    /// and the small model was a workaround for a ~7-min turn. The adapter is pinned now;
+    /// the workaround is retired in favour of the smart model the contract calls for. See
+    /// docs/reactor-cognition-split.md.)
     pub fn reactor_model(&self) -> Option<String> {
         match self.wire {
             LlmWire::Claude => self
-                .small
+                .model
                 .as_ref()
-                .or(self.model.as_ref())
+                .or(self.small.as_ref())
                 .map(|m| with_context_window(m)),
             LlmWire::Codex => None,
         }

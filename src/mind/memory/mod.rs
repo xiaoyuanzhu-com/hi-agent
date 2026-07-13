@@ -20,7 +20,7 @@ pub mod snapshot;
 
 pub use self::core::refresh_hot;
 pub use journal::Journal;
-pub use snapshot::{Snapshot, build_for_scene};
+pub use snapshot::{Snapshot, build_for_scene, working_set};
 
 #[derive(Clone)]
 pub struct Memory {

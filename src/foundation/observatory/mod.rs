@@ -166,6 +166,8 @@ pub enum EventKind {
     WorkerResumed { id: u64, task: String },
     WorkerFinished { id: u64, state: WorkerState, summary_chars: usize },
     WorkerQuestion { id: u64, question: String },
+    /// A worker handed something to the voice mid-work (the `surface` tool).
+    WorkerSurfaced { id: u64, message: String },
     AlarmScheduled { note: String, delay_s: u64 },
     AlarmFired { note: String },
 }
@@ -381,6 +383,11 @@ impl Observatory {
             EventKind::WorkerQuestion { id, question } => {
                 if let Some(w) = view.workers.iter_mut().find(|w| w.id == *id) {
                     w.last_question = Some(question.clone());
+                }
+            }
+            EventKind::WorkerSurfaced { id, message } => {
+                if let Some(w) = view.workers.iter_mut().find(|w| w.id == *id) {
+                    w.last_question = Some(message.clone());
                 }
             }
             EventKind::AlarmScheduled { note, delay_s } => {

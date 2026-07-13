@@ -208,6 +208,12 @@ pub(super) struct WorkerReport {
     pub(super) id: WorkerId,
     pub(super) task: String,
     pub(super) kind: WorkerReportKind,
+    /// Whether this is the scene's **cognition** worker (vs. an ordinary task worker).
+    /// Cognition is the reactor's own thinking, so its result is not one signal among
+    /// many the voice may note or drop — it is the substance of a reply the reactor
+    /// asked for, and [`render_report`] frames it as a must-relay instruction. A plain
+    /// worker's report stays an observation the reactor voices on its own social timing.
+    pub(super) is_cognition: bool,
 }
 
 pub(super) enum WorkerReportKind {
@@ -217,6 +223,10 @@ pub(super) enum WorkerReportKind {
     Failed(String),
     /// A non-blocking question raised mid-flight; the worker keeps going.
     Question(String),
+    /// Something the worker handed to the voice mid-work via the `surface` tool —
+    /// an interim finding, progress, or an unprompted heads-up — while it keeps
+    /// working. Interim, never terminal; the worker's drive loop is untouched.
+    Surfaced(String),
 }
 
 /// One live working session. The registry holds it to inspect its transcript, to
@@ -276,6 +286,19 @@ impl WorkerRegistry {
         reactor: &Reactor,
         task: String,
     ) -> anyhow::Result<WorkerId> {
+        self.spawn_inner(reactor, task, false).await
+    }
+
+    /// `spawn`, plus the `is_cognition` flag that tags every report this worker posts
+    /// so the reactor can tell its own thinking (must-relay) from a task worker's
+    /// observation. Cognition goes through [`cognize`](Self::cognize); everything else
+    /// through [`spawn`](Self::spawn) with the flag false.
+    async fn spawn_inner(
+        &mut self,
+        reactor: &Reactor,
+        task: String,
+        is_cognition: bool,
+    ) -> anyhow::Result<WorkerId> {
         let id = self.next_id;
         self.next_id += 1;
 
@@ -315,6 +338,7 @@ impl WorkerRegistry {
             self.scene.clone(),
             mailbox.clone(),
             busy.clone(),
+            is_cognition,
         ));
 
         self.workers.insert(
@@ -344,6 +368,7 @@ impl WorkerRegistry {
         reactor: &Reactor,
         id: WorkerId,
         task: String,
+        is_cognition: bool,
     ) -> anyhow::Result<WorkerId> {
         if let Some(w) = self.workers.get_mut(&id) {
             // Merge under the mailbox lock — the same critical section the drive
@@ -377,7 +402,7 @@ impl WorkerRegistry {
             self.workers.remove(&id);
         }
         tracing::info!(scene = %self.scene, worker = id, "follow-up target gone; spawning fresh worker");
-        self.spawn(reactor, task).await
+        self.spawn_inner(reactor, task, is_cognition).await
     }
 
     /// Ensure the scene's persistent **cognition** worker is working on `task`:
@@ -389,8 +414,8 @@ impl WorkerRegistry {
     /// if the tracked worker has gone, so the id is re-stored from whatever it returns.
     pub(super) async fn cognize(&mut self, reactor: &Reactor, task: String) -> anyhow::Result<()> {
         let id = match self.cognition {
-            Some(id) => self.follow_up(reactor, id, task).await?,
-            None => self.spawn(reactor, task).await?,
+            Some(id) => self.follow_up(reactor, id, task, true).await?,
+            None => self.spawn_inner(reactor, task, true).await?,
         };
         self.cognition = Some(id);
         Ok(())
@@ -412,7 +437,31 @@ impl WorkerRegistry {
             .get(&id)
             .map(|w| w.task.clone())
             .unwrap_or_else(|| "(finished worker)".to_string());
-        WorkerReport { id, task, kind: WorkerReportKind::Question(question) }
+        WorkerReport {
+            id,
+            task,
+            kind: WorkerReportKind::Question(question),
+            is_cognition: self.cognition == Some(id),
+        }
+    }
+
+    /// Build a surfaced report for the `surface` tool — something a worker handed to
+    /// the voice mid-work. Like [`question_report`](Self::question_report) it resolves
+    /// the worker's task and flags whether it's cognition (whose surfaced word is
+    /// must-relay). The loop folds the returned report in as a turn-driving signal, so
+    /// the voice gets a chance to say it even with no human input.
+    pub(super) fn surface_report(&self, id: WorkerId, message: String) -> WorkerReport {
+        let task = self
+            .workers
+            .get(&id)
+            .map(|w| w.task.clone())
+            .unwrap_or_else(|| "(finished worker)".to_string());
+        WorkerReport {
+            id,
+            task,
+            kind: WorkerReportKind::Surfaced(message),
+            is_cognition: self.cognition == Some(id),
+        }
     }
 
     /// A compact, stable-ordered view of every live worker — its id, task, whether
@@ -455,19 +504,55 @@ impl WorkerRegistry {
 }
 
 /// Render one report for the `## New signals` section the reactor sees.
+///
+/// A **cognition** report is the reactor's own thinking coming back — the answer to
+/// something it told the person it would look into — so it is framed as a *must-relay
+/// instruction*, not a passive "a worker finished" line the voice might note in passing
+/// and drop. This is the fix for cognition's substance never reaching the person: the
+/// result was structurally optional, one signal among many a mute-by-default voice
+/// discarded. A plain **task worker** report stays an observation the reactor voices on
+/// its own social timing (it may already have spoken to it, or choose to show a view
+/// instead of narrating). Both still pass through the reactor's judgment — must-relay
+/// means "this is a reply you owe them," not "dump it verbatim": the reactor still says
+/// it in its own plain words, reconciling with what it already said.
 pub(super) fn render_report(report: &WorkerReport) -> String {
     match &report.kind {
+        WorkerReportKind::Done(answer) if report.is_cognition => format!(
+            "Your thinking on \"{}\" is back — this is the answer you owe the person, so \
+relay what matters here in your own plain words now (don't leave them waiting, and \
+don't just acknowledge it — tell them what you found):\n{}",
+            report.task,
+            answer.trim()
+        ),
         WorkerReportKind::Done(answer) => format!(
             "working session {} finished — task was \"{}\":\n{}",
             report.id,
             report.task,
             answer.trim()
         ),
+        WorkerReportKind::Failed(err) if report.is_cognition => format!(
+            "Your thinking on \"{}\" hit a wall: {} — let the person know you couldn't get \
+there (plainly, no jargon), rather than going silent.",
+            report.task,
+            err.trim()
+        ),
         WorkerReportKind::Failed(err) => format!(
             "working session {} FAILED — task was \"{}\": {}",
             report.id,
             report.task,
             err.trim()
+        ),
+        WorkerReportKind::Surfaced(msg) if report.is_cognition => format!(
+            "You have something to tell the person (from your own thinking on \"{}\") — \
+say it now, in your own plain words, if the moment's right:\n{}",
+            report.task,
+            msg.trim()
+        ),
+        WorkerReportKind::Surfaced(msg) => format!(
+            "working session {} (task \"{}\") surfaced: {}",
+            report.id,
+            report.task,
+            msg.trim()
         ),
         WorkerReportKind::Question(q) => format!(
             "working session {} (task \"{}\") asks: {}",
@@ -492,6 +577,7 @@ async fn drive_worker(
     scene: Scene,
     mailbox: Arc<FollowMailbox>,
     busy: Arc<AtomicBool>,
+    is_cognition: bool,
 ) {
     let mut task = initial_task;
     loop {
@@ -504,14 +590,17 @@ async fn drive_worker(
         let (state, summary_chars) = match &kind {
             WorkerReportKind::Done(answer) => (WorkerState::Done, answer.chars().count()),
             WorkerReportKind::Failed(err) => (WorkerState::Failed, err.chars().count()),
-            // Questions are interim, never terminal — a drive pass only ever ends in
-            // Done or Failed, so this arm is unreachable, but keep it total.
-            WorkerReportKind::Question(_) => (WorkerState::Running, 0),
+            // Questions and surfaced findings are interim, never terminal — a drive
+            // pass only ever ends in Done or Failed, so these arms are unreachable,
+            // but keep the match total.
+            WorkerReportKind::Question(_) | WorkerReportKind::Surfaced(_) => {
+                (WorkerState::Running, 0)
+            }
         };
         observatory
             .record(&scene, EventKind::WorkerFinished { id, state, summary_chars })
             .await;
-        let report = WorkerReport { id, task: task.clone(), kind };
+        let report = WorkerReport { id, task: task.clone(), kind, is_cognition };
         if inbound.send(LoopInput::Worker(report)).await.is_err() {
             tracing::warn!(worker = id, "worker report dropped; scene loop gone");
             return;

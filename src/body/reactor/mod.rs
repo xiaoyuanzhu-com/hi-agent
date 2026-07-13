@@ -77,7 +77,7 @@ use crate::foundation::acp::{AcpSession, SessionOpts, SessionUpdate};
 use crate::foundation::agent::{AgentLayer, SessionRole};
 use crate::foundation::config;
 use crate::foundation::shutdown::Shutdown;
-use crate::mind::memory::{Memory, build_for_scene};
+use crate::mind::memory::{Memory, build_for_scene, working_set};
 use crate::foundation::observatory::{EventKind, Observatory, SessionKind};
 use crate::types::{Channel, Geometry, JournalEntry, Origin, Scene, Signal, ViewEnvelope, ViewOp};
 use bytes::Bytes;
@@ -1026,7 +1026,9 @@ async fn apply_control(
     match ctl {
         SceneControl::Delegate { task, worker } => {
             let outcome = match worker {
-                Some(id) => workers.follow_up(reactor, id, task).await,
+                // An explicit `delegate` is a plain task worker, never cognition —
+                // cognition is driven only through `cognize`, which tags its reports.
+                Some(id) => workers.follow_up(reactor, id, task, false).await,
                 None => workers.spawn(reactor, task).await,
             };
             if let Err(err) = outcome {
@@ -1045,6 +1047,17 @@ async fn apply_control(
                 .record(scene, EventKind::WorkerQuestion { id, question: question.clone() })
                 .await;
             Some(LoopInput::Worker(workers.question_report(id, question)))
+        }
+        SceneControl::WorkerSurface { id, message } => {
+            reactor
+                .inner
+                .observatory
+                .record(scene, EventKind::WorkerSurfaced { id, message: message.clone() })
+                .await;
+            // Return it as a turn-driving signal (like a worker question), so the loop
+            // breaks 'wait and runs a turn — the voice gets to say it even with no human
+            // input. This is the mechanism for cognition-initiated speech.
+            Some(LoopInput::Worker(workers.surface_report(id, message)))
         }
     }
 }
@@ -1415,7 +1428,8 @@ async fn run_reactor_turn(
 
     // Open (or reuse) the persistent reactor session. `speaking.md` is prepended
     // to its first prompt; the session then remembers prior turns, so only a *fresh*
-    // session is handed the memory snapshot — later turns send just the delta.
+    // session is handed the durable working set and the memory snapshot — later turns
+    // send just the delta, inheriting both from the session's own memory of the open.
     let (session, fresh) = match reactor_session {
         Some(s) => (s.clone(), false),
         None => {
@@ -1426,8 +1440,13 @@ async fn run_reactor_turn(
     };
 
     let context = if fresh {
+        // The reactor is tools-off, so its durable memory — identity, standing
+        // commitments, and what's lately been on its mind — has to be handed to it
+        // here rather than Read on its own. Prepended on the fresh turn so the voice is
+        // grounded from its very first word; the session retains it thereafter.
         let snap = build_for_scene(&reactor.inner.memory, scene).await?;
         join_sections(&[
+            &working_set(reactor.inner.memory.data_dir()).await,
             &snap.render_for_prompt(),
             &worker_status,
             &presence_note,

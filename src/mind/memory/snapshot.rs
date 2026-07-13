@@ -1,5 +1,7 @@
 //! Snapshot — the per-scene view passed into a scene's reactor session.
 
+use std::path::Path;
+
 use chrono::{DateTime, Duration, Utc};
 
 use crate::mind::memory::Memory;
@@ -7,6 +9,43 @@ use crate::types::{Channel, JournalEntry, Scene};
 
 pub const RECENT_WINDOW_MIN: i64 = 30;
 pub const RECENT_ENTRY_LIMIT: usize = 200;
+
+/// The durable working set the reactor carries so it is fast but never blind: who it is
+/// to this install (`self.md`), its standing duties (`commitments.md`), and what's
+/// lately been on its mind (`hot.md`). The reactor is tools-off — it cannot Read these
+/// itself the way an agentic session does via [`crate::identity::load_soul`] — so the
+/// durable memory is inlined into its prompt. Assembled when a reactor session opens
+/// (its warm-up) and retained by the session across the turns that follow; the cost is
+/// three small file reads, not a retrieval, so it never spends the turn's latency.
+///
+/// Every source is optional and read independently: a fresh install has no
+/// `commitments.md`, an unreflected store no `hot.md`, an operator who authored nothing
+/// no `self.md`. A missing or blank file is skipped, never an error — the reactor
+/// degrades to less context, it does not fail a turn. Returns `""` when nothing is
+/// present, which the reactor's `join_sections` drops.
+pub async fn working_set(data_dir: &Path) -> String {
+    use std::fmt::Write as _;
+
+    use crate::identity::{commitments_path, self_path};
+    use crate::mind::memory::layout::hot_path;
+
+    let sources = [
+        ("Who I am to this person", self_path(data_dir)),
+        ("My standing commitments", commitments_path(data_dir)),
+        ("Lately on my mind", hot_path(data_dir)),
+    ];
+    let mut s = String::new();
+    for (title, path) in sources {
+        if let Ok(body) = tokio::fs::read_to_string(&path).await {
+            let body = body.trim();
+            if !body.is_empty() {
+                let _ = write!(s, "## {title}\n{body}\n\n");
+            }
+        }
+    }
+    s.truncate(s.trim_end().len());
+    s
+}
 
 #[derive(Debug, Clone)]
 pub struct Snapshot {

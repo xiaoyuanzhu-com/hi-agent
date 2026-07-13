@@ -36,6 +36,14 @@ pub enum SceneControl {
     /// A working session raised a non-blocking question (the `ask` tool); `id`
     /// names the worker so the loop can attribute it to its task.
     WorkerAsk { id: u64, question: String },
+    /// A working session handed something to the voice mid-work (the `surface`
+    /// tool) — an interim finding, a heads-up, or something it raised on its own
+    /// initiative. `id` names the worker so the loop can tell whether it's the
+    /// scene's cognition (whose surfaced word is must-relay) or a task worker.
+    /// Unlike a pure side-effect, this drives a turn: it folds into the loop as a
+    /// signal, so the voice gets a chance to say it even with no human input — this
+    /// is how cognition brings something up like a person, not only in reply.
+    WorkerSurface { id: u64, message: String },
 }
 
 /// Per-scene handle the MCP handler dispatches to. Cheap to clone. Carries two

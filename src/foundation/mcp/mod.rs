@@ -60,6 +60,22 @@ fn tools_for_role(role: Option<&str>) -> Vec<Value> {
                 }),
             ),
             tool(
+                "surface",
+                "Hand something to the voice to tell the person — now, mid-work, without waiting \
+                 to finish. Use it the moment you have something worth their hearing before your \
+                 whole task is done: an interim finding, progress they'd want, a heads-up, or \
+                 something you noticed on your own that they'd want raised. The voice decides how \
+                 and when to say it (it reads the room), so write the substance plainly, not a \
+                 script — what you'd want passed on in your own words. You do NOT wait or speak \
+                 yourself; you keep working. This is how you bring something up on your own \
+                 initiative rather than only answering.",
+                json!({
+                    "type": "object",
+                    "properties": { "message": { "type": "string", "description": "What to pass to the voice to tell the person, in plain words." } },
+                    "required": ["message"],
+                }),
+            ),
+            tool(
                 "look",
                 "See the user's screen right now — returns a screenshot of the main display, plus \
                  its pixel size and the frontmost app. Use it to find where things are before you \
@@ -566,6 +582,16 @@ async fn dispatch_tool(
                 return tool_error("ask is only available to working sessions");
             };
             sink.send(SceneControl::WorkerAsk { id, question: arg_str("question") }).await.map(|()| "question noted")
+        }
+        "surface" => {
+            let Some(id) = worker_id else {
+                return tool_error("surface is only available to working sessions");
+            };
+            let message = arg_str("message");
+            if message.trim().is_empty() {
+                return tool_error("surface requires a non-empty `message`");
+            }
+            sink.send(SceneControl::WorkerSurface { id, message }).await.map(|()| "handed to the voice")
         }
         other => return tool_error(&format!("unknown tool: {other}")),
     };

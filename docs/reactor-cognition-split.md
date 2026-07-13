@@ -5,6 +5,129 @@
 > change makes the reactor a proper fast **communicator** and fixes the silence the split
 > shipped with — see *Current state* below. The legacy agentic reactor path is dead code
 > pending deletion.
+>
+> **The Contract section immediately below is authoritative (agreed 2026-07-12).** It
+> supersedes two things in the historical notes: the reactor runs a **smart** model, not a
+> small one (§Current state pt. 21 / Open fork 2 are wrong on this), and communication is
+> **bidirectional** (cognition initiates too), not one-way report-back.
+
+## The contract (agreed 2026-07-12)
+
+### Governing principle — fast is *no fetch*, not *no knowledge*
+
+The reactor's speed was never about the model tier; it's about **zero round-trips**. So
+the layers are cut on two independent lines:
+
+- **Think vs. act.** Reactor and cognition both only *think* — read and reason, never
+  touch the world. **Only workers act** (fetch, read files, build a view, open a PR, run a
+  task). Workers are the sole layer with side effects.
+- **Bounded/instant vs. open/deep.** The reactor thinks *only over what it already holds*,
+  in one generation. Cognition thinks *open-endedly* — pulls more memory, reasons in steps,
+  takes seconds.
+
+The reactor is a **smart** model precisely because its core skill is judging the edge of
+what it knows ("answer from what I hold, or hand to cognition?") — a small model can't do
+that. It's fast anyway: one generation, short output, no tools to wait on. Not blind
+because its memory is **prepared** (see Stage 1). Fast because it *cannot* fetch.
+
+### The three layers
+
+| | **Reactor** — the mouth | **Cognition** — the mind | **Workers** — the hands |
+|---|---|---|---|
+| Does | Speaks, holds the floor, manages the interaction | Interprets, reads *more* memory, reasons, plans, decides what work is needed | The actual work |
+| Model | Smart | Smart | Task-fit |
+| Tools | **None** — empty cwd; no read/fetch/work | Memory reads + reasoning — **never acts** | Everything; only layer with side effects |
+| Context | Prepared working set (reasonable size, not tiny) | Full memory, own history, worker reports | Just its task |
+| Time | One generation | Seconds+ | However long |
+| Emits | `say` (plain text), `show_view`, `delegate`→cognition | `surface`→reactor, `dispatch`→worker, memory read/write | `report`→cognition |
+| Never | Touch the world; command workers | `say`; act on the world | Speak; own memory/policy |
+
+Cognition doesn't build the view or open the PR *either* — the moment there's an artifact
+or a side effect, that's a worker. Cognition is pure planning + memory; workers are the
+effectors. Single mouth: **cognition never calls `say`** — everything it wants said is a
+`surface` *proposal* the reactor arbitrates.
+
+### Bidirectional communication — hi-agent is the switchboard
+
+There is **no agent↔agent link**. Both reactor and cognition are reactive ACP subprocesses
+that do nothing until prompted and have no clock. All bidirectionality, timers, and routing
+live in the Rust host. Each agent has exactly two wires, both to the host:
+
+- **ACP (stdio JSON-RPC)** — host→agent `session.prompt(text)`; agent→host a stream of
+  `session/update` notifications (`SessionUpdate::{Text,Thought,ToolCall,…}`), ending in a
+  stop. This is how a session is fed and read.
+- **MCP over local HTTP (`/mcp`, scene-routed by `X-HI-Scene`)** — the agent's tool calls
+  (`show_view`, `surface`, `dispatch`, `report`). The agent's *push* channel.
+
+The bridge between the two sessions is **two host-side tokio tasks + two `mpsc` channels**:
+
+```
+   human ─▶┌ reactor driver ─ select! over reactor_rx ─▶ session.prompt ─▶ say/show_view
+ (/mcp) ─▶ │                         ▲ reactor_tx        │ delegate → cognition_tx
+ surface   └────────────────────────────────────────────┘
+   (/mcp) ▶┌ cognition driver ─ select! over cognition_rx + timers ─▶ session.prompt
+ report    └──────── surface → reactor_tx · dispatch → worker registry
+```
+
+- **reactor→cognition** (`delegate`): after a turn, `cognition_tx.send(Delegate{…})`.
+  Non-blocking — the reactor never awaits a reply.
+- **cognition→reactor** (`surface`): cognition's `surface` tool call arrives at `/mcp`; the
+  handler does `reactor_tx.send(FromCognition{…})`, landing as an ordinary input on the
+  reactor's *next* turn (this generalizes today's `LoopInput::Worker` path). The reactor
+  arbitrates whether/when/how to voice it.
+
+**The driver owns the clock.** "Cognition brings something up on its own" = the *cognition
+driver task* has a `select!` arm on a timer or a worker report; when it fires, the driver
+prompts the parked session, which reasons and `surface`s. Two gates keep this human-shaped:
+cognition's "is this worth raising?" (memory + `proactivity.md`) then the reactor's "is now
+the moment?" (`speaking.md` + presence). The thinking part decides it matters; the social
+part decides the timing.
+
+### Warm-up — two sessions, both prepared, neither blocking
+
+- **Reactor warm-up** assembles the prepared working set (identity + `commitments.md` +
+  `hot.md` + scene recall) so the *first* turn already holds memory. Cheap file reads →
+  ready before the first word.
+- **Cognition warm-up** is heavier and **strictly async**: read `commitments.md`/`hot.md`,
+  decide which interrupted tasks to resume, and spin up workers for them.
+
+**Non-negotiable:** the reactor's first turn never waits on cognition. History — warm-up
+once ran synchronously and blocked the first turn, which *was* the silent-turn bug. So the
+reactor's cheap memory prep is the only synchronous part; cognition's warm is background.
+
+### Staging
+
+- **Stage 1 — prepared memory (this branch, `feat/reactor-prepared-memory`).** The reactor
+  carries its durable working set (`self.md` + `commitments.md` + `hot.md`) every session,
+  inlined because it's tools-off. `mind::memory::working_set()`; wired into the fresh
+  reactor turn (retained across warm turns via session memory). Directly fixes the "no
+  memory" symptom. **UNBUILT** — build on the Mac.
+- **Stage 2 — must-relay + smart model (DONE, unbuilt).** Cognition's report is tagged
+  `is_cognition` end-to-end (`WorkerReport`) and `render_report` frames a cognition result
+  as a *must-relay instruction to the voice* ("this is the answer you owe them — say what
+  you found now"), where a plain worker's report stays an observation on the reactor's own
+  timing. `reactor_model()` now returns the **main smart model** (was pinned to the small
+  slot — a retired workaround for the old adapter-hang era).
+- **Stage 3a — `surface`, cognition-initiated (DONE, unbuilt).** Cognition (and any worker)
+  gets a `surface` MCP verb: hand something to the voice *mid-work*, without waiting to
+  finish — an interim finding, or something raised on its own initiative. It rides the same
+  path as `ask` (`SceneControl::WorkerSurface` → `apply_control` → a `WorkerReportKind::
+  Surfaced` report), but crucially it **drives a turn** (returns `Some(LoopInput)`), so the
+  voice gets to say it *even with no human input*. That is the mechanism for
+  cognition-initiated speech — "bring something up like a person," gated by the reactor's
+  own read of the room. A cognition `surface` is must-relay; a task worker's is an
+  observation. Single mouth preserved: cognition still never `say`s — it proposes, the
+  reactor voices.
+- **Stage 3b — full switchboard (DEFERRED).** The remaining, larger pieces: promoting
+  cognition from a mute `Worker` into a **first-class session with its own driver task and
+  independent timer wake-source** (so it can surface from *idle*, not only while a turn or a
+  worker report pokes it); a cognition→worker **`dispatch`** verb (restores the 3rd tier —
+  today cognition does multi-step work inline, no fan-out); and the **two-session
+  non-blocking warm-up** (reactor prep sync + cheap; cognition warm strictly async, deciding
+  task resumptions off the first-turn path). Deferred because it reshapes the carefully-built
+  per-scene loop (down-state/backoff/pulse/barge-in) and is best done against a box where it
+  can be run; Stages 1–3a already deliver the felt fix (memory + guaranteed relay +
+  cognition-initiated word) without touching that loop's core.
 
 ## Current state (reactor-communicator change)
 
@@ -159,6 +282,7 @@ conversation, not presence.
 
 1. **cognition persistence** — one warm persistent cognition session per scene (as the
    reactor session is today) vs. spun per turn. Default: keep it persistent/warm.
-2. **fast model** — default to the `small` slot (Haiku-class); optionally route
-   nuance-heavy turns to a Sonnet-class mid model. Default: `small` for everything first.
+2. ~~**fast model** — default to the `small` slot~~ — **superseded by the Contract.** The
+   reactor runs a **smart** model: its job is judging the edge of what it knows, which a
+   small model can't do, and it's fast regardless (one generation, short output, no tools).
 3. **streaming vs. not** — non-streaming shipped first (correctness); streaming next.

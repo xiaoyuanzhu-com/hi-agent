@@ -152,10 +152,12 @@ impl AgentLayer {
         let mut env = spawn.env.clone();
         let cfg = AgentConfig::resolve(&self.inner.data_dir);
         env.extend(cfg.auth_child_env());
-        // The reactor is the fast conversational voice — pin it to the small/fast
-        // model rather than the heavy `ANTHROPIC_MODEL` `auth_child_env` sets, so a
-        // turn returns in ~a second. Replace (not append) the entry so there's no
-        // duplicate `ANTHROPIC_MODEL` for the child to disambiguate.
+        // The reactor runs the **smart** model (its job is judging the edge of what it
+        // knows; its speed is a single tools-off generation, not a lighter model — see
+        // `AgentConfig::reactor_model`). This override pins that explicitly rather than
+        // inheriting whatever `auth_child_env` set, so the reactor's model is decided in
+        // one place even if the background-slot logic changes. Replace (not append) the
+        // entry so there's no duplicate `ANTHROPIC_MODEL` for the child to disambiguate.
         if matches!(role, SessionRole::Reactor) {
             if let Some(model) = cfg.reactor_model() {
                 env.retain(|(k, _)| k.as_str() != "ANTHROPIC_MODEL");
