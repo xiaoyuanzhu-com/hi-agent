@@ -327,6 +327,7 @@ async fn run_with_shutdown(config: Config, shutdown: Arc<Notify>) -> anyhow::Res
         tool_registry,
         interrupts,
         presence,
+        seams.state.views.clone(),
         views_dir,
         reactor_shutdown.clone(),
     );

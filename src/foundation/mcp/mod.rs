@@ -403,8 +403,12 @@ fn show_view_tool() -> Value {
          to evolve a view in place; op=dismiss takes one down. The screen is persistent \
          state: whatever you've shown stays up — across page refreshes, other devices in \
          the scene, even restarts — until you dismiss or replace it, so never re-show \
-         something that's already on screen. Re-showing an existing id raises it above \
-         the other views. For a trivial one-off you may pass raw `source` JSX instead of \
+         something that's already on screen. What is up right now is listed for you \
+         under `## On screen now` in your context — trust that list, don't guess: dismiss \
+         or replace an id that appears there, and don't re-show one that's already listed \
+         (re-showing an existing id just raises it). If that section says the room is \
+         clear, there is nothing to dismiss — don't fire dismisses at remembered ids. \
+         For a trivial one-off you may pass raw `source` JSX instead of \
          a ref.",
         json!({
             "type": "object",

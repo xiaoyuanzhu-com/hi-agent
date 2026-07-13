@@ -188,6 +188,19 @@ impl ViewBus {
         persist(&self.data_dir, scene, entry).await;
     }
 
+    /// The ids currently on screen for a scene, in z-order (last = top-most). The
+    /// reactor reads this into each turn so the agent can *see* its own presentation
+    /// surface — what it has shown — instead of guessing ids from the transcript. This
+    /// is the read side of the same authoritative state [`apply`](Self::apply) writes,
+    /// so a view dismissed last turn is gone from this list the next, giving the agent
+    /// the confirmation it otherwise lacks. Empty when nothing is shown.
+    pub async fn on_screen(&self, scene: &Scene) -> Vec<String> {
+        let map = self.inner.lock().await;
+        map.get(scene)
+            .map(|a| a.views.iter().map(|v| v.id.clone()).collect())
+            .unwrap_or_default()
+    }
+
     /// The scene's appearance, as soon as its version exceeds `since`.
     /// `since: None` returns the present state immediately — even when empty —
     /// so a fresh page knows it is synced; passing the last seen version parks

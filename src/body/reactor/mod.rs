@@ -605,6 +605,13 @@ struct ReactorInner {
     /// each turn as one human-model presence sentence, so the mind knows which
     /// channels actually reach the person right now.
     presence: crate::body::presence::Presence,
+    /// The live per-scene appearance state, shared (a cloneable handle) with the
+    /// HTTP front's view bus. Read into each turn as `## On screen now` so the agent
+    /// can see what it has shown — the screen is its own presentation surface, and
+    /// without this it dismisses/re-shows views by guessing ids from the transcript.
+    /// Read-only here: views are still *emitted* via `show_view` → the binder →
+    /// `ViewBus::apply`; this is purely the reactor observing that authoritative state.
+    views: crate::foundation::server::ViewBus,
     /// Absolute path to the agent's view workshop (`<data_dir>/views`).
     /// Handed to every worker session as its `cwd`, so a build sub-agent works in a
     /// real project dir — `ls`-ing existing projects, writing source — like a human
@@ -649,6 +656,7 @@ pub fn start(
     tools: ToolRegistry,
     interrupts: InterruptRegistry,
     presence: crate::body::presence::Presence,
+    views: crate::foundation::server::ViewBus,
     views_dir: PathBuf,
     shutdown: Shutdown,
 ) -> Reactor {
@@ -663,6 +671,7 @@ pub fn start(
             tools,
             interrupts,
             presence,
+            views,
             views_dir,
             turn_seq: AtomicU64::new(0),
             scenes: Mutex::new(HashMap::new()),
@@ -1440,6 +1449,11 @@ async fn run_reactor_turn(
         .map(|i| interrupts::render_interruption(&i))
         .unwrap_or_default();
     let new_signals = format!("## New signals\n{}", render_batch(batch));
+    // What the agent has on screen right now — its own presentation surface. Read
+    // fresh every turn (it's a current fact, not durable memory), so a view dismissed
+    // last turn is gone from this list now: the agent can see what's up and dismiss by
+    // real id instead of guessing from the transcript.
+    let on_screen = render_on_screen(&reactor.inner.views.on_screen(scene).await);
 
     // Open (or reuse) the persistent reactor session. `speaking.md` is prepended
     // to its first prompt; the session then remembers prior turns, so only a *fresh*
@@ -1464,12 +1478,13 @@ async fn run_reactor_turn(
             &working_set(reactor.inner.memory.data_dir()).await,
             &snap.render_for_prompt(),
             &worker_status,
+            &on_screen,
             &presence_note,
             &interrupted,
             &new_signals,
         ])
     } else {
-        join_sections(&[&worker_status, &presence_note, &interrupted, &new_signals])
+        join_sections(&[&worker_status, &on_screen, &presence_note, &interrupted, &new_signals])
     };
 
     tracing::info!(scene = %scene, ctx_chars = context.chars().count(), "reactor: prompting session");
@@ -1651,6 +1666,25 @@ fn join_sections(sections: &[&str]) -> String {
         .filter(|s| !s.is_empty())
         .collect::<Vec<_>>()
         .join("\n\n")
+}
+
+/// Render the agent's own screen as a prompt section: the ids currently displayed,
+/// z-order top-most last. Always emitted (unlike the empty-dropping sections) — when
+/// the screen is clear the agent needs to *know* it's clear so it stops firing blind
+/// dismisses at ids that are already gone. Kept to bare ids: the reactor shows/dismisses
+/// by id, and the id is all it needs to target one.
+fn render_on_screen(ids: &[String]) -> String {
+    use std::fmt::Write as _;
+    let mut s = String::from("## On screen now\n");
+    if ids.is_empty() {
+        s.push_str("(nothing is on screen — the room is clear)");
+    } else {
+        for id in ids {
+            let _ = writeln!(s, "- {id}");
+        }
+        s.push_str("(these are the views currently up, top-most last; dismiss one by its id)");
+    }
+    s
 }
 
 fn render_batch(batch: &[LoopInput]) -> String {
