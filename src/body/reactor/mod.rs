@@ -1367,6 +1367,21 @@ async fn per_scene_loop(
         // Any completed turn is activity: the pulse clock restarts, so pulses
         // only ever fire into genuine quiet.
         last_activity = Instant::now();
+
+        // Coalesce mid-turn arrivals. Utterances that queued while this turn ran
+        // (a generation is now seconds, not ~1s) are siblings of the thread we just
+        // answered, not fresh threads — pull them all into one batch so they drive a
+        // SINGLE next turn (the commit-after-quiet settle still applies on top),
+        // instead of one redundant turn each. Without this, each nudge that landed
+        // mid-turn ("好了吗?" → "准备好了吗?") pops alone on re-entry and re-answers.
+        // Up only: while down, mail is held deliberately and the backoff path owns
+        // catch-up, so leave the queue for it. `try_recv` never surfaces pulses or
+        // alarms (those are generated inside `'wait`, not sent over `inbound`).
+        if !reactor.inner.vendor.is_down() {
+            while let Ok(extra) = inbound.try_recv() {
+                batch.push(extra);
+            }
+        }
     }
 }
 
