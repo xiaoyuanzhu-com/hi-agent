@@ -158,6 +158,13 @@ pub(super) async fn swap(
 /// they wait on the frontier for the next reflection tick.
 const MIN_REFLECT_SIGNALS: usize = 4;
 
+/// Whether the identity-cluster forgetting sweep only *reports* what it would forget
+/// (`true`) instead of deleting. Starts as a dry run so the criteria in
+/// [`people_vectors::sweep_forgettable`] can be watched on real data — the log shows
+/// each cluster it would drop — before it is trusted to delete. Flip to `false` to
+/// arm it.
+const SWEEP_DRY_RUN: bool = true;
+
 /// The pseudo-scene the single consolidated reflection session is opened under. It
 /// carries the `X-HI-Scene` header (so the `/mcp` dispatch has a scene to route by)
 /// and labels the session in logs, but it is never a real data path: one session
@@ -246,6 +253,33 @@ async fn run_consolidation(reactor: &Reactor, scenes: &[Scene]) -> anyhow::Resul
     let total: usize = groups.iter().map(|g| g.tail.len()).sum();
     let scene_list = groups.iter().map(|g| g.scene.0.as_str()).collect::<Vec<_>>().join(", ");
     tracing::info!(scenes = %scene_list, groups = groups.len(), n = total, "reflection fired");
+
+    // Forget ambient, one-off identity clusters — the video-night strangers and
+    // passers-by that would otherwise bury the real people. The people store is
+    // global, so this runs once per consolidation (not per scene), on the same
+    // reflection clock. Dry-run for now: it logs what it *would* forget so the
+    // strategy can be watched before it deletes anything (flip `SWEEP_DRY_RUN`).
+    match people_vectors::sweep_forgettable(data_dir, Utc::now(), SWEEP_DRY_RUN).await {
+        Ok(report) if !report.forgotten.is_empty() => {
+            for v in &report.forgotten {
+                tracing::info!(
+                    subject = %v.subject,
+                    samples = v.samples,
+                    occasions = v.occasions,
+                    dry_run = SWEEP_DRY_RUN,
+                    "identity cluster forgotten (ambient, one-off, gone cold)",
+                );
+            }
+            tracing::info!(
+                examined = report.examined,
+                forgotten = report.forgotten.len(),
+                deleted = report.deleted,
+                "cluster forgetting sweep",
+            );
+        }
+        Ok(_) => {}
+        Err(err) => tracing::warn!(error = %err, "cluster forgetting sweep failed"),
+    }
 
     // The facet subject index is global — gathered once, shared across every group so
     // the mind reuses a subject instead of coining a near-duplicate in each scene.

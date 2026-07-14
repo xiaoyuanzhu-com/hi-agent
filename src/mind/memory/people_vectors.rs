@@ -350,6 +350,191 @@ pub async fn purge_voice(data_dir: &Path) -> anyhow::Result<usize> {
     Ok(removed)
 }
 
+// ── Forgetting: let ambient, one-off clusters age out ────────────────────────
+//
+// Most voices and faces the agent meets are not people it needs to know — a
+// stranger in a café, a character in a video the kid played, a passer-by on the
+// street. Left alone they pile up: the store fills with single-shot noise, the
+// calibration view drowns, and every video night dumps more of it. So unnamed
+// clusters must be *biased to forget*; only the ones that **recur across time**
+// earn the right to persist.
+//
+// Recurrence — not sample count — is what earns keeping. 601 voice samples from
+// one bedtime-story video night are **one occasion**, not 601; a voice heard on
+// three separate days is genuinely someone. Both signals are already on disk for
+// free: every sample's filename is a uuid-v7 whose timestamp says *when* it was
+// seen, so [`cluster_vitals`] reconstructs a cluster's whole timeline by reading
+// stems — no schema, no salience field, no new store.
+//
+// The rule is deliberately gentle (see [[feedback-forgetting-keep-biased]]):
+//   - **Named/modeled clusters (a `facet.md` exists) are never touched** — a name
+//     is a human saying "this one matters", even at zero samples.
+//   - A cluster seen on **≥ [`KEEP_OCCASIONS`] occasions** is a keeper, forever.
+//   - Only a **single-occasion, unnamed** cluster is a candidate, and only after a
+//     **[`FORGET_AFTER`] grace** since it was last seen. That is the video-night
+//     stranger: one burst, never again, a month gone.
+// Forgetting is a plain delete — if that person ever matters, they show up again
+// and re-cluster from scratch, earning their keep the normal way. No archive.
+
+/// Two samples of one cluster belong to the **same occasion** if their sightings
+/// fall within this window; a larger gap starts a new occasion. So a long unbroken
+/// session (one bedtime video, one call) counts once however many samples it left,
+/// while re-encounters on separate days each add an occasion.
+const OCCASION_GAP: chrono::Duration = chrono::Duration::minutes(30);
+
+/// A cluster seen on at least this many distinct occasions is kept indefinitely —
+/// it has recurred across time, so it is plausibly a real person, named or not. Two
+/// is the gentle bar: seen on genuinely separate occasions even once is enough.
+const KEEP_OCCASIONS: usize = 2;
+
+/// Grace before a single-occasion, unnamed cluster becomes forgettable, measured
+/// from its most recent sample. Gives a one-off encounter a month to recur before
+/// it ages out.
+const FORGET_AFTER: chrono::Duration = chrono::Duration::days(30);
+
+/// A cluster's timeline, reconstructed from its sample stems — the inputs the
+/// forgetting rule reasons over. Merges both modalities: a person seen once by face
+/// and once by voice on the same evening is still one occasion.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ClusterVitals {
+    /// The cluster's directory name (a minted id, or a name once renamed).
+    pub subject: String,
+    /// Whether a prose `facet.md` exists — i.e. the mind has modeled this subject.
+    /// Named/modeled clusters are exempt from forgetting.
+    pub named: bool,
+    /// Total samples across face + voice.
+    pub samples: usize,
+    /// Distinct occasions the cluster was seen, sightings split by [`OCCASION_GAP`].
+    pub occasions: usize,
+    /// Most recent sighting (newest stem), or `None` if the cluster has no
+    /// timestamped samples (legacy blob-only, or empty).
+    pub last_seen: Option<chrono::DateTime<chrono::Utc>>,
+}
+
+impl ClusterVitals {
+    /// Whether this cluster may be forgotten as of `now`: unnamed, seen on fewer
+    /// than [`KEEP_OCCASIONS`] occasions, and quiet for at least [`FORGET_AFTER`].
+    /// A cluster with no datable samples is never forgettable here (nothing to age).
+    pub fn forgettable(&self, now: chrono::DateTime<chrono::Utc>) -> bool {
+        if self.named || self.occasions >= KEEP_OCCASIONS {
+            return false;
+        }
+        match self.last_seen {
+            Some(seen) => now - seen >= FORGET_AFTER,
+            None => false,
+        }
+    }
+}
+
+/// The sighting time of a sample, decoded from its uuid-v7 stem (the stem *is* the
+/// creation time). Delegates to the shared [`super::journal::uuidv7_ts`] so there is
+/// one decoder; `None` if the stem isn't a v7 uuid.
+fn stem_time(stem: &str) -> Option<chrono::DateTime<chrono::Utc>> {
+    super::journal::uuidv7_ts(stem)
+}
+
+/// Count distinct occasions in a set of sighting times: sort, then start a new
+/// occasion whenever the gap to the previous sighting exceeds [`OCCASION_GAP`].
+/// Empty input is zero occasions.
+fn count_occasions(mut times: Vec<chrono::DateTime<chrono::Utc>>) -> usize {
+    times.sort_unstable();
+    let mut occasions = 0;
+    let mut prev: Option<chrono::DateTime<chrono::Utc>> = None;
+    for t in times {
+        if prev.is_none_or(|p| t - p > OCCASION_GAP) {
+            occasions += 1;
+        }
+        prev = Some(t);
+    }
+    occasions
+}
+
+/// Read one cluster directory and reconstruct its [`ClusterVitals`] from the sample
+/// stems across both modalities. `subject` is the directory name. Legacy packed
+/// blobs contribute to the sample count but carry no per-sample time, so a
+/// blob-only cluster reports `occasions == 0` / `last_seen == None` and is thus
+/// never forgotten by [`sweep_forgettable`] — we don't age what we can't date.
+async fn cluster_vitals(data_dir: &Path, subject: &str) -> anyhow::Result<ClusterVitals> {
+    let mut times: Vec<chrono::DateTime<chrono::Utc>> = Vec::new();
+    let mut samples = 0usize;
+    for modality in [Modality::Face, Modality::Voice] {
+        for s in read_samples(&modality_dir(data_dir, subject, modality)).await? {
+            samples += 1;
+            if let Some(t) = stem_time(&s.stem) {
+                times.push(t);
+            }
+        }
+    }
+    let named = facets::read_facet(data_dir, DIM, subject).await?.is_some();
+    let last_seen = times.iter().copied().max();
+    let occasions = count_occasions(times);
+    Ok(ClusterVitals { subject: subject.to_string(), named, samples, occasions, last_seen })
+}
+
+/// The outcome of one forgetting sweep: what was (or, in a dry run, would be)
+/// forgotten, and how many clusters were examined.
+#[derive(Debug, Default, Clone)]
+pub struct ForgetReport {
+    /// Clusters examined (every subject directory in the people store).
+    pub examined: usize,
+    /// The vitals of each cluster judged forgettable, for logging/inspection.
+    pub forgotten: Vec<ClusterVitals>,
+    /// Whether deletion actually happened. In a dry run `forgotten` is populated but
+    /// nothing was removed.
+    pub deleted: bool,
+}
+
+/// Walk the people store and forget every ambient, one-off cluster — unnamed, seen
+/// on fewer than [`KEEP_OCCASIONS`] occasions, quiet for [`FORGET_AFTER`] as of
+/// `now` (see [`ClusterVitals::forgettable`]). When `dry_run`, judges and reports
+/// but deletes nothing — so a sweep can be watched before it is trusted. Named and
+/// recurring clusters are left untouched; a missing people dir is not an error.
+///
+/// Folds into the reflection pass ([`crate::body::reactor::heartbeat`]) beside the
+/// media [`super::decay`], on the same adaptive-backoff clock. Global, so it runs
+/// once per consolidation, not per scene.
+pub async fn sweep_forgettable(
+    data_dir: &Path,
+    now: chrono::DateTime<chrono::Utc>,
+    dry_run: bool,
+) -> anyhow::Result<ForgetReport> {
+    let dir = people_dir(data_dir);
+    let mut rd = match tokio::fs::read_dir(&dir).await {
+        Ok(rd) => rd,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(ForgetReport::default()),
+        Err(e) => return Err(e.into()),
+    };
+
+    let mut report = ForgetReport { deleted: !dry_run, ..Default::default() };
+    // Collect subjects first, then act — don't mutate the dir while reading it.
+    let mut subjects: Vec<String> = Vec::new();
+    while let Some(ent) = rd.next_entry().await? {
+        if !ent.file_type().await?.is_dir() {
+            continue;
+        }
+        if let Ok(name) = ent.file_name().into_string()
+            && !name.is_empty()
+            && !name.starts_with('.')
+        {
+            subjects.push(name);
+        }
+    }
+    drop(rd);
+
+    for subject in subjects {
+        report.examined += 1;
+        let vitals = cluster_vitals(data_dir, &subject).await?;
+        if !vitals.forgettable(now) {
+            continue;
+        }
+        if !dry_run {
+            tokio::fs::remove_dir_all(dir.join(&subject)).await?;
+        }
+        report.forgotten.push(vitals);
+    }
+    Ok(report)
+}
+
 /// Rank known subjects by how close `query` is to their nearest `modality` sample
 /// (the max cosine over that subject's samples), best first, capped at `k`. Reads
 /// both the per-sample `<uuid>.f32` sidecars and any legacy packed `<modality>.f32`
@@ -815,5 +1000,197 @@ mod tests {
         let got = nearest(dir.path(), Modality::Face, &emb, 1).await.unwrap();
         assert_eq!(got[0].subject, "legacy");
         assert!((got[0].similarity - 1.0).abs() < 1e-6);
+    }
+
+    // ── Forgetting ───────────────────────────────────────────────────────────
+
+    /// A fixed clock so tests don't depend on wall-time.
+    fn t0() -> chrono::DateTime<chrono::Utc> {
+        chrono::DateTime::from_timestamp(1_700_000_000, 0).unwrap()
+    }
+
+    /// A uuid-v7 whose embedded timestamp is exactly `at` — lets a test place a
+    /// sample at a chosen sighting time (the real `enroll` always stamps "now").
+    fn uuid_at(at: chrono::DateTime<chrono::Utc>) -> String {
+        let ts = uuid::Timestamp::from_unix(
+            uuid::NoContext,
+            at.timestamp() as u64,
+            at.timestamp_subsec_nanos(),
+        );
+        Uuid::new_v7(ts).simple().to_string()
+    }
+
+    /// Write one backdated sample pair (embedding + media) directly, bypassing
+    /// `enroll` so the stem carries `at` rather than "now". Distinct embeddings via
+    /// `seed` keep dedup/variant capping from collapsing them.
+    async fn place_sample(
+        data_dir: &Path,
+        subject: &str,
+        modality: Modality,
+        at: chrono::DateTime<chrono::Utc>,
+        seed: f32,
+    ) {
+        let dir = modality_dir(data_dir, &facets::slug(subject), modality);
+        tokio::fs::create_dir_all(&dir).await.unwrap();
+        let stem = uuid_at(at);
+        let emb = [seed, 1.0 - seed];
+        let emb_bytes: Vec<u8> = emb.iter().flat_map(|f| f.to_le_bytes()).collect();
+        tokio::fs::write(dir.join(format!("{stem}.f32")), &emb_bytes).await.unwrap();
+        tokio::fs::write(dir.join(format!("{stem}.wav")), b"m").await.unwrap();
+    }
+
+    #[test]
+    fn count_occasions_groups_a_burst_and_splits_days() {
+        let base = t0();
+        // A single burst: 5 sightings seconds apart → one occasion.
+        let burst: Vec<_> = (0..5).map(|i| base + chrono::Duration::seconds(i * 3)).collect();
+        assert_eq!(count_occasions(burst), 1);
+        // Three sightings on separate days → three occasions.
+        let days: Vec<_> =
+            (0..3).map(|i| base + chrono::Duration::days(i)).collect();
+        assert_eq!(count_occasions(days), 3);
+        // A gap just over the window opens a new occasion; just under does not.
+        assert_eq!(count_occasions(vec![base, base + OCCASION_GAP + chrono::Duration::seconds(1)]), 2);
+        assert_eq!(count_occasions(vec![base, base + OCCASION_GAP - chrono::Duration::seconds(1)]), 1);
+        assert_eq!(count_occasions(vec![]), 0);
+    }
+
+    #[test]
+    fn stem_time_round_trips_a_backdated_uuid() {
+        let at = t0() + chrono::Duration::days(3);
+        let stem = uuid_at(at);
+        let got = stem_time(&stem).expect("v7 stem has a timestamp");
+        // uuid-v7 carries millisecond precision — allow a millisecond of slack.
+        assert!((got - at).num_milliseconds().abs() <= 1, "got {got}, want {at}");
+        assert!(stem_time("not-a-uuid").is_none());
+    }
+
+    #[tokio::test]
+    async fn one_off_stranger_ages_out_after_the_grace() {
+        let dir = td();
+        let now = t0();
+        // Seen once, 40 days ago — a single-occasion unnamed cluster past its grace.
+        place_sample(dir.path(), "2xk04cyd", Modality::Voice, now - chrono::Duration::days(40), 0.1).await;
+
+        let v = cluster_vitals(dir.path(), "2xk04cyd").await.unwrap();
+        assert_eq!(v.occasions, 1);
+        assert!(!v.named);
+        assert!(v.forgettable(now), "one-off past grace should be forgettable");
+
+        let report = sweep_forgettable(dir.path(), now, false).await.unwrap();
+        assert!(report.deleted);
+        assert_eq!(report.forgotten.len(), 1);
+        assert_eq!(report.forgotten[0].subject, "2xk04cyd");
+        // The directory is gone.
+        assert!(!tokio::fs::try_exists(people_dir(dir.path()).join("2xk04cyd")).await.unwrap());
+    }
+
+    #[tokio::test]
+    async fn a_recurring_cluster_is_kept() {
+        let dir = td();
+        let now = t0();
+        // Same unnamed id, but seen on three separate days → keeper.
+        for d in [40, 25, 10] {
+            place_sample(dir.path(), "ydeeeu6v", Modality::Voice, now - chrono::Duration::days(d), 0.2).await;
+        }
+        let v = cluster_vitals(dir.path(), "ydeeeu6v").await.unwrap();
+        assert_eq!(v.occasions, 3);
+        assert!(!v.forgettable(now));
+
+        let report = sweep_forgettable(dir.path(), now, false).await.unwrap();
+        assert!(report.forgotten.is_empty());
+        assert!(tokio::fs::try_exists(people_dir(dir.path()).join("ydeeeu6v")).await.unwrap());
+    }
+
+    #[tokio::test]
+    async fn a_recent_one_off_is_kept_until_the_grace_passes() {
+        let dir = td();
+        let now = t0();
+        // Single occasion, but only 5 days ago — still within grace.
+        place_sample(dir.path(), "sgstq9sb", Modality::Face, now - chrono::Duration::days(5), 0.3).await;
+        let v = cluster_vitals(dir.path(), "sgstq9sb").await.unwrap();
+        assert_eq!(v.occasions, 1);
+        assert!(!v.forgettable(now), "within grace, keep it");
+        let report = sweep_forgettable(dir.path(), now, false).await.unwrap();
+        assert!(report.forgotten.is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_named_cluster_is_never_forgotten_even_stale_and_one_off() {
+        let dir = td();
+        let now = t0();
+        // Named (has a facet.md), seen once long ago — exactly 糯米's shape.
+        place_sample(dir.path(), "糯米", Modality::Voice, now - chrono::Duration::days(200), 0.4).await;
+        facets::update_facet(dir.path(), DIM, "糯米", "女儿").await.unwrap();
+        let v = cluster_vitals(dir.path(), "糯米").await.unwrap();
+        assert!(v.named);
+        assert!(!v.forgettable(now), "a name means keep");
+        let report = sweep_forgettable(dir.path(), now, false).await.unwrap();
+        assert!(report.forgotten.is_empty());
+        assert!(tokio::fs::try_exists(people_dir(dir.path()).join("糯米")).await.unwrap());
+    }
+
+    #[tokio::test]
+    async fn a_burst_of_many_samples_in_one_night_is_still_one_occasion() {
+        let dir = td();
+        let now = t0();
+        // The 7/10 case in miniature: many samples, all one evening, 40 days ago.
+        let night = now - chrono::Duration::days(40);
+        for i in 0..30 {
+            place_sample(dir.path(), "b4gdp0hu", Modality::Voice, night + chrono::Duration::seconds(i * 20), i as f32 / 100.0).await;
+        }
+        let v = cluster_vitals(dir.path(), "b4gdp0hu").await.unwrap();
+        assert!(v.samples >= 3, "kept several samples: {}", v.samples);
+        assert_eq!(v.occasions, 1, "one night = one occasion regardless of sample count");
+        assert!(v.forgettable(now), "a one-night burst, gone cold, ages out");
+    }
+
+    #[tokio::test]
+    async fn dry_run_reports_but_deletes_nothing() {
+        let dir = td();
+        let now = t0();
+        place_sample(dir.path(), "urwmpurn", Modality::Voice, now - chrono::Duration::days(40), 0.5).await;
+        let report = sweep_forgettable(dir.path(), now, true).await.unwrap();
+        assert!(!report.deleted);
+        assert_eq!(report.forgotten.len(), 1, "still reported as forgettable");
+        // ...but the cluster is untouched.
+        assert!(tokio::fs::try_exists(people_dir(dir.path()).join("urwmpurn")).await.unwrap());
+    }
+
+    #[tokio::test]
+    async fn a_face_and_voice_on_one_evening_count_as_one_occasion() {
+        let dir = td();
+        let now = t0();
+        let evening = now - chrono::Duration::days(40);
+        place_sample(dir.path(), "e1y8mx6b", Modality::Face, evening, 0.1).await;
+        place_sample(dir.path(), "e1y8mx6b", Modality::Voice, evening + chrono::Duration::minutes(2), 0.6).await;
+        let v = cluster_vitals(dir.path(), "e1y8mx6b").await.unwrap();
+        assert_eq!(v.samples, 2);
+        assert_eq!(v.occasions, 1, "cross-modality sightings close in time are one occasion");
+    }
+
+    #[tokio::test]
+    async fn a_legacy_blob_only_cluster_is_never_forgotten() {
+        let dir = td();
+        let now = t0();
+        // No datable per-sample stems — only a packed blob. We can't age it, so keep.
+        let person = people_dir(dir.path()).join("legacyonly");
+        tokio::fs::create_dir_all(&person).await.unwrap();
+        let bytes: Vec<u8> = [1.0f32, 0.0].iter().flat_map(|f| f.to_le_bytes()).collect();
+        tokio::fs::write(person.join("voice.f32"), &bytes).await.unwrap();
+        let v = cluster_vitals(dir.path(), "legacyonly").await.unwrap();
+        assert_eq!(v.occasions, 0);
+        assert_eq!(v.last_seen, None);
+        assert!(!v.forgettable(now));
+        let report = sweep_forgettable(dir.path(), now, false).await.unwrap();
+        assert!(report.forgotten.is_empty());
+    }
+
+    #[tokio::test]
+    async fn sweep_on_empty_store_is_noop() {
+        let dir = td();
+        let report = sweep_forgettable(dir.path(), t0(), false).await.unwrap();
+        assert_eq!(report.examined, 0);
+        assert!(report.forgotten.is_empty());
     }
 }
