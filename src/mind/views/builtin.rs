@@ -14,6 +14,11 @@ use std::path::Path;
 /// Ref: `_builtin/upload` (the agent puts it on screen via `show_view`).
 const UPLOAD: &str = include_str!("builtin/upload.jsx");
 
+/// The "认识的人" review surface — review stored faces/voices, name the unknown
+/// ones, eject a mis-clustered clip, or auto-regroup a mixed cluster. Reads and
+/// writes the `/api/people/*` endpoints. Ref: `_builtin/people-review`.
+const PEOPLE_REVIEW: &str = include_str!("builtin/people-review.jsx");
+
 /// Write the bundled built-in views into `<data_dir>/views/_builtin/`, overwriting
 /// each on every boot so a binary update reseeds the latest (mirrors
 /// [`crate::identity::install_prompts`]). The views tree is disposable, so
@@ -22,5 +27,6 @@ pub fn install_builtin_views(data_dir: &Path) -> io::Result<()> {
     let dir = data_dir.join("views").join("_builtin");
     std::fs::create_dir_all(&dir)?;
     std::fs::write(dir.join("upload.jsx"), UPLOAD)?;
+    std::fs::write(dir.join("people-review.jsx"), PEOPLE_REVIEW)?;
     Ok(())
 }

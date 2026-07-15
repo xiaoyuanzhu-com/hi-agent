@@ -31,6 +31,7 @@ pub mod generated;
 pub mod headers;
 pub mod mcp;
 pub mod observe;
+pub mod people;
 pub mod reflex;
 pub mod sessions;
 pub mod settings;
@@ -521,6 +522,14 @@ pub fn build(
         // accessibility tree and type the stored value, no model in the loop. The
         // v1 trigger (a later hotkey/gesture would call the same path).
         .route("/api/reflex/invoke", post(reflex::post_invoke))
+        // The "认识的人" review surface: list stored people + their clips, serve one
+        // crop/clip, and correct identity — name/merge, eject a clip, auto-regroup.
+        .route("/api/people", get(people::get_people))
+        .route("/api/people/name", post(people::post_name))
+        .route("/api/people/eject", post(people::post_eject))
+        .route("/api/people/split/preview", post(people::post_split_preview))
+        .route("/api/people/split/apply", post(people::post_split_apply))
+        .route("/api/people/{subject}/{modality}/{stem}", get(people::get_clip))
         // The device account's energy standing + a signed-in upgrade link. Public,
         // like every route here; the out-of-energy card calls both.
         .route("/api/account/energy", get(account::get_energy))

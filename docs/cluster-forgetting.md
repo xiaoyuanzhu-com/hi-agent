@@ -111,6 +111,34 @@ cluster, the same `propose_split`/`apply_split` breaks the 601 mis-merged 7/10
 samples off into their own cluster to be renamed — so the calibration claim view
 and the 复盘 contamination-repair view use one capability.
 
+## The review surface — 认识的人
+
+A single web view (`_builtin/people-review`) is where a human sets identity
+straight — the human-in-the-loop moment for a system that otherwise clusters
+silently. It's a Contacts-style grid: each person a poster card (a face crop or a
+voice glyph) with just a name. Clicking a card expands it **in place** (the row
+grows, poster slides left, the review opens beside/below) into a review pane with
+the clips split into a **人脸** section and a **声音** section — the two modalities
+never mix, matching the store. There is no separate "contamination" view: a
+polluted known cluster is just a card whose 声音 section you auto-regroup.
+
+Every correction maps to a `people_vectors` primitive:
+
+- **Name / rename** — inline-editable name. Renaming onto an existing name **is the
+  merge** (`rename`); it's the only merge path and how a mistaken split heals.
+- **Eject a clip** — per-clip "不是这个人" pulls one clip out into its own fresh
+  cluster (`eject_clip`). The finest correction; the everyday tool.
+- **Auto-regroup** — "自动重新分组 ⟳" runs `propose_split` (preview, moves nothing)
+  → human confirms → `apply_split` (largest group keeps the name). The shortcut for
+  "too mixed to fix clip-by-clip."
+
+Backend (`src/foundation/server/people.rs`, global — no scene header):
+`GET /api/people`, `GET /api/people/{subject}/{modality}/{stem}` (serve one
+crop/clip), `POST /api/people/name`, `/eject`, `/split/preview`, `/split/apply`.
+Data layer: `people_vectors::{list_clusters, clip_media_path, eject_clip}`. The
+agent offers the view via `show_view _builtin/people-review`, taught in
+`identity/core.md` as a light, presence-appropriate exercise (offer, don't insist).
+
 ## Not in scope (deliberately)
 
 - **No media-playback detection.** Tagging encounters as "from a screen" vs "in

@@ -755,6 +755,142 @@ async fn move_stem(src: &Path, dst: &Path, stem: &str) {
     }
 }
 
+// ── Listing & per-clip eject: what the review view reads and does ─────────────
+//
+// The "认识的人" review surface reads the whole store as a list of people, each
+// with its face and voice sample stems (so the view can render a crop/clip per
+// clip by URL), and lets a human pull a single clip out of a cluster it doesn't
+// belong to. Eject is the finest-grained correction — the per-clip counterpart of
+// [`apply_split`]: one stem moves out into its own fresh minted cluster.
+
+/// One person as the review view sees them: the vitals plus the sample stems in
+/// each modality, newest last (uuid-v7 order). The view builds a crop/clip URL per
+/// stem and shows the two modalities as separate sections.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ClusterListing {
+    pub subject: String,
+    pub named: bool,
+    pub occasions: usize,
+    pub last_seen: Option<chrono::DateTime<chrono::Utc>>,
+    pub face_stems: Vec<String>,
+    pub voice_stems: Vec<String>,
+}
+
+/// List every person in the store with their per-modality sample stems, mirroring
+/// the directory walk in [`sweep_forgettable`]. Ordered most-populated first so the
+/// people worth attention float up; empty when no one is enrolled. Legacy blob-only
+/// clusters appear with empty stem lists (their samples aren't per-file addressable).
+pub async fn list_clusters(data_dir: &Path) -> anyhow::Result<Vec<ClusterListing>> {
+    let dir = people_dir(data_dir);
+    let mut rd = match tokio::fs::read_dir(&dir).await {
+        Ok(rd) => rd,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(e) => return Err(e.into()),
+    };
+    let mut subjects: Vec<String> = Vec::new();
+    while let Some(ent) = rd.next_entry().await? {
+        if !ent.file_type().await?.is_dir() {
+            continue;
+        }
+        if let Ok(name) = ent.file_name().into_string()
+            && !name.is_empty()
+            && !name.starts_with('.')
+        {
+            subjects.push(name);
+        }
+    }
+    drop(rd);
+
+    let mut out = Vec::with_capacity(subjects.len());
+    for subject in subjects {
+        let vitals = cluster_vitals(data_dir, &subject).await?;
+        let face_stems = stems(data_dir, &subject, Modality::Face).await?;
+        let voice_stems = stems(data_dir, &subject, Modality::Voice).await?;
+        out.push(ClusterListing {
+            subject,
+            named: vitals.named,
+            occasions: vitals.occasions,
+            last_seen: vitals.last_seen,
+            face_stems,
+            voice_stems,
+        });
+    }
+    // Named first, then by total sample count — the people most worth naming/fixing
+    // rise to the top; scattered one-offs sink.
+    out.sort_by(|a, b| {
+        b.named
+            .cmp(&a.named)
+            .then((b.face_stems.len() + b.voice_stems.len()).cmp(&(a.face_stems.len() + a.voice_stems.len())))
+    });
+    Ok(out)
+}
+
+/// The sample stems of one subject's `modality` gallery, oldest first. A thin public
+/// window onto [`read_samples`] for the review view; empty if the dir is absent.
+async fn stems(data_dir: &Path, subject: &str, modality: Modality) -> anyhow::Result<Vec<String>> {
+    Ok(read_samples(&modality_dir(data_dir, subject, modality))
+        .await?
+        .into_iter()
+        .map(|s| s.stem)
+        .collect())
+}
+
+/// Locate one sample's media file — `<subject>/<modality>/<stem>.<ext>` — for
+/// serving a crop/clip, returning its full path and extension. The extension isn't
+/// fixed (`enroll` takes whatever the source gave), so we scan for the `<stem>.*`
+/// sibling that isn't the `.f32` embedding. `None` if the stem has no media here.
+/// The caller must have already validated `subject`/`stem` as safe path segments.
+pub async fn clip_media_path(
+    data_dir: &Path,
+    subject: &str,
+    modality: Modality,
+    stem: &str,
+) -> anyhow::Result<Option<PathBuf>> {
+    let dir = modality_dir(data_dir, subject, modality);
+    let prefix = format!("{stem}.");
+    let mut rd = match tokio::fs::read_dir(&dir).await {
+        Ok(rd) => rd,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(e) => return Err(e.into()),
+    };
+    while let Some(ent) = rd.next_entry().await? {
+        if let Ok(name) = ent.file_name().into_string()
+            && name.starts_with(&prefix)
+            && !name.ends_with(".f32")
+        {
+            return Ok(Some(dir.join(name)));
+        }
+    }
+    Ok(None)
+}
+
+/// Pull one clip out of a cluster it doesn't belong to: move the `stem`'s pair from
+/// `subject`'s `modality` gallery into a fresh [`mint_id`]'d cluster, and return that
+/// new cluster's id. The per-clip counterpart of [`apply_split`] — the finest
+/// correction the review view offers ("this one isn't them"). The ejected clip
+/// becomes its own unnamed cluster; if it matters it re-clusters on future
+/// encounters, and if not the forgetting sweep eventually drops it. No-op returning
+/// `None` if the stem has no embedding in that gallery.
+pub async fn eject_clip(
+    data_dir: &Path,
+    subject: &str,
+    modality: Modality,
+    stem: &str,
+) -> anyhow::Result<Option<String>> {
+    let subj = facets::slug(subject);
+    let src = modality_dir(data_dir, &subj, modality);
+    // Confirm the stem actually exists here (has an embedding sidecar) before minting.
+    let exists = read_samples(&src).await?.iter().any(|s| s.stem == stem);
+    if !exists {
+        return Ok(None);
+    }
+    let id = mint_id();
+    let dst = modality_dir(data_dir, &id, modality);
+    tokio::fs::create_dir_all(&dst).await?;
+    move_stem(&src, &dst, stem).await;
+    Ok(Some(id))
+}
+
 /// Rank known subjects by how close `query` is to their nearest `modality` sample
 /// (the max cosine over that subject's samples), best first, capped at `k`. Reads
 /// both the per-sample `<uuid>.f32` sidecars and any legacy packed `<modality>.f32`
@@ -1502,5 +1638,63 @@ mod tests {
         assert!(ids.is_empty());
         let (kept, _) = sample_media_counts(dir.path(), "one", Modality::Voice).await;
         assert_eq!(kept, 1, "nothing moved");
+    }
+
+    // ── Listing + eject (the review view's read/write surface) ────────────────
+
+    #[tokio::test]
+    async fn list_clusters_reports_per_modality_stems_and_named_flag() {
+        let dir = td();
+        enroll_v(dir.path(), "糯米", Modality::Face, &near(0, 0.0)).await;
+        enroll_v(dir.path(), "糯米", Modality::Voice, &near(1, 0.0)).await;
+        facets::update_facet(dir.path(), DIM, "糯米", "女儿").await.unwrap();
+        enroll_v(dir.path(), "2xk04cyd", Modality::Voice, &near(2, 0.0)).await;
+
+        let list = list_clusters(dir.path()).await.unwrap();
+        assert_eq!(list.len(), 2);
+        // Named subject sorts first.
+        assert_eq!(list[0].subject, "糯米");
+        assert!(list[0].named);
+        assert_eq!(list[0].face_stems.len(), 1);
+        assert_eq!(list[0].voice_stems.len(), 1);
+        // The unnamed one has only voice.
+        assert_eq!(list[1].subject, "2xk04cyd");
+        assert!(!list[1].named);
+        assert!(list[1].face_stems.is_empty());
+        assert_eq!(list[1].voice_stems.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn list_clusters_is_empty_before_anyone_is_enrolled() {
+        let dir = td();
+        assert!(list_clusters(dir.path()).await.unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn clip_media_path_finds_the_media_sibling_not_the_embedding() {
+        let dir = td();
+        enroll(dir.path(), "alice", Modality::Face, &near(0, 0.0), b"jpgbytes", "jpg").await.unwrap();
+        let stem = stems(dir.path(), "alice", Modality::Face).await.unwrap().pop().unwrap();
+        let p = clip_media_path(dir.path(), "alice", Modality::Face, &stem).await.unwrap().unwrap();
+        assert!(p.to_string_lossy().ends_with(&format!("{stem}.jpg")));
+        // A stem that isn't there → None.
+        assert!(clip_media_path(dir.path(), "alice", Modality::Face, "nope").await.unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn eject_clip_moves_one_clip_into_a_fresh_cluster() {
+        let dir = td();
+        // Two distinct-look voice samples so both survive dedup.
+        enroll_v(dir.path(), "mix", Modality::Voice, &near(0, 0.0)).await;
+        enroll_v(dir.path(), "mix", Modality::Voice, &near(1, 0.0)).await;
+        let victim = stems(dir.path(), "mix", Modality::Voice).await.unwrap()[0].clone();
+
+        let new_id = eject_clip(dir.path(), "mix", Modality::Voice, &victim).await.unwrap().unwrap();
+        // The clip left the source and landed, pair intact, under the new cluster.
+        let (left, _) = sample_media_counts(dir.path(), "mix", Modality::Voice).await;
+        assert_eq!(left, 1, "one clip stayed");
+        assert_eq!(sample_media_counts(dir.path(), &new_id, Modality::Voice).await, (1, 1));
+        // Ejecting a stem that isn't there is a no-op None.
+        assert!(eject_clip(dir.path(), "mix", Modality::Voice, "nope").await.unwrap().is_none());
     }
 }
