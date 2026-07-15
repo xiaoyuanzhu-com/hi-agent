@@ -372,7 +372,9 @@ pub async fn subscribe_url(data_dir: &Path, prefer_path: Option<&str>) -> anyhow
 }
 
 /// Get a usable access token: refresh if we hold a refresh token, else bootstrap.
-/// Re-bootstraps on a failed refresh (device_id makes that idempotent).
+/// On a failed refresh, re-bootstraps on the **stable device_id** — which the broker
+/// resolves back to the *same* device account (it dedupes on device_id), not a new
+/// one. So this recovers the existing account; it never mints a fresh identity.
 async fn ensure_tokens(store: &Credentials) -> anyhow::Result<Tokens> {
     if let Some(t) = &store.tokens {
         if !t.refresh_token.trim().is_empty() {
@@ -380,8 +382,10 @@ async fn ensure_tokens(store: &Credentials) -> anyhow::Result<Tokens> {
                 Ok(nt) => return Ok(nt),
                 // Expected, self-healing path: the broker rotates/expires refresh
                 // tokens, and a stale one (prior run, broker DB reset) is idempotently
-                // recovered by re-bootstrapping on the stable device id. Not fatal.
-                Err(e) => tracing::warn!(error = %e, "broker refresh token stale; re-bootstrapping a fresh account (self-heals)"),
+                // recovered by re-bootstrapping on the stable device_id. Because the
+                // broker keys accounts on device_id, this re-resolves the SAME account
+                // — no new account is created. Not fatal.
+                Err(e) => tracing::warn!(error = %e, "broker refresh failed; re-resolving device account (idempotent on device_id, same account)"),
             }
         }
     }
@@ -499,7 +503,8 @@ fn record_status(data_dir: &Path, ok: bool, error: &str) {
 
 /// In xiaoyuanzhu mode: ensure account tokens (bootstrap/refresh), fetch configs +
 /// energy, and persist. Best-effort — failures log and keep any cached configs.
-/// Mints a `device_id` on first need. No-op in BYOK. The `bearer` (a signed-in
+/// Derives (or, as a fallback, mints) a `device_id` on first need — see
+/// `foundation::machine_id`. No-op in BYOK. The `bearer` (a signed-in
 /// Authentik session, when present) will seed the `sub`-tier bootstrap once that's
 /// wired; today an anonymous device account is always minted. v1 runs at startup
 /// and on mode-select; a periodic loop is wired in `lib.rs`.
@@ -513,7 +518,13 @@ pub async fn refresh(data_dir: &Path, bearer: Option<&str>) {
 
     let mut dirty = false;
     if store.device_id.trim().is_empty() {
-        store.device_id = uuid::Uuid::now_v7().to_string();
+        // First need: prefer a machine-derived id so the account survives an app
+        // uninstall / data-dir wipe (the broker keys one account per device_id).
+        // Fall back to a random UUID only when no platform source is readable. An
+        // install that already holds a device_id keeps it — we never re-derive out
+        // from under a live account. See `foundation::machine_id`.
+        store.device_id = crate::foundation::machine_id::derive()
+            .unwrap_or_else(|| uuid::Uuid::now_v7().to_string());
         dirty = true;
     }
 

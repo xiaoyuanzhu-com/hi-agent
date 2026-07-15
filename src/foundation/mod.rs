@@ -26,6 +26,7 @@ pub mod channel_log;
 pub mod config;
 pub mod credentials;
 pub mod energy_state;
+pub mod machine_id;
 pub mod mcp;
 pub mod models;
 pub mod observatory;
