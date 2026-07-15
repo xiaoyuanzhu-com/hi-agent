@@ -535,6 +535,226 @@ pub async fn sweep_forgettable(
     Ok(report)
 }
 
+// ── Re-clustering: de-mix a cluster the biometrics over-merged ────────────────
+//
+// A single cluster can hold *more than one person* — mostly voice (overlapping
+// speech, similar timbre, imperfect diarization), sometimes faces (siblings, dim
+// light, a crop spanning two faces). It is the same shape as the contamination in
+// the 复盘 view — others fused into one identity — just from the source rather than
+// a bad merge. The append threshold ([`APPEND_THRESHOLD`]) is deliberately loose,
+// so an over-broad cluster usually still contains *tighter knots* of embeddings:
+// re-cluster its own samples at a stricter threshold and the people fall apart.
+//
+// The threshold has no single right value (too loose → still one blob; too tight →
+// one person shatters), so [`propose_split`] doesn't ask for one: it **sweeps**
+// loose→tight and returns the loosest split that separates the cluster into ≥ 2
+// groups, preferring 2–3 (a person mixed with one or two others is the common
+// case) and hard-capped at [`MAX_SPLIT_GROUPS`] for the rare messy cluster. It
+// **moves nothing** — it returns a proposal to preview; [`apply_split`] commits
+// the human's accepted grouping by moving each group's sample pairs into a fresh
+// minted cluster. This is the un-merge primitive that also repairs contamination:
+// point it at a *named* cluster and the mis-merged samples split off to be renamed.
+
+/// Loosest-to-tightest cosine thresholds [`propose_split`] tries. Starts at
+/// [`APPEND_THRESHOLD`] (the clustering that produced the blob → one group) and
+/// tightens; the first that yields ≥ 2 groups is the loosest real split.
+const SPLIT_SWEEP: [f32; 9] = [0.5, 0.55, 0.6, 0.65, 0.7, 0.75, 0.8, 0.85, 0.9];
+
+/// Hard ceiling on the auto-proposed group count — a backstop for genuinely messy
+/// clusters (a party, a crowd) so they can still separate, not a target. The
+/// preferred 2–3 finds an option almost always; the human can push higher in
+/// preview if the samples really warrant it.
+const MAX_SPLIT_GROUPS: usize = 10;
+
+/// One proposed sub-group of a split: the sample stems (uuid pairs) that cluster
+/// together at the chosen threshold. `stems` index into the modality's gallery.
+#[derive(Debug, Clone, PartialEq)]
+pub struct SplitGroup {
+    pub stems: Vec<String>,
+}
+
+/// A proposed de-mixing of one cluster's `modality` gallery — several groups plus
+/// any leftover singleton strays (lone samples that joined no group; likely outlier
+/// frames, surfaced separately rather than inflating the group count). Empty
+/// `groups` means the samples did not separate — treat as "one person".
+#[derive(Debug, Clone, PartialEq)]
+pub struct SplitProposal {
+    pub subject: String,
+    pub modality: Modality,
+    pub groups: Vec<SplitGroup>,
+    /// Stems that clustered alone at the chosen threshold — probable outliers, kept
+    /// out of the group count so "2 people + 3 stray frames" reads as a 2-way split.
+    pub strays: Vec<String>,
+}
+
+/// Single-linkage grouping of `embeddings` by index: two samples share a group if a
+/// chain of pairwise cosines ≥ `threshold` connects them. Pure; O(n²) over the
+/// cluster's own (small) gallery. Returns groups of indices, each sorted, the whole
+/// stable by smallest member so results are deterministic.
+fn cluster_indices(embeddings: &[&[f32]], threshold: f32) -> Vec<Vec<usize>> {
+    let n = embeddings.len();
+    // Union-find over sample indices.
+    let mut parent: Vec<usize> = (0..n).collect();
+    fn find(parent: &mut [usize], mut x: usize) -> usize {
+        while parent[x] != x {
+            parent[x] = parent[parent[x]];
+            x = parent[x];
+        }
+        x
+    }
+    for i in 0..n {
+        for j in (i + 1)..n {
+            if cosine(embeddings[i], embeddings[j]) >= threshold {
+                let (ri, rj) = (find(&mut parent, i), find(&mut parent, j));
+                if ri != rj {
+                    parent[ri] = rj;
+                }
+            }
+        }
+    }
+    let mut by_root: std::collections::BTreeMap<usize, Vec<usize>> = std::collections::BTreeMap::new();
+    for i in 0..n {
+        let r = find(&mut parent, i);
+        by_root.entry(r).or_default().push(i);
+    }
+    let mut groups: Vec<Vec<usize>> = by_root.into_values().collect();
+    for g in &mut groups {
+        g.sort_unstable();
+    }
+    groups.sort_by_key(|g| g[0]);
+    groups
+}
+
+/// Propose how to de-mix `subject`'s `modality` gallery, without moving anything.
+/// Sweeps [`SPLIT_SWEEP`] loose→tight and picks the loosest threshold whose
+/// non-singleton group count is ≥ 2, capped at [`MAX_SPLIT_GROUPS`]; singletons at
+/// that threshold become `strays`. Because group count only grows as the threshold
+/// tightens, this loosest split lands in the common 2–3 range almost always.
+/// Returns a proposal with empty `groups` when nothing separates (≤ 1 real group
+/// at every tried threshold) — i.e. "this looks like one person". Errors only on IO.
+pub async fn propose_split(
+    data_dir: &Path,
+    subject: &str,
+    modality: Modality,
+) -> anyhow::Result<SplitProposal> {
+    let subj = facets::slug(subject);
+    let samples = read_samples(&modality_dir(data_dir, &subj, modality)).await?;
+    let embs: Vec<&[f32]> = samples.iter().map(|s| s.embedding.as_slice()).collect();
+
+    let none = SplitProposal {
+        subject: subj.clone(),
+        modality,
+        groups: Vec::new(),
+        strays: Vec::new(),
+    };
+    if samples.len() < 2 {
+        return Ok(none); // nothing to split
+    }
+
+    // Group count is monotonically non-decreasing as the threshold tightens, so the
+    // *first* threshold that yields ≥ 2 real (size ≥ 2) groups is always the loosest
+    // split — the one that keeps each person most whole. Take it, as long as it
+    // hasn't already fragmented past the cap (a party/crowd edge case); looser than
+    // it didn't separate at all, and tighter only fragments further, so there is no
+    // better option to keep sweeping for. The preferred 2–3 range is where this
+    // first split lands almost always; the cap is only a backstop.
+    let mut chosen: Option<Vec<Vec<usize>>> = None;
+    for &t in &SPLIT_SWEEP {
+        let groups = cluster_indices(&embs, t);
+        let real = groups.iter().filter(|g| g.len() >= 2).count();
+        if real < 2 {
+            continue; // didn't separate into ≥2 people at this tightness
+        }
+        if real <= MAX_SPLIT_GROUPS {
+            chosen = Some(groups);
+        }
+        // Whether accepted or over the cap, this is the loosest split and no looser
+        // one separated — stop either way (over-cap ⇒ leave `chosen` None ⇒ "one
+        // person", better than a 20-way shatter).
+        break;
+    }
+
+    let Some(groups) = chosen else {
+        return Ok(none);
+    };
+    let mut out = SplitProposal { subject: subj, modality, groups: Vec::new(), strays: Vec::new() };
+    for g in groups {
+        let stems: Vec<String> = g.iter().map(|&i| samples[i].stem.clone()).collect();
+        if stems.len() >= 2 {
+            out.groups.push(SplitGroup { stems });
+        } else {
+            out.strays.extend(stems);
+        }
+    }
+    Ok(out)
+}
+
+/// Commit a de-mixing: move every group in `groups` **except the largest** out of
+/// `subject`'s `modality` gallery into a freshly [`mint_id`]'d cluster, one new
+/// cluster per group, moving each stem's whole pair (embedding + media sibling).
+/// The largest group stays in place under `subject` (so a named cluster keeps its
+/// name and its dominant occupant). Stems not named in any group — strays and the
+/// retained largest group — are left untouched. Returns the new cluster ids, in the
+/// order of `groups` minus the retained one. A group naming an unknown stem is
+/// skipped for that stem (best-effort, like the rest of the store).
+///
+/// Only the passed `modality` moves; a cluster mixing face + voice is de-mixed one
+/// modality at a time (the two spaces don't compare, so a caller splits whichever
+/// looks mixed). Cross-modal re-binding is out of scope here.
+pub async fn apply_split(
+    data_dir: &Path,
+    subject: &str,
+    modality: Modality,
+    groups: &[SplitGroup],
+) -> anyhow::Result<Vec<String>> {
+    let subj = facets::slug(subject);
+    anyhow::ensure!(!subj.is_empty(), "subject must slug to something");
+    let src = modality_dir(data_dir, &subj, modality);
+    if groups.len() < 2 {
+        return Ok(Vec::new()); // nothing to separate
+    }
+
+    // Keep the largest group in place; move the rest out. Largest-stays means a
+    // named cluster retains its name for its main occupant.
+    let keep = groups
+        .iter()
+        .enumerate()
+        .max_by_key(|(_, g)| g.stems.len())
+        .map(|(i, _)| i)
+        .unwrap_or(0);
+
+    let mut new_ids = Vec::new();
+    for (i, group) in groups.iter().enumerate() {
+        if i == keep {
+            continue;
+        }
+        let id = mint_id();
+        let dst = modality_dir(data_dir, &id, modality);
+        tokio::fs::create_dir_all(&dst).await?;
+        for stem in &group.stems {
+            move_stem(&src, &dst, stem).await;
+        }
+        new_ids.push(id);
+    }
+    Ok(new_ids)
+}
+
+/// Move a sample's whole pair (the `<stem>.f32` embedding and its media sibling)
+/// from `src` to `dst`. Best-effort per file, mirroring [`remove_sample`]: names are
+/// unique uuids so there is never a collision in `dst`.
+async fn move_stem(src: &Path, dst: &Path, stem: &str) {
+    let prefix = format!("{stem}.");
+    if let Ok(mut rd) = tokio::fs::read_dir(src).await {
+        while let Ok(Some(ent)) = rd.next_entry().await {
+            if let Ok(name) = ent.file_name().into_string()
+                && name.starts_with(&prefix)
+            {
+                let _ = tokio::fs::rename(ent.path(), dst.join(&name)).await;
+            }
+        }
+    }
+}
+
 /// Rank known subjects by how close `query` is to their nearest `modality` sample
 /// (the max cosine over that subject's samples), best first, capped at `k`. Reads
 /// both the per-sample `<uuid>.f32` sidecars and any legacy packed `<modality>.f32`
@@ -1192,5 +1412,95 @@ mod tests {
         let report = sweep_forgettable(dir.path(), t0(), false).await.unwrap();
         assert_eq!(report.examined, 0);
         assert!(report.forgotten.is_empty());
+    }
+
+    // ── Re-clustering / split ─────────────────────────────────────────────────
+
+    /// A near-`axis` embedding (unit-ish, small jitter via `k`) so a group of them
+    /// is mutually cosine ≈ 1 but distinct from another axis.
+    fn near(axis: usize, k: f32) -> Vec<f32> {
+        let mut v = vec![0.0f32; 4];
+        v[axis] = 1.0;
+        v[(axis + 1) % 4] = k * 0.05; // tiny off-axis wobble, well within any group
+        v
+    }
+
+    #[test]
+    fn cluster_indices_splits_two_tight_knots() {
+        // Three near +x, two near +y — one loose blob, two tight knots.
+        let a = [near(0, 0.0), near(0, 1.0), near(0, 2.0), near(1, 0.0), near(1, 1.0)];
+        let refs: Vec<&[f32]> = a.iter().map(|v| v.as_slice()).collect();
+        // Loose: everything is one group (all cosine ≥ 0.5? +x·+y = 0 < 0.5, so two).
+        let g = cluster_indices(&refs, 0.6);
+        assert_eq!(g.len(), 2, "two knots at a tight-enough threshold");
+        assert_eq!(g[0], vec![0, 1, 2]);
+        assert_eq!(g[1], vec![3, 4]);
+    }
+
+    #[tokio::test]
+    async fn propose_split_finds_two_people_in_a_mixed_voice_cluster() {
+        let dir = td();
+        // A single unnamed cluster whose voice gallery is really two speakers:
+        // three samples near +x, two near +y.
+        for v in [near(0, 0.0), near(0, 1.0), near(0, 2.0), near(1, 0.0), near(1, 1.0)] {
+            enroll_v(dir.path(), "mixedvox", Modality::Voice, &v).await;
+        }
+        let p = propose_split(dir.path(), "mixedvox", Modality::Voice).await.unwrap();
+        assert_eq!(p.groups.len(), 2, "proposes two speakers");
+        let sizes: Vec<usize> = p.groups.iter().map(|g| g.stems.len()).collect();
+        assert!(sizes.contains(&3) && sizes.contains(&2), "3 + 2 split, got {sizes:?}");
+        assert!(p.strays.is_empty());
+    }
+
+    #[tokio::test]
+    async fn propose_split_returns_empty_for_one_person() {
+        let dir = td();
+        // All near one axis — one person, however many samples.
+        for k in 0..4 {
+            enroll_v(dir.path(), "solo", Modality::Voice, &near(0, k as f32)).await;
+        }
+        let p = propose_split(dir.path(), "solo", Modality::Voice).await.unwrap();
+        assert!(p.groups.is_empty(), "one person does not split");
+    }
+
+    #[tokio::test]
+    async fn propose_split_prefers_two_to_three_over_more() {
+        let dir = td();
+        // Three distinct axes → a clean 3-way split is available and preferred.
+        for axis in [0, 1, 2] {
+            for k in 0..2 {
+                enroll_v(dir.path(), "trio", Modality::Voice, &near(axis, k as f32)).await;
+            }
+        }
+        let p = propose_split(dir.path(), "trio", Modality::Voice).await.unwrap();
+        assert_eq!(p.groups.len(), 3, "three speakers, three groups (within preferred range)");
+    }
+
+    #[tokio::test]
+    async fn apply_split_moves_all_but_the_largest_group_into_new_clusters() {
+        let dir = td();
+        for v in [near(0, 0.0), near(0, 1.0), near(0, 2.0), near(1, 0.0), near(1, 1.0)] {
+            enroll_v(dir.path(), "mixed2", Modality::Voice, &v).await;
+        }
+        let p = propose_split(dir.path(), "mixed2", Modality::Voice).await.unwrap();
+        assert_eq!(p.groups.len(), 2);
+        let new_ids = apply_split(dir.path(), "mixed2", Modality::Voice, &p.groups).await.unwrap();
+        assert_eq!(new_ids.len(), 1, "largest group stays, one new cluster minted");
+
+        // The retained cluster keeps the larger (3) group; the new one has the 2.
+        let (kept, _) = sample_media_counts(dir.path(), "mixed2", Modality::Voice).await;
+        let (moved, moved_media) = sample_media_counts(dir.path(), &new_ids[0], Modality::Voice).await;
+        assert_eq!(kept, 3, "largest group retained under original subject");
+        assert_eq!((moved, moved_media), (2, 2), "smaller group moved with its media pairs");
+    }
+
+    #[tokio::test]
+    async fn apply_split_is_a_noop_below_two_groups() {
+        let dir = td();
+        enroll_v(dir.path(), "one", Modality::Voice, &near(0, 0.0)).await;
+        let ids = apply_split(dir.path(), "one", Modality::Voice, &[]).await.unwrap();
+        assert!(ids.is_empty());
+        let (kept, _) = sample_media_counts(dir.path(), "one", Modality::Voice).await;
+        assert_eq!(kept, 1, "nothing moved");
     }
 }

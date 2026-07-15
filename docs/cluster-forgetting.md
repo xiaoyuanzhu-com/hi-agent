@@ -76,13 +76,49 @@ All live in `people_vectors.rs` (criteria) and `heartbeat.rs` (`SWEEP_DRY_RUN`).
 - Hooked in `heartbeat::run_consolidation` right after the "reflection fired"
   log, gated by `SWEEP_DRY_RUN`.
 
+## De-mixing a cluster that is actually several people
+
+A cluster can hold **more than one person** — mostly voice (overlapping speech,
+similar timbre, imperfect diarization), sometimes faces. Same shape as the
+contamination in the 复盘 view, but from the source rather than a bad merge. Since
+the append threshold is loose, an over-broad cluster still contains tighter knots
+of embeddings, so re-clustering its own samples at a stricter threshold separates
+the people.
+
+There is no single right threshold, so the machine doesn't ask for one — it
+**sweeps** and proposes:
+
+- `propose_split(subject, modality)` — sweeps cosine thresholds loose→tight
+  (`SPLIT_SWEEP`), returns the **loosest** split into **≥ 2** groups (group count
+  only grows as the threshold tightens, so the loosest split lands in the preferred
+  **2–3** range almost always), hard-capped at **10** (`MAX_SPLIT_GROUPS`, a
+  backstop for a party/crowd, not a target). Singleton samples become `strays`
+  (probable outlier frames), kept out of the group count. Empty `groups` = "one
+  person, didn't separate". **Moves nothing** — it is a proposal to preview.
+- `apply_split(subject, modality, groups)` — commits the human's accepted grouping:
+  the **largest group stays** under the original subject (a named cluster keeps its
+  name for its main occupant); every other group's sample pairs move into a fresh
+  `mint_id`'d cluster. Per-modality (voice and face spaces don't compare; a
+  mixed-modality cluster is de-mixed one modality at a time — cross-modal rebinding
+  is out of scope).
+
+In the view this is a **⟳ re-cluster button** on a cluster: tap → the proposal is
+previewed (each group auditionable) → **Apply**. Preview-before-apply is the whole
+safety story: a bad threshold costs nothing because nothing moves until accepted.
+
+**This is the shared un-merge primitive.** Pointed at the *named*, contaminated 赵力
+cluster, the same `propose_split`/`apply_split` breaks the 601 mis-merged 7/10
+samples off into their own cluster to be renamed — so the calibration claim view
+and the 复盘 contamination-repair view use one capability.
+
 ## Not in scope (deliberately)
 
 - **No media-playback detection.** Tagging encounters as "from a screen" vs "in
   the room" would need a context flag threaded into `assign` (doesn't exist
   today). Not needed: the recurrence rule already catches video nights, because
   they are single-occasion bursts. A later refinement, not a prerequisite.
-- **No `split_cluster`.** Un-merging the contaminated 赵力 cluster (601 misattributed
-  samples on 7/10) is a separate capability, tracked with the calibration view.
+- **No cross-modal binding in split.** `apply_split` moves one modality; it does
+  not try to keep a person's face and voice together across the split (that
+  binding is unsolved and designed elsewhere).
 - **No salience curve.** A binary grace-gated keep/forget is easier to audit than
   a half-life, and enough for the goal.
