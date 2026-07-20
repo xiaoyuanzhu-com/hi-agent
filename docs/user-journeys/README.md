@@ -76,3 +76,7 @@ What "done" looks like, and how the user knows it worked.
 
 - [26 · 看懂一帧:举起来当场问 / 存下来回头找](26-look-and-recall.md) — 通用视觉**最典型一路**(frame endpoint):举起实物 / 发来照片,既当场答到点(剂量、成分、跨设备读报错),这份"看懂"又留存让图按**内容**找回;升级现有固定字幕路径(`server/vision.rs`)。与 [16](16-recognize-people.md)(脸=内置模型软证据)、[19](19-upload-passport.md)(文件=物件不走感官)区分。
 - [27 · 看我做,给我反馈(看一段过程,不是一帧)](27-watch-and-guide.md) — 通用视觉 **video endpoint**:看懂一段过程的先后 / 节奏 / 对错(发球、做菜),给针对性反馈、跨段对比进步;语气陪练式(连 [12](12-play-with-child.md))。区别于 [10](10-vision-sam-yolo.md)(建项目跑 CV 模型)。
+
+> **测试即素材(29)**:把"体验一个产品 + 传播"整件交出去——agent 在能碰到的设备上真操作、录下来、剪成对外成片、操作登录态 app 发出去。缝合已有几路(操作设备 / 浏览器 / 看一段过程 / 研究+批判反射);盘完**核心回路无硬缺口**,都是驱动已有 effector。
+
+- [29 · 去体验个产品的新功能,剪条小红书发出来(测试即素材)](29-test-and-post.md) — 整件"体验 + 传播"交出去:在能碰到的设备(Mac mini)上真操作 pi.dev 新功能、边测边录、**判定跑没跑通(红的落 bug 报告不发)**、干净那次剪成成片(裁/字幕/旁白/竖版)、**发布前过目**、拿到 go 后**操作登录态的小红书**发出去(**非 API**)。缝合 [08](08-operate-apps.md)/[07](07-browser-errand.md)/[27](27-watch-and-guide.md)/[22](22-research-before-stale-answer.md)/[23](23-critique-before-shipping.md);核心回路无硬缺口(设备接口 abacad 式 MCP + 设备自带录屏/ffmpeg + TTS-to-file + 操作登录态 app),唯一待确认原语 = **TTS 渲文件**,待打通 = Mac mini 录屏 TCC。net-new 未建未测。
